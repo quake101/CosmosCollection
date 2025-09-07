@@ -1,0 +1,33 @@
+# CosmosCollection Requirements
+# Python astronomy application for deep sky object management and observation planning
+
+# Core GUI Framework
+PySide6==6.9.0
+
+# Astronomy Libraries
+astropy==7.0.2
+astroplan==0.10.1
+astropy-iers-data==0.2025.5.12.0.38.29
+
+# Scientific Computing
+numpy==2.2.5
+matplotlib==3.10.3
+
+# Timezone Support
+pytz==2025.2
+
+# Optional: For building executable (development)
+pyinstaller==6.12.0
+pyinstaller-hooks-contrib==2025.2
+
+# Optional: Required for PyInstaller on Windows
+pywin32-ctypes==0.2.3
+
+# Image processing (dependency of matplotlib/astropy)
+pillow==11.2.1
+
+# Date/time utilities (dependency of matplotlib)
+python-dateutil==2.9.0.post0
+
+# Packaging utilities (dependency)
+packaging==24.2

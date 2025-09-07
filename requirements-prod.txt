@@ -1,0 +1,26 @@
+# CosmosCollection Production Requirements
+# Minimal dependencies for running the application
+
+# Core GUI Framework
+PySide6==6.9.0
+
+# Astronomy Libraries
+astropy==7.0.2
+astroplan==0.10.1
+astropy-iers-data==0.2025.5.12.0.38.29
+
+# Scientific Computing
+numpy==2.2.5
+matplotlib==3.10.3
+
+# Timezone Support
+pytz==2025.2
+
+# Image processing
+pillow==11.2.1
+
+# Date/time utilities
+python-dateutil==2.9.0.post0
+
+# Packaging utilities
+packaging==24.2

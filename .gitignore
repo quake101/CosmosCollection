@@ -1,0 +1,25 @@
+# Python
+__pycache__
+.py[cod]
+.so
+
+# PyInstaller  packaging
+dist
+build
+.spec
+
+# Virtualenv
+.env
+venv
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.vscode
+.idea
+
+# Other Random Items
+_unused
+ToDO.txt

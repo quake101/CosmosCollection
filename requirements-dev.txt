@@ -1,0 +1,16 @@
+# CosmosCollection Development Requirements
+# Additional dependencies for development and building
+
+# Include production requirements
+-r requirements-prod.txt
+
+# Building and packaging
+pyinstaller==6.12.0
+pyinstaller-hooks-contrib==2025.2
+
+# Windows-specific for PyInstaller
+pywin32-ctypes==0.2.3
+
+# Build utilities
+altgraph==0.17.4
+pefile==2023.2.7
