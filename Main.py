@@ -444,8 +444,18 @@ class AladinLiteWindow(QDialog):
         # Add Aladin Lite viewer
         self.web_view = QWebEngineView()
         base_url = "https://aladin.u-strasbg.fr/AladinLite/?target="
-        # Use dsodetailid as the target
+        
+        # Use multiple fallback methods to get target
         target_id = data.get('dsodetailid', '')
+        if not target_id:
+            # Try using object name directly
+            target_id = data.get('name', '')
+        if not target_id and 'ra_deg' in data and 'dec_deg' in data:
+            # Use coordinates if available
+            ra = data['ra_deg']
+            dec = data['dec_deg']
+            target_id = f"{ra}+{dec}"
+        
         image_url = f"{base_url}{target_id}&fov={fov}&survey=P%2FDSS2%2Fcolor"
         self.web_view.setUrl(QUrl(image_url))
         layout.addWidget(self.web_view)
@@ -2734,7 +2744,7 @@ class MainWindow(QMainWindow):
         logger.debug("MainWindow initialization complete")
 
     def _create_toolbar(self):
-        """Create the main toolbar with Settings, Telescopes, and About actions"""
+        """Create the main toolbar with Settings, Telescopes, DSO tools, and About actions"""
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
@@ -2752,6 +2762,20 @@ class MainWindow(QMainWindow):
         telescopes_action.setToolTip("Manage telescope configurations")
         telescopes_action.triggered.connect(self._show_telescopes)
         toolbar.addAction(telescopes_action)
+        
+        toolbar.addSeparator()
+        
+        # DSO Visibility Calculator action
+        visibility_action = QAction("DSO Visibility", self)
+        visibility_action.setToolTip("Calculate DSO visibility from your location")
+        visibility_action.triggered.connect(self._show_dso_visibility)
+        toolbar.addAction(visibility_action)
+        
+        # Best DSO Tonight action
+        best_dso_action = QAction("Best DSO Tonight", self)
+        best_dso_action.setToolTip("Find the best DSOs visible tonight")
+        best_dso_action.triggered.connect(self._show_best_dso_tonight)
+        toolbar.addAction(best_dso_action)
         
         toolbar.addSeparator()
         
@@ -2775,6 +2799,34 @@ class MainWindow(QMainWindow):
         """Show the about dialog"""
         about_dialog = AboutDialog(self)
         about_dialog.exec()
+        
+    def _show_dso_visibility(self):
+        """Show the DSO Visibility Calculator window"""
+        try:
+            from DSOVisibilityCalculator import DSOVisibilityApp
+            if not hasattr(self, 'dso_visibility_window') or not self.dso_visibility_window.isVisible():
+                self.dso_visibility_window = DSOVisibilityApp()
+            self.dso_visibility_window.show()
+            self.dso_visibility_window.raise_()
+            self.dso_visibility_window.activateWindow()
+        except ImportError as e:
+            QMessageBox.warning(self, "Import Error", f"Could not load DSO Visibility Calculator: {e}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not open DSO Visibility Calculator: {e}")
+            
+    def _show_best_dso_tonight(self):
+        """Show the Best DSO Tonight window"""
+        try:
+            from BestDSOTonight import BestDSOTonightWindow
+            if not hasattr(self, 'best_dso_window') or not self.best_dso_window.isVisible():
+                self.best_dso_window = BestDSOTonightWindow()
+            self.best_dso_window.show()
+            self.best_dso_window.raise_()
+            self.best_dso_window.activateWindow()
+        except ImportError as e:
+            QMessageBox.warning(self, "Import Error", f"Could not load Best DSO Tonight: {e}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not open Best DSO Tonight: {e}")
 
     def _on_show_images_changed(self, state):
         """Handle show images only checkbox state change"""
