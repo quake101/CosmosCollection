@@ -14,6 +14,7 @@ CosmosCollection is designed to help astrophotographers manage their image colle
 - **Image data Management**: Track technical details like exposure settings, equipment used, and capture conditions
 - **DSO Visibility Calculator**: Used to determine when DSOs are optimally visible
 - **Best DSO Tonight**: Calculates and displays the best Deep Sky Objects visible from user's location tonight
+- **DSO TargetList**: DSO Target management list for planning observing sessions
 
 ## Getting Started
 

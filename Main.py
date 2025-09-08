@@ -1035,6 +1035,11 @@ class ObjectDetailWindow(QDialog):
             aladin_button.clicked.connect(lambda: self._open_aladin_lite(self.data))
             buttons_layout.addWidget(aladin_button)
 
+            # Add to Target List button
+            target_list_button = QPushButton("Add to Target List")
+            target_list_button.clicked.connect(self._add_to_target_list)
+            buttons_layout.addWidget(target_list_button)
+
             # Add close button at the bottom
             close_button = QPushButton("Close")
             close_button.clicked.connect(self.close)
@@ -1828,6 +1833,25 @@ class ObjectDetailWindow(QDialog):
         except Exception as e:
             logger.error(f"Error relocating image: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to relocate image:\n{str(e)}")
+
+    def _add_to_target_list(self):
+        """Add this DSO to the target list"""
+        try:
+            # Import DSOTargetList module
+            from DSOTargetList import AddTargetDialog
+            
+            # Create dialog with current DSO data
+            dialog = AddTargetDialog(dso_data=self.data, parent=self)
+            if dialog.exec():
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "Success", f"{self.data['name']} has been added to your target list!")
+                
+        except ImportError as e:
+            logger.error(f"Could not import DSOTargetList: {str(e)}")
+            QMessageBox.warning(self, "Import Error", f"Could not load Target List feature: {e}")
+        except Exception as e:
+            logger.error(f"Error adding to target list: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to add to target list: {str(e)}")
 
 
 class CustomTableView(QTableView):
@@ -2777,6 +2801,12 @@ class MainWindow(QMainWindow):
         best_dso_action.triggered.connect(self._show_best_dso_tonight)
         toolbar.addAction(best_dso_action)
         
+        # Target List action
+        target_list_action = QAction("Target List", self)
+        target_list_action.setToolTip("Manage your DSO target list")
+        target_list_action.triggered.connect(self._show_target_list)
+        toolbar.addAction(target_list_action)
+        
         toolbar.addSeparator()
         
         # About action
@@ -2827,6 +2857,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Import Error", f"Could not load Best DSO Tonight: {e}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not open Best DSO Tonight: {e}")
+            
+    def _show_target_list(self):
+        """Show the DSO Target List window"""
+        try:
+            from DSOTargetList import DSOTargetListWindow
+            if not hasattr(self, 'target_list_window') or not self.target_list_window.isVisible():
+                self.target_list_window = DSOTargetListWindow()
+            self.target_list_window.show()
+            self.target_list_window.raise_()
+            self.target_list_window.activateWindow()
+        except ImportError as e:
+            QMessageBox.warning(self, "Import Error", f"Could not load Target List: {e}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not open Target List: {e}")
 
     def _on_show_images_changed(self, state):
         """Handle show images only checkbox state change"""

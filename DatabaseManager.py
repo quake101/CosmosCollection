@@ -70,6 +70,27 @@ class DatabaseManager:
                     )
                 """)
                 
+                # Create usertargetlist table for user's observing target list
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS usertargetlist (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        dso_type TEXT,
+                        constellation TEXT,
+                        ra_deg REAL,
+                        dec_deg REAL,
+                        magnitude REAL,
+                        size_info TEXT,
+                        priority TEXT DEFAULT 'Medium',
+                        status TEXT DEFAULT 'Not Observed',
+                        best_months TEXT,
+                        notes TEXT,
+                        date_added TEXT,
+                        date_observed TEXT,
+                        created_date TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
                 conn.commit()
                 logger.debug("Database tables initialized successfully")
                 
