@@ -2860,9 +2860,7 @@ class ObjectDetailWindow(QDialog):
             
             # Create dialog with current DSO data
             dialog = AddTargetDialog(dso_data=self.data, parent=self)
-            if dialog.exec():
-                from PySide6.QtWidgets import QMessageBox
-                QMessageBox.information(self, "Success", f"{self.data['name']} has been added to your target list!")
+            dialog.exec()
                 
         except ImportError as e:
             logger.error(f"Could not import DSOTargetList: {str(e)}")
