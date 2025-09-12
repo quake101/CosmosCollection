@@ -91,6 +91,35 @@ class DatabaseManager:
                     )
                 """)
                 
+                # Create usercollages table for user's collage projects
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS usercollages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        dsodetailid INTEGER,
+                        name TEXT NOT NULL,
+                        grid_width INTEGER NOT NULL DEFAULT 3,
+                        grid_height INTEGER NOT NULL DEFAULT 3,
+                        cell_size INTEGER NOT NULL DEFAULT 400,
+                        spacing INTEGER NOT NULL DEFAULT 20,
+                        background_color TEXT NOT NULL DEFAULT 'black',
+                        created_date TEXT NOT NULL,
+                        modified_date TEXT NOT NULL,
+                        FOREIGN KEY (dsodetailid) REFERENCES dsodetail(id)
+                    )
+                """)
+                
+                # Create usercollageimages table for collage image associations
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS usercollageimages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        collage_id INTEGER NOT NULL,
+                        userimage_id INTEGER NOT NULL,
+                        position_index INTEGER NOT NULL,
+                        FOREIGN KEY (collage_id) REFERENCES usercollages(id) ON DELETE CASCADE,
+                        FOREIGN KEY (userimage_id) REFERENCES userimages(id) ON DELETE CASCADE
+                    )
+                """)
+                
                 conn.commit()
                 logger.debug("Database tables initialized successfully")
                 

@@ -2,6 +2,8 @@
 """
 Deep Sky Object Visibility Calculator
 Uses astropy and PySide6 to determine when DSOs are optimally visible
+
+Contains the centralized DSOVisibilityCalculator class for all visibility calculations
 """
 
 import sys
@@ -36,8 +38,343 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 from DatabaseManager import DatabaseManager
 
 
+class DSOVisibilityCalculator:
+    """
+    Centralized class for all DSO visibility calculations.
+    
+    This class provides a single interface for calculating DSO visibility, altitude,
+    azimuth, optimal viewing times, and seasonal visibility across the application.
+    """
+    
+    def __init__(self, location_lat=None, location_lon=None, timezone=None, height=250):
+        """
+        Initialize the visibility calculator.
+        
+        Args:
+            location_lat (float): Observer latitude in degrees (+ for North, - for South)
+            location_lon (float): Observer longitude in degrees (+ for East, - for West)
+            timezone (str): Timezone string (e.g., 'America/New_York')
+            height (float): Observer height above sea level in meters (default: 250)
+        """
+        self.location = None
+        self.timezone = pytz.UTC  # Default to UTC
+        
+        if location_lat is not None and location_lon is not None:
+            self.set_location(location_lat, location_lon, height)
+        else:
+            self._load_location_from_database()
+            
+        if timezone:
+            self.set_timezone(timezone)
+        else:
+            self._load_timezone_from_database()
+    
+    def set_location(self, lat, lon, height=250):
+        """Set observer location."""
+        self.location = EarthLocation(lat=lat*u.deg, lon=lon*u.deg, height=height*u.m)
+    
+    def set_timezone(self, timezone_str):
+        """Set timezone for local time calculations."""
+        try:
+            self.timezone = pytz.timezone(timezone_str)
+        except pytz.UnknownTimeZoneError:
+            self.timezone = pytz.UTC
+    
+    def _load_location_from_database(self):
+        """Load observer location from database."""
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
+                row = cursor.fetchone()
+                if row and row[0] is not None and row[1] is not None:
+                    self.set_location(row[0], row[1])
+        except Exception:
+            pass
+    
+    def _load_timezone_from_database(self):
+        """Load timezone from database."""
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                row = cursor.fetchone()
+                if row and row[0]:
+                    self.set_timezone(row[0])
+        except Exception:
+            pass
+    
+    def get_dso_coordinates(self, dso_name):
+        """
+        Get coordinates for a DSO by name.
+        
+        Args:
+            dso_name (str): Name of the DSO (e.g., 'M31', 'NGC 7000')
+            
+        Returns:
+            tuple: (SkyCoord object, error_message) - error_message is None if successful
+        """
+        try:
+            coord = SkyCoord.from_name(dso_name)
+            return coord, None
+        except Exception as e:
+            return None, str(e)
+    
+    def calculate_altaz_over_time(self, dso_coord, start_time, duration_hours, time_resolution=4):
+        """
+        Calculate altitude and azimuth for a DSO over a time period.
+        
+        Args:
+            dso_coord (SkyCoord): DSO coordinates
+            start_time (str or Time): Start time (ISO format string or astropy Time)
+            duration_hours (float): Duration in hours
+            time_resolution (int): Time points per hour (default: 4, i.e., every 15 minutes)
+            
+        Returns:
+            tuple: (time_range, dso_altaz, sun_altaz)
+        """
+        if self.location is None:
+            raise ValueError("Observer location not set")
+        
+        if isinstance(start_time, str):
+            start_time = Time(start_time)
+        
+        # Create time range
+        time_range = start_time + np.linspace(0, duration_hours, int(duration_hours * time_resolution)) * u.hour
+        
+        # Calculate DSO altitude/azimuth
+        altaz_frame = AltAz(obstime=time_range, location=self.location)
+        dso_altaz = dso_coord.transform_to(altaz_frame)
+        
+        # Calculate sun altitude/azimuth
+        sun = get_sun(time_range)
+        sun_altaz = sun.transform_to(altaz_frame)
+        
+        return time_range, dso_altaz, sun_altaz
+    
+    def find_optimal_viewing_times(self, dso_altaz, sun_altaz, min_altitude=30, max_sun_altitude=-12):
+        """
+        Find optimal viewing times based on altitude and darkness criteria.
+        
+        Args:
+            dso_altaz: DSO altitude/azimuth data
+            sun_altaz: Sun altitude/azimuth data
+            min_altitude (float): Minimum DSO altitude in degrees (default: 30)
+            max_sun_altitude (float): Maximum sun altitude for dark sky (default: -12)
+            
+        Returns:
+            numpy array: Boolean array indicating optimal viewing times
+        """
+        dso_visible = dso_altaz.alt.deg > min_altitude
+        dark_sky = sun_altaz.alt.deg < max_sun_altitude
+        return dso_visible & dark_sky
+    
+    def calculate_visibility_for_date(self, dso_name, date, duration_hours=24, min_altitude=30):
+        """
+        Calculate complete visibility information for a DSO on a specific date.
+        
+        Args:
+            dso_name (str): Name of the DSO
+            date (str): Date in ISO format (YYYY-MM-DD)
+            duration_hours (float): Duration to calculate (default: 24 hours)
+            min_altitude (float): Minimum altitude threshold (default: 30 degrees)
+            
+        Returns:
+            dict: Complete visibility results or None if error
+        """
+        # Get DSO coordinates
+        dso_coord, error = self.get_dso_coordinates(dso_name)
+        if dso_coord is None:
+            return {"error": f"Could not find coordinates for {dso_name}: {error}"}
+        
+        try:
+            # Calculate altitude/azimuth over time
+            time_range, dso_altaz, sun_altaz = self.calculate_altaz_over_time(
+                dso_coord, date, duration_hours)
+            
+            # Find optimal viewing times
+            optimal_times = self.find_optimal_viewing_times(dso_altaz, sun_altaz, min_altitude)
+            
+            # Calculate summary statistics
+            max_altitude = np.max(dso_altaz.alt.deg)
+            max_alt_idx = np.argmax(dso_altaz.alt.deg)
+            max_alt_time = time_range[max_alt_idx]
+            max_alt_azimuth = dso_altaz.az.deg[max_alt_idx]
+            
+            # Find viewing windows
+            viewing_windows = self._find_viewing_windows(time_range, optimal_times, dso_altaz)
+            
+            return {
+                "dso_name": dso_name,
+                "dso_coord": dso_coord,
+                "time_range": time_range,
+                "dso_altaz": dso_altaz,
+                "sun_altaz": sun_altaz,
+                "optimal_times": optimal_times,
+                "max_altitude": max_altitude,
+                "max_alt_time": max_alt_time,
+                "max_alt_azimuth": max_alt_azimuth,
+                "viewing_windows": viewing_windows,
+                "timezone": self.timezone
+            }
+            
+        except Exception as e:
+            return {"error": f"Calculation error: {str(e)}"}
+    
+    def calculate_seasonal_visibility(self, dso_coord, year=None, min_altitude=30):
+        """
+        Calculate when a DSO is optimally visible throughout a year.
+        
+        Args:
+            dso_coord (SkyCoord): DSO coordinates
+            year (int): Year to calculate (default: current year)
+            min_altitude (float): Minimum altitude threshold (default: 30 degrees)
+            
+        Returns:
+            list: List of date ranges when DSO is optimally visible
+        """
+        if self.location is None:
+            return []
+        
+        if year is None:
+            from datetime import datetime
+            year = datetime.now().year
+        
+        try:
+            # Sample dates throughout the year (every 10 days)
+            dates = []
+            visibility_data = []
+            
+            for day_of_year in range(1, 366, 10):  # Every 10 days
+                try:
+                    date = Time(f"{year}-01-01") + (day_of_year - 1) * u.day
+                    
+                    # Calculate for midnight (when most DSOs are best visible)
+                    midnight = date + 12 * u.hour  # Approximate local midnight
+                    
+                    altaz_frame = AltAz(obstime=midnight, location=self.location)
+                    dso_altaz = dso_coord.transform_to(altaz_frame)
+                    sun = get_sun(midnight)
+                    sun_altaz = sun.transform_to(altaz_frame)
+                    
+                    # Check if object is well-visible (above min altitude and sun is down)
+                    is_visible = (dso_altaz.alt.deg > min_altitude and 
+                                sun_altaz.alt.deg < -12)
+                    
+                    dates.append(date)
+                    visibility_data.append(is_visible)
+                    
+                except Exception:
+                    continue
+            
+            # Find continuous visibility periods
+            return self._group_visibility_seasons(dates, visibility_data)
+            
+        except Exception:
+            return []
+    
+    def _find_viewing_windows(self, time_range, optimal_times, dso_altaz):
+        """Find continuous viewing windows from optimal times array."""
+        if not np.any(optimal_times):
+            return []
+        
+        # Find continuous windows
+        diff = np.diff(np.concatenate(([False], optimal_times, [False])).astype(int))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        
+        windows = []
+        for start_idx, end_idx in zip(starts, ends):
+            start_time = time_range[start_idx]
+            end_time = time_range[end_idx - 1]
+            duration = (end_time - start_time).to(u.hour).value
+            
+            # Calculate mid-window statistics
+            mid_idx = (start_idx + end_idx) // 2
+            mid_altitude = dso_altaz.alt.deg[mid_idx]
+            mid_azimuth = dso_altaz.az.deg[mid_idx]
+            
+            windows.append({
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration_hours": duration,
+                "mid_altitude": mid_altitude,
+                "mid_azimuth": mid_azimuth
+            })
+        
+        return windows
+    
+    def _group_visibility_seasons(self, dates, visibility_data):
+        """Group contiguous visibility dates into seasons."""
+        if not dates or not any(visibility_data):
+            return []
+        
+        seasons = []
+        current_season_start = None
+        
+        for i, (date, is_visible) in enumerate(zip(dates, visibility_data)):
+            if is_visible and current_season_start is None:
+                current_season_start = date
+            elif not is_visible and current_season_start is not None:
+                # End of a visibility season
+                seasons.append({
+                    "start_date": current_season_start,
+                    "end_date": dates[i-1] if i > 0 else current_season_start,
+                })
+                current_season_start = None
+        
+        # Handle case where season extends to end of year
+        if current_season_start is not None:
+            seasons.append({
+                "start_date": current_season_start,
+                "end_date": dates[-1],
+            })
+        
+        return seasons
+    
+    @staticmethod
+    def azimuth_to_direction(azimuth):
+        """
+        Convert azimuth angle to cardinal direction.
+        
+        Args:
+            azimuth (float): Azimuth in degrees (0-360)
+            
+        Returns:
+            str: Cardinal direction (e.g., 'N', 'NE', 'SSW')
+        """
+        directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+                      'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
+        idx = int((azimuth + 11.25) / 22.5) % 16
+        return directions[idx]
+    
+    @staticmethod
+    def get_twilight_condition(sun_altitude):
+        """
+        Get twilight condition based on sun altitude.
+        
+        Args:
+            sun_altitude (float): Sun altitude in degrees
+            
+        Returns:
+            str: Twilight condition
+        """
+        if sun_altitude > 0:
+            return "Daylight"
+        elif sun_altitude > -6:
+            return "Civil Twilight"
+        elif sun_altitude > -12:
+            return "Nautical Twilight"
+        elif sun_altitude > -18:
+            return "Astronomical Twilight"
+        else:
+            return "Night"
+
+
 class CalculationThread(QThread):
-    """Thread for performing visibility calculations"""
+    """Thread for performing visibility calculations using centralized calculator"""
     finished = Signal(object)
     error = Signal(str)
 
@@ -47,108 +384,30 @@ class CalculationThread(QThread):
         self.date = date
         self.hours = hours
         self.min_altitude = min_altitude
-        self.location = self.setup_location()
-        # Set up user's time zone for local time display
-        self.local_tz = self.setup_timezone()
-
-    def setup_location(self):
-        """Set up the observer location from database or return None if not configured"""
-        try:
-            db_manager = DatabaseManager()
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
-                row = cursor.fetchone()
-                if row:
-                    lat, lon = row
-                    if lat is not None and lon is not None:
-                        lat = lat * u.deg
-                        lon = lon * u.deg
-                        height = 250 * u.m  # Default height
-                        return EarthLocation(lat=lat, lon=lon, height=height)
-        except Exception:
-            pass  # Database error
         
-        return None  # No location configured
-
-    def setup_timezone(self):
-        """Set up the user's timezone from database or return UTC if not configured"""
-        try:
-            db_manager = DatabaseManager()
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                # Try to get timezone, but fall back if column doesn't exist
-                try:
-                    cursor.execute("SELECT timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-                    if row and row[0]:
-                        # Validate the timezone
-                        tz = pytz.timezone(row[0])
-                        return tz
-                except Exception:
-                    pass  # Column doesn't exist or invalid timezone
-        except Exception:
-            pass  # Database error
-        
-        # Default timezone: UTC when no location is configured
-        return pytz.UTC
-
-    def get_dso_coordinates(self, dso_name):
-        """Get coordinates for a DSO by name"""
-        try:
-            coord = SkyCoord.from_name(dso_name)
-            return coord, None
-        except Exception as e:
-            return None, str(e)
-
-    def calculate_visibility(self, dso_coord, date, hours):
-        """Calculate visibility for a DSO over a given time period"""
-        start_time = Time(date)
-        time_range = start_time + np.linspace(0, hours, int(hours * 4)) * u.hour
-
-        altaz_frame = AltAz(obstime=time_range, location=self.location)
-        dso_altaz = dso_coord.transform_to(altaz_frame)
-
-        sun = get_sun(time_range)
-        sun_altaz = sun.transform_to(altaz_frame)
-
-        return time_range, dso_altaz, sun_altaz
-
-    def find_optimal_viewing_times(self, time_range, dso_altaz, sun_altaz):
-        """Find when the DSO is optimally visible"""
-        dso_visible = dso_altaz.alt.deg > self.min_altitude
-        dark_sky = sun_altaz.alt.deg < -12
-        optimal_times = dso_visible & dark_sky
-        return optimal_times
+        # Use centralized calculator
+        self.calculator = DSOVisibilityCalculator()
+        self.location = self.calculator.location
+        self.local_tz = self.calculator.timezone
 
     def run(self):
-        """Main calculation thread"""
+        """Main calculation thread using centralized calculator"""
         try:
-            # Get DSO coordinates
-            dso_coord, error = self.get_dso_coordinates(self.dso_name)
-            if dso_coord is None:
-                self.error.emit(f"Error finding {self.dso_name}: {error}")
+            if self.location is None:
+                self.error.emit("Observer location not configured. Please set your location in settings.")
                 return
-
-            # Calculate visibility
-            time_range, dso_altaz, sun_altaz = self.calculate_visibility(
-                dso_coord, self.date, self.hours)
-
-            # Find optimal times
-            optimal_times = self.find_optimal_viewing_times(
-                time_range, dso_altaz, sun_altaz)
-
-            # Package results
-            results = {
-                'dso_coord': dso_coord,
-                'time_range': time_range,
-                'dso_altaz': dso_altaz,
-                'sun_altaz': sun_altaz,
-                'optimal_times': optimal_times,
-                'dso_name': self.dso_name,
-                'local_tz': self.local_tz
-            }
-
+            
+            # Use centralized calculator for all calculations
+            results = self.calculator.calculate_visibility_for_date(
+                self.dso_name, self.date, self.hours, self.min_altitude)
+            
+            if "error" in results:
+                self.error.emit(results["error"])
+                return
+            
+            # Add local timezone for compatibility with existing UI code
+            results['local_tz'] = self.local_tz
+            
             self.finished.emit(results)
 
         except Exception as e:
@@ -298,24 +557,12 @@ class VisibilityPlot(FigureCanvas):
         self.draw()
 
     def azimuth_to_direction(self, az):
-        """Convert azimuth to cardinal direction"""
-        directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
-                      'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
-        idx = int((az + 11.25) / 22.5) % 16
-        return directions[idx]
+        """Convert azimuth to cardinal direction using centralized method"""
+        return DSOVisibilityCalculator.azimuth_to_direction(az)
 
     def get_twilight_condition(self, sun_alt):
-        """Get twilight condition based on sun altitude"""
-        if sun_alt > 0:
-            return "Daylight"
-        elif sun_alt > -6:
-            return "Civil Twilight"
-        elif sun_alt > -12:
-            return "Nautical Twilight"
-        elif sun_alt > -18:
-            return "Astronomical Twilight"
-        else:
-            return "Night"
+        """Get twilight condition using centralized method"""
+        return DSOVisibilityCalculator.get_twilight_condition(sun_alt)
 
     def find_nearest_data_point(self, x_pos):
         """Find the nearest data point to the mouse position"""
@@ -896,14 +1143,8 @@ class DSOVisibilityApp(QMainWindow):
         max_altitude = dso_altaz.alt.deg[max_alt_idx]
         max_azimuth = dso_altaz.az.deg[max_alt_idx]
 
-        # Convert azimuth to cardinal direction
-        def azimuth_to_direction(az):
-            directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
-                          'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
-            idx = int((az + 11.25) / 22.5) % 16
-            return directions[idx]
-
-        max_direction = azimuth_to_direction(max_azimuth)
+        # Convert azimuth to cardinal direction using centralized method
+        max_direction = DSOVisibilityCalculator.azimuth_to_direction(max_azimuth)
 
         # Determine if we're in EST or EDT
         tz_name = max_alt_time_local.strftime('%Z')
@@ -936,7 +1177,7 @@ class DSOVisibilityApp(QMainWindow):
                 end_az = dso_altaz.az.deg[end_idx - 1]
                 mid_idx = (start_idx + end_idx) // 2
                 mid_az = dso_altaz.az.deg[mid_idx]
-                mid_direction = azimuth_to_direction(mid_az)
+                mid_direction = DSOVisibilityCalculator.azimuth_to_direction(mid_az)
 
                 text += f"From: {start_time_local.strftime('%H:%M')} {tz_name}\n"
                 text += f"To:   {end_time_local.strftime('%H:%M')} {tz_name}\n"

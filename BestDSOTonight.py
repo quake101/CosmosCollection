@@ -37,8 +37,17 @@ class DSOCalculationThread(QThread):
         self.max_magnitude = max_magnitude
         self.selected_catalogs = selected_catalogs or []
         self.dso_limit = dso_limit
-        self.location = self.setup_location()
-        self.local_tz = self.setup_timezone()
+        
+        # Use centralized calculator
+        try:
+            from DSOVisibilityCalculator import DSOVisibilityCalculator
+            self.calculator = DSOVisibilityCalculator()
+            self.location = self.calculator.location
+            self.local_tz = self.calculator.timezone
+        except ImportError:
+            self.calculator = None
+            self.location = self.setup_location()
+            self.local_tz = self.setup_timezone()
 
     def setup_location(self):
         """Set up the observer location from database"""
@@ -73,29 +82,72 @@ class DSOCalculationThread(QThread):
             pass
         return pytz.UTC
 
-    def get_dso_coordinates(self, dso_name):
-        """Get coordinates for a DSO by name"""
-        try:
-            coord = SkyCoord.from_name(dso_name)
-            return coord, None
-        except Exception as e:
-            return None, str(e)
-
     def calculate_tonight_visibility(self, dso_info):
-        """Calculate visibility for a DSO tonight"""
+        """Calculate visibility for a DSO tonight using centralized calculator"""
+        try:
+            if self.calculator is None:
+                # Fallback to original method if centralized calculator not available
+                return self._calculate_tonight_visibility_fallback(dso_info)
+            
+            # Get tonight's date
+            now = datetime.now(self.local_tz)
+            tonight_date = now.strftime('%Y-%m-%d')
+            
+            # Use centralized calculator
+            results = self.calculator.calculate_visibility_for_date(
+                dso_info["name"], tonight_date, 12, self.min_altitude)
+            
+            if "error" in results or not np.any(results.get("optimal_times", [])):
+                return None
+            
+            # Extract relevant information
+            optimal_times = results["optimal_times"]
+            dso_altaz = results["dso_altaz"]
+            time_range = results["time_range"]
+            
+            # Calculate metrics
+            max_altitude = np.max(dso_altaz.alt.deg[optimal_times])
+            visible_hours = np.sum(optimal_times) * 0.25  # 15-minute intervals
+            
+            # Find optimal viewing time (mid-point of viewing window)
+            optimal_indices = np.where(optimal_times)[0]
+            if len(optimal_indices) > 0:
+                mid_idx = optimal_indices[len(optimal_indices)//2]
+                optimal_time_utc = time_range[mid_idx].datetime.replace(tzinfo=pytz.UTC)
+                optimal_time_local = optimal_time_utc.astimezone(self.local_tz)
+                optimal_altitude = dso_altaz.alt.deg[mid_idx]
+                optimal_azimuth = dso_altaz.az.deg[mid_idx]
+            else:
+                return None
+            
+            return {
+                "dso_info": dso_info,
+                "max_altitude": max_altitude,
+                "visible_hours": visible_hours,
+                "optimal_time": optimal_time_local,
+                "optimal_altitude": optimal_altitude,
+                "optimal_azimuth": optimal_azimuth,
+                "coordinates": results["dso_coord"]
+            }
+            
+        except Exception:
+            return None
+    
+    def _calculate_tonight_visibility_fallback(self, dso_info):
+        """Fallback method using original calculations if centralized calculator unavailable"""
         try:
             # Get tonight's date range (sunset to sunrise)
             now = datetime.now(self.local_tz)
             tonight_start = now.replace(hour=18, minute=0, second=0, microsecond=0)
-            tonight_end = tonight_start + timedelta(hours=12)
             
             # Convert to astropy Time objects
             start_time = Time(tonight_start.astimezone(pytz.UTC).replace(tzinfo=None))
             time_range = start_time + np.linspace(0, 12, 48) * u.hour  # Every 15 minutes
             
             # Get DSO coordinates
-            dso_coord, error = self.get_dso_coordinates(dso_info["name"])
-            if dso_coord is None:
+            try:
+                dso_coord = SkyCoord.from_name(dso_info["name"])
+            except Exception:
                 return None
             
             # Calculate altitude/azimuth
@@ -143,11 +195,15 @@ class DSOCalculationThread(QThread):
             return None
 
     def azimuth_to_direction(self, az):
-        """Convert azimuth to cardinal direction"""
-        directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
-                      'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
-        idx = int((az + 11.25) / 22.5) % 16
-        return directions[idx]
+        """Convert azimuth to cardinal direction using centralized method"""
+        if self.calculator:
+            return self.calculator.azimuth_to_direction(az)
+        else:
+            # Fallback implementation
+            directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+                          'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
+            idx = int((az + 11.25) / 22.5) % 16
+            return directions[idx]
 
     def get_available_catalogs(self):
         """Get list of available catalogs from database"""

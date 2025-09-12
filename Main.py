@@ -22,6 +22,7 @@ from astropy.time import Time
 # Import DatabaseManager and ResourceManager
 from DatabaseManager import DatabaseManager
 from ResourceManager import ResourceManager
+from CollageBuilder import CollageBuilder
 
 # Import the DSO Visibility Calculator
 try:
@@ -157,81 +158,86 @@ class VisibilityCalculationWorker(QObject):
         self.ra_deg = ra_deg
         self.dec_deg = dec_deg
         self.object_name = object_name
+        
+        # Import the centralized calculator
+        try:
+            from DSOVisibilityCalculator import DSOVisibilityCalculator
+            self.calculator = DSOVisibilityCalculator(lat, lon)
+        except ImportError:
+            self.calculator = None
 
     def calculate_visibility(self):
         """Calculate visibility seasons in background thread"""
         try:
-            from datetime import date, timedelta
+            if self.calculator is None:
+                self.error.emit("Visibility calculator not available. Please ensure DSOVisibilityCalculator.py is properly installed.")
+                return
             
-            observer = Observer(latitude=self.lat * u.deg, longitude=self.lon * u.deg, name="User Location")
-            target = FixedTarget(coord=SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg), 
-                               name=self.object_name)
-
-            # Start from today and check the next 365 days
-            today = date.today()
-            observable_dates = []
-
-            for day_offset in range(365):
-                current_date = today + timedelta(days=day_offset)
-                
-                # Create midnight time for this date (local solar midnight)
-                midnight_time = Time(f"{current_date.year}-{current_date.month:02d}-{current_date.day:02d} 00:00:00", 
-                                   location=observer.location)
-                
-                # Check conditions at local solar midnight (best viewing time)
+            # Create DSO coordinate
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            dso_coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
+            
+            # Use a more thorough seasonal visibility check that matches Best DSO Tonight logic
+            # Check multiple nights throughout the year using the same method as Best DSO Tonight
+            seasons = []
+            from datetime import datetime, timedelta
+            import numpy as np
+            
+            current_year = datetime.now().year
+            min_altitude = 30  # Use 30° minimum altitude for seasonal visibility
+            
+            # Sample dates throughout the year (every 15 days for better coverage)
+            sample_dates = []
+            visibility_results = []
+            
+            for day_offset in range(0, 365, 15):
                 try:
-                    # Get sun position at midnight
-                    sun_altaz = observer.sun_altaz(midnight_time)
+                    test_date = datetime(current_year, 1, 1) + timedelta(days=day_offset)
+                    date_str = test_date.strftime('%Y-%m-%d')
                     
-                    # Only consider if sun is down (astronomical twilight or darker)
-                    if sun_altaz.alt.degree < -12:
-                        # Get target position at midnight
-                        target_altaz = observer.altaz(midnight_time, target)
-                        
-                        # Object is well-visible if altitude > 30 degrees
-                        if target_altaz.alt.degree > 30:
-                            observable_dates.append(current_date)
-                except:
-                    # If calculation fails for this date, skip it
+                    # Use the same calculation method as Best DSO Tonight
+                    results = self.calculator.calculate_visibility_for_date(
+                        self.object_name, date_str, 12, min_altitude)
+                    
+                    is_visible = False
+                    if "error" not in results and np.any(results.get("optimal_times", [])):
+                        is_visible = True
+                    
+                    sample_dates.append(test_date)
+                    visibility_results.append(is_visible)
+                    
+                except Exception:
                     continue
-
-            if not observable_dates:
-                visibility_text = "Object not optimally visible from your location this year.<br>Try checking the Visibility Calculator for detailed viewing times."
-            else:
-                # Group contiguous dates as visibility seasons
-                seasons = []
-                if observable_dates:
-                    start_date = observable_dates[0]
-                    end_date = start_date
-                    
-                    for i in range(1, len(observable_dates)):
-                        # Allow small gaps (1-2 days) to be part of same season
-                        if (observable_dates[i] - end_date).days <= 3:
-                            end_date = observable_dates[i]
-                        else:
-                            # Only add seasons that are at least 7 days long
-                            if (end_date - start_date).days >= 6:
-                                seasons.append((start_date, end_date))
-                            start_date = observable_dates[i]
-                            end_date = start_date
-                    
-                    # Don't forget the last season
-                    if (end_date - start_date).days >= 6:
-                        seasons.append((start_date, end_date))
-
-                if not seasons:
-                    visibility_text = "Object has brief visibility periods.<br>Check the Visibility Calculator for specific viewing times."
+            
+            # Group consecutive visible periods into seasons
+            if any(visibility_results):
+                season_strs = []
+                in_season = False
+                season_start = None
+                
+                for i, (date, visible) in enumerate(zip(sample_dates, visibility_results)):
+                    if visible and not in_season:
+                        # Start of a visible season
+                        season_start = date
+                        in_season = True
+                    elif not visible and in_season:
+                        # End of a visible season
+                        if season_start:
+                            season_strs.append(f"{season_start.strftime('%B %d')} - {sample_dates[i-1].strftime('%B %d')}")
+                        in_season = False
+                    elif i == len(sample_dates) - 1 and in_season:
+                        # Season extends to end of year
+                        if season_start:
+                            season_strs.append(f"{season_start.strftime('%B %d')} - {date.strftime('%B %d')}")
+                
+                if season_strs:
+                    visibility_text = f"Best viewing seasons (>30° altitude in dark sky):<br>" + "<br>".join(season_strs)
+                    visibility_text += "<br><br><small>Times shown are when object is well-positioned in dark sky.<br>Use Visibility Calculator for detailed nightly times.</small>"
                 else:
-                    # Format season strings
-                    season_strs = []
-                    for start, end in seasons:
-                        if start == end:
-                            season_strs.append(f"{start.strftime('%B %d')}")
-                        else:
-                            season_strs.append(f"{start.strftime('%B %d')} - {end.strftime('%B %d')}")
-                    
-                    visibility_text = f"Best viewing seasons (>30° altitude at midnight):<br>" + "<br>".join(season_strs)
-                    visibility_text += "<br><br><small>Times shown are when object is highest in dark sky.<br>Use Visibility Calculator for detailed times.</small>"
+                    visibility_text = "Object not optimally visible from your location this year.<br>Try checking the Visibility Calculator for detailed viewing times."
+            else:
+                visibility_text = "Object not optimally visible from your location this year.<br>Try checking the Visibility Calculator for detailed viewing times."
 
             self.finished.emit(visibility_text)
         except Exception as e:
@@ -710,6 +716,1048 @@ class ImageViewerWindow(QDialog):
                 QMessageBox.critical(self, "Error", "Failed to open file location")
 
 
+# --- Collage Builder Window ---
+class CollageBuilderWindow(QDialog):
+    """Window for creating and managing multiple collages"""
+    
+    def __init__(self, user_images: list, dso_name: str, dsodetailid: int, parent=None):
+        super().__init__(parent)
+        self.user_images = user_images
+        self.dso_name = dso_name
+        self.dsodetailid = dsodetailid  # Store the dsodetailid
+        self.collage_projects = {}  # Dict to store multiple collage projects
+        self.current_project = None
+        
+        self.setWindowTitle(f"Collage Builder - {dso_name}")
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | 
+                          Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
+        self.resize(1000, 700)
+        self.setMinimumSize(800, 600)
+        
+        self._setup_ui()
+        self._create_new_project("Default Collage")
+        
+    def _setup_ui(self):
+        """Set up the user interface"""
+        from PySide6.QtWidgets import (QSplitter, QListWidget, QSpinBox, 
+                                     QColorDialog, QScrollArea)
+        
+        main_layout = QVBoxLayout(self)
+        
+        # Top toolbar
+        toolbar = QHBoxLayout()
+        
+        new_project_btn = QPushButton("New Collage")
+        new_project_btn.clicked.connect(self._create_new_project)
+        toolbar.addWidget(new_project_btn)
+        
+        rename_project_btn = QPushButton("Rename")
+        rename_project_btn.clicked.connect(self._rename_project)
+        toolbar.addWidget(rename_project_btn)
+        
+        delete_project_btn = QPushButton("Delete")
+        delete_project_btn.clicked.connect(self._delete_project)
+        toolbar.addWidget(delete_project_btn)
+        
+        toolbar.addStretch()
+        
+        save_collage_btn = QPushButton("Save Collage")
+        save_collage_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
+        save_collage_btn.clicked.connect(self._save_current_collage)
+        toolbar.addWidget(save_collage_btn)
+        
+        main_layout.addLayout(toolbar)
+        
+        # Main content area with splitter
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # Left panel - Project list and settings
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        
+        # Project list
+        left_layout.addWidget(QLabel("Collage Projects:"))
+        self.project_list = QListWidget()
+        self.project_list.currentItemChanged.connect(self._on_project_selected)
+        left_layout.addWidget(self.project_list)
+        
+        # Settings group
+        settings_group = QGroupBox("Collage Settings")
+        settings_layout = QVBoxLayout(settings_group)
+        
+        # Grid size
+        grid_layout = QHBoxLayout()
+        grid_layout.addWidget(QLabel("Grid Width:"))
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(1, 10)
+        self.width_spin.setValue(3)
+        self.width_spin.valueChanged.connect(self._update_current_project)
+        grid_layout.addWidget(self.width_spin)
+        
+        grid_layout.addWidget(QLabel("Height:"))
+        self.height_spin = QSpinBox()
+        self.height_spin.setRange(1, 10)
+        self.height_spin.setValue(3)
+        self.height_spin.valueChanged.connect(self._update_current_project)
+        grid_layout.addWidget(self.height_spin)
+        settings_layout.addLayout(grid_layout)
+        
+        # Cell size
+        cell_layout = QHBoxLayout()
+        cell_layout.addWidget(QLabel("Cell Size:"))
+        self.cell_size_spin = QSpinBox()
+        self.cell_size_spin.setRange(100, 800)
+        self.cell_size_spin.setValue(400)
+        self.cell_size_spin.setSuffix(" px")
+        self.cell_size_spin.valueChanged.connect(self._update_current_project)
+        cell_layout.addWidget(self.cell_size_spin)
+        settings_layout.addLayout(cell_layout)
+        
+        # Spacing
+        spacing_layout = QHBoxLayout()
+        spacing_layout.addWidget(QLabel("Spacing:"))
+        self.spacing_spin = QSpinBox()
+        self.spacing_spin.setRange(0, 50)
+        self.spacing_spin.setValue(20)
+        self.spacing_spin.setSuffix(" px")
+        self.spacing_spin.valueChanged.connect(self._update_current_project)
+        spacing_layout.addWidget(self.spacing_spin)
+        settings_layout.addLayout(spacing_layout)
+        
+        # Background color
+        color_layout = QHBoxLayout()
+        color_layout.addWidget(QLabel("Background:"))
+        self.color_button = QPushButton("Black")
+        self.color_button.setStyleSheet("QPushButton { background-color: black; color: white; }")
+        self.color_button.clicked.connect(self._choose_background_color)
+        color_layout.addWidget(self.color_button)
+        settings_layout.addLayout(color_layout)
+        
+        left_layout.addWidget(settings_group)
+        
+        # Preview button
+        preview_btn = QPushButton("Preview Layout")
+        preview_btn.clicked.connect(self._preview_layout)
+        left_layout.addWidget(preview_btn)
+        
+        left_panel.setMaximumWidth(300)
+        splitter.addWidget(left_panel)
+        
+        # Right panel - Image management
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        
+        right_layout.addWidget(QLabel("Available Images:"))
+        
+        # Available images area
+        scroll_area = QScrollArea()
+        self.images_widget = QWidget()
+        self.images_layout = QVBoxLayout(self.images_widget)
+        scroll_area.setWidget(self.images_widget)
+        scroll_area.setWidgetResizable(True)
+        right_layout.addWidget(scroll_area)
+        
+        # Image management buttons
+        img_buttons = QHBoxLayout()
+        add_all_btn = QPushButton("Add All Images")
+        add_all_btn.clicked.connect(self._add_all_images)
+        img_buttons.addWidget(add_all_btn)
+        
+        clear_btn = QPushButton("Clear Images")
+        clear_btn.clicked.connect(self._clear_images)
+        img_buttons.addWidget(clear_btn)
+        
+        right_layout.addLayout(img_buttons)
+        
+        splitter.addWidget(right_panel)
+        splitter.setSizes([300, 700])
+        
+        main_layout.addWidget(splitter)
+        
+        self._populate_available_images()
+        
+    def _populate_available_images(self):
+        """Populate the available images list with checkboxes"""
+        # Clear existing widgets
+        for i in reversed(range(self.images_layout.count())):
+            self.images_layout.itemAt(i).widget().setParent(None)
+        
+        for i, image_data in enumerate(self.user_images):
+            image_path = image_data['image_path']
+            filename = os.path.basename(image_path)
+            
+            # Create checkbox for each image
+            checkbox = QCheckBox(f"{i+1}. {filename}")
+            checkbox.setProperty("image_index", i)
+            checkbox.stateChanged.connect(self._on_image_selection_changed)
+            self.images_layout.addWidget(checkbox)
+        
+        self.images_layout.addStretch()
+    
+    def _create_new_project(self, name=None):
+        """Create a new collage project"""
+        from PySide6.QtWidgets import QInputDialog
+        
+        if name is None:
+            name, ok = QInputDialog.getText(self, "New Collage Project", 
+                                          "Enter collage name:", text=f"Collage {len(self.collage_projects) + 1}")
+            if not ok or not name.strip():
+                return
+            name = name.strip()
+        
+        # Check if name already exists
+        if name in self.collage_projects:
+            QMessageBox.warning(self, "Name Exists", "A collage with this name already exists.")
+            return
+        
+        # Create new project
+        project_data = {
+            'name': name,
+            'grid_width': 3,
+            'grid_height': 3,
+            'cell_size': 400,
+            'spacing': 20,
+            'background_color': 'black',
+            'selected_images': []
+        }
+        
+        self.collage_projects[name] = project_data
+        self.project_list.addItem(name)
+        
+        # Select the new project
+        items = self.project_list.findItems(name, Qt.MatchExactly)
+        if items:
+            self.project_list.setCurrentItem(items[0])
+    
+    def _rename_project(self):
+        """Rename the current project"""
+        if not self.current_project:
+            return
+            
+        from PySide6.QtWidgets import QInputDialog
+        
+        new_name, ok = QInputDialog.getText(self, "Rename Collage", 
+                                          "Enter new name:", text=self.current_project)
+        if not ok or not new_name.strip():
+            return
+            
+        new_name = new_name.strip()
+        if new_name == self.current_project:
+            return
+            
+        if new_name in self.collage_projects:
+            QMessageBox.warning(self, "Name Exists", "A collage with this name already exists.")
+            return
+        
+        # Rename project
+        self.collage_projects[new_name] = self.collage_projects.pop(self.current_project)
+        self.collage_projects[new_name]['name'] = new_name
+        
+        # Update list
+        current_row = self.project_list.currentRow()
+        self.project_list.takeItem(current_row)
+        self.project_list.insertItem(current_row, new_name)
+        self.project_list.setCurrentRow(current_row)
+        
+        self.current_project = new_name
+    
+    def _delete_project(self):
+        """Delete the current project"""
+        if not self.current_project or len(self.collage_projects) <= 1:
+            QMessageBox.information(self, "Cannot Delete", "Cannot delete the last project.")
+            return
+            
+        reply = QMessageBox.question(self, "Delete Project", 
+                                   f"Are you sure you want to delete '{self.current_project}'?")
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Remove project
+        del self.collage_projects[self.current_project]
+        
+        # Remove from list and select another
+        current_row = self.project_list.currentRow()
+        self.project_list.takeItem(current_row)
+        
+        if self.project_list.count() > 0:
+            self.project_list.setCurrentRow(0)
+        else:
+            self.current_project = None
+    
+    def _on_project_selected(self, current, previous):
+        """Handle project selection change"""
+        if current is None:
+            return
+            
+        project_name = current.text()
+        self.current_project = project_name
+        project = self.collage_projects[project_name]
+        
+        # Update UI with project settings
+        self.width_spin.setValue(project['grid_width'])
+        self.height_spin.setValue(project['grid_height'])
+        self.cell_size_spin.setValue(project['cell_size'])
+        self.spacing_spin.setValue(project['spacing'])
+        self._update_color_button(project['background_color'])
+        
+        # Update image selection
+        self._update_image_selection(project['selected_images'])
+    
+    def _update_current_project(self):
+        """Update current project settings"""
+        if not self.current_project:
+            return
+            
+        project = self.collage_projects[self.current_project]
+        project['grid_width'] = self.width_spin.value()
+        project['grid_height'] = self.height_spin.value()
+        project['cell_size'] = self.cell_size_spin.value()
+        project['spacing'] = self.spacing_spin.value()
+    
+    def _choose_background_color(self):
+        """Choose background color"""
+        color = QColorDialog.getColor(QColor("black"), self, "Choose Background Color")
+        if color.isValid():
+            color_name = color.name()
+            if self.current_project:
+                self.collage_projects[self.current_project]['background_color'] = color_name
+            self._update_color_button(color_name)
+    
+    def _update_color_button(self, color_name):
+        """Update the color button appearance"""
+        self.color_button.setText(color_name.title())
+        text_color = "white" if color_name in ["black", "#000000"] else "black"
+        self.color_button.setStyleSheet(f"QPushButton {{ background-color: {color_name}; color: {text_color}; }}")
+    
+    def _on_image_selection_changed(self):
+        """Handle image selection changes"""
+        if not self.current_project:
+            return
+            
+        selected_images = []
+        for i in range(self.images_layout.count() - 1):  # -1 for stretch
+            widget = self.images_layout.itemAt(i).widget()
+            if isinstance(widget, QCheckBox) and widget.isChecked():
+                selected_images.append(widget.property("image_index"))
+        
+        self.collage_projects[self.current_project]['selected_images'] = selected_images
+    
+    def _update_image_selection(self, selected_indices):
+        """Update image checkboxes based on selection"""
+        for i in range(self.images_layout.count() - 1):  # -1 for stretch
+            widget = self.images_layout.itemAt(i).widget()
+            if isinstance(widget, QCheckBox):
+                image_index = widget.property("image_index")
+                widget.setChecked(image_index in selected_indices)
+    
+    def _add_all_images(self):
+        """Add all available images to current project"""
+        if not self.current_project:
+            return
+            
+        for i in range(self.images_layout.count() - 1):  # -1 for stretch
+            widget = self.images_layout.itemAt(i).widget()
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(True)
+    
+    def _clear_images(self):
+        """Clear all images from current project"""
+        if not self.current_project:
+            return
+            
+        for i in range(self.images_layout.count() - 1):  # -1 for stretch
+            widget = self.images_layout.itemAt(i).widget()
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(False)
+    
+    def _preview_layout(self):
+        """Show a preview of the current collage layout"""
+        if not self.current_project:
+            return
+            
+        project = self.collage_projects[self.current_project]
+        selected_images = project['selected_images']
+        
+        if not selected_images:
+            QMessageBox.information(self, "No Images", "Please select some images for the preview.")
+            return
+        
+        # Create preview text
+        preview_text = f"Collage: {project['name']}\n"
+        preview_text += f"Grid: {project['grid_width']}×{project['grid_height']}\n"
+        preview_text += f"Cell Size: {project['cell_size']}×{project['cell_size']} px\n"
+        preview_text += f"Spacing: {project['spacing']} px\n"
+        preview_text += f"Background: {project['background_color']}\n"
+        preview_text += f"Images Selected: {len(selected_images)}\n\n"
+        preview_text += "Selected Images:\n"
+        
+        for i, img_index in enumerate(selected_images):
+            if i >= project['grid_width'] * project['grid_height']:
+                preview_text += f"  (Extra images will be ignored)\n"
+                break
+            row = i // project['grid_width']
+            col = i % project['grid_width']
+            filename = os.path.basename(self.user_images[img_index]['image_path'])
+            preview_text += f"  [{row},{col}] {filename}\n"
+        
+        QMessageBox.information(self, "Layout Preview", preview_text)
+    
+    def _save_current_collage(self):
+        """Save the current collage project to database"""
+        from PySide6.QtWidgets import QInputDialog
+        from datetime import datetime
+        
+        if not self.current_project:
+            QMessageBox.warning(self, "No Project", "Please select a project to save.")
+            return
+            
+        project = self.collage_projects[self.current_project]
+        selected_images = project['selected_images']
+        
+        if not selected_images:
+            QMessageBox.warning(self, "No Images", "Please select some images for the project before saving.")
+            return
+        
+        # Get save name from user
+        save_name, ok = QInputDialog.getText(self, "Save Project", 
+            f"Enter a name for saving '{project['name']}':", text=project['name'])
+        if not ok or not save_name.strip():
+            return
+            
+        save_name = save_name.strip()
+        
+        try:
+            # Use the stored dsodetailid (can be None for general collages)
+            dsodetailid = self.dsodetailid
+            
+            current_time = datetime.now().isoformat()
+            
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Check if a project with this name already exists
+                if dsodetailid is not None:
+                    cursor.execute("""
+                        SELECT id FROM usercollages 
+                        WHERE dsodetailid = ? AND name = ?
+                    """, (dsodetailid, save_name))
+                else:
+                    cursor.execute("""
+                        SELECT id FROM usercollages 
+                        WHERE dsodetailid IS NULL AND name = ?
+                    """, (save_name,))
+                existing = cursor.fetchone()
+                
+                if existing:
+                    reply = QMessageBox.question(self, "Project Exists", 
+                        f"A project named '{save_name}' already exists for this DSO. "
+                        f"Do you want to update it?")
+                    if reply != QMessageBox.Yes:
+                        return
+                    
+                    collage_id = existing[0]
+                    # Update existing project
+                    cursor.execute("""
+                        UPDATE usercollages 
+                        SET grid_width = ?, grid_height = ?, cell_size = ?, 
+                            spacing = ?, background_color = ?, modified_date = ?
+                        WHERE id = ?
+                    """, (project['grid_width'], project['grid_height'], project['cell_size'],
+                          project['spacing'], project['background_color'], current_time, collage_id))
+                    
+                    # Clear existing image associations
+                    cursor.execute("DELETE FROM usercollageimages WHERE collage_id = ?", (collage_id,))
+                    
+                else:
+                    # Create new project
+                    cursor.execute("""
+                        INSERT INTO usercollages 
+                        (dsodetailid, name, grid_width, grid_height, cell_size, 
+                         spacing, background_color, created_date, modified_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (dsodetailid, save_name, project['grid_width'], project['grid_height'],
+                          project['cell_size'], project['spacing'], project['background_color'],
+                          current_time, current_time))
+                    
+                    collage_id = cursor.lastrowid
+                
+                # Add image associations
+                for position, image_index in enumerate(selected_images):
+                    user_image = self.user_images[image_index]
+                    userimage_id = user_image.get('id')
+                    
+                    # If image doesn't have an ID, save it to userimages table first
+                    if not userimage_id:
+                        cursor.execute("""
+                            INSERT INTO userimages (dsodetailid, image_path, integration_time, equipment, date_taken, notes)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (
+                            dsodetailid,
+                            user_image.get('image_path', ''),
+                            user_image.get('integration_time', ''),
+                            user_image.get('equipment', ''),
+                            user_image.get('date_taken', ''),
+                            user_image.get('notes', '')
+                        ))
+                        userimage_id = cursor.lastrowid
+                        # Update the user_image with the new ID for future reference
+                        self.user_images[image_index]['id'] = userimage_id
+                    
+                    cursor.execute("""
+                        INSERT INTO usercollageimages (collage_id, userimage_id, position_index)
+                        VALUES (?, ?, ?)
+                    """, (collage_id, userimage_id, position))
+                
+                conn.commit()
+            
+            QMessageBox.information(self, "Project Saved", 
+                f"Project '{save_name}' has been saved successfully!\n\n"
+                f"Grid: {project['grid_width']}×{project['grid_height']}\n"
+                f"Images: {len(selected_images)} selected")
+                
+            logger.debug(f"Saved collage project '{save_name}' with {len(selected_images)} images")
+            
+        except Exception as e:
+            logger.error(f"Error saving project: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to save project: {str(e)}")
+    
+    def _save_current_project(self):
+        """Save the current collage project to database"""
+        from PySide6.QtWidgets import QInputDialog
+        from datetime import datetime
+        
+        if not self.current_project:
+            QMessageBox.warning(self, "No Project", "Please select a project to save.")
+            return
+            
+        project = self.collage_projects[self.current_project]
+        selected_images = project['selected_images']
+        
+        if not selected_images:
+            QMessageBox.warning(self, "No Images", "Please select some images for the project before saving.")
+            return
+        
+        # Get save name from user
+        save_name, ok = QInputDialog.getText(self, "Save Project", 
+            f"Enter a name for saving '{project['name']}':", text=project['name'])
+        if not ok or not save_name.strip():
+            return
+            
+        save_name = save_name.strip()
+        
+        try:
+            # Get dsodetailid for this DSO
+            dsodetailid = None
+            for image_data in self.user_images:
+                if image_data.get('id'):
+                    with DatabaseManager().get_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT dsodetailid FROM userimages WHERE id = ?", (image_data['id'],))
+                        result = cursor.fetchone()
+                        if result:
+                            dsodetailid = result[0]
+                            break
+            
+            if not dsodetailid:
+                QMessageBox.critical(self, "Error", "Could not determine DSO for this project.")
+                return
+            
+            current_time = datetime.now().isoformat()
+            
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Check if a project with this name already exists
+                if dsodetailid is not None:
+                    cursor.execute("""
+                        SELECT id FROM usercollages 
+                        WHERE dsodetailid = ? AND name = ?
+                    """, (dsodetailid, save_name))
+                else:
+                    cursor.execute("""
+                        SELECT id FROM usercollages 
+                        WHERE dsodetailid IS NULL AND name = ?
+                    """, (save_name,))
+                existing = cursor.fetchone()
+                
+                if existing:
+                    reply = QMessageBox.question(self, "Project Exists", 
+                        f"A project named '{save_name}' already exists for this DSO. "
+                        f"Do you want to update it?")
+                    if reply != QMessageBox.Yes:
+                        return
+                    
+                    collage_id = existing[0]
+                    # Update existing project
+                    cursor.execute("""
+                        UPDATE usercollages 
+                        SET grid_width = ?, grid_height = ?, cell_size = ?, 
+                            spacing = ?, background_color = ?, modified_date = ?
+                        WHERE id = ?
+                    """, (project['grid_width'], project['grid_height'], project['cell_size'],
+                          project['spacing'], project['background_color'], current_time, collage_id))
+                    
+                    # Clear existing image associations
+                    cursor.execute("DELETE FROM usercollageimages WHERE collage_id = ?", (collage_id,))
+                    
+                else:
+                    # Create new project
+                    cursor.execute("""
+                        INSERT INTO usercollages 
+                        (dsodetailid, name, grid_width, grid_height, cell_size, 
+                         spacing, background_color, created_date, modified_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (dsodetailid, save_name, project['grid_width'], project['grid_height'],
+                          project['cell_size'], project['spacing'], project['background_color'],
+                          current_time, current_time))
+                    
+                    collage_id = cursor.lastrowid
+                
+                # Add image associations
+                for position, image_index in enumerate(selected_images):
+                    user_image = self.user_images[image_index]
+                    userimage_id = user_image.get('id')
+                    
+                    # If image doesn't have an ID, save it to userimages table first
+                    if not userimage_id:
+                        cursor.execute("""
+                            INSERT INTO userimages (dsodetailid, image_path, integration_time, equipment, date_taken, notes)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (
+                            dsodetailid,
+                            user_image.get('image_path', ''),
+                            user_image.get('integration_time', ''),
+                            user_image.get('equipment', ''),
+                            user_image.get('date_taken', ''),
+                            user_image.get('notes', '')
+                        ))
+                        userimage_id = cursor.lastrowid
+                        # Update the user_image with the new ID for future reference
+                        self.user_images[image_index]['id'] = userimage_id
+                    
+                    cursor.execute("""
+                        INSERT INTO usercollageimages (collage_id, userimage_id, position_index)
+                        VALUES (?, ?, ?)
+                    """, (collage_id, userimage_id, position))
+                
+                conn.commit()
+            
+            QMessageBox.information(self, "Project Saved", 
+                f"Project '{save_name}' has been saved successfully!\n\n"
+                f"Grid: {project['grid_width']}×{project['grid_height']}\n"
+                f"Images: {len(selected_images)} selected")
+                
+            logger.debug(f"Saved collage project '{save_name}' with {len(selected_images)} images")
+            
+        except Exception as e:
+            logger.error(f"Error saving project: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to save project: {str(e)}")
+    
+    def _load_saved_project(self):
+        """Load a saved collage project from database"""
+        from PySide6.QtWidgets import QInputDialog
+        
+        try:
+            # Get dsodetailid for this DSO
+            dsodetailid = None
+            for image_data in self.user_images:
+                if image_data.get('id'):
+                    with DatabaseManager().get_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT dsodetailid FROM userimages WHERE id = ?", (image_data['id'],))
+                        result = cursor.fetchone()
+                        if result:
+                            dsodetailid = result[0]
+                            break
+            
+            if not dsodetailid:
+                QMessageBox.critical(self, "Error", "Could not determine DSO for loading projects.")
+                return
+            
+            # Get list of saved projects for this DSO
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT name, created_date, modified_date 
+                    FROM usercollages 
+                    WHERE dsodetailid = ?
+                    ORDER BY modified_date DESC
+                """, (dsodetailid,))
+                
+                saved_projects = cursor.fetchall()
+            
+            if not saved_projects:
+                QMessageBox.information(self, "No Saved Projects", 
+                    "No saved projects found for this DSO.")
+                return
+            
+            # Create list of project names with dates for selection
+            project_items = []
+            for name, created, modified in saved_projects:
+                modified_date = datetime.fromisoformat(modified).strftime("%Y-%m-%d %H:%M")
+                project_items.append(f"{name} (modified: {modified_date})")
+            
+            # Let user select project to load
+            selected_item, ok = QInputDialog.getItem(self, "Load Project", 
+                "Select a project to load:", project_items, 0, False)
+            if not ok:
+                return
+                
+            # Extract project name from selection
+            project_name = selected_item.split(" (modified:")[0]
+            
+            # Load the selected project
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Get project data
+                cursor.execute("""
+                    SELECT id, name, grid_width, grid_height, cell_size, 
+                           spacing, background_color
+                    FROM usercollages 
+                    WHERE dsodetailid = ? AND name = ?
+                """, (dsodetailid, project_name))
+                
+                project_data = cursor.fetchone()
+                if not project_data:
+                    QMessageBox.critical(self, "Error", f"Project '{project_name}' not found.")
+                    return
+                
+                collage_id, name, grid_width, grid_height, cell_size, spacing, bg_color = project_data
+                
+                # Get associated images
+                cursor.execute("""
+                    SELECT ui.id, uci.position_index
+                    FROM usercollageimages uci
+                    JOIN userimages ui ON uci.userimage_id = ui.id
+                    WHERE uci.collage_id = ?
+                    ORDER BY uci.position_index
+                """, (collage_id,))
+                
+                saved_images = cursor.fetchall()
+            
+            # Map saved image IDs to current image indices
+            selected_image_indices = []
+            for userimage_id, position in saved_images:
+                for i, image_data in enumerate(self.user_images):
+                    if image_data.get('id') == userimage_id:
+                        selected_image_indices.append(i)
+                        break
+            
+            # Create new project with loaded data
+            new_project_name = f"{name}_loaded"
+            count = 1
+            while new_project_name in self.collage_projects:
+                new_project_name = f"{name}_loaded_{count}"
+                count += 1
+            
+            project_data = {
+                'name': new_project_name,
+                'grid_width': grid_width,
+                'grid_height': grid_height,
+                'cell_size': cell_size,
+                'spacing': spacing,
+                'background_color': bg_color,
+                'selected_images': selected_image_indices
+            }
+            
+            self.collage_projects[new_project_name] = project_data
+            self.project_list.addItem(new_project_name)
+            
+            # Select the new project
+            items = self.project_list.findItems(new_project_name, Qt.MatchExactly)
+            if items:
+                self.project_list.setCurrentItem(items[0])
+            
+            QMessageBox.information(self, "Project Loaded", 
+                f"Project '{name}' has been loaded as '{new_project_name}'!\n\n"
+                f"Grid: {grid_width}×{grid_height}\n"
+                f"Images: {len(selected_image_indices)} loaded")
+            
+            logger.debug(f"Loaded project '{name}' with {len(selected_image_indices)} images")
+            
+        except Exception as e:
+            logger.error(f"Error loading project: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to load project: {str(e)}")
+    
+    def _load_collage_data(self, collage_data):
+        """Load existing collage data and create a project from it"""
+        try:
+            if not collage_data:
+                return False
+                
+            # Create a new project with the loaded settings
+            project_name = collage_data['name']
+            
+            # Make sure the project name is unique
+            if project_name in self.collage_projects:
+                counter = 1
+                base_name = project_name
+                while f"{base_name} ({counter})" in self.collage_projects:
+                    counter += 1
+                project_name = f"{base_name} ({counter})"
+            
+            # Load existing images from the collage
+            existing_images = []
+            if 'id' in collage_data:
+                with DatabaseManager().get_connection() as conn:
+                    cursor = conn.cursor()
+                    # Get existing images from this collage
+                    cursor.execute("""
+                        SELECT ui.image_path, uci.position_index
+                        FROM usercollageimages uci
+                        JOIN userimages ui ON uci.userimage_id = ui.id
+                        WHERE uci.collage_id = ?
+                        ORDER BY uci.position_index
+                    """, (collage_data['id'],))
+                    existing_image_data = cursor.fetchall()
+                    
+                    for image_path, position in existing_image_data:
+                        existing_images.append({
+                            'image_path': image_path,
+                            'position': position,
+                            'id': None  # Will be filled if needed
+                        })
+            
+            # Merge existing images with current user_images
+            # Add existing images to the user_images list if they're not already there
+            all_images = list(self.user_images)  # Start with current DSO images
+            existing_image_indices = []
+            
+            for existing_img in existing_images:
+                # Check if this image is already in user_images
+                found_index = None
+                for i, user_img in enumerate(all_images):
+                    if user_img.get('image_path') == existing_img['image_path']:
+                        found_index = i
+                        break
+                
+                if found_index is None:
+                    # Add the existing image to our list
+                    all_images.append(existing_img)
+                    existing_image_indices.append(len(all_images) - 1)
+                else:
+                    existing_image_indices.append(found_index)
+            
+            # Update user_images to include all images
+            self.user_images = all_images
+            
+            # Create project data with loaded settings and selected existing images
+            project_data = {
+                'name': project_name,
+                'grid_width': collage_data.get('grid_width', 3),
+                'grid_height': collage_data.get('grid_height', 3),
+                'cell_size': collage_data.get('cell_size', 400),
+                'spacing': collage_data.get('spacing', 20),
+                'background_color': collage_data.get('background_color', 'black'),
+                'selected_images': existing_image_indices  # Pre-select the existing images
+            }
+            
+            # Add the project
+            self.collage_projects[project_name] = project_data
+            self.project_list.addItem(project_name)
+            
+            # Select and activate this project
+            self.project_list.setCurrentRow(self.project_list.count() - 1)
+            self.current_project = project_name
+            
+            # Update UI with the loaded settings
+            self.width_spin.setValue(project_data['grid_width'])
+            self.height_spin.setValue(project_data['grid_height'])
+            self.cell_size_spin.setValue(project_data['cell_size'])
+            self.spacing_spin.setValue(project_data['spacing'])
+            
+            # Update background color if the UI component exists
+            if hasattr(self, 'color_button'):
+                self.color_button.setStyleSheet(f"background-color: {project_data['background_color']}")
+            
+            logger.debug(f"Loaded collage data for '{project_name}' with {len(existing_images)} existing images and {len(self.user_images)} total images available")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error loading collage data: {str(e)}", exc_info=True)
+            return False
+
+
+# --- Collage Selection Dialog ---
+class CollageSelectionDialog(QDialog):
+    """Dialog for selecting whether to create a new collage or add to existing one"""
+    
+    def __init__(self, dsodetailid, parent=None):
+        super().__init__(parent)
+        self.dsodetailid = dsodetailid
+        self.selected_action = None
+        self.selected_collage = None
+        
+        self.setWindowTitle("Create Collage")
+        self.setModal(True)
+        self.resize(400, 300)
+        
+        self._setup_ui()
+        self._load_existing_collages()
+        
+    def _setup_ui(self):
+        """Set up the dialog UI"""
+        layout = QVBoxLayout()
+        
+        # Title
+        title = QLabel("Create Collage")
+        title.setStyleSheet("font-size: 16pt; font-weight: bold; margin-bottom: 10px;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Instructions
+        instructions = QLabel("Choose how you want to create your collage:")
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        
+        # Radio buttons for selection
+        from PySide6.QtWidgets import QRadioButton, QButtonGroup
+        
+        self.button_group = QButtonGroup()
+        
+        self.new_collage_radio = QRadioButton("Create new collage")
+        self.new_collage_radio.setChecked(True)
+        self.new_collage_radio.toggled.connect(self._on_new_collage_selected)
+        self.button_group.addButton(self.new_collage_radio)
+        layout.addWidget(self.new_collage_radio)
+        
+        self.existing_collage_radio = QRadioButton("Add to existing collage")
+        self.existing_collage_radio.toggled.connect(self._on_existing_collage_selected)
+        self.button_group.addButton(self.existing_collage_radio)
+        layout.addWidget(self.existing_collage_radio)
+        
+        # Collage selection dropdown (initially hidden)
+        self.collage_selection_widget = QWidget()
+        collage_layout = QVBoxLayout(self.collage_selection_widget)
+        
+        collage_label = QLabel("Select existing collage:")
+        collage_layout.addWidget(collage_label)
+        
+        self.collage_combo = QComboBox()
+        collage_layout.addWidget(self.collage_combo)
+        
+        self.collage_selection_widget.setVisible(False)
+        layout.addWidget(self.collage_selection_widget)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        self.ok_button = QPushButton("OK")
+        self.ok_button.clicked.connect(self._on_ok_clicked)
+        self.ok_button.setDefault(True)
+        button_layout.addWidget(self.ok_button)
+        
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_button)
+        
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+        
+    def _on_new_collage_selected(self, checked):
+        """Handle new collage radio button selection"""
+        if checked:
+            self.collage_selection_widget.setVisible(False)
+            
+    def _on_existing_collage_selected(self, checked):
+        """Handle existing collage radio button selection"""  
+        if checked:
+            self.collage_selection_widget.setVisible(True)
+            
+    def _load_existing_collages(self):
+        """Load existing collages for this DSO"""
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Tables are now created automatically by DatabaseManager
+                
+                # Debug: Log that we're loading all existing collages
+                logger.debug("Loading all existing collages")
+                
+                cursor.execute("""
+                    SELECT id, name, created_date, modified_date 
+                    FROM usercollages 
+                    ORDER BY modified_date DESC
+                """)
+                
+                collages = cursor.fetchall()
+                
+                # Debug: Log the results
+                logger.debug(f"Found {len(collages)} existing collages")
+                for collage_id, name, created, modified in collages:
+                    logger.debug(f"  Collage ID: {collage_id}, Name: {name}")
+                
+                self.collage_combo.clear()
+                for collage_id, name, created, modified in collages:
+                    from datetime import datetime
+                    modified_date = datetime.fromisoformat(modified).strftime("%Y-%m-%d %H:%M")
+                    display_text = f"{name} (modified: {modified_date})"
+                    self.collage_combo.addItem(display_text, collage_id)
+                
+                # Disable existing collage option if no collages exist
+                if not collages:
+                    self.existing_collage_radio.setEnabled(False)
+                    self.existing_collage_radio.setText("Add to existing collage (none available)")
+                    
+        except Exception as e:
+            logger.error(f"Error loading existing collages: {str(e)}")
+            self.existing_collage_radio.setEnabled(False)
+            self.existing_collage_radio.setText("Add to existing collage (error loading)")
+            
+    def _on_ok_clicked(self):
+        """Handle OK button click"""
+        if self.new_collage_radio.isChecked():
+            self.selected_action = "new"
+            self.selected_collage = None
+        elif self.existing_collage_radio.isChecked():
+            if self.collage_combo.currentIndex() >= 0:
+                self.selected_action = "existing"
+                collage_id = self.collage_combo.currentData()
+                # Load the full collage data
+                self.selected_collage = self._load_collage_data(collage_id)
+            else:
+                QMessageBox.warning(self, "No Selection", "Please select a collage to add images to.")
+                return
+        else:
+            QMessageBox.warning(self, "No Selection", "Please choose an option.")
+            return
+            
+        self.accept()
+        
+    def _load_collage_data(self, collage_id):
+        """Load full collage data for the selected collage"""
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, name, grid_width, grid_height, cell_size, 
+                           spacing, background_color
+                    FROM usercollages 
+                    WHERE id = ?
+                """, (collage_id,))
+                
+                result = cursor.fetchone()
+                if result:
+                    return {
+                        'id': result[0],
+                        'name': result[1], 
+                        'grid_width': result[2],
+                        'grid_height': result[3],
+                        'cell_size': result[4],
+                        'spacing': result[5],
+                        'background_color': result[6]
+                    }
+        except Exception as e:
+            logger.error(f"Error loading collage data: {str(e)}")
+            return None
+            
+    def get_selection(self):
+        """Get the user's selection"""
+        return self.selected_action, self.selected_collage
+
+
 # --- Object Detail Window ---
 class ObjectDetailWindow(QDialog):
     image_added = Signal()  # Add this signal at the class level
@@ -920,6 +1968,11 @@ class ObjectDetailWindow(QDialog):
             user_image_button.clicked.connect(self._add_user_image)
             left_layout.addWidget(user_image_button)
             
+            # Create collage button
+            #collage_button = QPushButton("Create Collage")
+            #collage_button.clicked.connect(self._create_collage)
+            #left_layout.addWidget(collage_button)
+            
             # Relocate image button (initially hidden)
             self.relocate_button = QPushButton("Relocate Image")
             self.relocate_button.clicked.connect(self._relocate_image)
@@ -958,12 +2011,28 @@ class ObjectDetailWindow(QDialog):
 
             # Add object designations with proper formatting
             logger.debug(f"Designations data: {self.data.get('designations')}")
-            if self.data.get('designations'):
-                designations = self.data['designations'].split(', ')
+            designations_str = self.data.get('designations')
+            if designations_str and designations_str.strip():
+                designations = [d.strip() for d in designations_str.split(',') if d.strip()]
                 logger.debug(f"Split designations: {designations}")
-                # Skip the first designation as it's the primary one
-                for designation in designations[1:]:
-                    object_info_text += f"{designation}<br>"
+                
+                # Get the current primary designation (as shown in the title)
+                primary_name = self.data.get('name', '').strip()
+                
+                # Show all designations except the current primary one
+                other_designations = []
+                for designation in designations:
+                    if designation and designation != primary_name:
+                        other_designations.append(designation)
+                
+                # Display other designations
+                if other_designations:
+                    for designation in other_designations:
+                        object_info_text += f"{designation}<br>"
+                else:
+                    object_info_text += "None<br>"
+            else:
+                object_info_text += "None<br>"
 
             object_info_text += "<br><b>Source:</b> N.I.N.A. Database"
 
@@ -1207,7 +2276,7 @@ class ObjectDetailWindow(QDialog):
                 cursor.execute("INSERT INTO usersettings (location_lat, location_lon) VALUES (?, ?)", (lat, lon))
                 conn.commit()
                 logger.debug(f"Saved user location to DB: lat={lat}, lon={lon}")
-            self._update_visibility_info()
+            self._set_season_label_from_location()
         except Exception as e:
             logger.error(f"Error saving user location: {str(e)}")
             from PySide6.QtWidgets import QMessageBox
@@ -1266,57 +2335,6 @@ class ObjectDetailWindow(QDialog):
         self.season_label.setText(error_message)
         logger.error("Visibility calculation failed in background thread")
 
-    def _update_visibility_info(self):
-        """Calculate and display visibility season/dates using astroplan"""
-        try:
-            lat_text = self.location_lat_edit.text().strip()
-            lon_text = self.location_lon_edit.text().strip()
-            if not lat_text or not lon_text:
-                self.visibility_label.setText("Enter your location to see visibility information.")
-                return
-            lat = float(lat_text)
-            lon = float(lon_text)
-            observer = Observer(latitude=lat * u.deg, longitude=lon * u.deg, name="User Location")
-            ra = self.data.get("ra_deg")
-            dec = self.data.get("dec_deg")
-            target = FixedTarget(coord=SkyCoord(ra=ra * u.deg, dec=dec * u.deg), name=self.data.get("name"))
-
-            # Use current year and calculate next visibility window
-            time_now = Time.now()
-            midnight = time_now.midnight()
-            delta_days = range(0, 365)
-            observable_dates = []
-
-            for day in delta_days:
-                obs_time = midnight + day * u.day
-                altaz = observer.altaz(obs_time, target)
-                if altaz.alt.degree > 20:  # Visible if altitude > 20 degrees
-                    observable_dates.append(obs_time.datetime.date())
-
-            if not observable_dates:
-                visibility_text = "Object not visible from your location this year."
-            else:
-                # Group contiguous dates as visibility seasons
-                seasons = []
-                start_date = observable_dates[0]
-                end_date = start_date
-                for i in range(1, len(observable_dates)):
-                    if (observable_dates[i] - end_date).days == 1:
-                        end_date = observable_dates[i]
-                    else:
-                        seasons.append((start_date, end_date))
-                        start_date = observable_dates[i]
-                        end_date = start_date
-                seasons.append((start_date, end_date))
-
-                # Format season strings
-                season_strs = [f"{s[0].strftime('%b %d')} - {s[1].strftime('%b %d')}" for s in seasons]
-                visibility_text = "Visibility season(s):<br>" + "<br>".join(season_strs)
-
-            self.visibility_label.setText(visibility_text)
-        except Exception as e:
-            logger.error(f"Error calculating visibility: {str(e)}")
-            self.visibility_label.setText("Error calculating visibility information.")
 
     def _save_image_info(self):
         """Save the current image information to the database"""
@@ -1852,6 +2870,66 @@ class ObjectDetailWindow(QDialog):
         except Exception as e:
             logger.error(f"Error adding to target list: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to add to target list: {str(e)}")
+    
+    def _create_collage(self):
+        """Open the CollageBuilder window for this DSO with option to create new or add to existing collage"""
+        try:
+            # Check if there are any user images
+            if not self.user_images:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "No Images", 
+                    "No images have been added for this object yet. "
+                    "Add some images first using the 'Add User Image' button.")
+                return
+            
+            # Get the dsodetailid for this object
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                logger.debug(f"Looking up dsodetailid for catalogue: {self.data['catalogue']}, designation: {self.data['id']}")
+                cursor.execute("""
+                    SELECT d.id 
+                    FROM dsodetail d
+                    JOIN cataloguenr c ON d.id = c.dsodetailid
+                    WHERE c.catalogue = ? AND c.designation = ?
+                """, (self.data['catalogue'], self.data['id']))
+                result = cursor.fetchone()
+                
+                if result:
+                    dsodetailid = result[0]
+                    logger.debug(f"Found dsodetailid: {dsodetailid} for {self.data['name']}")
+                else:
+                    logger.error(f"Could not find dsodetailid for {self.data['name']} (catalogue: {self.data['catalogue']}, designation: {self.data['id']})")
+                    QMessageBox.critical(self, "Error", "Could not determine DSO ID for creating collage.")
+                    return
+            
+            # Show collage selection dialog
+            dialog = CollageSelectionDialog(dsodetailid, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                action, collage_data = dialog.get_selection()
+                
+                if action == "new":
+                    # Create new collage
+                    self.collage_builder_window = CollageBuilderWindow(self.user_images, self.data['name'], dsodetailid, self)
+                    self.collage_builder_window.setModal(False)
+                    self.collage_builder_window.show()
+                    logger.debug(f"Opened new CollageBuilder window for {self.data['name']} with {len(self.user_images)} images")
+                    
+                elif action == "existing" and collage_data:
+                    # Load existing collage and add current images
+                    self.collage_builder_window = CollageBuilderWindow(self.user_images, self.data['name'], dsodetailid, self)
+                    
+                    # Load the existing collage data
+                    if self.collage_builder_window._load_collage_data(collage_data):
+                        self.collage_builder_window.setModal(False)
+                        self.collage_builder_window.show()
+                        logger.debug(f"Loaded existing collage '{collage_data['name']}' with {len(self.user_images)} images available")
+                    else:
+                        QMessageBox.critical(self, "Error", "Failed to load existing collage data.")
+                
+        except Exception as e:
+            logger.error(f"Error opening collage builder: {str(e)}", exc_info=True)
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Error", f"Failed to open collage builder: {str(e)}")
 
 
 class CustomTableView(QTableView):
@@ -2807,6 +3885,12 @@ class MainWindow(QMainWindow):
         target_list_action.triggered.connect(self._show_target_list)
         toolbar.addAction(target_list_action)
         
+        # Collage Builder action
+        #collage_builder_action = QAction("Collage Builder", self)
+        #collage_builder_action.setToolTip("Create image collages from your DSO photos")
+        #collage_builder_action.triggered.connect(self._show_collage_builder)
+        #toolbar.addAction(collage_builder_action)
+        
         toolbar.addSeparator()
         
         # About action
@@ -2871,6 +3955,49 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Import Error", f"Could not load Target List: {e}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not open Target List: {e}")
+
+    def _show_collage_builder(self):
+        """Show the Collage Builder window"""
+        try:
+            # Get all user images from the database
+            user_images = []
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT ui.id, ui.image_path, ui.integration_time, ui.equipment, 
+                           ui.date_taken, ui.notes, c.designation as dso_name
+                    FROM userimages ui
+                    LEFT JOIN cataloguenr c ON ui.dsodetailid = c.dsodetailid
+                    ORDER BY ui.id DESC
+                """)
+                rows = cursor.fetchall()
+                for row in rows:
+                    user_images.append({
+                        'id': row[0],
+                        'image_path': row[1],
+                        'integration_time': row[2] or '',
+                        'equipment': row[3] or '',
+                        'date_taken': row[4] or '',
+                        'notes': row[5] or '',
+                        'dso_name': row[6] or 'Unknown DSO'
+                    })
+            
+            if not user_images:
+                QMessageBox.information(self, "No Images", 
+                    "No user images found. Add some images to DSO objects first, then you can create collages with them.")
+                return
+            
+            # Create collage builder window with all user images
+            if not hasattr(self, 'collage_builder_window') or not self.collage_builder_window.isVisible():
+                # Use a dummy dsodetailid since we're showing all images
+                self.collage_builder_window = CollageBuilderWindow(user_images, "All DSO Images", None, self)
+            self.collage_builder_window.show()
+            self.collage_builder_window.raise_()
+            self.collage_builder_window.activateWindow()
+            
+        except Exception as e:
+            logger.error(f"Error opening collage builder: {str(e)}", exc_info=True)
+            QMessageBox.warning(self, "Error", f"Could not open Collage Builder: {str(e)}")
 
     def _on_show_images_changed(self, state):
         """Handle show images only checkbox state change"""
@@ -2991,7 +4118,7 @@ class MainWindow(QMainWindow):
         dec_str = self._format_dec(dec)
 
         data = {
-            "name": f"{catalogue} {designation}",
+            "name": entry["name"],  # Use the name from the table entry instead of reconstructing it
             "ra": ra_str,
             "dec": dec_str,
             "ra_deg": ra,
@@ -3041,7 +4168,13 @@ class MainWindow(QMainWindow):
                            CAST(d.sizemin/60.0 AS REAL) as sizemin,
                            CAST(d.sizemax/60.0 AS REAL) as sizemax,
                            d.constellation, d.dsotype, d.dsoclass,
-                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ') as designations,
+                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY 
+                               CASE c.catalogue 
+                                   WHEN 'M' THEN 1
+                                   WHEN 'NGC' THEN 2
+                                   WHEN 'IC' THEN 3
+                                   ELSE 4
+                               END, c.designation) as designations,
                            ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
                            (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
                     FROM dsodetail d

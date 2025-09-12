@@ -6,6 +6,7 @@ Allows users to manage their observing target list for deep sky objects
 
 import sys
 import os
+import calendar
 from datetime import datetime
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
@@ -34,6 +35,8 @@ class AddTargetDialog(QDialog):
         
         self.dso_data = dso_data
         self.db_manager = DatabaseManager()
+        self.is_edit_mode = False  # Track if we're editing an existing target
+        self.target_id = None  # Store the ID of the target being edited
         self._setup_ui()
         
         # Pre-fill with DSO data if provided
@@ -139,13 +142,19 @@ class AddTargetDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         buttons_layout.addWidget(cancel_btn)
         
-        save_btn = QPushButton("Add to Target List")
-        save_btn.clicked.connect(self._save_target)
-        save_btn.setDefault(True)
-        buttons_layout.addWidget(save_btn)
+        self.save_btn = QPushButton("Add to Target List")
+        self.save_btn.clicked.connect(self._save_target)
+        self.save_btn.setDefault(True)
+        buttons_layout.addWidget(self.save_btn)
         
         layout.addLayout(buttons_layout)
         self.setLayout(layout)
+    
+    def set_edit_mode(self, target_id):
+        """Set the dialog to edit mode, changing the button text"""
+        self.is_edit_mode = True
+        self.target_id = target_id
+        self.save_btn.setText("Save Changes")
     
     def _populate_from_dso_data(self):
         """Populate dialog fields with DSO data"""
@@ -189,23 +198,43 @@ class AddTargetDialog(QDialog):
                 "date_added": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
             
-            # Save to database
+            # Save to database - either INSERT new or UPDATE existing
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO usertargetlist (
-                        name, dso_type, constellation, ra_deg, dec_deg, magnitude, 
-                        size_info, priority, status, best_months, notes, date_added
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    target_data["name"], target_data["dso_type"], target_data["constellation"],
-                    target_data["ra_deg"], target_data["dec_deg"], target_data["magnitude"],
-                    target_data["size_info"], target_data["priority"], target_data["status"],
-                    target_data["best_months"], target_data["notes"], target_data["date_added"]
-                ))
+                
+                if self.is_edit_mode and self.target_id:
+                    # Update existing record
+                    cursor.execute("""
+                        UPDATE usertargetlist SET 
+                            name = ?, dso_type = ?, constellation = ?, ra_deg = ?, dec_deg = ?, 
+                            magnitude = ?, size_info = ?, priority = ?, status = ?, 
+                            best_months = ?, notes = ?
+                        WHERE id = ?
+                    """, (
+                        target_data["name"], target_data["dso_type"], target_data["constellation"],
+                        target_data["ra_deg"], target_data["dec_deg"], target_data["magnitude"],
+                        target_data["size_info"], target_data["priority"], target_data["status"],
+                        target_data["best_months"], target_data["notes"], self.target_id
+                    ))
+                    success_message = f"{target_data['name']} has been updated in your target list."
+                else:
+                    # Insert new record
+                    cursor.execute("""
+                        INSERT INTO usertargetlist (
+                            name, dso_type, constellation, ra_deg, dec_deg, magnitude, 
+                            size_info, priority, status, best_months, notes, date_added
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        target_data["name"], target_data["dso_type"], target_data["constellation"],
+                        target_data["ra_deg"], target_data["dec_deg"], target_data["magnitude"],
+                        target_data["size_info"], target_data["priority"], target_data["status"],
+                        target_data["best_months"], target_data["notes"], target_data["date_added"]
+                    ))
+                    success_message = f"{target_data['name']} has been added to your target list."
+                
                 conn.commit()
             
-            QMessageBox.information(self, "Success", f"{target_data['name']} has been added to your target list.")
+            QMessageBox.information(self, "Success", success_message)
             self.accept()
             
         except ValueError as e:
@@ -362,6 +391,13 @@ class DSOTargetListWindow(QMainWindow):
         self.edit_target_btn.setEnabled(False)
         control_layout.addWidget(self.edit_target_btn)
         
+        # View details button
+        self.view_details_btn = QPushButton("View Details")
+        self.view_details_btn.clicked.connect(self._view_target_details)
+        self.view_details_btn.setEnabled(False)
+        self.view_details_btn.setToolTip("Open detailed view of selected target")
+        control_layout.addWidget(self.view_details_btn)
+        
         # Remove target button
         self.remove_target_btn = QPushButton("Remove Selected")
         self.remove_target_btn.clicked.connect(self._remove_selected_target)
@@ -431,7 +467,7 @@ class DSOTargetListWindow(QMainWindow):
         self.targets_table.setAlternatingRowColors(True)
         self.targets_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.targets_table.selectionModel().selectionChanged.connect(self._on_selection_changed)
-        self.targets_table.itemDoubleClicked.connect(self._edit_selected_target)
+        self.targets_table.itemDoubleClicked.connect(self._view_target_details)
         
         targets_layout.addWidget(self.targets_table)
         targets_group.setLayout(targets_layout)
@@ -457,6 +493,7 @@ class DSOTargetListWindow(QMainWindow):
         target_data = self.targets_data[current_row]
         dialog = AddTargetDialog(dso_data=target_data, parent=self)
         dialog.setWindowTitle("Edit Target")
+        dialog.set_edit_mode(target_data["id"])  # Change button text to "Save Changes" and set target ID
         
         # Pre-populate with target data
         dialog.name_edit.setText(target_data.get("name", ""))
@@ -544,7 +581,77 @@ class DSOTargetListWindow(QMainWindow):
         """Handle selection changes in the table"""
         has_selection = self.targets_table.currentRow() >= 0
         self.edit_target_btn.setEnabled(has_selection)
+        self.view_details_btn.setEnabled(has_selection)
         self.remove_target_btn.setEnabled(has_selection)
+    
+    def _view_target_details(self):
+        """Open ObjectDetailWindow for the selected target"""
+        current_row = self.targets_table.currentRow()
+        if current_row < 0 or current_row >= len(self.targets_data):
+            QMessageBox.warning(self, "No Selection", "Please select a target to view details.")
+            return
+        
+        try:
+            target_data = self.targets_data[current_row]
+            
+            # Import ObjectDetailWindow from Main.py
+            from Main import ObjectDetailWindow
+            
+            # Convert target data to the format expected by ObjectDetailWindow
+            detail_data = {
+                "name": target_data.get("name", ""),
+                "ra": self._format_ra_for_display(target_data.get("ra_deg", 0)),
+                "dec": self._format_dec_for_display(target_data.get("dec_deg", 0)),
+                "ra_deg": target_data.get("ra_deg", 0),
+                "dec_deg": target_data.get("dec_deg", 0),
+                "magnitude": target_data.get("magnitude", 0),
+                "surface_brightness": 0,  # Not stored in target list
+                "size_min": 0,  # Not stored in target list  
+                "size_max": 0,  # Not stored in target list
+                "constellation": target_data.get("constellation", ""),
+                "dso_type": target_data.get("dso_type", ""),
+                "dso_class": "",  # Not stored in target list
+                "designations": target_data.get("name", ""),  # Use name as primary designation
+                "catalogue": target_data.get("name", "").split()[0] if " " in target_data.get("name", "") else "",
+                "id": target_data.get("name", "").split()[1:] if " " in target_data.get("name", "") else "",
+                "dsodetailid": 0,  # Not applicable for target list items
+                "image_path": None,  # Not stored in target list
+                "integration_time": None,
+                "equipment": None,
+                "date_taken": None,
+                "notes": target_data.get("notes", ""),
+                "image_count": 0
+            }
+            
+            # Create and show the ObjectDetailWindow
+            detail_window = ObjectDetailWindow(detail_data, self)
+            detail_window.show()
+            
+        except ImportError as e:
+            QMessageBox.critical(self, "Error", "Could not import ObjectDetailWindow. Please ensure Main.py is available.")
+            logger.error(f"Failed to import ObjectDetailWindow: {str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open target details: {str(e)}")
+            logger.error(f"Error opening target details: {str(e)}")
+    
+    def _format_ra_for_display(self, ra_deg):
+        """Format RA in degrees to HMS format for display"""
+        ra_hours = ra_deg / 15.0
+        ra_h = int(ra_hours)
+        ra_remaining = (ra_hours - ra_h) * 60
+        ra_m = int(ra_remaining)
+        ra_s = (ra_remaining - ra_m) * 60
+        return f"{ra_h:02d}h{ra_m:02d}m{ra_s:05.2f}s"
+    
+    def _format_dec_for_display(self, dec_deg):
+        """Format Dec in degrees to DMS format for display"""
+        dec_sign = '-' if dec_deg < 0 else '+'
+        dec_abs = abs(dec_deg)
+        dec_d = int(dec_abs)
+        dec_remaining = (dec_abs - dec_d) * 60
+        dec_m = int(dec_remaining)
+        dec_s = (dec_remaining - dec_m) * 60
+        return f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
     
     def _filter_targets(self):
         """Apply filters to the targets table"""
@@ -711,54 +818,76 @@ class DSOTargetListWindow(QMainWindow):
             self.status_label.setText(f"Loaded {len(self.targets_data)} targets")
     
     def _calculate_best_months_for_target(self, ra_deg, dec_deg, lat, lon):
-        """Calculate best viewing months for a single target"""
+        """Calculate best viewing months for a single target using centralized calculator"""
+        # Import required modules at the very top, outside any try blocks
+        import numpy as np
+        from datetime import datetime, timedelta
+        
         try:
             # Import astronomy libraries
-            from astroplan import Observer, FixedTarget
-            from astropy import units as u
+            from DSOVisibilityCalculator import DSOVisibilityCalculator
             from astropy.coordinates import SkyCoord
-            from astropy.time import Time
-            from datetime import date, timedelta
-            import calendar
+            import astropy.units as u
             
-            # Create observer and target
-            observer = Observer(latitude=lat * u.deg, longitude=lon * u.deg, name="User Location")
-            target = FixedTarget(coord=SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg), name="Target")
+            # Create calculator with user location
+            calculator = DSOVisibilityCalculator(lat, lon)
             
-            # Check visibility for each month
-            good_months = []
-            today = date.today()
+            # Create coordinate object once since we have RA/Dec
+            dso_coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
             
-            for month in range(1, 13):
-                # Check the 15th of each month as representative
+            # Sample dates throughout the year (same approach as ObjectDetailWindow)
+            current_year = datetime.now().year
+            min_altitude = 30  # Use 30° minimum altitude
+            
+            sample_dates = []
+            visibility_results = []
+            
+            for day_offset in range(0, 365, 15):  # Every 15 days like ObjectDetailWindow
                 try:
-                    check_date = date(today.year, month, 15)
-                    midnight_time = Time(f"{check_date.year}-{check_date.month:02d}-{check_date.day:02d} 00:00:00", 
-                                       location=observer.location)
+                    test_date = datetime(current_year, 1, 1) + timedelta(days=day_offset)
+                    date_str = test_date.strftime('%Y-%m-%d')
                     
-                    # Get sun and target positions at midnight
-                    sun_altaz = observer.sun_altaz(midnight_time)
-                    target_altaz = observer.altaz(midnight_time, target)
+                    # Use coordinate-based calculation instead of name-based
+                    time_range, dso_altaz, sun_altaz = calculator.calculate_altaz_over_time(
+                        dso_coord, date_str, 12)
                     
-                    # Target is good for this month if:
-                    # 1. Sun is down (astronomical twilight or darker)
-                    # 2. Target is reasonably high (>30 degrees altitude)
-                    if sun_altaz.alt.degree < -12 and target_altaz.alt.degree > 30:
-                        good_months.append(calendar.month_abbr[month])
-                        
+                    # Find optimal viewing times using same criteria
+                    optimal_times = calculator.find_optimal_viewing_times(
+                        dso_altaz, sun_altaz, min_altitude)
+                    
+                    results = {"optimal_times": optimal_times}
+                    
+                    is_visible = False
+                    if "error" not in results and np.any(results.get("optimal_times", [])):
+                        is_visible = True
+                    
+                    sample_dates.append(test_date)
+                    visibility_results.append(is_visible)
+                    
                 except Exception as e:
-                    logger.debug(f"Error checking month {month}: {e}")
+                    logger.debug(f"Error checking date {day_offset}: {e}")
                     continue
             
-            # Format the result
-            if good_months:
-                # Group consecutive months for cleaner display
-                return self._format_month_ranges(good_months)
+            # Group visible periods into months
+            if any(visibility_results):
+                good_months = set()
+                for date, visible in zip(sample_dates, visibility_results):
+                    if visible:
+                        good_months.add(date.month)
+                
+                # Convert month numbers to abbreviations
+                month_abbrs = [calendar.month_abbr[month] for month in sorted(good_months)]
+                
+                # Format the result
+                if month_abbrs:
+                    return self._format_month_ranges(month_abbrs)
+                else:
+                    return "Not optimal from location"
             else:
                 return "Not optimal from location"
                 
         except ImportError:
-            logger.error("Missing astronomy libraries for best months calculation")
+            logger.error("Missing DSOVisibilityCalculator for best months calculation")
             return "Calculation unavailable"
         except Exception as e:
             logger.error(f"Error calculating best months for target: {str(e)}")
