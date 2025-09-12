@@ -1760,7 +1760,23 @@ class CollageSelectionDialog(QDialog):
 
 # --- Object Detail Window ---
 class ObjectDetailWindow(QDialog):
+    """
+    Detail window for DSO objects with image support including FITS files.
+    
+    Supports the following image formats:
+    - Regular formats: PNG, JPG, JPEG, TIFF, TIF, GIF, BMP
+    - Astronomical formats: FITS, FIT, FTS (requires astropy and matplotlib)
+    
+    FITS files support both natural RGB and false color display:
+    - RGB FITS files: Displayed in natural colors (no colormap applied)
+    - Grayscale FITS files: Default 'gray' for natural B&W appearance
+    - False color options: 'viridis', 'hot', 'cool', 'plasma', 'inferno' for grayscale data
+    - Change FITS_COLORMAP class variable to customize display
+    """
     image_added = Signal()  # Add this signal at the class level
+    
+    # FITS colormap configuration - users can change this to their preference
+    FITS_COLORMAP = 'gray'  # Options: 'gray' (natural B&W), 'viridis', 'hot', 'cool', 'plasma', 'inferno'
 
     def __init__(self, data: dict, parent=None):
         super().__init__(None)  # Pass None as parent to make it independent
@@ -2395,7 +2411,7 @@ class ObjectDetailWindow(QDialog):
             self,
             f"Select Image for {self.data['name']}",
             os.path.expanduser("~"),  # Start in user's home directory
-            "Image Files (*.png *.jpg *.jpeg *.tif *.tiff)"
+            "Image Files (*.png *.jpg *.jpeg *.tif *.tiff *.fits *.fit *.fts);;Regular Images (*.png *.jpg *.jpeg *.tif *.tiff);;FITS Files (*.fits *.fit *.fts);;All Files (*)"
         )
 
         if file_name:
@@ -2470,8 +2486,204 @@ class ObjectDetailWindow(QDialog):
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.critical(self, "Error", f"Failed to add image: {str(e)}")
 
+    def _load_fits_image(self, fits_path, colormap='viridis'):
+        """
+        Load a FITS image file and convert to QPixmap with color mapping.
+        
+        Args:
+            fits_path (str): Path to the FITS file
+            colormap (str): Matplotlib colormap name ('viridis', 'hot', 'cool', 'plasma', 'inferno', 'gray')
+        """
+        try:
+            logger.debug(f"Loading FITS file: {fits_path}")
+            
+            # Import required libraries
+            from astropy.io import fits
+            from astropy.visualization import simple_norm
+            import numpy as np
+            from PySide6.QtGui import QImage
+            
+            # Open FITS file
+            with fits.open(fits_path) as hdul:
+                # Get the primary image data (usually the first HDU with data)
+                image_data = None
+                for hdu in hdul:
+                    if hdu.data is not None and len(hdu.data.shape) >= 2:
+                        image_data = hdu.data
+                        break
+                
+                if image_data is None:
+                    logger.error(f"No image data found in FITS file: {fits_path}")
+                    return None
+                
+                # Handle different dimensionalities
+                is_rgb = False
+                if len(image_data.shape) > 2:
+                    # Check if this is an RGB image (3 color planes)
+                    if len(image_data.shape) == 3 and image_data.shape[2] == 3:
+                        # This is an RGB FITS image
+                        is_rgb = True
+                        logger.debug("Detected RGB FITS image")
+                    elif len(image_data.shape) == 3 and image_data.shape[0] == 3:
+                        # RGB planes are in first dimension, transpose
+                        image_data = np.transpose(image_data, (1, 2, 0))
+                        is_rgb = True
+                        logger.debug("Detected RGB FITS image (transposed)")
+                    elif len(image_data.shape) == 3:
+                        # Take the first 2D slice if it's a cube
+                        image_data = image_data[0]
+                        logger.debug("Using first slice of 3D FITS data")
+                    elif len(image_data.shape) == 4:
+                        image_data = image_data[0, 0]
+                        logger.debug("Using first slice of 4D FITS data")
+                    else:
+                        logger.error(f"Unsupported FITS image dimensions: {image_data.shape}")
+                        return None
+                
+                # Normalize the data for display (handle NaN values)
+                image_data = np.nan_to_num(image_data, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                if is_rgb:
+                    # Handle RGB FITS data - normalize each channel separately
+                    logger.debug("Processing RGB FITS data")
+                    normalized_data = np.zeros_like(image_data)
+                    
+                    for channel in range(3):
+                        channel_data = image_data[:, :, channel]
+                        # Apply normalization to each color channel
+                        try:
+                            norm = simple_norm(channel_data, stretch='linear', percent=99.5)
+                            normalized_data[:, :, channel] = norm(channel_data)
+                        except Exception as e:
+                            logger.warning(f"Astropy normalization failed for channel {channel}, using simple scaling: {e}")
+                            # Fallback to simple min-max normalization per channel
+                            data_min, data_max = np.percentile(channel_data, [0.5, 99.5])
+                            if data_max > data_min:
+                                normalized_data[:, :, channel] = (channel_data - data_min) / (data_max - data_min)
+                            else:
+                                normalized_data[:, :, channel] = channel_data
+                    
+                    # Clip to valid range
+                    normalized_data = np.clip(normalized_data, 0, 1)
+                    
+                    # Convert directly to 8-bit RGB (no false color mapping needed)
+                    rgb_data = (normalized_data * 255).astype(np.uint8)
+                    
+                    # Ensure the array is C-contiguous for QImage
+                    if not rgb_data.flags['C_CONTIGUOUS']:
+                        rgb_data = np.ascontiguousarray(rgb_data)
+                    
+                    # Create QImage from RGB array
+                    height, width, channels = rgb_data.shape
+                    bytes_per_line = width * channels
+                    
+                    qimage = QImage(rgb_data.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                    logger.debug("Created RGB QImage from FITS data")
+                    
+                else:
+                    # Handle grayscale FITS data
+                    logger.debug("Processing grayscale FITS data")
+                    
+                    # Apply simple normalization (linear stretch between percentiles)
+                    try:
+                        norm = simple_norm(image_data, stretch='linear', percent=99.5)
+                        normalized_data = norm(image_data)
+                    except Exception as e:
+                        logger.warning(f"Astropy normalization failed, using simple scaling: {e}")
+                        # Fallback to simple min-max normalization
+                        data_min, data_max = np.percentile(image_data, [0.5, 99.5])
+                        if data_max > data_min:
+                            normalized_data = (image_data - data_min) / (data_max - data_min)
+                        else:
+                            normalized_data = image_data
+                        normalized_data = np.clip(normalized_data, 0, 1)
+                    
+                    # For grayscale data, apply color mapping if specified
+                    if colormap == 'gray' or colormap == 'grey':
+                        # Display as grayscale
+                        image_8bit = (normalized_data * 255).astype(np.uint8)
+                        
+                        # Ensure the array is C-contiguous for QImage
+                        if not image_8bit.flags['C_CONTIGUOUS']:
+                            image_8bit = np.ascontiguousarray(image_8bit)
+                        
+                        height, width = image_8bit.shape
+                        bytes_per_line = width
+                        qimage = QImage(image_8bit.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
+                        logger.debug("Created grayscale QImage from FITS data")
+                    else:
+                        # Apply color mapping for better visualization
+                        try:
+                            import matplotlib.pyplot as plt
+                            import matplotlib.cm as cm
+                            
+                            # Apply a color map for better astronomical visualization
+                            try:
+                                cmap = cm.get_cmap(colormap)
+                            except ValueError:
+                                logger.warning(f"Unknown colormap '{colormap}', falling back to 'viridis'")
+                                cmap = cm.get_cmap('viridis')
+                            
+                            colored_data = cmap(normalized_data)
+                            
+                            # Convert to 8-bit RGB
+                            rgb_data = (colored_data[:, :, :3] * 255).astype(np.uint8)
+                            
+                            # Ensure the array is C-contiguous for QImage
+                            if not rgb_data.flags['C_CONTIGUOUS']:
+                                rgb_data = np.ascontiguousarray(rgb_data)
+                            
+                            # Create QImage from RGB array
+                            height, width, channels = rgb_data.shape
+                            bytes_per_line = width * channels
+                            
+                            qimage = QImage(rgb_data.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                            logger.debug(f"Created color-mapped QImage using {colormap}")
+                            
+                        except ImportError:
+                            logger.warning("Matplotlib not available, displaying FITS as grayscale")
+                            # Fallback to grayscale
+                            image_8bit = (normalized_data * 255).astype(np.uint8)
+                            
+                            # Ensure the array is C-contiguous for QImage
+                            if not image_8bit.flags['C_CONTIGUOUS']:
+                                image_8bit = np.ascontiguousarray(image_8bit)
+                            
+                            height, width = image_8bit.shape
+                            bytes_per_line = width
+                            qimage = QImage(image_8bit.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
+                        except Exception as e:
+                            logger.warning(f"Color mapping failed, using grayscale: {e}")
+                            # Fallback to grayscale
+                            image_8bit = (normalized_data * 255).astype(np.uint8)
+                            
+                            # Ensure the array is C-contiguous for QImage
+                            if not image_8bit.flags['C_CONTIGUOUS']:
+                                image_8bit = np.ascontiguousarray(image_8bit)
+                            
+                            height, width = image_8bit.shape
+                            bytes_per_line = width
+                            qimage = QImage(image_8bit.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
+                
+                # Convert to QPixmap
+                pixmap = QPixmap.fromImage(qimage)
+                
+                if not pixmap.isNull():
+                    logger.debug(f"Successfully loaded FITS image: {width}x{height}")
+                    return pixmap
+                else:
+                    logger.error("Failed to convert FITS data to QPixmap")
+                    return None
+                    
+        except ImportError as e:
+            logger.error(f"Missing required libraries for FITS support (astropy): {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error loading FITS file {fits_path}: {str(e)}")
+            return None
+    
     def _load_user_image(self, image_path):
-        """Load and display a user image with caching"""
+        """Load and display a user image with caching (supports FITS files)"""
         try:
             from PySide6.QtGui import QImageReader
             import os
@@ -2513,19 +2725,36 @@ class ObjectDetailWindow(QDialog):
                 logger.debug("Using cached image")
                 self.original_pixmap = cached_pixmap
             else:
-                # Create QPixmap from the image file
-                logger.debug("Loading image from file")
-                self.original_pixmap = QPixmap(image_path)
-                if self.original_pixmap.isNull():
-                    logger.error(f"QPixmap failed to load image: {image_path}")
-                    # Try to get more specific error information
-                    reader = QImageReader(image_path)
-                    if reader.canRead():
-                        logger.debug(f"QImageReader can read the file, format: {reader.format()}")
-                    else:
-                        logger.error(f"QImageReader cannot read file, error: {reader.errorString()}")
+                # Check if this is a FITS file
+                file_ext = os.path.splitext(image_path)[1].lower()
+                if file_ext in ['.fits', '.fit', '.fts']:
+                    # Load FITS file
+                    logger.debug("Loading FITS image")
+                    self.original_pixmap = self._load_fits_image(image_path, self.FITS_COLORMAP)
+                else:
+                    # Create QPixmap from regular image file
+                    logger.debug("Loading regular image from file")
+                    self.original_pixmap = QPixmap(image_path)
+                
+                if self.original_pixmap is None or self.original_pixmap.isNull():
+                    logger.error(f"Failed to load image: {image_path}")
                     
-                    self.image_label.setText(f"Failed to load image:\n{os.path.basename(image_path)}\n\nCheck if file is a valid image format")
+                    if file_ext in ['.fits', '.fit', '.fts']:
+                        # FITS file failed to load
+                        self.image_label.setText(f"Failed to load FITS file:\n{os.path.basename(image_path)}\n\nRequires astropy library for FITS support")
+                    else:
+                        # Try to get more specific error information for regular images
+                        try:
+                            reader = QImageReader(image_path)
+                            if reader.canRead():
+                                logger.debug(f"QImageReader can read the file, format: {reader.format()}")
+                            else:
+                                logger.error(f"QImageReader cannot read file, error: {reader.errorString()}")
+                        except Exception as e:
+                            logger.error(f"Error checking image readability: {e}")
+                        
+                        self.image_label.setText(f"Failed to load image:\n{os.path.basename(image_path)}\n\nCheck if file is a valid image format")
+                    
                     self.image_label.setToolTip(f"File path: {image_path}")
                     return
                 
@@ -2822,7 +3051,7 @@ class ObjectDetailWindow(QDialog):
                 self,
                 f"Select new location for {original_filename}",
                 "",
-                "Image Files (*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.gif);;All Files (*)"
+                "Image Files (*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.gif *.fits *.fit *.fts);;Regular Images (*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.gif);;FITS Files (*.fits *.fit *.fts);;All Files (*)"
             )
             
             if new_image_path:
@@ -4173,11 +4402,11 @@ class MainWindow(QMainWindow):
                                    WHEN 'IC' THEN 3
                                    ELSE 4
                                END, c.designation) as designations,
-                           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+                           NULL as image_path, NULL as integration_time, NULL as equipment, 
+                           NULL as date_taken, NULL as notes,
                            (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
                     FROM dsodetail d
                     JOIN cataloguenr c ON d.id = c.dsodetailid
-                    LEFT JOIN userimages ui ON d.id = ui.dsodetailid
                     GROUP BY d.id
                     ORDER BY c.catalogue, CAST(c.designation AS INTEGER)
                 """)
