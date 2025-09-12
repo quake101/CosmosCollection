@@ -453,44 +453,138 @@ class AladinLiteWindow(QDialog):
         self.setWindowTitle(f"Aladin Lite - {data['name']}")
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint)
         self.resize(1200, 800)
+        
+        self.data = data
+        self.telescopes = []
+        self.selected_telescope = None
+        self.current_fov = None
 
-        # Calculate FOV based on object size
-        # Use the larger dimension and scale it down for better viewing
-        size_max = max(data['size_min'], data['size_max'])
-        fov = size_max * 0.05  # Scale down to 5% of the object's size
+        # Calculate default FOV based on object size (in degrees)
+        size_max = max(data['size_min'], data['size_max'])  # arcminutes
+        self.default_fov = max(size_max / 60.0 * 3.0, 0.5)  # Convert to degrees, 3x object size, min 0.5°
+        self.current_fov = self.default_fov
 
         logger.debug(f"Size values for {data['name']}: min={data['size_min']:.1f}', max={data['size_max']:.1f}'")
-        logger.debug(f"Calculated FOV: {fov:.2f}'")
+        logger.debug(f"Calculated default FOV: {self.default_fov:.3f}°")
 
         # Create main layout
         layout = QVBoxLayout()
+        
+        # Create telescope controls layout
+        telescope_layout = QHBoxLayout()
+        
+        # Telescope selection
+        telescope_label = QLabel("Telescope:")
+        self.telescope_combo = QComboBox()
+        self.telescope_combo.addItem("Default View", None)
+        self.telescope_combo.currentTextChanged.connect(self._on_telescope_changed)
+        
+        # Load telescopes
+        self._load_telescopes()
+        
+        # FOV display controls
+        self.show_telescope_fov = QCheckBox("Show Telescope FOV")
+        self.show_telescope_fov.setChecked(False)
+        self.show_telescope_fov.toggled.connect(self._update_aladin_view)
+        
+        # Camera/Eyepiece selection (for different FOVs)
+        camera_label = QLabel("Camera/Eyepiece:")
+        self.camera_combo = QComboBox()
+        
+        # Visual eyepieces with typical apparent FOV values
+        self.camera_combo.addItem("--- EYEPIECES ---", None)
+        self.camera_combo.addItem("32mm Eyepiece (52° AFOV)", {"type": "eyepiece", "focal_length": 32, "apparent_fov": 52})
+        self.camera_combo.addItem("25mm Eyepiece (52° AFOV)", {"type": "eyepiece", "focal_length": 25, "apparent_fov": 52})
+        self.camera_combo.addItem("20mm Eyepiece (50° AFOV)", {"type": "eyepiece", "focal_length": 20, "apparent_fov": 50})
+        self.camera_combo.addItem("15mm Eyepiece (50° AFOV)", {"type": "eyepiece", "focal_length": 15, "apparent_fov": 50})
+        self.camera_combo.addItem("10mm Eyepiece (50° AFOV)", {"type": "eyepiece", "focal_length": 10, "apparent_fov": 50})
+        self.camera_combo.addItem("6mm Eyepiece (50° AFOV)", {"type": "eyepiece", "focal_length": 6, "apparent_fov": 50})
+        
+        # DSLR cameras
+        self.camera_combo.addItem("--- DSLR CAMERAS ---", None)
+        self.camera_combo.addItem("Canon Full Frame (36x24mm)", {"type": "camera", "sensor_width": 36, "sensor_height": 24})
+        self.camera_combo.addItem("Canon APS-C (22.3x14.9mm)", {"type": "camera", "sensor_width": 22.3, "sensor_height": 14.9})
+        self.camera_combo.addItem("Canon APS-H (28.7x19mm)", {"type": "camera", "sensor_width": 28.7, "sensor_height": 19.0})
+        self.camera_combo.addItem("Nikon Full Frame (35.9x24mm)", {"type": "camera", "sensor_width": 35.9, "sensor_height": 24.0})
+        self.camera_combo.addItem("Nikon APS-C (23.5x15.6mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.6})
+        self.camera_combo.addItem("Sony Full Frame (35.8x23.8mm)", {"type": "camera", "sensor_width": 35.8, "sensor_height": 23.8})
+        self.camera_combo.addItem("Sony APS-C (23.5x15.6mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.6})
+        
+        # ZWO ASI cameras (popular for astrophotography)
+        self.camera_combo.addItem("--- ZWO ASI CAMERAS ---", None)
+        self.camera_combo.addItem("ASI6200MM Pro (36x24mm)", {"type": "camera", "sensor_width": 36.0, "sensor_height": 24.0})
+        self.camera_combo.addItem("ASI2600MM Pro (23.5x15.7mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.7})
+        self.camera_combo.addItem("ASI533MM Pro (11.3x7.1mm)", {"type": "camera", "sensor_width": 11.3, "sensor_height": 7.1})
+        self.camera_combo.addItem("ASI294MM Pro (19.1x13.0mm)", {"type": "camera", "sensor_width": 19.1, "sensor_height": 13.0})
+        self.camera_combo.addItem("ASI183MM Pro (13.2x8.8mm)", {"type": "camera", "sensor_width": 13.2, "sensor_height": 8.8})
+        self.camera_combo.addItem("ASI585MC (8.3x6.2mm)", {"type": "camera", "sensor_width": 8.3, "sensor_height": 6.2})
+        self.camera_combo.addItem("ASI385MC (7.7x4.9mm)", {"type": "camera", "sensor_width": 7.7, "sensor_height": 4.9})
+        self.camera_combo.addItem("ASI224MC (3.9x2.8mm)", {"type": "camera", "sensor_width": 3.9, "sensor_height": 2.8})
+        self.camera_combo.addItem("ASI120MM (3.8x2.8mm)", {"type": "camera", "sensor_width": 3.8, "sensor_height": 2.8})
+        
+        # QHY cameras
+        self.camera_combo.addItem("--- QHY CAMERAS ---", None)
+        self.camera_combo.addItem("QHY600M (36x24mm)", {"type": "camera", "sensor_width": 36.0, "sensor_height": 24.0})
+        self.camera_combo.addItem("QHY268M (23.5x15.7mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.7})
+        self.camera_combo.addItem("QHY294M (19.1x13.0mm)", {"type": "camera", "sensor_width": 19.1, "sensor_height": 13.0})
+        self.camera_combo.addItem("QHY183M (13.2x8.8mm)", {"type": "camera", "sensor_width": 13.2, "sensor_height": 8.8})
+        self.camera_combo.addItem("QHY174M (11.3x7.1mm)", {"type": "camera", "sensor_width": 11.3, "sensor_height": 7.1})
+        
+        # SBIG cameras
+        self.camera_combo.addItem("--- SBIG CAMERAS ---", None)
+        self.camera_combo.addItem("SBIG STF-8300M (17.96x13.52mm)", {"type": "camera", "sensor_width": 17.96, "sensor_height": 13.52})
+        self.camera_combo.addItem("SBIG ST-2000XM (15.2x15.2mm)", {"type": "camera", "sensor_width": 15.2, "sensor_height": 15.2})
+        
+        # Atik cameras
+        self.camera_combo.addItem("--- ATIK CAMERAS ---", None)
+        self.camera_combo.addItem("Atik 460EX (36x24mm)", {"type": "camera", "sensor_width": 36.0, "sensor_height": 24.0})
+        self.camera_combo.addItem("Atik 383L+ (23.6x15.8mm)", {"type": "camera", "sensor_width": 23.6, "sensor_height": 15.8})
+        
+        self.camera_combo.currentTextChanged.connect(self._on_camera_changed)
+        
+        # Arrange telescope controls
+        telescope_layout.addWidget(telescope_label)
+        telescope_layout.addWidget(self.telescope_combo)
+        telescope_layout.addWidget(self.show_telescope_fov)
+        telescope_layout.addWidget(camera_label)
+        telescope_layout.addWidget(self.camera_combo)
+        telescope_layout.addStretch()
+        
+        layout.addLayout(telescope_layout)
 
         # Add Aladin Lite viewer
         self.web_view = QWebEngineView()
-        base_url = "https://aladin.u-strasbg.fr/AladinLite/?target="
         
-        # Use multiple fallback methods to get target
-        target_id = data.get('dsodetailid', '')
-        if not target_id:
-            # Try using object name directly
-            target_id = data.get('name', '')
-        if not target_id and 'ra_deg' in data and 'dec_deg' in data:
-            # Use coordinates if available
-            ra = data['ra_deg']
-            dec = data['dec_deg']
-            target_id = f"{ra}+{dec}"
+        # Enable developer tools for debugging
+        try:
+            from PySide6.QtWebEngineCore import QWebEngineSettings
+            # Try different attribute names depending on PySide6 version
+            try:
+                self.web_view.settings().setAttribute(QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled, True)
+            except AttributeError:
+                try:
+                    self.web_view.settings().setAttribute(QWebEngineSettings.DeveloperExtrasEnabled, True)
+                except AttributeError:
+                    # Alternative approach for older versions
+                    settings = self.web_view.settings()
+                    settings.setAttribute(settings.DeveloperExtrasEnabled, True)
+            
+            # Enable context menu for developer tools
+            self.web_view.setContextMenuPolicy(Qt.DefaultContextMenu)
+            logger.debug("Developer tools enabled for Aladin window")
+        except Exception as e:
+            logger.debug(f"Could not enable developer tools: {e}")
+            # Continue without developer tools
         
-        image_url = f"{base_url}{target_id}&fov={fov}&survey=P%2FDSS2%2Fcolor"
-        self.web_view.setUrl(QUrl(image_url))
         layout.addWidget(self.web_view)
 
         # Create a horizontal layout for the bottom controls
         bottom_layout = QHBoxLayout()
 
-        # Add compact size information
-        size_info = QLabel(f"FOV: {fov:.2f}' | Size: {data['size_min']:.1f}'—{data['size_max']:.1f}'")
-        size_info.setStyleSheet("font-size: 10pt;")
-        bottom_layout.addWidget(size_info)
+        # Add FOV information display
+        self.fov_info_label = QLabel()
+        self.fov_info_label.setStyleSheet("font-size: 10pt;")
+        bottom_layout.addWidget(self.fov_info_label)
 
         # Add close button
         close_button = QPushButton("Close")
@@ -501,7 +595,711 @@ class AladinLiteWindow(QDialog):
         layout.addLayout(bottom_layout)
 
         self.setLayout(layout)
-        logger.debug(f"Opened Aladin Lite window with FOV: {fov:.2f}'")
+        
+        # Initialize overlay data storage
+        self.pending_fov_overlay = None
+        self.target_coordinates = None
+        
+        # Now that UI is fully initialized, update the Aladin view
+        self._update_aladin_view()
+        
+        logger.debug(f"Opened Aladin Lite window with default FOV: {self.default_fov:.2f}'")
+    
+    def _load_telescopes(self):
+        """Load user telescopes from database"""
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, name, aperture, focal_length, is_active 
+                    FROM usertelescopes 
+                    WHERE focal_length IS NOT NULL AND focal_length > 0
+                    ORDER BY is_active DESC, name ASC
+                """)
+                
+                telescopes = cursor.fetchall()
+                self.telescopes = []
+                
+                for telescope_id, name, aperture, focal_length, is_active in telescopes:
+                    telescope_data = {
+                        'id': telescope_id,
+                        'name': name,
+                        'aperture': aperture,
+                        'focal_length': focal_length,
+                        'is_active': is_active
+                    }
+                    self.telescopes.append(telescope_data)
+                    
+                    # Add to combo box
+                    display_name = f"{name} ({focal_length}mm f/{focal_length/aperture:.1f})" if aperture else f"{name} ({focal_length}mm)"
+                    if is_active:
+                        display_name += " *"
+                    self.telescope_combo.addItem(display_name, telescope_data)
+                
+                logger.debug(f"Loaded {len(telescopes)} telescopes with focal length data")
+                
+        except Exception as e:
+            logger.error(f"Error loading telescopes: {str(e)}")
+    
+    def _on_telescope_changed(self):
+        """Handle telescope selection change"""
+        current_data = self.telescope_combo.currentData()
+        if current_data:
+            self.selected_telescope = current_data
+            logger.debug(f"Selected telescope: {current_data['name']} ({current_data['focal_length']}mm)")
+        else:
+            self.selected_telescope = None
+            logger.debug("Selected default view")
+        
+        self._update_aladin_view()
+    
+    def _on_camera_changed(self):
+        """Handle camera/sensor selection change"""
+        self._update_aladin_view()
+    
+    def _calculate_telescope_fov(self):
+        """Calculate telescope FOV based on selected telescope and camera/eyepiece"""
+        if not self.selected_telescope:
+            return None
+        
+        telescope_fl = self.selected_telescope['focal_length']  # mm
+        telescope_aperture = self.selected_telescope.get('aperture', 100)  # mm
+        camera_data = self.camera_combo.currentData()
+        
+        if not camera_data or camera_data is None:
+            return None
+        
+        import math
+        
+        if camera_data.get('type') == 'eyepiece':
+            # Visual observation with eyepiece
+            eyepiece_fl = camera_data['focal_length']  # mm
+            apparent_fov = camera_data['apparent_fov']  # degrees
+            
+            # Calculate magnification
+            magnification = telescope_fl / eyepiece_fl
+            
+            # True FOV = Apparent FOV / Magnification
+            true_fov_deg = apparent_fov / magnification
+            true_fov_arcmin = true_fov_deg * 60
+            
+            logger.debug(f"Eyepiece FOV calculation: {eyepiece_fl}mm eyepiece, {apparent_fov}° AFOV, {magnification:.1f}x mag, {true_fov_arcmin:.1f}' true FOV")
+            
+            return {
+                'width_arcmin': true_fov_arcmin,
+                'height_arcmin': true_fov_arcmin,
+                'type': 'visual',
+                'details': f"{eyepiece_fl}mm eyepiece, {magnification:.0f}x mag"
+            }
+        
+        elif camera_data.get('type') == 'camera':
+            # Camera sensor
+            sensor_width = camera_data['sensor_width']  # mm
+            sensor_height = camera_data['sensor_height']  # mm
+            
+            # FOV = 2 * arctan(sensor_size / (2 * focal_length)) * (180/π) * 60 (arcmin)
+            fov_width_rad = 2 * math.atan(sensor_width / (2 * telescope_fl))
+            fov_height_rad = 2 * math.atan(sensor_height / (2 * telescope_fl))
+            
+            fov_width_arcmin = fov_width_rad * (180 / math.pi) * 60
+            fov_height_arcmin = fov_height_rad * (180 / math.pi) * 60
+            
+            # Calculate pixel scale for additional info
+            pixel_scale_arcsec = 206265 * (sensor_width / 1000) / telescope_fl  # arcsec/mm (assuming square pixels)
+            
+            logger.debug(f"Camera FOV calculation: {sensor_width}x{sensor_height}mm sensor, {telescope_fl}mm FL, FOV={fov_width_arcmin:.1f}'x{fov_height_arcmin:.1f}'")
+            
+            return {
+                'width_arcmin': fov_width_arcmin,
+                'height_arcmin': fov_height_arcmin,
+                'type': 'camera',
+                'details': f"{sensor_width}×{sensor_height}mm sensor",
+                'pixel_scale_arcsec': pixel_scale_arcsec
+            }
+        
+        return None
+    
+    def _update_aladin_view(self):
+        """Update the Aladin Lite view with current settings"""
+        # Determine FOV to use
+        telescope_fov_data = None
+        display_fov = self.default_fov
+        
+        if self.selected_telescope and self.show_telescope_fov.isChecked():
+            telescope_fov_data = self._calculate_telescope_fov()
+            if telescope_fov_data:
+                # Use the larger dimension for display FOV, but convert to degrees and add reasonable margin
+                telescope_fov_arcmin = max(telescope_fov_data['width_arcmin'], telescope_fov_data['height_arcmin'])
+                display_fov = telescope_fov_arcmin / 60.0 * 1.5  # Convert to degrees and add 50% margin
+                logger.debug(f"Telescope FOV: {telescope_fov_arcmin:.1f}' -> Display FOV: {display_fov:.3f}°")
+        
+        self.current_fov = display_fov
+        
+        # Build Aladin URL
+        base_url = "https://aladin.u-strasbg.fr/AladinLite/?"
+        
+        # Use coordinates as primary method since object names can be unreliable
+        target_id = None
+        if 'ra_deg' in self.data and 'dec_deg' in self.data and self.data['ra_deg'] is not None and self.data['dec_deg'] is not None:
+            ra = self.data['ra_deg']
+            dec = self.data['dec_deg']
+            # Format coordinates properly for Aladin (space-separated)
+            target_id = f"{ra} {dec}"
+            logger.debug(f"Using coordinates for Aladin target: RA={ra}, Dec={dec}")
+        else:
+            # Fallback to object names
+            target_id = self.data.get('name', '')
+            logger.debug(f"Using object name for Aladin target: {target_id}")
+            
+            # If still no target, try dsodetailid
+            if not target_id:
+                target_id = self.data.get('dsodetailid', '')
+                logger.debug(f"Using dsodetailid for Aladin target: {target_id}")
+        
+        if not target_id:
+            logger.error(f"No valid target found for Aladin. Data keys: {list(self.data.keys())}")
+            target_id = "M1"  # Default fallback
+        
+        # URL encode the target if it contains coordinates
+        import urllib.parse
+        encoded_target = urllib.parse.quote(str(target_id))
+        
+        # Build URL with parameters
+        url_params = [
+            f"target={encoded_target}",
+            f"fov={display_fov}",
+            "survey=P%2FDSS2%2Fcolor",
+            "showReticle=true"
+        ]
+        
+        # Always use standard Aladin URL first
+        image_url = f"{base_url}{'&'.join(url_params)}"
+        logger.debug(f"Final Aladin URL: {image_url}")
+        self.web_view.setUrl(QUrl(image_url))
+        
+        # Add telescope FOV overlay using JavaScript injection if enabled
+        if telescope_fov_data and self.show_telescope_fov.isChecked():
+            logger.debug(f"Will inject FOV overlay. Telescope: {self.selected_telescope['name']}, FOV: {telescope_fov_data['width_arcmin']:.1f}'x{telescope_fov_data['height_arcmin']:.1f}', Type: {telescope_fov_data['type']}")
+            # Store the FOV data for injection after page loads
+            self.pending_fov_overlay = telescope_fov_data
+            self.target_coordinates = target_id
+            # Connect to page load finished signal
+            self.web_view.loadFinished.connect(self._inject_fov_overlay)
+        else:
+            self.pending_fov_overlay = None
+        
+        self._update_fov_info()
+        
+        logger.debug(f"Updated Aladin view with FOV: {display_fov:.3f}° ({display_fov*60:.1f}')")
+    
+    def _create_aladin_html_with_overlay(self, target, fov, telescope_fov_data):
+        """Create custom HTML with Aladin Lite and telescope FOV overlay"""
+        
+        # Convert FOV to degrees for JavaScript
+        telescope_fov_width_deg = telescope_fov_data['width_arcmin'] / 60.0
+        telescope_fov_height_deg = telescope_fov_data['height_arcmin'] / 60.0
+        
+        # Determine overlay shape and color
+        if telescope_fov_data['type'] == 'visual':
+            # Circular overlay for eyepieces
+            overlay_shape = "circle"
+            overlay_color = "#00ff00"  # Green for visual
+            overlay_radius = telescope_fov_width_deg / 2.0
+        else:
+            # Rectangular overlay for cameras
+            overlay_shape = "rectangle"
+            overlay_color = "#ff8800"  # Orange for cameras
+        
+        html_template = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Aladin Lite with Telescope FOV</title>
+    <link rel="stylesheet" href="https://aladin.u-strasbg.fr/AladinLite/api/v2/latest/aladin.min.css" />
+    <style>
+        body {{ margin: 0; padding: 0; background: #1a1a1a; }}
+        #aladin-lite-div {{ width: 100%; height: 100vh; }}
+        .info-overlay {{
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.8);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            z-index: 1000;
+            max-width: 300px;
+        }}
+    </style>
+</head>
+<body>
+    <div id="aladin-lite-div"></div>
+    <div class="info-overlay">
+        <strong>Telescope FOV:</strong> {telescope_fov_data['width_arcmin']:.1f}' × {telescope_fov_data['height_arcmin']:.1f}'<br>
+        <strong>Type:</strong> {telescope_fov_data['details']}
+    </div>
+    
+    <script src="https://aladin.u-strasbg.fr/AladinLite/api/v2/latest/aladin.min.js"></script>
+    <script>
+        // Initialize Aladin Lite
+        A.init.then(() => {{
+            let aladin = A.aladin('#aladin-lite-div', {{
+                survey: "P/DSS2/color",
+                fov: {fov},
+                target: "{target}",
+                showReticle: true,
+                showZoomControl: true,
+                showFullscreenControl: true,
+                showLayersControl: true,
+                showGotoControl: true,
+                showProjectionControl: true,
+                showFrame: true
+            }});
+            
+            // Add FOV overlay after Aladin loads
+            setTimeout(() => {{
+                try {{
+                    let overlay = A.graphicOverlay({{
+                        color: '{overlay_color}',
+                        lineWidth: 2
+                    }});
+                    aladin.addOverlay(overlay);
+                    
+                    // Parse target coordinates
+                    let coords = "{target}".split(' ');
+                    let ra = parseFloat(coords[0]);
+                    let dec = parseFloat(coords[1]);
+                    
+                    if (!isNaN(ra) && !isNaN(dec)) {{
+                        if ("{overlay_shape}" === "circle") {{
+                            // Circular FOV for eyepieces
+                            overlay.addShape(A.circle(ra, dec, {overlay_radius:.6f}));
+                        }} else {{
+                            // Rectangular FOV for cameras
+                            let hw = {telescope_fov_width_deg / 2.0:.6f};
+                            let hh = {telescope_fov_height_deg / 2.0:.6f};
+                            let poly = A.polygon([
+                                [ra - hw, dec - hh],
+                                [ra + hw, dec - hh],
+                                [ra + hw, dec + hh],
+                                [ra - hw, dec + hh]
+                            ]);
+                            overlay.addShape(poly);
+                        }}
+                        console.log("FOV overlay added successfully");
+                    }}
+                }} catch(e) {{
+                    console.error("Error adding FOV overlay:", e);
+                }}
+            }}, 1500);
+        }}).catch(e => {{
+            console.error("Aladin initialization failed:", e);
+            document.getElementById('aladin-lite-div').innerHTML = '<div style="color:white;padding:20px;text-align:center;">Failed to load Aladin Lite. Please check your internet connection.</div>';
+        }});
+    </script>
+</body>
+</html>"""
+        
+        return html_template
+    
+    def _inject_fov_overlay(self, success):
+        """Inject FOV overlay JavaScript after Aladin page loads"""
+        if not success or not self.pending_fov_overlay:
+            return
+            
+        try:
+            # Disconnect the signal to avoid multiple injections
+            self.web_view.loadFinished.disconnect(self._inject_fov_overlay)
+        except:
+            pass  # Signal might not be connected
+        
+        fov_data = self.pending_fov_overlay
+        target_coords = self.target_coordinates
+        
+        logger.debug(f"Injecting FOV overlay for {fov_data['type']} with {fov_data['width_arcmin']:.1f}' FOV")
+        
+        # Convert FOV to degrees for JavaScript
+        telescope_fov_width_deg = fov_data['width_arcmin'] / 60.0
+        telescope_fov_height_deg = fov_data['height_arcmin'] / 60.0
+        
+        # Determine overlay properties
+        if fov_data['type'] == 'visual':
+            overlay_shape = "circle"
+            overlay_color = "#00ff00"  # Green for visual
+            overlay_radius = telescope_fov_width_deg / 2.0
+        else:
+            overlay_shape = "rectangle"
+            overlay_color = "#ff8800"  # Orange for cameras
+        
+        # Parse coordinates
+        coords = target_coords.split(' ')
+        if len(coords) >= 2:
+            try:
+                ra = float(coords[0])
+                dec = float(coords[1])
+            except ValueError:
+                logger.error(f"Invalid coordinates: {target_coords}")
+                return
+        else:
+            logger.error(f"Invalid coordinate format: {target_coords}")
+            return
+        
+        # Enhanced overlay creation code that integrates with the setup
+        if overlay_shape == "circle":
+            overlay_creation = f"""
+                var overlay = A.graphicOverlay({{
+                    color: '{overlay_color}',
+                    lineWidth: 3
+                }});
+                aladinInstance.addOverlay(overlay);
+                overlay.addShape(A.circle({ra}, {dec}, {overlay_radius:.6f}));
+                console.log('FOV Overlay Debug: Circle overlay added at RA={ra}, Dec={dec}, radius={overlay_radius:.6f}°');
+            """
+        else:
+            half_width = telescope_fov_width_deg / 2.0
+            half_height = telescope_fov_height_deg / 2.0
+            overlay_creation = f"""
+                var overlay = A.graphicOverlay({{
+                    color: '{overlay_color}',
+                    lineWidth: 3
+                }});
+                aladinInstance.addOverlay(overlay);
+                
+                var poly = A.polygon([
+                    [{ra - half_width:.6f}, {dec - half_height:.6f}],
+                    [{ra + half_width:.6f}, {dec - half_height:.6f}],
+                    [{ra + half_width:.6f}, {dec + half_height:.6f}],
+                    [{ra - half_width:.6f}, {dec + half_height:.6f}]
+                ]);
+                overlay.addShape(poly);
+                console.log('FOV Overlay Debug: Rectangle overlay added at RA={ra}, Dec={dec}, size={half_width*2:.6f}°x{half_height*2:.6f}°');
+            """
+        
+        # Combined JavaScript code that creates overlay when instance is found
+        js_code = f"""
+            var originalAddOverlayWhenReady = addOverlayWhenReady;
+            addOverlayWhenReady = function(attemptCount) {{
+                attemptCount = attemptCount || 0;
+                console.log('FOV Overlay Debug: Overlay creation attempt', attemptCount);
+                
+                var aladinInstance = findAladinInstance();
+                
+                if (aladinInstance && typeof A !== 'undefined') {{
+                    try {{
+                        console.log('FOV Overlay Debug: Creating overlay...');
+                        
+                        {overlay_creation}
+                        
+                        // Add info overlay
+                        var infoDiv = document.createElement('div');
+                        infoDiv.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(0,0,0,0.8);color:white;padding:10px;border-radius:5px;font-family:Arial;font-size:12px;z-index:1000;';
+                        infoDiv.innerHTML = '<strong>Telescope FOV:</strong> {fov_data["width_arcmin"]:.1f}\\' × {fov_data["height_arcmin"]:.1f}\\'<br><strong>Type:</strong> {fov_data["details"]}';
+                        document.body.appendChild(infoDiv);
+                        
+                        console.log('FOV Overlay Debug: Overlay and info panel added successfully!');
+                        return true;
+                        
+                    }} catch(e) {{
+                        console.error('FOV Overlay Debug: Error creating overlay:', e);
+                        console.error('FOV Overlay Debug: Stack trace:', e.stack);
+                    }}
+                }} else {{
+                    console.log('FOV Overlay Debug: Prerequisites not met - Aladin:', !!aladinInstance, 'A defined:', typeof A !== 'undefined');
+                    if (attemptCount < 30) {{
+                        setTimeout(function() {{ addOverlayWhenReady(attemptCount + 1); }}, 500);
+                    }} else {{
+                        console.log('FOV Overlay Debug: Giving up after 30 attempts');
+                    }}
+                }}
+                return false;
+            }};
+        """
+        
+        # Enhanced setup code with more debugging
+        setup_code = f"""
+            console.log('FOV Overlay Debug: Starting injection');
+            console.log('FOV Overlay Debug: Target coordinates = {target_coords}');
+            console.log('FOV Overlay Debug: Overlay type = {overlay_shape}');
+            console.log('FOV Overlay Debug: FOV = {fov_data["width_arcmin"]:.1f} arcmin');
+            
+            // Try multiple methods to find Aladin instance
+            var findAladinInstance = function() {{
+                var instance = null;
+                
+                // Method 1: Check global aladin variable
+                if (typeof aladin !== 'undefined') {{
+                    instance = aladin;
+                    console.log('FOV Overlay Debug: Found aladin via global variable');
+                }}
+                
+                // Method 2: Check window.aladin
+                if (!instance && typeof window.aladin !== 'undefined') {{
+                    instance = window.aladin;
+                    console.log('FOV Overlay Debug: Found aladin via window.aladin');
+                }}
+                
+                // Method 3: Look in DOM element
+                if (!instance) {{
+                    var aladinDiv = document.querySelector('#aladin-lite-div');
+                    if (aladinDiv) {{
+                        if (aladinDiv._aladin) {{
+                            instance = aladinDiv._aladin;
+                            console.log('FOV Overlay Debug: Found aladin via DOM._aladin');
+                        }} else if (aladinDiv.aladin) {{
+                            instance = aladinDiv.aladin;
+                            console.log('FOV Overlay Debug: Found aladin via DOM.aladin');
+                        }}
+                    }}
+                }}
+                
+                // Method 4: Check if A is defined and has instances
+                if (!instance && typeof A !== 'undefined') {{
+                    console.log('FOV Overlay Debug: A is defined, checking for instances');
+                    // Try to get the first aladin instance
+                    if (A.aladinInstances && A.aladinInstances.length > 0) {{
+                        instance = A.aladinInstances[0];
+                        console.log('FOV Overlay Debug: Found aladin via A.aladinInstances[0]');
+                    }}
+                }}
+                
+                return instance;
+            }};
+            
+            var addOverlayWhenReady = function(attemptCount) {{
+                attemptCount = attemptCount || 0;
+                console.log('FOV Overlay Debug: Attempt', attemptCount);
+                
+                var aladinInstance = findAladinInstance();
+                
+                if (aladinInstance) {{
+                    console.log('FOV Overlay Debug: Aladin instance found!', aladinInstance);
+                    window.aladinInstance = aladinInstance;
+                    return true;
+                }} else {{
+                    console.log('FOV Overlay Debug: Aladin instance not found');
+                    if (attemptCount < 20) {{
+                        setTimeout(function() {{ addOverlayWhenReady(attemptCount + 1); }}, 500);
+                    }} else {{
+                        console.log('FOV Overlay Debug: Giving up after 20 attempts');
+                    }}
+                    return false;
+                }}
+            }};
+            
+            // Start looking for Aladin instance
+            setTimeout(function() {{ addOverlayWhenReady(0); }}, 1000);
+        """
+        
+        # First try the complex Aladin API approach
+        self.web_view.page().runJavaScript(setup_code)
+        self.web_view.page().runJavaScript(js_code)
+        
+        # Also add a dynamically scaling HTML overlay
+        # Get the current display FOV
+        current_display_fov = self.current_fov
+        
+        simple_overlay_js = f"""
+            // Global variables for the overlay system
+            window.telescopeFovData = {{
+                telescopeFovDegrees: {telescope_fov_width_deg:.6f},
+                telescopeFovHeightDegrees: {telescope_fov_height_deg:.6f},
+                overlayColor: '{overlay_color}',
+                overlayShape: '{overlay_shape}',
+                fovDetails: '{fov_data["details"]}',
+                fovWidthArcmin: {fov_data["width_arcmin"]:.1f},
+                fovHeightArcmin: {fov_data["height_arcmin"]:.1f},
+                targetRA: {ra:.3f},
+                targetDec: {dec:.3f}
+            }};
+            
+            // Function to update overlay scale based on current Aladin FOV
+            window.updateTelescopeFovOverlay = function() {{
+                var existingIndicator = document.getElementById('telescope-fov-indicator');
+                var existingPanel = document.getElementById('telescope-fov-panel');
+                
+                // Get current Aladin FOV dynamically
+                var currentAladinFov = {current_display_fov};  // Fallback value
+                
+                // Try to get actual current FOV from Aladin instance
+                try {{
+                    if (window.aladinInstance && window.aladinInstance.getFov) {{
+                        currentAladinFov = window.aladinInstance.getFov()[0]; // Get width FOV
+                    }} else if (typeof aladin !== 'undefined' && aladin.getFov) {{
+                        currentAladinFov = aladin.getFov()[0];
+                    }}
+                }} catch(e) {{
+                    console.log('Could not get dynamic FOV, using fallback:', currentAladinFov);
+                }}
+                
+                var data = window.telescopeFovData;
+                
+                // Calculate the size of the overlay as a percentage of the view
+                var overlayWidthPercent = (data.telescopeFovDegrees / currentAladinFov) * 100;
+                var overlayHeightPercent = (data.telescopeFovHeightDegrees / currentAladinFov) * 100;
+                
+                // Limit the overlay size to reasonable bounds
+                overlayWidthPercent = Math.max(2, Math.min(95, overlayWidthPercent));
+                overlayHeightPercent = Math.max(2, Math.min(95, overlayHeightPercent));
+                
+                console.log('FOV Update: Current Aladin FOV=' + currentAladinFov.toFixed(3) + '°, Telescope FOV=' + data.telescopeFovDegrees.toFixed(3) + '°, Overlay size=' + overlayWidthPercent.toFixed(1) + '%');
+                
+                // Find the Aladin container
+                var aladinContainer = document.querySelector('#aladin-lite-div') || document.querySelector('.aladin-reticleContainer') || document.body;
+                
+                // Remove existing elements
+                if (existingIndicator) existingIndicator.remove();
+                if (existingPanel) existingPanel.remove();
+                
+                // Create new telescope FOV indicator
+                var fovIndicator = document.createElement('div');
+                fovIndicator.id = 'telescope-fov-indicator';
+                fovIndicator.style.cssText = `
+                    position: absolute;
+                    left: 50%;
+                    top: 50%;
+                    width: ${{overlayWidthPercent}}%;
+                    height: ${{overlayHeightPercent}}%;
+                    border: 3px solid ${{data.overlayColor}};
+                    border-radius: {50 if overlay_shape == 'circle' else 0}%;
+                    background: transparent;
+                    transform: translate(-50%, -50%);
+                    pointer-events: none;
+                    z-index: 1000;
+                    box-shadow: 0 0 10px rgba(0,0,0,0.8);
+                    transition: all 0.3s ease;
+                `;
+                
+                // Position relative to Aladin container
+                if (aladinContainer !== document.body) {{
+                    aladinContainer.style.position = 'relative';
+                    aladinContainer.appendChild(fovIndicator);
+                }} else {{
+                    fovIndicator.style.position = 'fixed';
+                    document.body.appendChild(fovIndicator);
+                }}
+                
+                // Add crosshair at center
+                var crosshair = document.createElement('div');
+                crosshair.style.cssText = `
+                    position: absolute;
+                    left: 50%;
+                    top: 50%;
+                    width: 20px;
+                    height: 20px;
+                    transform: translate(-50%, -50%);
+                    pointer-events: none;
+                    z-index: 1001;
+                `;
+                crosshair.innerHTML = `
+                    <div style="position:absolute;left:50%;top:0;width:1px;height:100%;background:${{data.overlayColor}};transform:translateX(-50%);"></div>
+                    <div style="position:absolute;top:50%;left:0;height:1px;width:100%;background:${{data.overlayColor}};transform:translateY(-50%);"></div>
+                `;
+                fovIndicator.appendChild(crosshair);
+                
+                // Update info panel
+                var scaleInfo = data.telescopeFovDegrees < currentAladinFov ? '📏 TO SCALE' : '⚠️ FOV larger than view';
+                
+                var infoPanel = document.createElement('div');
+                infoPanel.id = 'telescope-fov-panel';
+                infoPanel.style.cssText = `
+                    position: fixed;
+                    top: 10px;
+                    right: 10px;
+                    background: rgba(0,0,0,0.9);
+                    color: white;
+                    padding: 12px;
+                    border-radius: 8px;
+                    font-family: 'Segoe UI', Arial, sans-serif;
+                    font-size: 12px;
+                    z-index: 1001;
+                    border: 2px solid ${{data.overlayColor}};
+                    min-width: 200px;
+                `;
+                
+                infoPanel.innerHTML = `
+                    <div style="text-align:center;margin-bottom:8px;font-weight:bold;color:${{data.overlayColor}};">🔭 TELESCOPE FOV</div>
+                    <div><strong>Size:</strong> ${{data.fovWidthArcmin}}' × ${{data.fovHeightArcmin}}'</div>
+                    <div><strong>Setup:</strong> ${{data.fovDetails}}</div>
+                    <div><strong>View:</strong> ${{currentAladinFov.toFixed(2)}}° (${{(currentAladinFov*60).toFixed(0)}}')</div>
+                    <div><strong>Scale:</strong> ${{scaleInfo}}</div>
+                    <div style="font-size:10px;color:#ccc;margin-top:5px;">Target: RA ${{data.targetRA}}° Dec ${{data.targetDec}}°</div>
+                `;
+                document.body.appendChild(infoPanel);
+            }};
+            
+            // Initial overlay creation
+            setTimeout(function() {{
+                window.updateTelescopeFovOverlay();
+                
+                // Set up zoom change detection
+                var lastFov = null;
+                setInterval(function() {{
+                    try {{
+                        var currentFov = null;
+                        if (window.aladinInstance && window.aladinInstance.getFov) {{
+                            currentFov = window.aladinInstance.getFov()[0];
+                        }} else if (typeof aladin !== 'undefined' && aladin.getFov) {{
+                            currentFov = aladin.getFov()[0];
+                        }}
+                        
+                        if (currentFov && Math.abs(currentFov - lastFov) > 0.001) {{
+                            lastFov = currentFov;
+                            window.updateTelescopeFovOverlay();
+                        }}
+                    }} catch(e) {{
+                        // Silently ignore errors in polling
+                    }}
+                }}, 500); // Check every 500ms for zoom changes
+                
+                console.log('Dynamic FOV overlay system initialized');
+            }}, 1500);
+        """
+        
+        # Inject both approaches
+        self.web_view.page().runJavaScript(simple_overlay_js)
+        
+        logger.debug("JavaScript FOV overlay injection completed (with simple fallback)")
+    
+    def _generate_fov_overlay_script(self, telescope_fov_data):
+        """Generate JavaScript for FOV overlay (legacy method)"""
+        # This method is now replaced by _inject_fov_overlay
+        return None
+    
+    def _update_fov_info(self):
+        """Update the FOV information display"""
+        info_parts = [f"View FOV: {self.current_fov:.2f}° ({self.current_fov*60:.1f}')"]
+        
+        # Object size info
+        obj_size_min = self.data.get('size_min', 0)
+        obj_size_max = self.data.get('size_max', 0)
+        if obj_size_min > 0 and obj_size_max > 0:
+            if abs(obj_size_min - obj_size_max) < 0.1:
+                info_parts.append(f"Object: {obj_size_min:.1f}'")
+            else:
+                info_parts.append(f"Object: {obj_size_min:.1f}'–{obj_size_max:.1f}'")
+        
+        # Telescope FOV info
+        if self.selected_telescope:
+            telescope_fov_data = self._calculate_telescope_fov()
+            if telescope_fov_data:
+                telescope_name = self.selected_telescope['name']
+                telescope_fl = self.selected_telescope['focal_length']
+                
+                if telescope_fov_data['type'] == 'visual':
+                    fov_str = f"{telescope_fov_data['width_arcmin']:.1f}'"
+                    info_parts.append(f"{telescope_name} ({telescope_fl}mm): {fov_str} {telescope_fov_data['details']}")
+                else:
+                    fov_str = f"{telescope_fov_data['width_arcmin']:.1f}'×{telescope_fov_data['height_arcmin']:.1f}'"
+                    info_parts.append(f"{telescope_name} ({telescope_fl}mm): {fov_str} {telescope_fov_data['details']}")
+                    
+                    # Add pixel scale if available
+                    if 'pixel_scale_arcsec' in telescope_fov_data:
+                        info_parts.append(f"Pixel scale: {telescope_fov_data['pixel_scale_arcsec']:.1f}\"/px")
+        
+        self.fov_info_label.setText(" | ".join(info_parts))
 
 
 # --- Image Viewer Window ---
