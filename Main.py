@@ -147,7 +147,12 @@ class ObjectDetailWorker(QObject):
 
 
 class VisibilityCalculationWorker(QObject):
-    """Worker for performing heavy visibility calculations in a background thread"""
+    """
+    Worker for performing heavy visibility calculations in a background thread.
+    
+    Uses coordinate-based calculations to avoid issues with object name resolution
+    (e.g., 'sh2 142' vs 'sh2-142' naming variations in astronomical databases).
+    """
     finished = Signal(str)  # Signal with visibility text result
     error = Signal(str)  # Signal for error reporting
 
@@ -191,14 +196,27 @@ class VisibilityCalculationWorker(QObject):
             sample_dates = []
             visibility_results = []
             
+            # Import required libraries once outside the loop
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            
+            # Create coordinate object once from stored RA/Dec
+            dso_coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
+            
             for day_offset in range(0, 365, 15):
                 try:
                     test_date = datetime(current_year, 1, 1) + timedelta(days=day_offset)
                     date_str = test_date.strftime('%Y-%m-%d')
                     
-                    # Use the same calculation method as Best DSO Tonight
-                    results = self.calculator.calculate_visibility_for_date(
-                        self.object_name, date_str, 12, min_altitude)
+                    # Use coordinate-based calculation
+                    time_range, dso_altaz, sun_altaz = self.calculator.calculate_altaz_over_time(
+                        dso_coord, date_str, 12)
+                    
+                    # Find optimal viewing times using same criteria
+                    optimal_times = self.calculator.find_optimal_viewing_times(
+                        dso_altaz, sun_altaz, min_altitude)
+                    
+                    results = {"optimal_times": optimal_times}
                     
                     is_visible = False
                     if "error" not in results and np.any(results.get("optimal_times", [])):
@@ -2012,16 +2030,27 @@ class ObjectDetailWindow(QDialog):
                 "QGroupBox:title { subcontrol-position: top center; font-size: 28pt; font-weight: bold; }")
             object_info_layout = QVBoxLayout()
 
-            # Add Object information
+            # Add Object information with proper null handling
+            magnitude_str = f"{self.data['magnitude']:.2f}" if self.data['magnitude'] is not None else "Unknown"
+            surface_brightness_str = f"{self.data['surface_brightness']:.2f} mag/arcmin²" if self.data['surface_brightness'] is not None else "Unknown"
+            
+            # Handle size information
+            size_min = self.data['size_min'] if self.data['size_min'] is not None else 0
+            size_max = self.data['size_max'] if self.data['size_max'] is not None else 0
+            if size_min > 0 or size_max > 0:
+                size_str = f"{size_min:.1f}' — {size_max:.1f}'"
+            else:
+                size_str = "Unknown"
+            
             object_info_text = (
                 f"<b>Right Ascension:</b> {self.ra_str}<br>"
                 f"<b>Declination:</b> {self.dec_str}<br>"
-                f"<b>Constellation:</b> {self.data['constellation']}<br><br>"
-                f"<b>Magnitude:</b> {self.data['magnitude']:.2f}<br>"
-                f"<b>Surface Brightness:</b> {self.data['surface_brightness']:.2f} mag/arcmin²<br>"
-                f"<b>Size:</b> {self.data['size_min']:.1f}' — {self.data['size_max']:.1f}'<br>"
-                f"<b>Type:</b> {self.data['dso_type']}<br>"
-                f"<b>Class:</b> {self.data['dso_class']}<br><br>"
+                f"<b>Constellation:</b> {self.data['constellation'] or 'Unknown'}<br><br>"
+                f"<b>Magnitude:</b> {magnitude_str}<br>"
+                f"<b>Surface Brightness:</b> {surface_brightness_str}<br>"
+                f"<b>Size:</b> {size_str}<br>"
+                f"<b>Type:</b> {self.data['dso_type'] or 'Unknown'}<br>"
+                f"<b>Class:</b> {self.data['dso_class'] or 'Unknown'}<br><br>"
                 f"<b>Other Designations:</b><br>"
             )
 

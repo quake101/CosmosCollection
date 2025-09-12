@@ -26,7 +26,12 @@ warnings.filterwarnings('ignore')
 from DatabaseManager import DatabaseManager
 
 class DSOCalculationThread(QThread):
-    """Thread for calculating best DSOs for tonight"""
+    """
+    Thread for calculating best DSOs for tonight.
+    
+    Uses coordinate-based visibility calculations for reliability and consistency
+    with other tools (avoids object name resolution issues like 'sh2 142' vs 'sh2-142').
+    """
     progress = Signal(int)
     result_ready = Signal(object)
     error_occurred = Signal(str)
@@ -83,7 +88,7 @@ class DSOCalculationThread(QThread):
         return pytz.UTC
 
     def calculate_tonight_visibility(self, dso_info):
-        """Calculate visibility for a DSO tonight using centralized calculator"""
+        """Calculate visibility for a DSO tonight using centralized calculator with coordinates"""
         try:
             if self.calculator is None:
                 # Fallback to original method if centralized calculator not available
@@ -93,9 +98,29 @@ class DSOCalculationThread(QThread):
             now = datetime.now(self.local_tz)
             tonight_date = now.strftime('%Y-%m-%d')
             
-            # Use centralized calculator
-            results = self.calculator.calculate_visibility_for_date(
-                dso_info["name"], tonight_date, 12, self.min_altitude)
+            # Use coordinate-based calculation for reliability (avoids name resolution issues)
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            
+            # Create coordinate object from DSO data
+            dso_coord = SkyCoord(ra=dso_info["ra_deg"] * u.deg, dec=dso_info["dec_deg"] * u.deg)
+            
+            # Use coordinate-based calculation
+            time_range, dso_altaz, sun_altaz = self.calculator.calculate_altaz_over_time(
+                dso_coord, tonight_date, 12)
+            
+            # Find optimal viewing times using same criteria
+            optimal_times = self.calculator.find_optimal_viewing_times(
+                dso_altaz, sun_altaz, self.min_altitude)
+            
+            # Create results structure compatible with existing code
+            results = {
+                "optimal_times": optimal_times,
+                "dso_altaz": dso_altaz,
+                "time_range": time_range,
+                "sun_altaz": sun_altaz,
+                "timezone": self.local_tz
+            }
             
             if "error" in results or not np.any(results.get("optimal_times", [])):
                 return None
@@ -144,9 +169,11 @@ class DSOCalculationThread(QThread):
             start_time = Time(tonight_start.astimezone(pytz.UTC).replace(tzinfo=None))
             time_range = start_time + np.linspace(0, 12, 48) * u.hour  # Every 15 minutes
             
-            # Get DSO coordinates
+            # Get DSO coordinates from database data (coordinate-based for reliability)
             try:
-                dso_coord = SkyCoord.from_name(dso_info["name"])
+                from astropy.coordinates import SkyCoord
+                import astropy.units as u
+                dso_coord = SkyCoord(ra=dso_info["ra_deg"] * u.deg, dec=dso_info["dec_deg"] * u.deg)
             except Exception:
                 return None
             

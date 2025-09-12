@@ -122,6 +122,118 @@ class DSOVisibilityCalculator:
         except Exception as e:
             return None, str(e)
     
+    def get_dso_coordinates_enhanced(self, dso_name):
+        """
+        Get coordinates for a DSO by name with enhanced name resolution.
+        
+        Tries multiple name variations and also attempts database lookup for coordinates.
+        
+        Args:
+            dso_name (str): Name of the DSO (e.g., 'M31', 'NGC 7000', 'sh2 142')
+            
+        Returns:
+            tuple: (SkyCoord object, error_message) - error_message is None if successful
+        """
+        # First try the original name
+        coord, error = self.get_dso_coordinates(dso_name)
+        if coord is not None:
+            return coord, None
+        
+        # Try various name formatting variations
+        name_variations = [dso_name.strip()]
+        original_name = dso_name.strip().upper()
+        
+        # Common variations for different naming patterns
+        variations_to_try = []
+        
+        # Handle spaces vs hyphens (e.g., "sh2 142" vs "sh2-142")
+        if ' ' in original_name:
+            variations_to_try.append(original_name.replace(' ', '-'))
+            variations_to_try.append(original_name.replace(' ', ''))
+        if '-' in original_name:
+            variations_to_try.append(original_name.replace('-', ' '))
+            variations_to_try.append(original_name.replace('-', ''))
+        
+        # Handle common catalog prefixes
+        catalog_mappings = {
+            'SH2': 'SHARPLESS',
+            'SHARPLESS': 'SH2',
+            'SH': 'SHARPLESS',
+            'IC': 'IC',
+            'NGC': 'NGC',
+            'M': 'MESSIER',
+            'MESSIER': 'M',
+            'LDN': 'LDN',
+            'BARNARD': 'B',
+            'B': 'BARNARD'
+        }
+        
+        # Extract catalog prefix and number
+        import re
+        match = re.match(r'^([A-Z]+)[\s-]?(\d+)', original_name)
+        if match:
+            prefix, number = match.groups()
+            
+            # Try different catalog name formats
+            for alt_prefix in catalog_mappings.get(prefix, [prefix]):
+                if alt_prefix != prefix:
+                    variations_to_try.extend([
+                        f"{alt_prefix} {number}",
+                        f"{alt_prefix}-{number}",
+                        f"{alt_prefix}{number}"
+                    ])
+        
+        # Try all variations
+        for variation in variations_to_try:
+            if variation not in name_variations:  # Avoid duplicates
+                name_variations.append(variation)
+                coord, _ = self.get_dso_coordinates(variation)
+                if coord is not None:
+                    return coord, None
+        
+        # If name resolution fails, try database lookup
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Try exact name match first
+                cursor.execute("""
+                    SELECT ra_deg, dec_deg FROM dso 
+                    WHERE UPPER(TRIM(name)) = ? 
+                    OR UPPER(TRIM(alternate_names)) LIKE ?
+                    LIMIT 1
+                """, (original_name, f"%{original_name}%"))
+                
+                row = cursor.fetchone()
+                if row and row[0] is not None and row[1] is not None:
+                    coord = SkyCoord(ra=row[0] * u.deg, dec=row[1] * u.deg)
+                    return coord, None
+                
+                # Try partial matches with variations
+                for variation in name_variations:
+                    cursor.execute("""
+                        SELECT ra_deg, dec_deg FROM dso 
+                        WHERE UPPER(TRIM(name)) LIKE ? 
+                        OR UPPER(TRIM(alternate_names)) LIKE ?
+                        LIMIT 1
+                    """, (f"%{variation}%", f"%{variation}%"))
+                    
+                    row = cursor.fetchone()
+                    if row and row[0] is not None and row[1] is not None:
+                        coord = SkyCoord(ra=row[0] * u.deg, dec=row[1] * u.deg)
+                        return coord, None
+                        
+        except Exception:
+            pass  # Database lookup failed, continue with original error
+        
+        # If all attempts fail, return the original error with helpful message
+        error_msg = f"Could not resolve coordinates for '{dso_name}'. Tried variations: {', '.join(name_variations[:5])}"
+        if len(name_variations) > 5:
+            error_msg += f" (and {len(name_variations)-5} more)"
+        
+        return None, error_msg
+    
     def calculate_altaz_over_time(self, dso_coord, start_time, duration_hours, time_resolution=4):
         """
         Calculate altitude and azimuth for a DSO over a time period.
@@ -184,11 +296,27 @@ class DSOVisibilityCalculator:
         Returns:
             dict: Complete visibility results or None if error
         """
-        # Get DSO coordinates
-        dso_coord, error = self.get_dso_coordinates(dso_name)
+        # Get DSO coordinates with enhanced name resolution
+        dso_coord, error = self.get_dso_coordinates_enhanced(dso_name)
         if dso_coord is None:
             return {"error": f"Could not find coordinates for {dso_name}: {error}"}
+
+        return self.calculate_visibility_for_coordinates(dso_coord, date, duration_hours, min_altitude, dso_name)
+    
+    def calculate_visibility_for_coordinates(self, dso_coord, date, duration_hours=24, min_altitude=30, dso_name=None):
+        """
+        Calculate complete visibility information for DSO coordinates on a specific date.
         
+        Args:
+            dso_coord (SkyCoord): Coordinates of the DSO
+            date (str): Date in ISO format (YYYY-MM-DD)
+            duration_hours (float): Duration to calculate (default: 24 hours)
+            min_altitude (float): Minimum altitude threshold (default: 30 degrees)
+            dso_name (str, optional): Name of the DSO for display purposes
+            
+        Returns:
+            dict: Complete visibility results or None if error
+        """
         try:
             # Calculate altitude/azimuth over time
             time_range, dso_altaz, sun_altaz = self.calculate_altaz_over_time(
@@ -207,7 +335,7 @@ class DSOVisibilityCalculator:
             viewing_windows = self._find_viewing_windows(time_range, optimal_times, dso_altaz)
             
             return {
-                "dso_name": dso_name,
+                "dso_name": dso_name or f"RA {dso_coord.ra.deg:.4f}° DEC {dso_coord.dec.deg:.4f}°",
                 "dso_coord": dso_coord,
                 "time_range": time_range,
                 "dso_altaz": dso_altaz,
