@@ -2949,10 +2949,20 @@ class ObjectDetailWindow(QDialog):
             aladin_button.clicked.connect(lambda: self._open_aladin_lite(self.data))
             buttons_layout.addWidget(aladin_button)
 
-            # Add to Target List button
-            target_list_button = QPushButton("Add to Target List")
-            target_list_button.clicked.connect(self._add_to_target_list)
-            buttons_layout.addWidget(target_list_button)
+            # Add to Target List button (conditional based on whether DSO is already in target list)
+            self.target_list_button = QPushButton("Add to Target List")
+            self.target_list_button.clicked.connect(self._add_to_target_list)
+            
+            # Remove from Target List button (initially hidden)
+            self.remove_target_button = QPushButton("Remove from Target List")
+            self.remove_target_button.clicked.connect(self._remove_from_target_list)
+            self.remove_target_button.setVisible(False)
+            
+            buttons_layout.addWidget(self.target_list_button)
+            buttons_layout.addWidget(self.remove_target_button)
+            
+            # Check if DSO is already in target list and update button visibility
+            self._update_target_list_buttons()
 
             # Add close button at the bottom
             close_button = QPushButton("Close")
@@ -3910,15 +3920,86 @@ class ObjectDetailWindow(QDialog):
             logger.error(f"Error relocating image: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to relocate image:\n{str(e)}")
 
+    def _update_target_list_buttons(self):
+        """Update target list button visibility based on whether DSO is already in target list"""
+        try:
+            is_in_target_list = self._check_if_in_target_list()
+            
+            if is_in_target_list:
+                self.target_list_button.setVisible(False)
+                self.remove_target_button.setVisible(True)
+            else:
+                self.target_list_button.setVisible(True)
+                self.remove_target_button.setVisible(False)
+                
+        except Exception as e:
+            logger.error(f"Error updating target list buttons: {str(e)}")
+            # Show add button as fallback
+            self.target_list_button.setVisible(True)
+            self.remove_target_button.setVisible(False)
+    
+    def _check_if_in_target_list(self):
+        """Check if current DSO is already in the target list"""
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Check by DSO name and coordinates (to handle different name formats)
+                dso_name = self.data.get('name', '').strip()
+                ra_deg = self.data.get('ra_deg')
+                dec_deg = self.data.get('dec_deg')
+                
+                if not dso_name:
+                    return False
+                
+                # First check by exact name match
+                cursor.execute("""
+                    SELECT COUNT(*) FROM usertargetlist 
+                    WHERE UPPER(TRIM(name)) = ?
+                """, (dso_name.upper(),))
+                
+                if cursor.fetchone()[0] > 0:
+                    return True
+                
+                # If coordinates are available, also check by coordinates (within small tolerance)
+                if ra_deg is not None and dec_deg is not None:
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM usertargetlist 
+                        WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001
+                    """, (ra_deg, dec_deg))
+                    
+                    if cursor.fetchone()[0] > 0:
+                        return True
+                
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error checking target list status: {str(e)}")
+            return False
+    
     def _add_to_target_list(self):
-        """Add this DSO to the target list"""
+        """Add this DSO to the target list with pre-calculated visibility information"""
         try:
             # Import DSOTargetList module
             from DSOTargetList import AddTargetDialog
             
-            # Create dialog with current DSO data
-            dialog = AddTargetDialog(dso_data=self.data, parent=self)
-            dialog.exec()
+            # Use already calculated visibility information from the season label
+            enhanced_data = self.data.copy()
+            visibility_text = self.season_label.text()
+            
+            # Extract useful visibility information if available
+            if visibility_text and not visibility_text.startswith("Enter your location") and not visibility_text.startswith("Loading"):
+                # Clean the visibility text to extract only month ranges
+                cleaned_months = self._extract_month_ranges_from_visibility(visibility_text)
+                if cleaned_months:
+                    enhanced_data['best_months'] = cleaned_months
+                    logger.debug(f"Using cleaned visibility info for {self.data.get('name', 'DSO')}: {cleaned_months}")
+            
+            # Create dialog with enhanced DSO data including visibility
+            dialog = AddTargetDialog(dso_data=enhanced_data, parent=self)
+            if dialog.exec():
+                # Update button visibility after successful addition
+                self._update_target_list_buttons()
                 
         except ImportError as e:
             logger.error(f"Could not import DSOTargetList: {str(e)}")
@@ -3926,6 +4007,97 @@ class ObjectDetailWindow(QDialog):
         except Exception as e:
             logger.error(f"Error adding to target list: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to add to target list: {str(e)}")
+    
+    def _extract_month_ranges_from_visibility(self, visibility_text):
+        """Extract only month ranges from visibility text, removing HTML and descriptive text"""
+        import re
+        
+        # Remove HTML tags
+        clean_text = re.sub(r'<[^>]+>', '', visibility_text)
+        
+        # Skip if it contains error messages
+        if "not optimally visible" in clean_text.lower() or "error" in clean_text.lower():
+            return ""
+        
+        # Extract date ranges that contain month names
+        # Pattern matches things like "January 15 - March 20", "October 01 - December 31"
+        month_pattern = r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d+\s*-\s*(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d+'
+        
+        matches = re.findall(month_pattern, clean_text)
+        
+        if matches:
+            # Convert full month names to abbreviated form and create ranges
+            month_abbrev = {
+                'January': 'Jan', 'February': 'Feb', 'March': 'Mar', 'April': 'Apr',
+                'May': 'May', 'June': 'Jun', 'July': 'Jul', 'August': 'Aug',
+                'September': 'Sep', 'October': 'Oct', 'November': 'Nov', 'December': 'Dec'
+            }
+            
+            ranges = []
+            for start_month, end_month in matches:
+                start_abbrev = month_abbrev.get(start_month, start_month[:3])
+                end_abbrev = month_abbrev.get(end_month, end_month[:3])
+                
+                if start_abbrev == end_abbrev:
+                    ranges.append(start_abbrev)
+                else:
+                    ranges.append(f"{start_abbrev}-{end_abbrev}")
+            
+            return ", ".join(ranges)
+        
+        return ""
+    
+    
+    def _remove_from_target_list(self):
+        """Remove this DSO from the target list"""
+        try:
+            # Confirm removal
+            reply = QMessageBox.question(
+                self, 
+                "Remove from Target List", 
+                f"Remove '{self.data.get('name', 'this DSO')}' from the target list?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                
+                dso_name = self.data.get('name', '').strip()
+                ra_deg = self.data.get('ra_deg')
+                dec_deg = self.data.get('dec_deg')
+                
+                if not dso_name:
+                    QMessageBox.warning(self, "Error", "Cannot remove: DSO name not found")
+                    return
+                
+                # Remove by name first
+                cursor.execute("""
+                    DELETE FROM usertargetlist 
+                    WHERE UPPER(TRIM(name)) = ?
+                """, (dso_name.upper(),))
+                
+                # Also remove by coordinates if available (to catch any duplicates)
+                if ra_deg is not None and dec_deg is not None:
+                    cursor.execute("""
+                        DELETE FROM usertargetlist 
+                        WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001
+                    """, (ra_deg, dec_deg))
+                
+                conn.commit()
+                
+                # Update button visibility
+                self._update_target_list_buttons()
+                
+                QMessageBox.information(self, "Success", f"'{dso_name}' removed from target list")
+                logger.debug(f"Removed {dso_name} from target list")
+                
+        except Exception as e:
+            logger.error(f"Error removing from target list: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to remove from target list: {str(e)}")
     
     def _create_collage(self):
         """Open the CollageBuilder window for this DSO with option to create new or add to existing collage"""

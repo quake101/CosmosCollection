@@ -173,6 +173,9 @@ class AddTargetDialog(QDialog):
         size_max = self.dso_data.get("size_max", 0)
         if size_min > 0 or size_max > 0:
             self.size_edit.setText(f"{size_min:.1f} x {size_max:.1f}")
+            
+        # Populate best months if available
+        self.months_edit.setText(self.dso_data.get("best_months", ""))
     
     def _save_target(self):
         """Save the target to the database"""
