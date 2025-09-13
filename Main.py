@@ -2730,6 +2730,26 @@ class ObjectDetailWindow(QDialog):
             self.next_image_button.setToolTip("Next image")
             zoom_layout.addWidget(self.next_image_button)
 
+            # Add image button
+            add_separator = QLabel("|")
+            add_separator.setStyleSheet("font-size: 14pt; color: #666666; padding: 0 5px;")
+            zoom_layout.addWidget(add_separator)
+
+            self.add_image_button = QPushButton("+")
+            self.add_image_button.setFixedSize(30, 30)
+            self.add_image_button.clicked.connect(self._add_user_image)
+            self.add_image_button.setToolTip("Add new image")
+            self.add_image_button.setStyleSheet("QPushButton { color: #4CAF50; font-size: 16pt; font-weight: bold; }")
+            zoom_layout.addWidget(self.add_image_button)
+
+            # Delete image button
+            self.delete_image_button = QPushButton("🗑")
+            self.delete_image_button.setFixedSize(30, 30)
+            self.delete_image_button.clicked.connect(self._delete_current_image)
+            self.delete_image_button.setToolTip("Delete current image")
+            self.delete_image_button.setStyleSheet("QPushButton { color: #ff6b6b; font-size: 12pt; }")
+            zoom_layout.addWidget(self.delete_image_button)
+
             zoom_layout.addStretch()
             image_container_layout.addLayout(zoom_layout)
 
@@ -2797,10 +2817,6 @@ class ObjectDetailWindow(QDialog):
             self.info_form_container.setLayout(info_form_layout)
             left_layout.addWidget(self.info_form_container, stretch=1)  # Give info area less stretch
 
-            # Add image button
-            user_image_button = QPushButton("Add User Image")
-            user_image_button.clicked.connect(self._add_user_image)
-            left_layout.addWidget(user_image_button)
             
             # Create collage button
             #collage_button = QPushButton("Create Collage")
@@ -3815,16 +3831,19 @@ class ObjectDetailWindow(QDialog):
             # No images
             self.prev_image_button.setEnabled(False)
             self.next_image_button.setEnabled(False)
+            self.delete_image_button.setEnabled(False)
             self.image_counter_label.setText("0/0")
         elif image_count == 1:
             # Only one image
             self.prev_image_button.setEnabled(False)
             self.next_image_button.setEnabled(False)
+            self.delete_image_button.setEnabled(True)
             self.image_counter_label.setText("1/1")
         else:
             # Multiple images
             self.prev_image_button.setEnabled(self.current_image_index > 0)
             self.next_image_button.setEnabled(self.current_image_index < image_count - 1)
+            self.delete_image_button.setEnabled(True)
             self.image_counter_label.setText(f"{self.current_image_index + 1}/{image_count}")
 
     def _previous_image(self):
@@ -3919,6 +3938,87 @@ class ObjectDetailWindow(QDialog):
         except Exception as e:
             logger.error(f"Error relocating image: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to relocate image:\n{str(e)}")
+
+    def _delete_current_image(self):
+        """Delete the current image from the database and update the display"""
+        try:
+            from PySide6.QtWidgets import QMessageBox
+            
+            # Check if we have images to delete
+            if not self.user_images:
+                QMessageBox.warning(self, "No Images", "No images available to delete.")
+                return
+            
+            if self.current_image_index < 0 or self.current_image_index >= len(self.user_images):
+                QMessageBox.warning(self, "Error", "No current image selected for deletion.")
+                return
+            
+            current_image = self.user_images[self.current_image_index]
+            image_id = current_image.get('id')
+            image_path = current_image.get('image_path', 'Unknown')
+            
+            if not image_id:
+                QMessageBox.warning(self, "Error", "Cannot identify current image for deletion.")
+                return
+            
+            # Get the filename for the confirmation dialog
+            import os
+            filename = os.path.basename(image_path) if image_path != 'Unknown' else 'this image'
+            
+            # Confirm deletion
+            reply = QMessageBox.question(
+                self, 
+                "Delete Image", 
+                f"Are you sure you want to delete '{filename}'?\n\nThis will remove the image record from the database but will not delete the actual image file.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            # Delete from database
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM userimages WHERE id = ?", (image_id,))
+                conn.commit()
+                
+                # Remove from local list
+                del self.user_images[self.current_image_index]
+                
+                # Update current image index
+                if self.user_images:
+                    # Adjust index if we deleted the last image
+                    if self.current_image_index >= len(self.user_images):
+                        self.current_image_index = len(self.user_images) - 1
+                    
+                    # Load the new current image
+                    current_image = self.user_images[self.current_image_index]
+                    self._load_user_image(current_image['image_path'])
+                    self._load_current_image_info()
+                else:
+                    # No more images - reset to default state
+                    self.current_image_index = 0
+                    self.image_label.setText("No Image Loaded")
+                    self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+                    self._clear_image_info()
+                
+                # Update navigation
+                self._update_image_navigation()
+                
+                QMessageBox.information(self, "Success", f"'{filename}' has been removed from the database.")
+                logger.info(f"Deleted image with ID {image_id}: {filename}")
+                
+        except Exception as e:
+            logger.error(f"Error deleting image: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to delete image:\n{str(e)}")
+    
+    def _clear_image_info(self):
+        """Clear all image information fields"""
+        self.integration_edit.setText("")
+        self.telescope_combo.setCurrentText("")
+        self.date_edit.setText("")
+        self.notes_edit.setText("")
 
     def _update_target_list_buttons(self):
         """Update target list button visibility based on whether DSO is already in target list"""
@@ -4107,7 +4207,7 @@ class ObjectDetailWindow(QDialog):
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.information(self, "No Images", 
                     "No images have been added for this object yet. "
-                    "Add some images first using the 'Add User Image' button.")
+                    "Add some images first using the + add image button.")
                 return
             
             # Get the dsodetailid for this object
