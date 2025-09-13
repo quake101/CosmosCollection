@@ -2604,7 +2604,7 @@ class ObjectDetailWindow(QDialog):
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.setWindowModality(Qt.NonModal)  # Ensure it's non-modal
-        self.resize(1200, 800)
+        self.resize(1000, 800)
         self.data = data  # Store data for later use
         self.current_image_path = None  # Store current image path
         self.zoom_factor = 1.0  # Current zoom level

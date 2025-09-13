@@ -36,20 +36,23 @@ class DSOCalculationThread(QThread):
     result_ready = Signal(object)
     error_occurred = Signal(str)
 
-    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200):
+    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None):
         super().__init__()
         self.min_altitude = min_altitude
         self.max_magnitude = max_magnitude
         self.selected_catalogs = selected_catalogs or []
+        self.selected_dso_types = selected_dso_types or []
         self.dso_limit = dso_limit
         
         # Use centralized calculator
         try:
             from DSOVisibilityCalculator import DSOVisibilityCalculator
+            # Initialize with location info - the calculator will load from database if no params provided
             self.calculator = DSOVisibilityCalculator()
             self.location = self.calculator.location
             self.local_tz = self.calculator.timezone
-        except ImportError:
+        except (ImportError, Exception) as e:
+            print(f"Warning: Could not initialize DSOVisibilityCalculator: {e}")
             self.calculator = None
             self.location = self.setup_location()
             self.local_tz = self.setup_timezone()
@@ -152,7 +155,7 @@ class DSOCalculationThread(QThread):
                 "optimal_time": optimal_time_local,
                 "optimal_altitude": optimal_altitude,
                 "optimal_azimuth": optimal_azimuth,
-                "coordinates": results["dso_coord"]
+                "coordinates": dso_coord
             }
             
         except Exception:
@@ -279,6 +282,8 @@ class DSOCalculationThread(QThread):
                     CAST(d.sizemin/60.0 AS REAL) as sizemin,
                     CAST(d.sizemax/60.0 AS REAL) as sizemax,
                     d.dsoclass,
+                    d.ra as ra_deg,
+                    d.dec as dec_deg,
                     (
                         SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ')
                         FROM cataloguenr c
@@ -290,6 +295,8 @@ class DSOCalculationThread(QThread):
                     AND d.magnitude <= ?
                     AND d.constellation IS NOT NULL
                     AND d.dsotype IS NOT NULL
+                    AND d.ra IS NOT NULL
+                    AND d.dec IS NOT NULL
             """
             
             params = [self.max_magnitude]
@@ -300,6 +307,12 @@ class DSOCalculationThread(QThread):
                 base_query += f" AND c.catalogue IN ({catalog_placeholders})"
                 params.extend(self.selected_catalogs)
             
+            # Add DSO type filtering if types are selected
+            if self.selected_dso_types:
+                type_placeholders = ','.join('?' * len(self.selected_dso_types))
+                base_query += f" AND d.dsotype IN ({type_placeholders})"
+                params.extend(self.selected_dso_types)
+            
             base_query += f" ORDER BY d.magnitude ASC LIMIT {self.dso_limit}"
             
             cursor.execute(base_query, params)
@@ -307,8 +320,8 @@ class DSOCalculationThread(QThread):
             rows = cursor.fetchall()
             dsos = []
             for row in rows:
-                name, dso_type, constellation, magnitude, surface_brightness, size_min, size_max, dso_class, designations = row
-                if name and magnitude is not None:
+                name, dso_type, constellation, magnitude, surface_brightness, size_min, size_max, dso_class, ra_deg, dec_deg, designations = row
+                if name and magnitude is not None and ra_deg is not None and dec_deg is not None:
                     # Take the first designation as the primary name
                     primary_name = name.split(',')[0].strip()
                     dsos.append({
@@ -320,6 +333,8 @@ class DSOCalculationThread(QThread):
                         "size_min": float(size_min) if size_min is not None else 0.0,
                         "size_max": float(size_max) if size_max is not None else 0.0,
                         "dso_class": dso_class or "Unknown",
+                        "ra_deg": float(ra_deg),
+                        "dec_deg": float(dec_deg),
                         "designations": designations or name
                     })
             
@@ -555,7 +570,7 @@ class BestDSOTonightWindow(QMainWindow):
         
         settings_layout.addLayout(settings_row1)
         
-        # Second row - Catalog selection
+        # Second row - Catalog and DSO Type selection
         catalog_row = QHBoxLayout()
         catalog_row.addWidget(QLabel("Catalog:"))
         
@@ -570,6 +585,12 @@ class BestDSOTonightWindow(QMainWindow):
         
         self.catalog_combo.setCurrentText("All Catalogs")
         catalog_row.addWidget(self.catalog_combo)
+        
+        # DSO Type filter
+        catalog_row.addWidget(QLabel("Type:"))
+        self.dso_type_combo = QComboBox()
+        self.load_dso_type_options()
+        catalog_row.addWidget(self.dso_type_combo)
         
         catalog_row.addStretch()
         settings_layout.addLayout(catalog_row)
@@ -591,6 +612,9 @@ class BestDSOTonightWindow(QMainWindow):
             "DSO", "Type", "Constellation", "Magnitude", 
             "Max Alt.", "Best Time", "Direction", "Visible Hours"
         ])
+        
+        # Enable sorting
+        self.results_table.setSortingEnabled(True)
         
         # Set column widths
         header = self.results_table.horizontalHeader()
@@ -671,6 +695,26 @@ class BestDSOTonightWindow(QMainWindow):
             print(f"Error loading catalogs: {e}")
             self.available_catalogs = ["M", "NGC", "IC"]  # Fallback default catalogs
     
+    def load_dso_type_options(self):
+        """Load available DSO types from database"""
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT DISTINCT dsotype FROM dsodetail WHERE dsotype IS NOT NULL ORDER BY dsotype")
+                dso_types = [row[0] for row in cursor.fetchall()]
+                
+                # Add "All Types" option first
+                self.dso_type_combo.addItem("All Types")
+                for dso_type in sorted(dso_types):
+                    self.dso_type_combo.addItem(dso_type)
+                
+                self.dso_type_combo.setCurrentText("All Types")
+        except Exception as e:
+            print(f"Error loading DSO type options: {e}")
+            # Add default option if database query fails
+            self.dso_type_combo.addItem("All Types")
+    
 
     def calculate_best_dsos(self):
         """Start the calculation of best DSOs for tonight"""
@@ -686,16 +730,23 @@ class BestDSOTonightWindow(QMainWindow):
         selected_catalog = self.catalog_combo.currentText()
         selected_catalogs = [] if selected_catalog == "All Catalogs" else [selected_catalog]
         
+        # Get selected DSO type
+        selected_dso_type = self.dso_type_combo.currentText()
+        selected_dso_types = [] if selected_dso_type == "All Types" else [selected_dso_type]
+        
         # Show progress
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.calculate_btn.setEnabled(False)
         self.calculate_btn.setText("Calculating...")
+        
+        # Create status text
         catalog_text = "all catalogs" if not selected_catalogs else f"{selected_catalog} catalog"
-        self.status_label.setText(f"Calculating visibility for DSOs from {catalog_text}...")
+        type_text = "all types" if not selected_dso_types else f"{selected_dso_type} objects"
+        self.status_label.setText(f"Calculating visibility for {type_text} from {catalog_text}...")
         
         # Start calculation thread
-        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit)
+        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit, selected_dso_types)
         self.calc_thread.progress.connect(self.progress_bar.setValue)
         self.calc_thread.result_ready.connect(self.display_results)
         self.calc_thread.error_occurred.connect(self.handle_error)
@@ -714,6 +765,9 @@ class BestDSOTonightWindow(QMainWindow):
         
         self.status_label.setText(f"Found {len(visible_dsos)} visible DSOs for tonight")
         
+        # Disable sorting temporarily while populating
+        self.results_table.setSortingEnabled(False)
+        
         # Populate table
         self.results_table.setRowCount(len(visible_dsos))
         
@@ -723,8 +777,10 @@ class BestDSOTonightWindow(QMainWindow):
         for row, dso_data in enumerate(visible_dsos):
             dso_info = dso_data["dso_info"]
             
-            # DSO name
-            self.results_table.setItem(row, 0, QTableWidgetItem(dso_info["name"]))
+            # DSO name - store DSO data in item for sorting
+            name_item = QTableWidgetItem(dso_info["name"])
+            name_item.setData(Qt.UserRole, dso_data)  # Store full DSO data
+            self.results_table.setItem(row, 0, name_item)
             
             # Type
             self.results_table.setItem(row, 1, QTableWidgetItem(dso_info["type"]))
@@ -732,18 +788,25 @@ class BestDSOTonightWindow(QMainWindow):
             # Constellation
             self.results_table.setItem(row, 2, QTableWidgetItem(dso_info["constellation"]))
             
-            # Magnitude
-            mag_item = QTableWidgetItem(f"{dso_info['magnitude']:.1f}")
+            # Magnitude - use numeric sorting
+            mag_item = QTableWidgetItem()
+            mag_item.setData(Qt.DisplayRole, f"{dso_info['magnitude']:.1f}")
+            mag_item.setData(Qt.UserRole, dso_info['magnitude'])  # Store numeric value for sorting
             mag_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 3, mag_item)
             
-            # Maximum altitude
-            alt_item = QTableWidgetItem(f"{dso_data['max_altitude']:.0f}°")
+            # Maximum altitude - use numeric sorting
+            alt_item = QTableWidgetItem()
+            alt_item.setData(Qt.DisplayRole, f"{dso_data['max_altitude']:.0f}°")
+            alt_item.setData(Qt.UserRole, dso_data['max_altitude'])  # Store numeric value for sorting
             alt_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 4, alt_item)
             
-            # Best time
-            time_item = QTableWidgetItem(dso_data["optimal_time"].strftime("%H:%M"))
+            # Best time - store time as sortable value
+            time_str = dso_data["optimal_time"].strftime("%H:%M")
+            time_item = QTableWidgetItem()
+            time_item.setData(Qt.DisplayRole, time_str)
+            time_item.setData(Qt.UserRole, dso_data["optimal_time"].hour * 60 + dso_data["optimal_time"].minute)
             time_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 5, time_item)
             
@@ -752,18 +815,27 @@ class BestDSOTonightWindow(QMainWindow):
             dir_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 6, dir_item)
             
-            # Visible hours
-            hours_item = QTableWidgetItem(f"{dso_data['visible_hours']:.1f}h")
+            # Visible hours - use numeric sorting
+            hours_item = QTableWidgetItem()
+            hours_item.setData(Qt.DisplayRole, f"{dso_data['visible_hours']:.1f}h")
+            hours_item.setData(Qt.UserRole, dso_data['visible_hours'])  # Store numeric value for sorting
             hours_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 7, hours_item)
+        
+        # Re-enable sorting
+        self.results_table.setSortingEnabled(True)
 
     def on_item_double_clicked(self, item):
         """Handle double-click on table item to show object details"""
         try:
-            row = item.row()
-            if row < len(self.visible_dsos_data):
-                dso_data = self.visible_dsos_data[row]
-                self.show_object_detail(dso_data)
+            # Get DSO data from the name item (column 0) of the clicked row
+            name_item = self.results_table.item(item.row(), 0)
+            if name_item:
+                dso_data = name_item.data(Qt.UserRole)
+                if dso_data:
+                    self.show_object_detail(dso_data)
+                else:
+                    QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not open object details: {e}")
     
