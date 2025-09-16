@@ -981,7 +981,7 @@ class DSOVisibilityApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("DSO Visibility Calculator - Delphos, OH")
+        self.setWindowTitle("DSO Visibility Calculator - Cosmos Collection")
         self.setGeometry(100, 100, 1200, 800)
 
         # Set dark theme for the application
@@ -1080,7 +1080,7 @@ class DSOVisibilityApp(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
 
         # Title
-        title = QLabel("DSO Visibility Calculator")
+        title = QLabel("DSO Visibility Calculator - Cosmos Collection")
         title.setAlignment(Qt.AlignCenter)
         left_layout.addWidget(title)
 
@@ -1212,11 +1212,11 @@ class DSOVisibilityApp(QMainWindow):
                             from datetime import datetime
                             now = datetime.now(tz_obj)
                             tz_abbrev = now.strftime('%Z')
-                            self.setWindowTitle(f"DSO Visibility Calculator - {display_name} ({tz_abbrev})")
+                            self.setWindowTitle(f"DSO Visibility Calculator - {display_name} ({tz_abbrev}) - Cosmos Collection")
                         except Exception:
-                            self.setWindowTitle(f"DSO Visibility Calculator - {display_name}")
+                            self.setWindowTitle(f"DSO Visibility Calculator - {display_name} - Cosmos Collection")
                     else:
-                        self.setWindowTitle(f"DSO Visibility Calculator - {display_name}")
+                        self.setWindowTitle(f"DSO Visibility Calculator - {display_name} - Cosmos Collection")
                 else:
                     # No location configured - prompt user to set location
                     self.location_name_label.setText("Location not set")
