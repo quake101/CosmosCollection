@@ -451,7 +451,7 @@ class AladinLiteWindow(QDialog):
     def __init__(self, data: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Aladin Lite - {data['name']}")
-        self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint)
+        self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMaximizeButtonHint)
         self.resize(1200, 800)
         
         self.data = data
