@@ -613,9 +613,10 @@ class BestDSOTonightWindow(QMainWindow):
             "Max Alt.", "Best Time", "Direction", "Visible Hours"
         ])
         
-        # Enable sorting
+        # Enable sorting and disable editing
         self.results_table.setSortingEnabled(True)
-        
+        self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
         # Set column widths
         header = self.results_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
@@ -851,7 +852,7 @@ class BestDSOTonightWindow(QMainWindow):
             if current_dir not in sys.path:
                 sys.path.insert(0, current_dir)
             
-            from Main import ObjectDetailWindow
+            from main import ObjectDetailWindow
             
             # Get DSO coordinates from astropy result
             coordinates = dso_data.get("coordinates")
