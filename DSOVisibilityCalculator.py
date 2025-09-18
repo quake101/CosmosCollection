@@ -1079,11 +1079,6 @@ class DSOVisibilityApp(QMainWindow):
         left_panel.setMaximumWidth(300)
         left_layout = QVBoxLayout(left_panel)
 
-        # Title
-        title = QLabel("DSO Visibility Calculator - Cosmos Collection")
-        title.setAlignment(Qt.AlignCenter)
-        left_layout.addWidget(title)
-
         # Location info
         self.location_group = QGroupBox("Observer Location")
         location_layout = QVBoxLayout(self.location_group)

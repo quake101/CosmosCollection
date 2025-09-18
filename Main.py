@@ -417,7 +417,7 @@ class CustomDSOVisibilityWindow(QDialog):
 
     def __init__(self, dso_name: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"DSO Visibility Calculator - {dso_name}")
+        self.setWindowTitle(f"{dso_name} - DSO Visibility Calculator - Cosmos Collection")
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.resize(1200, 800)
@@ -450,7 +450,7 @@ class CustomDSOVisibilityWindow(QDialog):
 class AladinLiteWindow(QDialog):
     def __init__(self, data: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Aladin Lite - {data['name']}")
+        self.setWindowTitle(f"{data['name']} - Aladin Lite - Cosmos Collection")
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMaximizeButtonHint)
         self.resize(1200, 800)
         
@@ -1403,7 +1403,7 @@ class ImageViewerWindow(QDialog):
 
     def __init__(self, pixmap: QPixmap, title: str, file_path: str = None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Image Viewer - {title}")
+        self.setWindowTitle(f"{title} - Image Viewer - Cosmos Collection")
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.resize(800, 600)
@@ -1828,7 +1828,7 @@ class ObjectDetailWindow(QDialog):
     def __init__(self, data: dict, parent=None):
         super().__init__(None)  # Pass None as parent to make it independent
         logger.debug(f"Creating ObjectDetailWindow for {data['name']}")
-        self.setWindowTitle(data["name"])
+        self.setWindowTitle(f"{data["name"]} - DSO Detail - Cosmos Collection")
         # Make it an independent window with window management buttons
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
@@ -1982,8 +1982,8 @@ class ObjectDetailWindow(QDialog):
             zoom_layout.addStretch()
             image_container_layout.addLayout(zoom_layout)
 
-            # Add image label
-            self.image_label = QLabel("No Image Loaded")
+            # Image label
+            self.image_label = QLabel("No image attached to this DSO.")
             self.image_label.setAlignment(Qt.AlignCenter)
             self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
             self.image_label.setMinimumSize(600, 400)  # Increased minimum size
