@@ -458,6 +458,7 @@ class AladinLiteWindow(QDialog):
         self.telescopes = []
         self.selected_telescope = None
         self.current_fov = None
+        self.current_target = None  # Track current target to preserve user changes
 
         # Calculate default FOV based on object size (in degrees)
         size_max = max(data['size_min'], data['size_max'])  # arcminutes
@@ -543,13 +544,40 @@ class AladinLiteWindow(QDialog):
         self.camera_combo.addItem("Atik 383L+ (23.6x15.8mm)", {"type": "camera", "sensor_width": 23.6, "sensor_height": 15.8})
         
         self.camera_combo.currentTextChanged.connect(self._on_camera_changed)
-        
+
+        # Barlow/Reducer selection
+        barlow_label = QLabel("Barlow/Reducer:")
+        self.barlow_combo = QComboBox()
+
+        # Optical accessories
+        self.barlow_combo.addItem("None (1.0x)", {"factor": 1.0, "type": "none"})
+        self.barlow_combo.addItem("--- BARLOWS ---", None)
+        self.barlow_combo.addItem("1.25x Barlow", {"factor": 1.25, "type": "barlow"})
+        self.barlow_combo.addItem("1.5x Barlow", {"factor": 1.5, "type": "barlow"})
+        self.barlow_combo.addItem("2x Barlow", {"factor": 2.0, "type": "barlow"})
+        self.barlow_combo.addItem("2.5x Barlow", {"factor": 2.5, "type": "barlow"})
+        self.barlow_combo.addItem("3x Barlow", {"factor": 3.0, "type": "barlow"})
+        self.barlow_combo.addItem("4x Barlow", {"factor": 4.0, "type": "barlow"})
+        self.barlow_combo.addItem("5x Barlow", {"factor": 5.0, "type": "barlow"})
+        self.barlow_combo.addItem("--- REDUCERS ---", None)
+        self.barlow_combo.addItem("0.5x Reducer", {"factor": 0.5, "type": "reducer"})
+        self.barlow_combo.addItem("0.6x Reducer", {"factor": 0.6, "type": "reducer"})
+        self.barlow_combo.addItem("0.63x Reducer", {"factor": 0.63, "type": "reducer"})
+        self.barlow_combo.addItem("0.67x Reducer", {"factor": 0.67, "type": "reducer"})
+        self.barlow_combo.addItem("0.7x Reducer", {"factor": 0.7, "type": "reducer"})
+        self.barlow_combo.addItem("0.75x Reducer", {"factor": 0.75, "type": "reducer"})
+        self.barlow_combo.addItem("0.8x Reducer", {"factor": 0.8, "type": "reducer"})
+
+        self.barlow_combo.currentTextChanged.connect(self._on_barlow_changed)
+
         # Arrange telescope controls
         telescope_layout.addWidget(telescope_label)
         telescope_layout.addWidget(self.telescope_combo)
         telescope_layout.addWidget(self.show_telescope_fov)
         telescope_layout.addWidget(camera_label)
         telescope_layout.addWidget(self.camera_combo)
+        telescope_layout.addWidget(barlow_label)
+        telescope_layout.addWidget(self.barlow_combo)
         telescope_layout.addStretch()
         
         layout.addLayout(telescope_layout)
@@ -603,8 +631,8 @@ class AladinLiteWindow(QDialog):
         self.target_coordinates = None
         
         # Now that UI is fully initialized, update the Aladin view
-        self._update_aladin_view()
-        
+        self._update_aladin_view(preserve_target=False)  # Initial load, set target from data
+
         logger.debug(f"Opened Aladin Lite window with default FOV: {self.default_fov:.2f}'")
     
     def _load_telescopes(self):
@@ -658,7 +686,11 @@ class AladinLiteWindow(QDialog):
     def _on_camera_changed(self):
         """Handle camera/sensor selection change"""
         self._update_aladin_view()
-    
+
+    def _on_barlow_changed(self):
+        """Handle barlow/reducer selection change"""
+        self._update_aladin_view()
+
     def _calculate_telescope_fov(self):
         """Calculate telescope FOV based on selected telescope and camera/eyepiece"""
         if not self.selected_telescope:
@@ -666,8 +698,18 @@ class AladinLiteWindow(QDialog):
         
         telescope_fl = self.selected_telescope['focal_length']  # mm
         telescope_aperture = self.selected_telescope.get('aperture', 100)  # mm
+
+        # Get barlow/reducer factor
+        barlow_data = self.barlow_combo.currentData()
+        barlow_factor = 1.0  # Default no change
+        if barlow_data and 'factor' in barlow_data:
+            barlow_factor = barlow_data['factor']
+
+        # Apply barlow/reducer to effective focal length
+        effective_fl = telescope_fl * barlow_factor
+
         camera_data = self.camera_combo.currentData()
-        
+
         if not camera_data or camera_data is None:
             return None
         
@@ -678,20 +720,22 @@ class AladinLiteWindow(QDialog):
             eyepiece_fl = camera_data['focal_length']  # mm
             apparent_fov = camera_data['apparent_fov']  # degrees
             
-            # Calculate magnification
-            magnification = telescope_fl / eyepiece_fl
-            
+            # Calculate magnification using effective focal length
+            magnification = effective_fl / eyepiece_fl
+
             # True FOV = Apparent FOV / Magnification
             true_fov_deg = apparent_fov / magnification
             true_fov_arcmin = true_fov_deg * 60
+
+            barlow_text = f" with {barlow_factor}x" if barlow_factor != 1.0 else ""
+            logger.debug(f"Eyepiece FOV calculation: {eyepiece_fl}mm eyepiece{barlow_text}, {apparent_fov}° AFOV, {magnification:.1f}x mag, {true_fov_arcmin:.1f}' true FOV")
             
-            logger.debug(f"Eyepiece FOV calculation: {eyepiece_fl}mm eyepiece, {apparent_fov}° AFOV, {magnification:.1f}x mag, {true_fov_arcmin:.1f}' true FOV")
-            
+            barlow_details = f" + {barlow_factor}x" if barlow_factor != 1.0 else ""
             return {
                 'width_arcmin': true_fov_arcmin,
                 'height_arcmin': true_fov_arcmin,
                 'type': 'visual',
-                'details': f"{eyepiece_fl}mm eyepiece, {magnification:.0f}x mag"
+                'details': f"{eyepiece_fl}mm eyepiece{barlow_details}, {magnification:.0f}x mag"
             }
         
         elif camera_data.get('type') == 'camera':
@@ -699,30 +743,36 @@ class AladinLiteWindow(QDialog):
             sensor_width = camera_data['sensor_width']  # mm
             sensor_height = camera_data['sensor_height']  # mm
             
-            # FOV = 2 * arctan(sensor_size / (2 * focal_length)) * (180/π) * 60 (arcmin)
-            fov_width_rad = 2 * math.atan(sensor_width / (2 * telescope_fl))
-            fov_height_rad = 2 * math.atan(sensor_height / (2 * telescope_fl))
-            
+            # FOV = 2 * arctan(sensor_size / (2 * effective_focal_length)) * (180/π) * 60 (arcmin)
+            fov_width_rad = 2 * math.atan(sensor_width / (2 * effective_fl))
+            fov_height_rad = 2 * math.atan(sensor_height / (2 * effective_fl))
+
             fov_width_arcmin = fov_width_rad * (180 / math.pi) * 60
             fov_height_arcmin = fov_height_rad * (180 / math.pi) * 60
+
+            # Calculate pixel scale for additional info using effective focal length
+            pixel_scale_arcsec = 206265 * (sensor_width / 1000) / effective_fl  # arcsec/mm (assuming square pixels)
+
+            barlow_text = f" with {barlow_factor}x" if barlow_factor != 1.0 else ""
+            logger.debug(f"Camera FOV calculation: {sensor_width}x{sensor_height}mm sensor, {effective_fl}mm effective FL{barlow_text}, FOV={fov_width_arcmin:.1f}'x{fov_height_arcmin:.1f}'")
             
-            # Calculate pixel scale for additional info
-            pixel_scale_arcsec = 206265 * (sensor_width / 1000) / telescope_fl  # arcsec/mm (assuming square pixels)
-            
-            logger.debug(f"Camera FOV calculation: {sensor_width}x{sensor_height}mm sensor, {telescope_fl}mm FL, FOV={fov_width_arcmin:.1f}'x{fov_height_arcmin:.1f}'")
-            
+            barlow_details = f" + {barlow_factor}x" if barlow_factor != 1.0 else ""
             return {
                 'width_arcmin': fov_width_arcmin,
                 'height_arcmin': fov_height_arcmin,
                 'type': 'camera',
-                'details': f"{sensor_width}×{sensor_height}mm sensor",
+                'details': f"{sensor_width}×{sensor_height}mm sensor{barlow_details}",
                 'pixel_scale_arcsec': pixel_scale_arcsec
             }
         
         return None
     
-    def _update_aladin_view(self):
-        """Update the Aladin Lite view with current settings"""
+    def _update_aladin_view(self, preserve_target=True):
+        """Update the Aladin Lite view with current settings
+
+        Args:
+            preserve_target: If True, preserve current target when updating FOV overlays
+        """
         # Determine FOV to use
         telescope_fov_data = None
         display_fov = self.default_fov
@@ -737,30 +787,52 @@ class AladinLiteWindow(QDialog):
         
         self.current_fov = display_fov
         
-        # Build Aladin URL
+        # If preserving target and we already have a page loaded, just update the FOV overlay
+        if preserve_target and self.current_target and hasattr(self, 'web_view') and self.web_view.url().toString():
+            logger.debug("Preserving target - updating FOV overlay only")
+            if telescope_fov_data and self.show_telescope_fov.isChecked():
+                self.pending_fov_overlay = telescope_fov_data
+                self.target_coordinates = self.current_target
+                self._inject_fov_overlay(True)
+            else:
+                # Remove FOV overlay
+                self._remove_fov_overlay()
+            self._update_fov_info()
+            return
+
+        # Build Aladin URL for full page load
         base_url = "https://aladin.u-strasbg.fr/AladinLite/?"
-        
-        # Use coordinates as primary method since object names can be unreliable
+
+        # Determine target to use
         target_id = None
-        if 'ra_deg' in self.data and 'dec_deg' in self.data and self.data['ra_deg'] is not None and self.data['dec_deg'] is not None:
-            ra = self.data['ra_deg']
-            dec = self.data['dec_deg']
-            # Format coordinates properly for Aladin (space-separated)
-            target_id = f"{ra} {dec}"
-            logger.debug(f"Using coordinates for Aladin target: RA={ra}, Dec={dec}")
+        if preserve_target and self.current_target:
+            # Use current target for URL
+            target_id = self.current_target
+            logger.debug(f"Using current target for URL: {target_id}")
         else:
-            # Fallback to object names
-            target_id = self.data.get('name', '')
-            logger.debug(f"Using object name for Aladin target: {target_id}")
-            
-            # If still no target, try dsodetailid
+            # Use original data to set initial target
+            if 'ra_deg' in self.data and 'dec_deg' in self.data and self.data['ra_deg'] is not None and self.data['dec_deg'] is not None:
+                ra = self.data['ra_deg']
+                dec = self.data['dec_deg']
+                # Format coordinates properly for Aladin (space-separated)
+                target_id = f"{ra} {dec}"
+                logger.debug(f"Using coordinates for Aladin target: RA={ra}, Dec={dec}")
+            else:
+                # Fallback to object names
+                target_id = self.data.get('name', '')
+                logger.debug(f"Using object name for Aladin target: {target_id}")
+
+                # If still no target, try dsodetailid
+                if not target_id:
+                    target_id = self.data.get('dsodetailid', '')
+                    logger.debug(f"Using dsodetailid for Aladin target: {target_id}")
+
             if not target_id:
-                target_id = self.data.get('dsodetailid', '')
-                logger.debug(f"Using dsodetailid for Aladin target: {target_id}")
-        
-        if not target_id:
-            logger.error(f"No valid target found for Aladin. Data keys: {list(self.data.keys())}")
-            target_id = "M1"  # Default fallback
+                logger.error(f"No valid target found for Aladin. Data keys: {list(self.data.keys())}")
+                target_id = "M1"  # Default fallback
+
+            # Store the target
+            self.current_target = target_id
         
         # URL encode the target if it contains coordinates
         import urllib.parse
@@ -1270,6 +1342,26 @@ class AladinLiteWindow(QDialog):
         # This method is now replaced by _inject_fov_overlay
         return None
     
+    def _remove_fov_overlay(self):
+        """Remove the FOV overlay from the current view"""
+        try:
+            remove_js = """
+                // Remove existing FOV overlay elements
+                var existingOverlay = document.querySelector('.telescope-fov-overlay');
+                if (existingOverlay) {
+                    existingOverlay.remove();
+                }
+                var existingInfo = document.querySelector('.telescope-fov-info');
+                if (existingInfo) {
+                    existingInfo.remove();
+                }
+                console.log('FOV overlay removed');
+            """
+            self.web_view.page().runJavaScript(remove_js)
+            logger.debug("Removed FOV overlay")
+        except Exception as e:
+            logger.debug(f"Could not remove FOV overlay: {e}")
+
     def _update_fov_info(self):
         """Update the FOV information display"""
         info_parts = [f"View FOV: {self.current_fov:.2f}° ({self.current_fov*60:.1f}')"]
@@ -4355,7 +4447,13 @@ class MainWindow(QMainWindow):
         collage_builder_action.setToolTip("Create image collages from your DSO photos")
         collage_builder_action.triggered.connect(self._show_collage_builder)
         toolbar.addAction(collage_builder_action)
-        
+
+        # Aladin Lite action
+        aladin_lite_action = QAction("Aladin Lite", self)
+        aladin_lite_action.setToolTip("Open Aladin Lite sky viewer")
+        aladin_lite_action.triggered.connect(self._show_aladin_lite_from_toolbar)
+        toolbar.addAction(aladin_lite_action)
+
         toolbar.addSeparator()
         
         # About action
@@ -4463,6 +4561,29 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error opening collage builder: {str(e)}", exc_info=True)
             QMessageBox.warning(self, "Error", f"Could not open Collage Builder: {str(e)}")
+
+    def _show_aladin_lite_from_toolbar(self):
+        """Open Aladin Lite from toolbar with general sky view"""
+        try:
+            # Create a default data dictionary for M33 (Triangulum Galaxy)
+            default_data = {
+                'name': 'M33',
+                'ra': 1.564,  # 1h 33m 50s
+                'dec': 30.66,  # +30° 39' 37"
+                'ra_deg': 23.46,  # 1.564 hours * 15 degrees/hour
+                'dec_deg': 30.66,   # +30.66 degrees
+                'dsodetailid': None,
+                'size_min': 70.8,  # M33 is about 70.8 x 41.7 arcminutes
+                'size_max': 41.7   # Using actual M33 dimensions
+            }
+
+            aladin_window = AladinLiteWindow(default_data, self)
+            aladin_window.setModal(False)  # Make window non-modal
+            aladin_window.show()
+            logger.debug("Opened Aladin Lite window from toolbar")
+        except Exception as e:
+            logger.error(f"Error opening Aladin Lite from toolbar: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Aladin Lite: {str(e)}")
 
     def _on_show_images_changed(self, state):
         """Handle show images only checkbox state change"""
