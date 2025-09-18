@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
     QVBoxLayout, QWidget, QLabel, QDialog,
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
-    QToolBar, QMessageBox
+    QToolBar, QMessageBox, QMenu
 )
 from PySide6.QtGui import QAction
 from astroplan import Observer, FixedTarget
@@ -4372,6 +4372,10 @@ class MainWindow(QMainWindow):
         self.table_view.setSelectionMode(QTableView.SingleSelection)
         self.table_view.setSortingEnabled(True)
 
+        # Enable context menu
+        self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table_view.customContextMenuRequested.connect(self._show_context_menu)
+
         # Set up the table view's style
         self.table_view.setStyleSheet("""
             QTableView {
@@ -4827,6 +4831,174 @@ class MainWindow(QMainWindow):
             "notes": notes,
             "image_count": image_count
         }
+
+    def _show_context_menu(self, position):
+        """Show context menu when right-clicking on the DSO table"""
+        # Get the item at the clicked position
+        index = self.table_view.indexAt(position)
+        if not index.isValid():
+            return  # No item at this position
+
+        # Get the row number
+        row = index.row()
+        if row < 0 or row >= len(self.model.filtered_data):
+            return
+
+        # Create context menu
+        context_menu = QMenu(self)
+
+        # Apply dark theme styling to the context menu
+        context_menu.setStyleSheet("""
+            QMenu {
+                background-color: #404040;
+                color: #ffffff;
+                border: 1px solid #666666;
+                padding: 2px;
+            }
+            QMenu::item {
+                background-color: transparent;
+                padding: 8px 16px;
+                border: none;
+            }
+            QMenu::item:selected {
+                background-color: #0078d4;
+                color: #ffffff;
+            }
+            QMenu::item:hover {
+                background-color: #0078d4;
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: #666666;
+                margin: 2px 8px;
+            }
+        """)
+
+        # Add menu actions
+        details_action = context_menu.addAction("View DSO Details")
+        details_action.triggered.connect(lambda: self._context_view_details(row))
+
+        visibility_action = context_menu.addAction("Open DSO Visibility Calculator")
+        visibility_action.triggered.connect(lambda: self._context_open_visibility(row))
+
+        aladin_action = context_menu.addAction("Open in Aladin Lite")
+        aladin_action.triggered.connect(lambda: self._context_open_aladin(row))
+
+        context_menu.addSeparator()
+
+        target_action = context_menu.addAction("Add to Target List")
+        target_action.triggered.connect(lambda: self._context_add_to_target_list(row))
+
+        # Show the menu at the clicked position
+        context_menu.exec(self.table_view.mapToGlobal(position))
+
+    def _context_view_details(self, row):
+        """View DSO details from context menu"""
+        # Get the index and trigger the existing double-click method
+        model_index = self.model.index(row, 0)
+        self._on_double_click(model_index)
+
+    def _context_open_visibility(self, row):
+        """Open DSO Visibility Calculator from context menu"""
+        try:
+            entry = self.model.filtered_data[row]
+            dso_name = entry.get("name", "")
+
+            if not dso_name:
+                QMessageBox.warning(self, "Error", "No DSO name available")
+                return
+
+            logger.debug(f"Opening DSO Visibility Calculator for: {dso_name}")
+
+            # Import and open DSO Visibility Calculator
+            from DSOVisibilityCalculator import DSOVisibilityApp
+
+            # Store reference to prevent garbage collection
+            self.visibility_window = DSOVisibilityApp()
+
+            # Pre-populate with the DSO name
+            if hasattr(self.visibility_window, 'dso_input'):
+                self.visibility_window.dso_input.setText(dso_name)
+                logger.debug(f"Set DSO name in input field: {dso_name}")
+            else:
+                logger.warning("DSO input field not found in visibility window")
+
+            # Show the window immediately
+            self.visibility_window.show()
+            self.visibility_window.raise_()
+            self.visibility_window.activateWindow()
+
+            # Automatically trigger calculation after a short delay
+            if hasattr(self.visibility_window, 'calculate_visibility'):
+                QTimer.singleShot(500, self.visibility_window.calculate_visibility)
+                logger.debug("Triggered automatic visibility calculation")
+            else:
+                logger.warning("Calculate visibility method not found in visibility window")
+
+            logger.debug("DSO Visibility Calculator window opened successfully")
+
+        except Exception as e:
+            logger.error(f"Error opening DSO Visibility Calculator: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open DSO Visibility Calculator: {str(e)}")
+
+    def _context_open_aladin(self, row):
+        """Open Aladin Lite from context menu"""
+        try:
+            entry = self.model.filtered_data[row]
+
+            # Create data dictionary similar to what ObjectDetailWindow creates
+            detail_data = {
+                'name': entry.get('name', ''),
+                'ra_deg': entry.get('ra_deg', 0),
+                'dec_deg': entry.get('dec_deg', 0),
+                'size_min': entry.get('size_min', 30),
+                'size_max': entry.get('size_max', 30),
+                'dsodetailid': entry.get('id', '')
+            }
+
+            # Import and open Aladin Lite window
+            aladin_window = AladinLiteWindow(detail_data, self)
+            aladin_window.setModal(False)
+            aladin_window.show()
+
+        except Exception as e:
+            logger.error(f"Error opening Aladin Lite: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Aladin Lite: {str(e)}")
+
+    def _context_add_to_target_list(self, row):
+        """Add DSO to target list from context menu"""
+        try:
+            entry = self.model.filtered_data[row]
+
+            # Create data dictionary for target list
+            dso_data = {
+                'name': entry.get('name', ''),
+                'ra_deg': entry.get('ra_deg', 0),
+                'dec_deg': entry.get('dec_deg', 0),
+                'magnitude': entry.get('magnitude', 0),
+                'size_min': entry.get('size_min', 0),
+                'size_max': entry.get('size_max', 0),
+                'constellation': entry.get('constellation', ''),
+                'dso_type': entry.get('dso_type', ''),
+                'dso_class': entry.get('dso_class', '')
+            }
+
+            # Import and open Target List window, then add the DSO
+            from DSOTargetList import DSOTargetListWindow
+            if not hasattr(self, 'target_list_window') or not self.target_list_window.isVisible():
+                self.target_list_window = DSOTargetListWindow()
+
+            self.target_list_window.show()
+            self.target_list_window.raise_()
+            self.target_list_window.activateWindow()
+
+            # Add the DSO to the target list
+            self.target_list_window.add_target_from_dso(dso_data)
+
+        except Exception as e:
+            logger.error(f"Error adding to target list: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to add to target list: {str(e)}")
 
     def _format_ra(self, ra_deg):
         """Convert RA in degrees to hms format"""

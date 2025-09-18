@@ -10,10 +10,10 @@ import calendar
 from datetime import datetime
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
-                               QWidget, QPushButton, QLabel, QTableWidget, 
-                               QTableWidgetItem, QGroupBox, QMessageBox, 
+                               QWidget, QPushButton, QLabel, QTableWidget,
+                               QTableWidgetItem, QGroupBox, QMessageBox,
                                QHeaderView, QTextEdit, QDialog, QComboBox,
-                               QLineEdit, QCheckBox, QDateEdit, QSpinBox)
+                               QLineEdit, QCheckBox, QDateEdit, QSpinBox, QMenu)
 from PySide6.QtGui import QFont
 
 from DatabaseManager import DatabaseManager
@@ -469,8 +469,13 @@ class DSOTargetListWindow(QMainWindow):
         
         self.targets_table.setAlternatingRowColors(True)
         self.targets_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.targets_table.setEditTriggers(QTableWidget.NoEditTriggers)  # Disable cell editing
         self.targets_table.selectionModel().selectionChanged.connect(self._on_selection_changed)
-        self.targets_table.itemDoubleClicked.connect(self._view_target_details)
+        self.targets_table.itemDoubleClicked.connect(self._edit_selected_target)
+
+        # Enable context menu
+        self.targets_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.targets_table.customContextMenuRequested.connect(self._show_context_menu)
         
         targets_layout.addWidget(self.targets_table)
         targets_group.setLayout(targets_layout)
@@ -598,8 +603,8 @@ class DSOTargetListWindow(QMainWindow):
             target_data = self.targets_data[current_row]
             target_name = target_data.get("name", "")
             
-            # Import ObjectDetailWindow from Main.py
-            from Main import ObjectDetailWindow
+            # Import ObjectDetailWindow from main.py
+            from main import ObjectDetailWindow
             
             # Try to find the complete DSO data in the main database
             detail_data = self._get_full_dso_data(target_name, target_data)
@@ -1064,6 +1069,154 @@ class DSOTargetListWindow(QMainWindow):
             ranges.append(f"{calendar.month_abbr[start]}-{calendar.month_abbr[end]}")
         
         return ", ".join(ranges)
+
+    def _show_context_menu(self, position):
+        """Show context menu when right-clicking on the table"""
+        # Get the item at the clicked position
+        item = self.targets_table.itemAt(position)
+        if not item:
+            return  # No item at this position
+
+        # Get the row number
+        row = item.row()
+        if row < 0 or row >= len(self.targets_data):
+            return
+
+        # Create context menu
+        context_menu = QMenu(self)
+
+        # Apply dark theme styling to the context menu
+        context_menu.setStyleSheet("""
+            QMenu {
+                background-color: #404040;
+                color: #ffffff;
+                border: 1px solid #666666;
+                padding: 2px;
+            }
+            QMenu::item {
+                background-color: transparent;
+                padding: 8px 16px;
+                border: none;
+            }
+            QMenu::item:selected {
+                background-color: #0078d4;
+                color: #ffffff;
+            }
+            QMenu::item:hover {
+                background-color: #0078d4;
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: #666666;
+                margin: 2px 8px;
+            }
+        """)
+
+        # Add menu actions
+        details_action = context_menu.addAction("View DSO Details")
+        details_action.triggered.connect(lambda: self._context_view_details(row))
+
+        visibility_action = context_menu.addAction("Open DSO Visibility Calculator")
+        visibility_action.triggered.connect(lambda: self._context_open_visibility(row))
+
+        aladin_action = context_menu.addAction("Open in Aladin Lite")
+        aladin_action.triggered.connect(lambda: self._context_open_aladin(row))
+
+        context_menu.addSeparator()
+
+        edit_action = context_menu.addAction("Edit Target")
+        edit_action.triggered.connect(lambda: self._context_edit_target(row))
+
+        remove_action = context_menu.addAction("Remove Target")
+        remove_action.triggered.connect(lambda: self._context_remove_target(row))
+
+        # Show the menu at the clicked position
+        context_menu.exec(self.targets_table.mapToGlobal(position))
+
+    def _context_view_details(self, row):
+        """View DSO details from context menu"""
+        # Set the table selection to this row and call existing method
+        self.targets_table.selectRow(row)
+        self._view_target_details()
+
+    def _context_open_visibility(self, row):
+        """Open DSO Visibility Calculator from context menu"""
+        try:
+            target_data = self.targets_data[row]
+            target_name = target_data.get("name", "")
+
+            if not target_name:
+                QMessageBox.warning(self, "Error", "No target name available")
+                return
+
+            logger.debug(f"Opening DSO Visibility Calculator for: {target_name}")
+
+            # Import and open DSO Visibility Calculator
+            from DSOVisibilityCalculator import DSOVisibilityApp
+
+            # Store reference to prevent garbage collection
+            self.visibility_window = DSOVisibilityApp()
+
+            # Pre-populate with the DSO name
+            if hasattr(self.visibility_window, 'dso_input'):
+                self.visibility_window.dso_input.setText(target_name)
+                logger.debug(f"Set DSO name in input field: {target_name}")
+            else:
+                logger.warning("DSO input field not found in visibility window")
+
+            # Show the window immediately
+            self.visibility_window.show()
+            self.visibility_window.raise_()
+            self.visibility_window.activateWindow()
+
+            # Automatically trigger calculation after a short delay to allow window to fully initialize
+            if hasattr(self.visibility_window, 'calculate_visibility'):
+                QTimer.singleShot(500, self.visibility_window.calculate_visibility)
+                logger.debug("Triggered automatic visibility calculation")
+            else:
+                logger.warning("Calculate visibility method not found in visibility window")
+
+            logger.debug("DSO Visibility Calculator window opened successfully")
+
+        except Exception as e:
+            logger.error(f"Error opening DSO Visibility Calculator: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open DSO Visibility Calculator: {str(e)}")
+
+    def _context_open_aladin(self, row):
+        """Open Aladin Lite from context menu"""
+        try:
+            target_data = self.targets_data[row]
+            target_name = target_data.get("name", "")
+
+            # Get full DSO data for Aladin Lite
+            detail_data = self._get_full_dso_data(target_name, target_data)
+            if not detail_data:
+                QMessageBox.warning(self, "Error", f"Could not find detailed data for {target_name}")
+                return
+
+            # Import and open Aladin Lite window
+            from main import AladinLiteWindow
+            aladin_window = AladinLiteWindow(detail_data, self)
+            aladin_window.setModal(False)
+            aladin_window.show()
+
+        except Exception as e:
+            logger.error(f"Error opening Aladin Lite: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Aladin Lite: {str(e)}")
+
+    def _context_edit_target(self, row):
+        """Edit target from context menu"""
+        # Set the table selection to this row and call existing method
+        self.targets_table.selectRow(row)
+        self._edit_selected_target()
+
+    def _context_remove_target(self, row):
+        """Remove target from context menu"""
+        # Set the table selection to this row and call existing method
+        self.targets_table.selectRow(row)
+        self._remove_selected_target()
+
 
     def add_target_from_dso(self, dso_data):
         """Add a target from DSO data (called from ObjectDetailWindow)"""
