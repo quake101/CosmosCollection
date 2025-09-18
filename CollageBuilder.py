@@ -5,34 +5,41 @@ from typing import List, Tuple, Optional
 
 
 class CollageBuilder:
-    def __init__(self, grid_width: int = 3, grid_height: int = 3, 
-                 cell_size: Tuple[int, int] = (300, 300), 
-                 spacing: int = 10, background_color: str = "white"):
+    def __init__(self, grid_width: int = 3, grid_height: int = 3,
+                 cell_size: Tuple[int, int] = (300, 300),
+                 spacing: int = 10, background_color: str = "white",
+                 show_labels: bool = True, label_position: str = "Bottom Center"):
         """
         Initialize the CollageBuilder.
-        
+
         Args:
             grid_width: Number of columns in the grid
             grid_height: Number of rows in the grid
             cell_size: Size of each cell (width, height) in pixels
             spacing: Spacing between images in pixels
             background_color: Background color of the collage
+            show_labels: Whether to show DSO name labels on images
+            label_position: Position of labels (Bottom Center, Top Center, etc.)
         """
         self.grid_width = grid_width
         self.grid_height = grid_height
         self.cell_size = cell_size
         self.spacing = spacing
         self.background_color = background_color
+        self.show_labels = show_labels
+        self.label_position = label_position
         self.images = []
         self.image_paths = []
+        self.dso_names = []
         
-    def add_image(self, image_path: str) -> bool:
+    def add_image(self, image_path: str, dso_name: str = "Unknown DSO") -> bool:
         """
         Add an image to the collage.
-        
+
         Args:
             image_path: Path to the image file
-            
+            dso_name: Name of the DSO (Deep Sky Object) associated with this image
+
         Returns:
             True if image was successfully added, False otherwise
         """
@@ -50,7 +57,8 @@ class CollageBuilder:
             image = self._resize_image_to_fit(image, self.cell_size)
             self.images.append(image)
             self.image_paths.append(image_path)
-            print(f"Added image: {os.path.basename(image_path)}")
+            self.dso_names.append(dso_name)
+            print(f"Added image: {os.path.basename(image_path)} ({dso_name})")
             return True
         except Exception as e:
             print(f"Error loading image {image_path}: {str(e)}")
@@ -94,6 +102,7 @@ class CollageBuilder:
         """
         if 0 <= index < len(self.images):
             removed_path = self.image_paths.pop(index)
+            removed_name = self.dso_names.pop(index) if index < len(self.dso_names) else "Unknown"
             self.images.pop(index)
             print(f"Removed image: {os.path.basename(removed_path)}")
             return True
@@ -105,6 +114,7 @@ class CollageBuilder:
         """Clear all images from the collage."""
         self.images.clear()
         self.image_paths.clear()
+        self.dso_names.clear()
         print("All images cleared from collage")
     
     def _resize_image_to_fit(self, image: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
@@ -151,25 +161,101 @@ class CollageBuilder:
         
         # Create canvas
         canvas = Image.new('RGB', (canvas_width, canvas_height), self.background_color)
-        
+        draw = ImageDraw.Draw(canvas)
+
+        # Try to load a font for labels
+        try:
+            # Try to use a system font for better readability
+            if os.name == 'nt':  # Windows
+                font = ImageFont.truetype("arial.ttf", 16)
+            else:  # Linux/Mac
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+        except:
+            # Fallback to default font
+            font = ImageFont.load_default()
+
         # Place images on canvas
         for i, image in enumerate(self.images):
             if i >= self.grid_width * self.grid_height:
                 break
-                
+
             # Calculate grid position
             col = i % self.grid_width
             row = i // self.grid_width
-            
+
             # Calculate position on canvas (centered within cell)
             x = self.spacing + (col * (self.cell_size[0] + self.spacing))
             y = self.spacing + (row * (self.cell_size[1] + self.spacing))
-            
+
             # Center image within cell
             x_offset = (self.cell_size[0] - image.width) // 2
             y_offset = (self.cell_size[1] - image.height) // 2
-            
+
             canvas.paste(image, (x + x_offset, y + y_offset))
+
+            # Add DSO name label if enabled
+            if self.show_labels and i < len(self.dso_names):
+                dso_name = self.dso_names[i]
+
+                # Get text bounding box for positioning calculations
+                bbox = draw.textbbox((0, 0), dso_name, font=font)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+
+                # Calculate text position based on label_position setting
+                if self.label_position == "Bottom Center":
+                    text_x = x + x_offset + (image.width // 2) - (text_width // 2)
+                    text_y = y + y_offset + image.height + 5
+                elif self.label_position == "Top Center":
+                    text_x = x + x_offset + (image.width // 2) - (text_width // 2)
+                    text_y = y + y_offset - text_height - 5
+                elif self.label_position == "Bottom Left":
+                    text_x = x + x_offset + 5
+                    text_y = y + y_offset + image.height + 5
+                elif self.label_position == "Bottom Right":
+                    text_x = x + x_offset + image.width - text_width - 5
+                    text_y = y + y_offset + image.height + 5
+                elif self.label_position == "Top Left":
+                    text_x = x + x_offset + 5
+                    text_y = y + y_offset - text_height - 5
+                elif self.label_position == "Top Right":
+                    text_x = x + x_offset + image.width - text_width - 5
+                    text_y = y + y_offset - text_height - 5
+                elif self.label_position == "Center Overlay":
+                    text_x = x + x_offset + (image.width // 2) - (text_width // 2)
+                    text_y = y + y_offset + (image.height // 2) - (text_height // 2)
+                else:
+                    # Default to bottom center
+                    text_x = x + x_offset + (image.width // 2) - (text_width // 2)
+                    text_y = y + y_offset + image.height + 5
+
+                # Ensure text stays within cell bounds
+                min_x = x + 2
+                max_x = x + self.cell_size[0] - text_width - 2
+                text_x = max(min_x, min(text_x, max_x))
+
+                min_y = y + 2
+                max_y = y + self.cell_size[1] - text_height - 2
+                text_y = max(min_y, min(text_y, max_y))
+
+                # Choose text and outline colors for visibility
+                if self.label_position == "Center Overlay":
+                    # For overlay, use high contrast colors
+                    outline_color = "black"
+                    text_color = "white"
+                else:
+                    # For edge positions, use colors based on background
+                    outline_color = "black" if self.background_color.lower() in ["white", "#ffffff"] else "white"
+                    text_color = "white" if self.background_color.lower() in ["black", "#000000"] else "black"
+
+                # Draw text with outline for better visibility
+                for dx in [-1, 0, 1]:
+                    for dy in [-1, 0, 1]:
+                        if dx != 0 or dy != 0:
+                            draw.text((text_x + dx, text_y + dy), dso_name, font=font, fill=outline_color)
+
+                # Draw main text
+                draw.text((text_x, text_y), dso_name, font=font, fill=text_color)
         
         # Save collage with appropriate format
         try:
@@ -224,6 +310,7 @@ class CollageBuilder:
             removed_count = len(self.images) - max_images
             self.images = self.images[:max_images]
             self.image_paths = self.image_paths[:max_images]
+            self.dso_names = self.dso_names[:max_images]
             print(f"Grid resized to {new_width}x{new_height}. Removed {removed_count} excess images.")
         else:
             print(f"Grid resized to {new_width}x{new_height}")
@@ -1077,7 +1164,9 @@ class CollageGenerationWorker(QThread):
                 grid_height=self.project_settings['grid_height'],
                 cell_size=(self.project_settings['cell_size'], self.project_settings['cell_size']),
                 spacing=self.project_settings['spacing'],
-                background_color=self.project_settings['background_color']
+                background_color=self.project_settings['background_color'],
+                show_labels=self.project_settings.get('show_labels', True),
+                label_position=self.project_settings.get('label_position', 'Bottom Center')
             )
 
             # Add images with progress updates
@@ -1096,12 +1185,15 @@ class CollageGenerationWorker(QThread):
                 image_path = image_data.get('image_path', '')
                 filename = os.path.basename(image_path) if image_path else 'Unknown'
 
+                # Get DSO name from image data (if available)
+                dso_name = image_data.get('dso_name', 'Unknown DSO')
+
                 # Update progress
                 progress = int((i / images_to_process) * 80)  # Use 80% for image loading
                 self.progress_updated.emit(progress, f"Loading image: {filename}")
 
                 if image_path and os.path.exists(image_path):
-                    if collage_builder.add_image(image_path):
+                    if collage_builder.add_image(image_path, dso_name):
                         added_count += 1
                 else:
                     logger.warning(f"Image not found: {image_path}")
@@ -1608,6 +1700,34 @@ class CollageBuilderWindow(QDialog):
         color_layout.addWidget(self.color_button)
         settings_layout.addLayout(color_layout)
 
+        # Label settings
+        label_layout = QVBoxLayout()
+
+        # Enable/disable labels
+        self.show_labels_checkbox = QCheckBox("Show DSO Labels")
+        self.show_labels_checkbox.setChecked(True)  # Default to enabled
+        self.show_labels_checkbox.toggled.connect(self._update_current_project)
+        label_layout.addWidget(self.show_labels_checkbox)
+
+        # Label position
+        position_layout = QHBoxLayout()
+        position_layout.addWidget(QLabel("Label Position:"))
+        self.label_position_combo = QComboBox()
+        self.label_position_combo.addItems([
+            "Bottom Center",
+            "Top Center",
+            "Bottom Left",
+            "Bottom Right",
+            "Top Left",
+            "Top Right",
+            "Center Overlay"
+        ])
+        self.label_position_combo.currentTextChanged.connect(self._update_current_project)
+        position_layout.addWidget(self.label_position_combo)
+        label_layout.addLayout(position_layout)
+
+        settings_layout.addLayout(label_layout)
+
         left_layout.addWidget(settings_group)
 
         # Save Project button
@@ -2107,6 +2227,8 @@ class CollageBuilderWindow(QDialog):
             'cell_size': 400,
             'spacing': 20,
             'background_color': 'black',
+            'show_labels': True,
+            'label_position': 'Bottom Center',
             'collage_images': []  # List of image data dictionaries
         }
 
@@ -2218,6 +2340,8 @@ class CollageBuilderWindow(QDialog):
         self.height_spin.valueChanged.disconnect()
         self.cell_size_spin.valueChanged.disconnect()
         self.spacing_spin.valueChanged.disconnect()
+        self.show_labels_checkbox.toggled.disconnect()
+        self.label_position_combo.currentTextChanged.disconnect()
 
         # Set the values
         self.width_spin.setValue(project['grid_width'])
@@ -2226,11 +2350,20 @@ class CollageBuilderWindow(QDialog):
         self.spacing_spin.setValue(project['spacing'])
         self._update_color_button(project['background_color'])
 
+        # Set label settings with defaults
+        self.show_labels_checkbox.setChecked(project.get('show_labels', True))
+        label_position = project.get('label_position', 'Bottom Center')
+        index = self.label_position_combo.findText(label_position)
+        if index >= 0:
+            self.label_position_combo.setCurrentIndex(index)
+
         # Reconnect signals
         self.width_spin.valueChanged.connect(self._update_current_project)
         self.height_spin.valueChanged.connect(self._update_current_project)
         self.cell_size_spin.valueChanged.connect(self._update_current_project)
         self.spacing_spin.valueChanged.connect(self._update_current_project)
+        self.show_labels_checkbox.toggled.connect(self._update_current_project)
+        self.label_position_combo.currentTextChanged.connect(self._update_current_project)
 
         # Debug: Verify what values were actually set
         logger.debug(f"UI values after setting: width={self.width_spin.value()}, height={self.height_spin.value()}, cell_size={self.cell_size_spin.value()}")
@@ -2265,6 +2398,8 @@ class CollageBuilderWindow(QDialog):
         project['grid_height'] = self.height_spin.value()
         project['cell_size'] = self.cell_size_spin.value()
         project['spacing'] = self.spacing_spin.value()
+        project['show_labels'] = self.show_labels_checkbox.isChecked()
+        project['label_position'] = self.label_position_combo.currentText()
 
         # Update grid widget if grid size changed
         new_width = project['grid_width']
