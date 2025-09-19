@@ -355,14 +355,14 @@ class DSOTableModel(QAbstractTableModel):
 
         self.layoutChanged.emit()
 
-    def filter_data(self, search_text, selected_catalog=None, show_images_only=False):
-        """Filter the data based on search text, catalog, and image presence"""
+    def filter_data(self, search_text, selected_catalog=None, show_images_only=False, selected_type=None):
+        """Filter the data based on search text, catalog, image presence, and DSO type"""
         self.layoutAboutToBeChanged.emit()
 
         # Store the selected catalog for use in data() method
         self.selected_catalog = selected_catalog
 
-        if not search_text and not selected_catalog and not show_images_only:
+        if not search_text and not selected_catalog and not show_images_only and not selected_type:
             self.filtered_data = self.dso_data.copy()
         else:
             search_text = search_text.lower() if search_text else ""
@@ -372,6 +372,9 @@ class DSOTableModel(QAbstractTableModel):
                      selected_catalog == "All Catalogs" or
                      any(designation.startswith(selected_catalog + " ")
                          for designation in item["designations"].split(", "))) and
+                    (not selected_type or
+                     selected_type == "All Types" or
+                     item.get("dso_type", "") == selected_type) and
                     (not show_images_only or item["image_count"] > 0) and
                     (not search_text or
                      search_text in item["catalogue"].lower() or
@@ -4331,6 +4334,46 @@ class MainWindow(QMainWindow):
         catalog_layout.addWidget(self.catalog_combo)
         controls_layout.addLayout(catalog_layout)
 
+        # DSO Type filter
+        type_layout = QHBoxLayout()
+        type_label = QLabel("Type:")
+        self.type_combo = QComboBox()
+        self.type_combo.addItem("All Types")
+        # Add common DSO types with readable names (ordered by frequency/popularity)
+        dso_types = [
+            ("GALXY", "Galaxy"),
+            ("DRKNB", "Dark Nebula"),
+            ("OPNCL", "Open Cluster"),
+            ("PLNNB", "Planetary Nebula"),
+            ("BRTNB", "Bright Nebula"),
+            ("SNREM", "Supernova Remnant"),
+            ("GALCL", "Galaxy Cluster"),
+            ("GLOCL", "Globular Cluster"),
+            ("ASTER", "Asterism"),
+            ("2STAR", "Double Star"),
+            ("CL+NB", "Cluster + Nebula"),
+            ("GX+DN", "Galaxy + Dark Nebula"),
+            ("3STAR", "Triple Star"),
+            ("4STAR", "Quadruple Star"),
+            ("1STAR", "Single Star"),
+            ("LMCOC", "LMC Open Cluster"),
+            ("LMCCN", "LMC Cluster/Nebula"),
+            ("LMCGC", "LMC Globular Cluster"),
+            ("LMCDN", "LMC Dark Nebula"),
+            ("SMCGC", "SMC Globular Cluster"),
+            ("SMCCN", "SMC Cluster/Nebula"),
+            ("SMCOC", "SMC Open Cluster"),
+            ("SMCDN", "SMC Dark Nebula"),
+            ("QUASR", "Quasar"),
+            ("NONEX", "Non-existent")
+        ]
+        for code, name in dso_types:
+            self.type_combo.addItem(name, code)
+        self.type_combo.currentTextChanged.connect(self._on_type_changed)
+        type_layout.addWidget(type_label)
+        type_layout.addWidget(self.type_combo)
+        controls_layout.addLayout(type_layout)
+
         # Search bar
         search_layout = QHBoxLayout()
         search_label = QLabel("Search:")
@@ -4594,7 +4637,8 @@ class MainWindow(QMainWindow):
         self.model.filter_data(
             self.search_input.text(),
             None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
-            self.show_images_only.isChecked()
+            self.show_images_only.isChecked(),
+            self._get_selected_type()
         )
         self._update_status()
 
@@ -4607,7 +4651,8 @@ class MainWindow(QMainWindow):
         self.catalog_combo.setCurrentIndex(0)
         self.show_images_only.setChecked(False)
         self.highlight_no_images.setChecked(False)
-        self.model.filter_data("", None, False)
+        self.type_combo.setCurrentIndex(0)
+        self.model.filter_data("", None, False, None)
         self._update_status()
 
     def _on_search(self, text):
@@ -4615,7 +4660,8 @@ class MainWindow(QMainWindow):
         self.model.filter_data(
             text,
             None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
-            self.show_images_only.isChecked()
+            self.show_images_only.isChecked(),
+            self._get_selected_type()
         )
         self._update_status()
 
@@ -4624,9 +4670,27 @@ class MainWindow(QMainWindow):
         self.model.filter_data(
             self.search_input.text(),
             None if catalog == "All Catalogs" else catalog,
-            self.show_images_only.isChecked()
+            self.show_images_only.isChecked(),
+            self._get_selected_type()
         )
         self._update_status()
+
+    def _on_type_changed(self, type_text):
+        """Handle DSO type selection changes"""
+        self.model.filter_data(
+            self.search_input.text(),
+            None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
+            self.show_images_only.isChecked(),
+            self._get_selected_type()
+        )
+        self._update_status()
+
+    def _get_selected_type(self):
+        """Get the currently selected DSO type code"""
+        current_data = self.type_combo.currentData()
+        if current_data and self.type_combo.currentText() != "All Types":
+            return current_data
+        return None
 
     def _update_status(self):
         """Update the status label"""
@@ -4786,7 +4850,8 @@ class MainWindow(QMainWindow):
             self.model.filter_data(
                 self.search_input.text(),
                 None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
-                self.show_images_only.isChecked()
+                self.show_images_only.isChecked(),
+                self._get_selected_type()
             )
 
             # Update status
@@ -4904,12 +4969,14 @@ class MainWindow(QMainWindow):
         try:
             entry = self.model.filtered_data[row]
             dso_name = entry.get("name", "")
+            ra_deg = entry.get("ra_deg", 0)
+            dec_deg = entry.get("dec_deg", 0)
 
             if not dso_name:
                 QMessageBox.warning(self, "Error", "No DSO name available")
                 return
 
-            logger.debug(f"Opening DSO Visibility Calculator for: {dso_name}")
+            logger.debug(f"Opening DSO Visibility Calculator for: {dso_name} at RA {ra_deg}° Dec {dec_deg}°")
 
             # Import and open DSO Visibility Calculator
             from DSOVisibilityCalculator import DSOVisibilityApp
@@ -4917,10 +4984,13 @@ class MainWindow(QMainWindow):
             # Store reference to prevent garbage collection
             self.visibility_window = DSOVisibilityApp()
 
-            # Pre-populate with the DSO name
+            # Use coordinates instead of name for more reliable calculation
+            # Format coordinates as a string that astropy can parse
+            coord_string = f"{ra_deg:.6f} {dec_deg:+.6f}"
+
             if hasattr(self.visibility_window, 'dso_input'):
-                self.visibility_window.dso_input.setText(dso_name)
-                logger.debug(f"Set DSO name in input field: {dso_name}")
+                self.visibility_window.dso_input.setText(coord_string)
+                logger.debug(f"Set coordinates in input field: {coord_string}")
             else:
                 logger.warning("DSO input field not found in visibility window")
 

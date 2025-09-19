@@ -1145,12 +1145,14 @@ class DSOTargetListWindow(QMainWindow):
         try:
             target_data = self.targets_data[row]
             target_name = target_data.get("name", "")
+            ra_deg = target_data.get("ra_deg", 0)
+            dec_deg = target_data.get("dec_deg", 0)
 
             if not target_name:
                 QMessageBox.warning(self, "Error", "No target name available")
                 return
 
-            logger.debug(f"Opening DSO Visibility Calculator for: {target_name}")
+            logger.debug(f"Opening DSO Visibility Calculator for: {target_name} at RA {ra_deg}° Dec {dec_deg}°")
 
             # Import and open DSO Visibility Calculator
             from DSOVisibilityCalculator import DSOVisibilityApp
@@ -1158,10 +1160,14 @@ class DSOTargetListWindow(QMainWindow):
             # Store reference to prevent garbage collection
             self.visibility_window = DSOVisibilityApp()
 
-            # Pre-populate with the DSO name
+            # Use coordinates instead of name for more reliable calculation
+            # Format coordinates as a string that astropy can parse
+            coord_string = f"{ra_deg:.6f} {dec_deg:+.6f}"
+
+            # Pre-populate with the coordinates
             if hasattr(self.visibility_window, 'dso_input'):
-                self.visibility_window.dso_input.setText(target_name)
-                logger.debug(f"Set DSO name in input field: {target_name}")
+                self.visibility_window.dso_input.setText(coord_string)
+                logger.debug(f"Set coordinates in input field: {coord_string}")
             else:
                 logger.warning("DSO input field not found in visibility window")
 

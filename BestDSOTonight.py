@@ -701,19 +701,37 @@ class BestDSOTonightWindow(QMainWindow):
             self.available_catalogs = ["M", "NGC", "IC"]  # Fallback default catalogs
     
     def load_dso_type_options(self):
-        """Load available DSO types from database"""
+        """Load available DSO types from database with friendly names"""
         try:
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT DISTINCT dsotype FROM dsodetail WHERE dsotype IS NOT NULL ORDER BY dsotype")
                 dso_types = [row[0] for row in cursor.fetchall()]
-                
+
                 # Add "All Types" option first
                 self.dso_type_combo.addItem("All Types")
+
+                # Add DSO types with friendly names, ordered by frequency/popularity
+                priority_types = [
+                    "GALXY", "DRKNB", "OPNCL", "PLNNB", "BRTNB", "SNREM",
+                    "GALCL", "GLOCL", "ASTER", "2STAR", "CL+NB", "GX+DN",
+                    "3STAR", "4STAR", "1STAR", "LMCOC", "LMCCN", "LMCGC",
+                    "LMCDN", "SMCGC", "SMCCN", "SMCOC", "SMCDN", "QUASR", "NONEX"
+                ]
+
+                # Add priority types first if they exist in database
+                for dso_type in priority_types:
+                    if dso_type in dso_types:
+                        friendly_name = self._get_friendly_type_name(dso_type)
+                        self.dso_type_combo.addItem(friendly_name, dso_type)
+
+                # Add any remaining types that weren't in priority list
                 for dso_type in sorted(dso_types):
-                    self.dso_type_combo.addItem(dso_type)
-                
+                    if dso_type not in priority_types:
+                        friendly_name = self._get_friendly_type_name(dso_type)
+                        self.dso_type_combo.addItem(friendly_name, dso_type)
+
                 self.dso_type_combo.setCurrentText("All Types")
         except Exception as e:
             print(f"Error loading DSO type options: {e}")
@@ -736,8 +754,13 @@ class BestDSOTonightWindow(QMainWindow):
         selected_catalogs = [] if selected_catalog == "All Catalogs" else [selected_catalog]
         
         # Get selected DSO type
-        selected_dso_type = self.dso_type_combo.currentText()
-        selected_dso_types = [] if selected_dso_type == "All Types" else [selected_dso_type]
+        selected_dso_type_text = self.dso_type_combo.currentText()
+        if selected_dso_type_text == "All Types":
+            selected_dso_types = []
+        else:
+            # Get the database code from the combo box data
+            selected_dso_type = self.dso_type_combo.currentData()
+            selected_dso_types = [selected_dso_type] if selected_dso_type else []
         
         # Show progress
         self.progress_bar.setVisible(True)
@@ -787,8 +810,9 @@ class BestDSOTonightWindow(QMainWindow):
             name_item.setData(Qt.UserRole, dso_data)  # Store full DSO data
             self.results_table.setItem(row, 0, name_item)
             
-            # Type
-            self.results_table.setItem(row, 1, QTableWidgetItem(dso_info["type"]))
+            # Type - use friendly name
+            friendly_type = self._get_friendly_type_name(dso_info["type"])
+            self.results_table.setItem(row, 1, QTableWidgetItem(friendly_type))
             
             # Constellation
             self.results_table.setItem(row, 2, QTableWidgetItem(dso_info["constellation"]))
@@ -908,6 +932,37 @@ class BestDSOTonightWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not open object details: {e}")
 
+    def _get_friendly_type_name(self, dso_type):
+        """Convert DSO type code to user-friendly name"""
+        type_mapping = {
+            "GALXY": "Galaxy",
+            "DRKNB": "Dark Nebula",
+            "OPNCL": "Open Cluster",
+            "PLNNB": "Planetary Nebula",
+            "BRTNB": "Bright Nebula",
+            "SNREM": "Supernova Remnant",
+            "GALCL": "Galaxy Cluster",
+            "GLOCL": "Globular Cluster",
+            "CL+NB": "Cluster + Nebula",
+            "GX+DN": "Galaxy + Dark Nebula",
+            "ASTER": "Asterism",
+            "2STAR": "Double Star",
+            "3STAR": "Triple Star",
+            "4STAR": "Quadruple Star",
+            "1STAR": "Single Star",
+            "QUASR": "Quasar",
+            "NONEX": "Non-existent",
+            "LMCCN": "LMC Cluster/Nebula",
+            "LMCDN": "LMC Dark Nebula",
+            "LMCGC": "LMC Globular Cluster",
+            "LMCOC": "LMC Open Cluster",
+            "SMCCN": "SMC Cluster/Nebula",
+            "SMCDN": "SMC Dark Nebula",
+            "SMCGC": "SMC Globular Cluster",
+            "SMCOC": "SMC Open Cluster"
+        }
+        return type_mapping.get(dso_type, dso_type)  # Return original if not found
+
     def handle_error(self, error_msg):
         """Handle calculation errors"""
         self.progress_bar.setVisible(False)
@@ -1001,15 +1056,35 @@ class BestDSOTonightWindow(QMainWindow):
                 if dso_data:
                     dso_name = dso_data["dso_info"]["name"]
 
+                    # Get coordinates
+                    coordinates = dso_data.get("coordinates")
+                    if coordinates:
+                        ra_deg = coordinates.ra.degree
+                        dec_deg = coordinates.dec.degree
+                    else:
+                        # Fallback - try to get coordinates again
+                        from astropy.coordinates import SkyCoord
+                        try:
+                            coord = SkyCoord.from_name(dso_name)
+                            ra_deg = coord.ra.degree
+                            dec_deg = coord.dec.degree
+                        except:
+                            ra_deg = 0.0
+                            dec_deg = 0.0
+
                     # Import and open DSO Visibility Calculator
                     from DSOVisibilityCalculator import DSOVisibilityApp
 
                     # Store reference to prevent garbage collection
                     self.visibility_window = DSOVisibilityApp()
 
-                    # Pre-populate with the DSO name
+                    # Use coordinates instead of name for more reliable calculation
+                    # Format coordinates as a string that astropy can parse
+                    coord_string = f"{ra_deg:.6f} {dec_deg:+.6f}"
+
+                    # Pre-populate with the coordinates
                     if hasattr(self.visibility_window, 'dso_input'):
-                        self.visibility_window.dso_input.setText(dso_name)
+                        self.visibility_window.dso_input.setText(coord_string)
 
                     # Show the window immediately
                     self.visibility_window.show()
