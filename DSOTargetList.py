@@ -441,10 +441,10 @@ class DSOTargetListWindow(QMainWindow):
         targets_layout = QVBoxLayout()
         
         self.targets_table = QTableWidget()
-        self.targets_table.setColumnCount(9)
+        self.targets_table.setColumnCount(10)
         self.targets_table.setHorizontalHeaderLabels([
-            "Name", "Type", "Constellation", "Magnitude", "Size", 
-            "Priority", "Status", "Best Months", "Date Added"
+            "Name", "Type", "Constellation", "Magnitude", "Size",
+            "Priority", "Status", "Direction", "Best Months", "Date Added"
         ])
         
         # Set column widths
@@ -456,16 +456,18 @@ class DSOTargetListWindow(QMainWindow):
         header.setSectionResizeMode(4, QHeaderView.Fixed)  # Size
         header.setSectionResizeMode(5, QHeaderView.Fixed)  # Priority
         header.setSectionResizeMode(6, QHeaderView.Fixed)  # Status
-        header.setSectionResizeMode(7, QHeaderView.Stretch)  # Best Months
-        header.setSectionResizeMode(8, QHeaderView.Fixed)  # Date Added
-        
+        header.setSectionResizeMode(7, QHeaderView.Fixed)  # Direction
+        header.setSectionResizeMode(8, QHeaderView.Stretch)  # Best Months
+        header.setSectionResizeMode(9, QHeaderView.Fixed)  # Date Added
+
         self.targets_table.setColumnWidth(0, 120)
         self.targets_table.setColumnWidth(2, 100)
         self.targets_table.setColumnWidth(3, 70)
         self.targets_table.setColumnWidth(4, 80)
         self.targets_table.setColumnWidth(5, 70)
         self.targets_table.setColumnWidth(6, 100)
-        self.targets_table.setColumnWidth(8, 100)
+        self.targets_table.setColumnWidth(7, 70)
+        self.targets_table.setColumnWidth(9, 100)
         
         self.targets_table.setAlternatingRowColors(True)
         self.targets_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -799,7 +801,7 @@ class DSOTargetListWindow(QMainWindow):
                 status_item = self.targets_table.item(row, 6)  # Status column
                 if not status_item or status_item.text() != status_filter:
                     show_row = False
-            
+
             if priority_filter != "All" and show_row:
                 priority_item = self.targets_table.item(row, 5)  # Priority column
                 if not priority_item or priority_item.text() != priority_filter:
@@ -857,8 +859,10 @@ class DSOTargetListWindow(QMainWindow):
             # Name
             self.targets_table.setItem(row, 0, QTableWidgetItem(target.get("name", "")))
             
-            # Type
-            self.targets_table.setItem(row, 1, QTableWidgetItem(target.get("dso_type", "")))
+            # Type - use friendly name
+            dso_type = target.get("dso_type", "")
+            friendly_type = self._get_friendly_type_name(dso_type)
+            self.targets_table.setItem(row, 1, QTableWidgetItem(friendly_type))
             
             # Constellation
             self.targets_table.setItem(row, 2, QTableWidgetItem(target.get("constellation", "")))
@@ -881,10 +885,21 @@ class DSOTargetListWindow(QMainWindow):
             status_item = QTableWidgetItem(target.get("status", ""))
             status_item.setTextAlignment(Qt.AlignCenter)
             self.targets_table.setItem(row, 6, status_item)
-            
+
+            # Direction - calculate current direction
+            ra_deg = target.get("ra_deg", 0)
+            dec_deg = target.get("dec_deg", 0)
+            if ra_deg and dec_deg:
+                direction = self._calculate_current_direction(ra_deg, dec_deg)
+            else:
+                direction = "No coordinates"
+            direction_item = QTableWidgetItem(direction)
+            direction_item.setTextAlignment(Qt.AlignCenter)
+            self.targets_table.setItem(row, 7, direction_item)
+
             # Best Months
-            self.targets_table.setItem(row, 7, QTableWidgetItem(target.get("best_months", "")))
-            
+            self.targets_table.setItem(row, 8, QTableWidgetItem(target.get("best_months", "")))
+
             # Date Added
             date_added = target.get("date_added", "")
             if date_added:
@@ -899,7 +914,7 @@ class DSOTargetListWindow(QMainWindow):
             
             date_item = QTableWidgetItem(formatted_date)
             date_item.setTextAlignment(Qt.AlignCenter)
-            self.targets_table.setItem(row, 8, date_item)
+            self.targets_table.setItem(row, 9, date_item)
     
     def _calculate_best_months_for_all(self):
         """Calculate best viewing months for all targets based on user location"""
@@ -1069,6 +1084,98 @@ class DSOTargetListWindow(QMainWindow):
             ranges.append(f"{calendar.month_abbr[start]}-{calendar.month_abbr[end]}")
         
         return ", ".join(ranges)
+
+    def _get_friendly_type_name(self, dso_type):
+        """Convert DSO type code to user-friendly name"""
+        type_mapping = {
+            "GALXY": "Galaxy",
+            "DRKNB": "Dark Nebula",
+            "OPNCL": "Open Cluster",
+            "PLNNB": "Planetary Nebula",
+            "BRTNB": "Bright Nebula",
+            "SNREM": "Supernova Remnant",
+            "GALCL": "Galaxy Cluster",
+            "GLOCL": "Globular Cluster",
+            "CL+NB": "Cluster + Nebula",
+            "GX+DN": "Galaxy + Dark Nebula",
+            "ASTER": "Asterism",
+            "2STAR": "Double Star",
+            "3STAR": "Triple Star",
+            "4STAR": "Quadruple Star",
+            "1STAR": "Single Star",
+            "QUASR": "Quasar",
+            "NONEX": "Non-existent",
+            "LMCCN": "LMC Cluster/Nebula",
+            "LMCDN": "LMC Dark Nebula",
+            "LMCGC": "LMC Globular Cluster",
+            "LMCOC": "LMC Open Cluster",
+            "SMCCN": "SMC Cluster/Nebula",
+            "SMCDN": "SMC Dark Nebula",
+            "SMCGC": "SMC Globular Cluster",
+            "SMCOC": "SMC Open Cluster"
+        }
+        return type_mapping.get(dso_type, dso_type)  # Return original if not found
+
+    def azimuth_to_direction(self, az):
+        """Convert azimuth to cardinal direction"""
+        directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+                      'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
+        idx = int((az + 11.25) / 22.5) % 16
+        return directions[idx]
+
+    def _calculate_current_direction(self, ra_deg, dec_deg):
+        """Calculate current direction for a DSO based on current time and user location"""
+        try:
+            # Get user location
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                location_row = cursor.fetchone()
+
+                if not location_row:
+                    return "Location not set"
+
+                lat, lon, timezone_str = location_row
+                if lat is None or lon is None:
+                    return "Location not set"
+
+            # Use DSOVisibilityCalculator to get current azimuth
+            from DSOVisibilityCalculator import DSOVisibilityCalculator
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            from datetime import datetime
+            import pytz
+
+            # Create calculator
+            calculator = DSOVisibilityCalculator(lat, lon)
+
+            # Create coordinate object
+            dso_coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
+
+            # Get current time in user's timezone
+            if timezone_str:
+                try:
+                    user_tz = pytz.timezone(timezone_str)
+                    current_time = datetime.now(user_tz)
+                except:
+                    current_time = datetime.now()
+            else:
+                current_time = datetime.now()
+
+            # Calculate current position
+            date_str = current_time.strftime('%Y-%m-%d')
+            time_range, dso_altaz, sun_altaz = calculator.calculate_altaz_over_time(
+                dso_coord, date_str, 0.25)  # Just get current position
+
+            if len(dso_altaz.az.deg) > 0:
+                current_azimuth = dso_altaz.az.deg[0]
+                return self.azimuth_to_direction(current_azimuth)
+            else:
+                return "Calculation error"
+
+        except Exception as e:
+            logger.debug(f"Error calculating direction: {e}")
+            return "Not available"
 
     def _show_context_menu(self, position):
         """Show context menu when right-clicking on the table"""
