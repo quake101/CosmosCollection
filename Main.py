@@ -1831,7 +1831,7 @@ class ObjectDetailWindow(QDialog):
     def __init__(self, data: dict, parent=None):
         super().__init__(None)  # Pass None as parent to make it independent
         logger.debug(f"Creating ObjectDetailWindow for {data['name']}")
-        self.setWindowTitle(f"{data["name"]} - DSO Detail - Cosmos Collection")
+        self.setWindowTitle(f"{data['name']} - DSO Detail - Cosmos Collection")
         # Make it an independent window with window management buttons
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
