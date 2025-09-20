@@ -25,7 +25,7 @@ jobs:
 
     - name: Build with PyInstaller
       run: |
-        pyinstaller --onefile --windowed --name CosmosCollection --icon=images/CosmosCollection.png Main.py
+        pyinstaller --onefile --windowed --name CosmosCollection --icon=images/CosmosCollection.png main.py
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
