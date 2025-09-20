@@ -1,10 +1,10 @@
-# CosmosCollection
+# Cosmos Collection
 
-A personal astrophotography catalog and image viewer for organizing and exploring your celestial images.
+A personal astrophotography catalog and session planning tools for organizing and exploring your celestial images.
 
 ## Overview
 
-CosmosCollection is designed to help astrophotographers manage their image collections with features tailored specifically for astronomical photography. Keep track of your deep sky objects, planetary shots, and wide-field captures all in one place.
+Cosmos Collection is designed to help astrophotographers manage their image collections with features tailored specifically for astronomical photography. Keep track of your deep sky objects, planetary shots, and wide-field captures all in one place.
 
 ## Features
 
@@ -39,7 +39,7 @@ CosmosCollection is designed to help astrophotographers manage their image colle
 
 ## Usage
 
-Launch CosmosCollection and start building your personal astrophotography catalog by importing your images and adding relevant metadata for each capture.
+Launch Cosmos Collection and start building your personal astrophotography catalog by importing your images and adding relevant metadata for each capture.
 
 ## Contributing
 
@@ -49,7 +49,7 @@ This is a personal project for astrophotography organization. Feel free to fork 
 
 MIT License
 
-Copyright (c) 2025 CosmosCollection
+Copyright (c) 2025 Cosmos Collection
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
