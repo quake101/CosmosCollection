@@ -4242,8 +4242,10 @@ class AboutDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("About Cosmos Collection")
-        self.setFixedSize(400, 300)
-        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.MSWindowsFixedSizeDialogHint)
+
+        # Set a fixed size that accommodates the new version content
+        self.setFixedSize(420, 380)
 
         # Create main layout with proper margins and spacing
         About_layout = QVBoxLayout(self)
@@ -4267,8 +4269,21 @@ class AboutDialog(QDialog):
         title_label.setStyleSheet("font-size: 18pt; font-weight: bold; color: #ffffff;")
         About_layout.addWidget(title_label)
 
+        # Version information
+        try:
+            from version import version_manager
+            version_text = version_manager.get_detailed_version_info()
+        except ImportError:
+            version_text = "Version information not available"
+
+        version_label = QLabel(version_text)
+        version_label.setAlignment(Qt.AlignCenter)
+        version_label.setWordWrap(True)  # Allow text wrapping if needed
+        version_label.setStyleSheet("font-size: 10pt; color: #bbbbbb; margin: 5px 0px; font-family: monospace;")
+        About_layout.addWidget(version_label)
+
         # Description
-        desc_label = QLabel("Your personal astrophotography catalog and image viewer application.")
+        desc_label = QLabel("A personal astrophotography catalog and session planning tools for organizing and exploring your celestial images.")
         desc_label.setAlignment(Qt.AlignCenter)
         desc_label.setWordWrap(True)
         desc_label.setStyleSheet("font-size: 11pt; color: #cccccc; margin: 10px 0px;")
@@ -4282,22 +4297,70 @@ class AboutDialog(QDialog):
         link_label.setStyleSheet("font-size: 10pt;")
         About_layout.addWidget(link_label)
 
-        # Add stretch to push everything up
-        About_layout.addStretch()
+        # Add fixed stretch to prevent layout jumping
+        About_layout.addStretch(1)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        # Check for updates button
+        try:
+            from version import check_for_updates
+            self.update_button = QPushButton("Check for Updates")
+            self.update_button.setFixedSize(130, 30)
+            self.update_button.clicked.connect(self._check_updates)
+            button_layout.addWidget(self.update_button)
+        except ImportError:
+            pass
 
         # Close button
         close_button = QPushButton("Close")
         close_button.setFixedSize(80, 30)
         close_button.clicked.connect(self.close)
         close_button.setDefault(True)
-        
-        # Center the close button
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
         button_layout.addWidget(close_button)
+
         button_layout.addStretch()
-        
         About_layout.addLayout(button_layout)
+
+    def _check_updates(self):
+        """Check for updates and show result"""
+        try:
+            from version import version_manager
+            from PySide6.QtWidgets import QMessageBox
+            import webbrowser
+
+            # Force refresh the GitHub release info
+            version_manager._cached_release_info = None
+            version_info = version_manager.get_version_info()
+
+            if not version_info['github_available']:
+                QMessageBox.information(self, "Update Check",
+                    "Unable to check for updates. Please check your internet connection.")
+                return
+
+            if version_info['update_available']:
+                msg = QMessageBox()
+                msg.setWindowTitle("Update Available")
+                msg.setText(f"A new version is available!")
+                msg.setInformativeText(
+                    f"Current version: {version_info['local_version']}\n"
+                    f"Latest version: {version_info['github_version']}\n\n"
+                    f"Would you like to visit the download page?"
+                )
+                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                msg.setDefaultButton(QMessageBox.Yes)
+
+                if msg.exec() == QMessageBox.Yes and version_info['github_url']:
+                    webbrowser.open(version_info['github_url'])
+            else:
+                QMessageBox.information(self, "No Updates",
+                    f"You are running the latest version ({version_info['local_version']}).")
+
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Error", f"Error checking for updates: {str(e)}")
 
 
 # --- Main App Window ---
@@ -4305,7 +4368,15 @@ class MainWindow(QMainWindow):
     def __init__(self, dso_data, catalogs):
         super().__init__()
         logger.debug("Initializing MainWindow")
-        self.setWindowTitle("Cosmos Collection")
+
+        # Set window title with version
+        try:
+            from version import get_version_display
+            window_title = f"Cosmos Collection - {get_version_display()}"
+        except ImportError:
+            window_title = "Cosmos Collection"
+
+        self.setWindowTitle(window_title)
         self.setGeometry(100, 100, 1200, 800)
         self.setWindowFlags(Qt.Window)
         self.db_manager = DatabaseManager()

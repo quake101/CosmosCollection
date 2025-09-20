@@ -26,6 +26,31 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
+    - name: Update version file
+      if: startsWith(github.ref, 'refs/tags/')
+      run: |
+        python -c "
+        import re
+        from datetime import datetime
+
+        # Extract version from tag
+        tag = '${{ github.ref }}'.replace('refs/tags/', '')
+
+        # Read current version.py
+        with open('version.py', 'r') as f:
+            content = f.read()
+
+        # Update version and build date
+        content = re.sub(r'__version__ = \"[^\"]*\"', f'__version__ = \"{tag}\"', content)
+        content = re.sub(r'__build_date__ = \"[^\"]*\"', f'__build_date__ = \"{datetime.now().strftime(\"%Y-%m-%d\")}\"', content)
+
+        # Write back
+        with open('version.py', 'w') as f:
+            f.write(content)
+
+        print(f'Updated version to {tag}')
+        "
+
     - name: Build with PyInstaller
       run: |
         pyinstaller CosmosCollection.spec
