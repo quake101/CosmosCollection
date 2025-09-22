@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
     QVBoxLayout, QWidget, QLabel, QDialog,
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
-    QToolBar, QMessageBox, QMenu
+    QToolBar, QMessageBox, QMenu, QScrollArea
 )
 from PySide6.QtGui import QAction
 from astroplan import Observer, FixedTarget
@@ -464,12 +464,19 @@ class AladinLiteWindow(QDialog):
         self.current_target = None  # Track current target to preserve user changes
 
         # Calculate default FOV based on object size (in degrees)
-        size_max = max(data['size_min'], data['size_max'])  # arcminutes
-        self.default_fov = max(size_max / 60.0 * 3.0, 0.5)  # Convert to degrees, 3x object size, min 0.5°
-        self.current_fov = self.default_fov
+        try:
+            size_min = data.get('size_min', 30) or 30  # Default to 30 arcminutes if None
+            size_max = data.get('size_max', 30) or 30  # Default to 30 arcminutes if None
+            size_max = max(size_min, size_max)  # arcminutes
+            self.default_fov = max(size_max / 60.0 * 3.0, 0.5)  # Convert to degrees, 3x object size, min 0.5°
+            self.current_fov = self.default_fov
 
-        logger.debug(f"Size values for {data['name']}: min={data['size_min']:.1f}', max={data['size_max']:.1f}'")
-        logger.debug(f"Calculated default FOV: {self.default_fov:.3f}°")
+            logger.debug(f"Size values for {data['name']}: min={size_min:.1f}', max={size_max:.1f}'")
+            logger.debug(f"Calculated default FOV: {self.default_fov:.3f}°")
+        except Exception as e:
+            logger.warning(f"Error calculating FOV for {data.get('name', 'Unknown')}: {e}")
+            self.default_fov = 1.0  # Safe fallback
+            self.current_fov = 1.0
 
         # Create main layout
         layout = QVBoxLayout()
@@ -585,31 +592,17 @@ class AladinLiteWindow(QDialog):
         
         layout.addLayout(telescope_layout)
 
-        # Add Aladin Lite viewer
-        self.web_view = QWebEngineView()
-        
-        # Enable developer tools for debugging
-        try:
-            from PySide6.QtWebEngineCore import QWebEngineSettings
-            # Try different attribute names depending on PySide6 version
-            try:
-                self.web_view.settings().setAttribute(QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled, True)
-            except AttributeError:
-                try:
-                    self.web_view.settings().setAttribute(QWebEngineSettings.DeveloperExtrasEnabled, True)
-                except AttributeError:
-                    # Alternative approach for older versions
-                    settings = self.web_view.settings()
-                    settings.setAttribute(settings.DeveloperExtrasEnabled, True)
-            
-            # Enable context menu for developer tools
-            self.web_view.setContextMenuPolicy(Qt.DefaultContextMenu)
-            logger.debug("Developer tools enabled for Aladin window")
-        except Exception as e:
-            logger.debug(f"Could not enable developer tools: {e}")
-            # Continue without developer tools
-        
-        layout.addWidget(self.web_view)
+        # Initialize web view as None initially - we'll create it safely later
+        self.web_view = None
+        self.web_view_error = None
+
+        # Create a placeholder widget for the web view
+        self.web_placeholder = QLabel("Loading Aladin Lite...")
+        self.web_placeholder.setAlignment(Qt.AlignCenter)
+        self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: white; font-size: 14px; }")
+        self.web_placeholder.setMinimumSize(400, 300)
+
+        layout.addWidget(self.web_placeholder)
 
         # Create a horizontal layout for the bottom controls
         bottom_layout = QHBoxLayout()
@@ -633,11 +626,142 @@ class AladinLiteWindow(QDialog):
         self.pending_fov_overlay = None
         self.target_coordinates = None
         
-        # Now that UI is fully initialized, update the Aladin view
-        self._update_aladin_view(preserve_target=False)  # Initial load, set target from data
+        # Defer web view creation to avoid initialization crashes
+        QTimer.singleShot(100, self._create_web_view_safely)
 
         logger.debug(f"Opened Aladin Lite window with default FOV: {self.default_fov:.2f}'")
-    
+
+    def _create_web_view_safely(self):
+        """Safely create the web view with error handling"""
+        try:
+            logger.debug("Creating web view safely...")
+
+            # Try to create the web view
+            try:
+                from PySide6.QtWebEngineWidgets import QWebEngineView
+                from PySide6.QtCore import QUrl
+            except ImportError as ie:
+                raise Exception(f"QWebEngineView not available: {ie}")
+
+            self.web_view = QWebEngineView()
+            self.web_view.setMinimumSize(400, 300)
+
+            # Enable developer tools for debugging (optional)
+            try:
+                from PySide6.QtWebEngineCore import QWebEngineSettings
+                # Try different attribute names depending on PySide6 version
+                try:
+                    self.web_view.settings().setAttribute(QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled, True)
+                except AttributeError:
+                    try:
+                        self.web_view.settings().setAttribute(QWebEngineSettings.DeveloperExtrasEnabled, True)
+                    except AttributeError:
+                        # Alternative approach for older versions
+                        settings = self.web_view.settings()
+                        settings.setAttribute(settings.DeveloperExtrasEnabled, True)
+
+                # Enable context menu for developer tools
+                self.web_view.setContextMenuPolicy(Qt.DefaultContextMenu)
+                logger.debug("Developer tools enabled for Aladin window")
+            except Exception as e:
+                logger.debug(f"Could not enable developer tools: {e}")
+                # Continue without developer tools
+
+            # Replace the placeholder with the actual web view
+            layout = self.layout()
+            if layout and self.web_placeholder:
+                # Find the placeholder in the layout and replace it
+                for i in range(layout.count()):
+                    item = layout.itemAt(i)
+                    if item and item.widget() == self.web_placeholder:
+                        # Remove placeholder
+                        layout.removeWidget(self.web_placeholder)
+                        self.web_placeholder.deleteLater()
+                        self.web_placeholder = None
+
+                        # Add web view in the same position
+                        layout.insertWidget(i, self.web_view)
+                        break
+
+            # Now that web view is created, load Aladin
+            self._update_aladin_view(preserve_target=False)
+            logger.debug("Web view created successfully")
+
+        except Exception as e:
+            logger.error(f"Failed to create web view safely: {e}")
+            self.web_view_error = str(e)
+
+            # Update placeholder to show error and offer browser fallback
+            if self.web_placeholder:
+                self.web_placeholder.setText(f"Failed to load Aladin Lite\nError: {str(e)}\n\nClick below to open in browser instead.")
+                self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: #ff6b6b; font-size: 12px; }")
+
+                # Add a button to open in browser as fallback
+                self._add_browser_fallback_button()
+
+    def _add_browser_fallback_button(self):
+        """Add a button to open Aladin Lite in the default browser"""
+        try:
+            # Find the main layout
+            main_layout = self.layout()
+            if main_layout:
+                # Create a fallback button
+                fallback_button = QPushButton("Open Aladin Lite in Browser")
+                fallback_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; margin: 10px; }")
+                fallback_button.clicked.connect(self._open_in_browser)
+
+                # Insert before the bottom controls
+                main_layout.insertWidget(main_layout.count() - 1, fallback_button)
+        except Exception as e:
+            logger.error(f"Failed to add browser fallback button: {e}")
+
+    def _open_in_browser(self):
+        """Open Aladin Lite in the default browser"""
+        try:
+            import webbrowser
+
+            # Build the same URL we would use in the web view
+            ra = self.data.get('ra_deg', 0)
+            dec = self.data.get('dec_deg', 0)
+            target_id = f"{ra} {dec}" if ra and dec else self.data.get('name', 'M1')
+
+            url_params = [
+                f"target={target_id}",
+                f"fov={self.default_fov}",
+                "survey=P%2FDSS2%2Fcolor",
+                "showReticle=true"
+            ]
+
+            base_url = "https://aladin.u-strasbg.fr/AladinLite/?"
+            browser_url = f"{base_url}{'&'.join(url_params)}"
+
+            logger.debug(f"Opening Aladin Lite in browser: {browser_url}")
+            webbrowser.open(browser_url)
+
+            # Show a message to the user
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Opened in Browser",
+                                  f"Aladin Lite has been opened in your default browser for {self.data.get('name', 'the selected object')}.")
+
+        except Exception as e:
+            logger.error(f"Failed to open Aladin Lite in browser: {e}")
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Error", f"Failed to open Aladin Lite in browser: {str(e)}")
+
+    def closeEvent(self, event):
+        """Handle window close event with proper cleanup"""
+        try:
+            logger.debug("Cleaning up Aladin Lite window")
+            # Stop any pending JavaScript operations
+            if hasattr(self, 'web_view') and self.web_view:
+                self.web_view.stop()
+                # Clear the web view content
+                self.web_view.setHtml("")
+            event.accept()
+        except Exception as e:
+            logger.warning(f"Error during Aladin window cleanup: {e}")
+            event.accept()  # Always accept to prevent hanging
+
     def _load_telescopes(self):
         """Load user telescopes from database"""
         try:
@@ -776,6 +900,10 @@ class AladinLiteWindow(QDialog):
         Args:
             preserve_target: If True, preserve current target when updating FOV overlays
         """
+        # Check if web view is available
+        if not self.web_view:
+            logger.debug("Web view not yet created, skipping Aladin update")
+            return
         # Determine FOV to use
         telescope_fov_data = None
         display_fov = self.default_fov
@@ -852,7 +980,18 @@ class AladinLiteWindow(QDialog):
         # Always use standard Aladin URL first
         image_url = f"{base_url}{'&'.join(url_params)}"
         logger.debug(f"Final Aladin URL: {image_url}")
-        self.web_view.setUrl(QUrl(image_url))
+
+        # Safely load the URL with error handling
+        try:
+            if hasattr(self, 'web_view') and self.web_view:
+                self.web_view.setUrl(QUrl(image_url))
+            else:
+                logger.error("Web view not available for URL loading")
+        except Exception as e:
+            logger.error(f"Error loading Aladin URL: {e}")
+            # Try loading a simple error page instead
+            if hasattr(self, 'web_view') and self.web_view:
+                self.web_view.setHtml("<html><body><h3>Error loading Aladin Lite</h3><p>Please check your internet connection.</p></body></html>")
         
         # Add telescope FOV overlay using JavaScript injection if enabled
         if telescope_fov_data and self.show_telescope_fov.isChecked():
@@ -984,7 +1123,7 @@ class AladinLiteWindow(QDialog):
     
     def _inject_fov_overlay(self, success):
         """Inject FOV overlay JavaScript after Aladin page loads"""
-        if not success or not self.pending_fov_overlay:
+        if not success or not self.pending_fov_overlay or not self.web_view:
             return
             
         try:
@@ -1423,7 +1562,7 @@ class ImageViewerWindow(QDialog):
         self.is_panning = False
 
         # Create main layout
-        layout = QVBoxLayout()
+        main_layout = QVBoxLayout()
 
         # Create toolbar for controls
         toolbar = QHBoxLayout()
@@ -1459,7 +1598,19 @@ class ImageViewerWindow(QDialog):
 
         toolbar.addStretch()
 
-        layout.addLayout(toolbar)
+        # Add file info toggle button (if file path is available)
+        if self.file_path:
+            self.info_toggle_button = QPushButton("Show File Info")
+            self.info_toggle_button.setFixedSize(100, 30)
+            self.info_toggle_button.setCheckable(True)
+            self.info_toggle_button.setChecked(False)
+            self.info_toggle_button.clicked.connect(self._toggle_file_info)
+            toolbar.addWidget(self.info_toggle_button)
+
+        main_layout.addLayout(toolbar)
+
+        # Create horizontal layout for image and file info panel
+        content_layout = QHBoxLayout()
 
         # Create a container widget for the image
         self.image_container = QWidget()
@@ -1475,19 +1626,104 @@ class ImageViewerWindow(QDialog):
 
         # Add image label to container
         self.image_container.layout().addWidget(self.image_label)
-        layout.addWidget(self.image_container)
+        content_layout.addWidget(self.image_container)
+
+        # Create file information panel as a right-side groupbox (hidden by default)
+        self.file_info_panel = QGroupBox("File Information")
+        self.file_info_panel.setVisible(False)
+        self.file_info_panel.setFixedWidth(350)
+
+        # Dark mode styling for the groupbox
+        self.file_info_panel.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 12pt;
+                color: #e0e0e0;
+                background-color: #2b2b2b;
+                border: 2px solid #555555;
+                border-radius: 8px;
+                margin: 5px;
+                padding-top: 15px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 8px 0 8px;
+                color: #ffffff;
+                background-color: #2b2b2b;
+            }
+        """)
+
+        # Create file info layout
+        file_info_layout = QVBoxLayout()
+        file_info_layout.setContentsMargins(15, 10, 15, 15)
+
+        # Create scrollable area for file info content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        # Dark mode styling for scroll area
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                background-color: #1e1e1e;
+                border: 1px solid #444444;
+                border-radius: 4px;
+            }
+            QScrollBar:vertical {
+                background-color: #2b2b2b;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #555555;
+                border-radius: 6px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #666666;
+            }
+        """)
+
+        self.file_info_content = QLabel()
+        # Dark mode styling for the content label
+        self.file_info_content.setStyleSheet("""
+            QLabel {
+                font-size: 10pt;
+                color: #d0d0d0;
+                font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                padding: 10px;
+                background-color: #1e1e1e;
+                border: none;
+            }
+        """)
+        self.file_info_content.setWordWrap(True)
+        self.file_info_content.setAlignment(Qt.AlignTop)
+
+        scroll_area.setWidget(self.file_info_content)
+        file_info_layout.addWidget(scroll_area)
+
+        self.file_info_panel.setLayout(file_info_layout)
+        content_layout.addWidget(self.file_info_panel)
+
+        # Set stretch ratios - image container gets most space, info panel gets fixed width
+        content_layout.setStretch(0, 1)  # image_container
+        content_layout.setStretch(1, 0)  # file_info_panel
+
+        main_layout.addLayout(content_layout)
 
         # Add status bar
         self.status_bar = QLabel()
         self.status_bar.setStyleSheet("font-size: 10pt;")
-        layout.addWidget(self.status_bar)
+        main_layout.addWidget(self.status_bar)
 
-        # Set stretch to ensure image container takes most space and status bar stays at bottom
-        layout.setStretch(0, 0)  # toolbar
-        layout.setStretch(1, 1)  # image_container
-        layout.setStretch(2, 0)  # status_bar
+        # Set stretch to ensure content takes most space and status bar stays at bottom
+        main_layout.setStretch(0, 0)  # toolbar
+        main_layout.setStretch(1, 1)  # content_layout
+        main_layout.setStretch(2, 0)  # status_bar
 
-        self.setLayout(layout)
+        self.setLayout(main_layout)
 
         # Calculate initial zoom to fit window
         self._fit_to_window()
@@ -1627,6 +1863,281 @@ class ImageViewerWindow(QDialog):
             if not success:
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.critical(self, "Error", "Failed to open file location")
+
+    def _toggle_file_info(self):
+        """Toggle the visibility of the file information panel"""
+        if hasattr(self, 'file_info_panel'):
+            is_visible = self.file_info_panel.isVisible()
+            self.file_info_panel.setVisible(not is_visible)
+
+            # Update button text
+            if hasattr(self, 'info_toggle_button'):
+                if not is_visible:
+                    self.info_toggle_button.setText("Hide File Info")
+                    # Load and display file information when showing
+                    self._load_file_information()
+                else:
+                    self.info_toggle_button.setText("Show File Info")
+
+    def _load_file_information(self):
+        """Load and display file information"""
+        if not self.file_path or not hasattr(self, 'file_info_content'):
+            return
+
+        try:
+            import os
+            from datetime import datetime
+            from pathlib import Path
+
+            # Get file stats
+            file_stats = os.stat(self.file_path)
+            file_path_obj = Path(self.file_path)
+
+            # Basic file information
+            file_name = file_path_obj.name
+            file_dir = str(file_path_obj.parent)
+            file_size_bytes = file_stats.st_size
+
+            # Format file size
+            if file_size_bytes < 1024:
+                file_size = f"{file_size_bytes} bytes"
+            elif file_size_bytes < 1024 * 1024:
+                file_size = f"{file_size_bytes / 1024:.1f} KB"
+            elif file_size_bytes < 1024 * 1024 * 1024:
+                file_size = f"{file_size_bytes / (1024 * 1024):.1f} MB"
+            else:
+                file_size = f"{file_size_bytes / (1024 * 1024 * 1024):.1f} GB"
+
+            # Dates
+            created_time = datetime.fromtimestamp(file_stats.st_ctime).strftime('%Y-%m-%d %H:%M:%S')
+            modified_time = datetime.fromtimestamp(file_stats.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+
+            # Image dimensions
+            if self.original_pixmap:
+                width = self.original_pixmap.width()
+                height = self.original_pixmap.height()
+                dimensions = f"{width} × {height} pixels"
+
+                # Calculate megapixels
+                megapixels = (width * height) / 1000000
+                if megapixels >= 1:
+                    megapixels_str = f"({megapixels:.1f} MP)"
+                else:
+                    megapixels_str = f"({megapixels * 1000:.0f}K pixels)"
+            else:
+                dimensions = "Unknown"
+                megapixels_str = ""
+
+            # Try to get EXIF data if available
+            exif_info = self._get_exif_info()
+
+            # Try to get FITS header information if available
+            fits_info = self._get_fits_info()
+
+            # Build information string
+            info_lines = [
+                f"Filename: {file_name}",
+                f"Location: {file_dir}",
+                f"File Size: {file_size}",
+                f"Dimensions: {dimensions} {megapixels_str}",
+                f"Created: {created_time}",
+                f"Modified: {modified_time}",
+            ]
+
+            # Add FITS information if available
+            if fits_info:
+                info_lines.append("")
+                info_lines.append("FITS Header Information:")
+                for key, value in fits_info.items():
+                    info_lines.append(f"  {key}: {value}")
+
+            # Add EXIF information if available
+            if exif_info:
+                info_lines.append("")
+                info_lines.append("EXIF Data:")
+                for key, value in exif_info.items():
+                    info_lines.append(f"  {key}: {value}")
+
+            # Display the information
+            self.file_info_content.setText("\n".join(info_lines))
+
+        except Exception as e:
+            self.file_info_content.setText(f"Error loading file information:\n{str(e)}")
+
+    def _get_exif_info(self):
+        """Extract basic EXIF information from the image file"""
+        try:
+            from PIL import Image
+            from PIL.ExifTags import TAGS
+
+            # Open image with PIL to read EXIF
+            with Image.open(self.file_path) as img:
+                exif_data = img.getexif()
+
+                if not exif_data:
+                    return None
+
+                # Extract useful EXIF information
+                exif_info = {}
+
+                # Common EXIF tags we want to show
+                useful_tags = {
+                    'Make': 'Camera Make',
+                    'Model': 'Camera Model',
+                    'DateTime': 'Date Taken',
+                    'ExposureTime': 'Exposure Time',
+                    'FNumber': 'F-Number',
+                    'ISO': 'ISO Speed',
+                    'FocalLength': 'Focal Length',
+                    'Flash': 'Flash',
+                    'WhiteBalance': 'White Balance',
+                    'ExposureProgram': 'Exposure Program',
+                    'MeteringMode': 'Metering Mode'
+                }
+
+                for tag_id, value in exif_data.items():
+                    tag_name = TAGS.get(tag_id, tag_id)
+                    if tag_name in useful_tags:
+                        # Format specific values
+                        if tag_name == 'ExposureTime' and isinstance(value, tuple):
+                            value = f"{value[0]}/{value[1]} sec"
+                        elif tag_name == 'FNumber' and isinstance(value, tuple):
+                            value = f"f/{value[0]/value[1]:.1f}"
+                        elif tag_name == 'FocalLength' and isinstance(value, tuple):
+                            value = f"{value[0]/value[1]:.1f}mm"
+
+                        exif_info[useful_tags[tag_name]] = str(value)
+
+                return exif_info if exif_info else None
+
+        except ImportError:
+            # PIL not available
+            return None
+        except Exception as e:
+            # Any other error reading EXIF
+            return None
+
+    def _get_fits_info(self):
+        """Extract FITS header information from the image file"""
+        try:
+            from astropy.io import fits
+            from pathlib import Path
+
+            # Check if file is a FITS file
+            file_ext = Path(self.file_path).suffix.lower()
+            if file_ext not in ['.fits', '.fit', '.fts']:
+                return None
+
+            # Open FITS file and read header
+            with fits.open(self.file_path) as hdul:
+                header = hdul[0].header
+
+                if not header:
+                    return None
+
+                # Extract useful FITS header information
+                fits_info = {}
+
+                # Common FITS keywords we want to show
+                useful_keywords = {
+                    'OBJECT': 'Object Name',
+                    'TELESCOP': 'Telescope',
+                    'INSTRUME': 'Instrument',
+                    'OBSERVER': 'Observer',
+                    'DATE-OBS': 'Observation Date',
+                    'EXPTIME': 'Exposure Time (s)',
+                    'FILTER': 'Filter',
+                    'FOCALLEN': 'Focal Length (mm)',
+                    'APTDIA': 'Aperture Diameter (mm)',
+                    'APTAREA': 'Aperture Area (mm²)',
+                    'FWHM': 'FWHM (arcsec)',
+                    'EQUINOX': 'Equinox',
+                    'RA': 'Right Ascension',
+                    'DEC': 'Declination',
+                    'OBJCTRA': 'Object RA',
+                    'OBJCTDEC': 'Object Dec',
+                    'AIRMASS': 'Airmass',
+                    'GAIN': 'Gain',
+                    'OFFSET': 'Offset',
+                    'TEMP': 'Temperature (°C)',
+                    'CCD-TEMP': 'CCD Temperature (°C)',
+                    'SET-TEMP': 'Set Temperature (°C)',
+                    'XBINNING': 'X Binning',
+                    'YBINNING': 'Y Binning',
+                    'IMAGETYP': 'Image Type',
+                    'FRAME': 'Frame Type',
+                    'SWCREATE': 'Software Created',
+                    'SWMODIFY': 'Software Modified'
+                }
+
+                for keyword, description in useful_keywords.items():
+                    if keyword in header:
+                        value = header[keyword]
+
+                        # Format specific values
+                        if keyword in ['DATE-OBS'] and isinstance(value, str):
+                            # Try to format the date nicely
+                            try:
+                                from datetime import datetime
+                                if 'T' in value:
+                                    dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                                    value = dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+                            except:
+                                pass
+                        elif keyword in ['EXPTIME'] and isinstance(value, (int, float)):
+                            if value >= 60:
+                                minutes = int(value // 60)
+                                seconds = value % 60
+                                if seconds == 0:
+                                    value = f"{value} s ({minutes}m)"
+                                else:
+                                    value = f"{value} s ({minutes}m {seconds:.1f}s)"
+                            else:
+                                value = f"{value} s"
+                        elif keyword in ['RA', 'OBJCTRA'] and isinstance(value, (int, float)):
+                            # Convert RA from degrees to hours:minutes:seconds
+                            ra_hours = value / 15.0
+                            hours = int(ra_hours)
+                            minutes = int((ra_hours - hours) * 60)
+                            seconds = ((ra_hours - hours) * 60 - minutes) * 60
+                            value = f"{value}° ({hours:02d}h {minutes:02d}m {seconds:05.2f}s)"
+                        elif keyword in ['DEC', 'OBJCTDEC'] and isinstance(value, (int, float)):
+                            # Format declination as degrees:arcminutes:arcseconds
+                            dec_deg = abs(value)
+                            sign = '+' if value >= 0 else '-'
+                            degrees = int(dec_deg)
+                            arcmin = int((dec_deg - degrees) * 60)
+                            arcsec = ((dec_deg - degrees) * 60 - arcmin) * 60
+                            value = f"{value}° ({sign}{degrees:02d}° {arcmin:02d}' {arcsec:05.2f}\")"
+                        elif keyword in ['TEMP', 'CCD-TEMP', 'SET-TEMP'] and isinstance(value, (int, float)):
+                            value = f"{value}°C"
+
+                        fits_info[description] = str(value)
+
+                # Add image dimensions from FITS if available
+                if 'NAXIS1' in header and 'NAXIS2' in header:
+                    width = header['NAXIS1']
+                    height = header['NAXIS2']
+                    if 'NAXIS3' in header:
+                        depth = header['NAXIS3']
+                        fits_info['Image Dimensions'] = f"{width} × {height} × {depth} pixels"
+                    else:
+                        fits_info['Image Dimensions'] = f"{width} × {height} pixels"
+
+                # Add pixel scale if available
+                if 'PIXSCALE' in header:
+                    fits_info['Pixel Scale'] = f"{header['PIXSCALE']} arcsec/pixel"
+                elif 'CDELT1' in header:
+                    fits_info['Pixel Scale'] = f"{abs(header['CDELT1']) * 3600:.2f} arcsec/pixel"
+
+                return fits_info if fits_info else None
+
+        except ImportError:
+            # Astropy not available
+            return None
+        except Exception as e:
+            # Any other error reading FITS
+            return None
 
 
 # --- Collage Selection Dialog ---
@@ -2881,10 +3392,17 @@ class ObjectDetailWindow(QDialog):
     def _open_aladin_lite(self, data):
         """Open Aladin Lite in a new window"""
         try:
-            aladin_window = AladinLiteWindow(data, self)
-            aladin_window.setModal(False)  # Make window non-modal
-            aladin_window.show()
-            logger.debug(f"Opened Aladin Lite window for {data['name']}")
+            # Store reference to prevent garbage collection and manage window lifecycle
+            if not hasattr(self, 'aladin_window') or not self.aladin_window.isVisible():
+                self.aladin_window = AladinLiteWindow(data, self)
+                self.aladin_window.setModal(False)  # Make window non-modal
+                self.aladin_window.show()
+                logger.debug(f"Opened Aladin Lite window for {data['name']}")
+            else:
+                # If window is already open, bring it to front and update data
+                self.aladin_window.raise_()
+                self.aladin_window.activateWindow()
+                logger.debug(f"Aladin Lite window already open, bringing to front")
         except Exception as e:
             logger.error(f"Error opening Aladin Lite: {str(e)}", exc_info=True)
             from PySide6.QtWidgets import QMessageBox
@@ -3462,21 +3980,44 @@ class ObjectDetailWindow(QDialog):
                     QMessageBox.critical(self, "Error", "Could not determine DSO ID for creating collage.")
                     return
             
+            # Get all user images from the database (not just for this DSO)
+            all_user_images = []
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT ui.id, ui.image_path, ui.integration_time, ui.equipment,
+                           ui.date_taken, ui.notes, c.designation as dso_name
+                    FROM userimages ui
+                    LEFT JOIN cataloguenr c ON ui.dsodetailid = c.dsodetailid
+                    ORDER BY ui.id DESC
+                """)
+                rows = cursor.fetchall()
+                for row in rows:
+                    all_user_images.append({
+                        'id': row[0],
+                        'image_path': row[1],
+                        'integration_time': row[2] or '',
+                        'equipment': row[3] or '',
+                        'date_taken': row[4] or '',
+                        'notes': row[5] or '',
+                        'dso_name': row[6] or 'Unknown DSO'
+                    })
+
             # Show collage selection dialog
             dialog = CollageSelectionDialog(dsodetailid, self)
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 action, collage_data = dialog.get_selection()
-                
+
                 if action == "new":
-                    # Create new collage
-                    self.collage_builder_window = CollageBuilderWindow(self.user_images, self.data['name'], dsodetailid, self)
+                    # Create new collage with all user images
+                    self.collage_builder_window = CollageBuilderWindow(all_user_images, self.data['name'], dsodetailid, self)
                     self.collage_builder_window.setModal(False)
                     self.collage_builder_window.show()
-                    logger.debug(f"Opened new CollageBuilder window for {self.data['name']} with {len(self.user_images)} images")
-                    
+                    logger.debug(f"Opened new CollageBuilder window for {self.data['name']} with {len(all_user_images)} images")
+
                 elif action == "existing" and collage_data:
                     # Load existing collage and add current images
-                    self.collage_builder_window = CollageBuilderWindow(self.user_images, self.data['name'], dsodetailid, self)
+                    self.collage_builder_window = CollageBuilderWindow(all_user_images, self.data['name'], dsodetailid, self)
                     
                     # Load the existing collage data
                     if self.collage_builder_window._load_collage_data(collage_data):
@@ -4695,10 +5236,17 @@ class MainWindow(QMainWindow):
                 'size_max': 41.7   # Using actual M33 dimensions
             }
 
-            aladin_window = AladinLiteWindow(default_data, self)
-            aladin_window.setModal(False)  # Make window non-modal
-            aladin_window.show()
-            logger.debug("Opened Aladin Lite window from toolbar")
+            # Store reference to prevent garbage collection and manage window lifecycle
+            if not hasattr(self, 'aladin_window') or not self.aladin_window.isVisible():
+                self.aladin_window = AladinLiteWindow(default_data, self)
+                self.aladin_window.setModal(False)  # Make window non-modal
+                self.aladin_window.show()
+                logger.debug("Opened Aladin Lite window from toolbar")
+            else:
+                # If window is already open, bring it to front
+                self.aladin_window.raise_()
+                self.aladin_window.activateWindow()
+                logger.debug("Aladin Lite window already open, bringing to front")
         except Exception as e:
             logger.error(f"Error opening Aladin Lite from toolbar: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to open Aladin Lite: {str(e)}")
@@ -5099,9 +5647,15 @@ class MainWindow(QMainWindow):
             }
 
             # Import and open Aladin Lite window
-            aladin_window = AladinLiteWindow(detail_data, self)
-            aladin_window.setModal(False)
-            aladin_window.show()
+            # Store reference to prevent garbage collection and manage window lifecycle
+            if not hasattr(self, 'aladin_window') or not self.aladin_window.isVisible():
+                self.aladin_window = AladinLiteWindow(detail_data, self)
+                self.aladin_window.setModal(False)
+                self.aladin_window.show()
+            else:
+                # If window is already open, bring it to front
+                self.aladin_window.raise_()
+                self.aladin_window.activateWindow()
 
         except Exception as e:
             logger.error(f"Error opening Aladin Lite: {str(e)}", exc_info=True)

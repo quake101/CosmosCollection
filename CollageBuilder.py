@@ -89,7 +89,42 @@ class CollageBuilder:
                     added_count += 1
                     
         return added_count
-    
+
+    def add_images_from_collage_data(self, collage_images_list) -> int:
+        """
+        Add images from the collage images data structure.
+
+        Args:
+            collage_images_list: List of image data dictionaries from CollageBuilder UI
+
+        Returns:
+            Number of images successfully added
+        """
+        added_count = 0
+
+        for image_data in collage_images_list:
+            image_path = image_data.get('image_path', '')
+            dso_name = image_data.get('dso_name', 'Unknown DSO')
+
+            # Use integration_time as part of DSO identifier if available
+            integration_time = image_data.get('integration_time', '')
+            equipment = image_data.get('equipment', '')
+
+            # Create a more descriptive name if we have additional info
+            if integration_time or equipment:
+                details = []
+                if equipment:
+                    details.append(equipment)
+                if integration_time:
+                    details.append(f"{integration_time}")
+                if details:
+                    dso_name = f"{dso_name} ({', '.join(details)})"
+
+            if self.add_image(image_path, dso_name):
+                added_count += 1
+
+        return added_count
+
     def remove_image(self, index: int) -> bool:
         """
         Remove an image from the collage by index.
@@ -116,7 +151,94 @@ class CollageBuilder:
         self.image_paths.clear()
         self.dso_names.clear()
         print("All images cleared from collage")
-    
+
+    def _group_images_by_path(self) -> dict:
+        """
+        Group DSO names by their image paths to identify shared images.
+
+        Returns:
+            Dictionary where keys are image paths and values are lists of DSO names
+        """
+        image_groups = {}
+        for i, image_path in enumerate(self.image_paths):
+            if i < len(self.dso_names):
+                dso_name = self.dso_names[i]
+                if image_path not in image_groups:
+                    image_groups[image_path] = []
+                image_groups[image_path].append(dso_name)
+        return image_groups
+
+    def _calculate_merged_layout(self) -> list:
+        """
+        Calculate layout with merged cells for shared images.
+
+        Returns:
+            List of dictionaries containing layout information for each cell.
+            Each dict contains: 'image_path', 'dso_names', 'start_col', 'start_row', 'span_cols', 'span_rows'
+        """
+        image_groups = self._group_images_by_path()
+        layout = []
+        processed_paths = set()
+
+        current_row = 0
+        current_col = 0
+
+        for i, image_path in enumerate(self.image_paths):
+            if image_path in processed_paths:
+                continue
+
+            dso_names = image_groups[image_path]
+            num_dsos = len(dso_names)
+
+            # Determine cell span based on number of DSOs sharing the image
+            if num_dsos == 1:
+                span_cols = 1
+                span_rows = 1
+            elif num_dsos == 2:
+                span_cols = 2
+                span_rows = 1
+            elif num_dsos <= 4:
+                span_cols = 2
+                span_rows = 2
+            elif num_dsos <= 6:
+                span_cols = 3
+                span_rows = 2
+            else:
+                span_cols = 3
+                span_rows = 3
+
+            # Check if the span fits in current row
+            if current_col + span_cols > self.grid_width:
+                current_row += 1
+                current_col = 0
+
+            # Check if we have enough vertical space
+            if current_row + span_rows > self.grid_height:
+                # If we can't fit, use smaller span
+                available_rows = self.grid_height - current_row
+                available_cols = self.grid_width - current_col
+                span_rows = min(span_rows, available_rows)
+                span_cols = min(span_cols, available_cols)
+
+            layout.append({
+                'image_path': image_path,
+                'dso_names': dso_names,
+                'start_col': current_col,
+                'start_row': current_row,
+                'span_cols': span_cols,
+                'span_rows': span_rows
+            })
+
+            processed_paths.add(image_path)
+
+            # Move to next position
+            current_col += span_cols
+            if current_col >= self.grid_width:
+                current_row += 1
+                current_col = 0
+
+        return layout
+
     def _resize_image_to_fit(self, image: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
         """
         Resize image to fit within target size while maintaining aspect ratio.
@@ -165,13 +287,11 @@ class CollageBuilder:
 
         # Try to load a font for labels
         try:
-            # Try to use a system font for better readability
             if os.name == 'nt':  # Windows
                 font = ImageFont.truetype("arial.ttf", 16)
             else:  # Linux/Mac
                 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
         except:
-            # Fallback to default font
             font = ImageFont.load_default()
 
         # Place images on canvas
@@ -238,15 +358,20 @@ class CollageBuilder:
                 max_y = y + self.cell_size[1] - text_height - 2
                 text_y = max(min_y, min(text_y, max_y))
 
-                # Choose text and outline colors for visibility
-                if self.label_position == "Center Overlay":
-                    # For overlay, use high contrast colors
-                    outline_color = "black"
-                    text_color = "white"
-                else:
-                    # For edge positions, use colors based on background
-                    outline_color = "black" if self.background_color.lower() in ["white", "#ffffff"] else "white"
-                    text_color = "white" if self.background_color.lower() in ["black", "#000000"] else "black"
+                # Draw semi-transparent background box for better text visibility
+                padding = 4
+                box_x1 = text_x - padding
+                box_y1 = text_y - padding
+                box_x2 = text_x + text_width + padding
+                box_y2 = text_y + text_height + padding
+
+                # Create semi-transparent background
+                box_overlay = Image.new('RGBA', (box_x2 - box_x1, box_y2 - box_y1), (0, 0, 0, 128))
+                canvas.paste(box_overlay, (box_x1, box_y1), box_overlay)
+
+                # Use white text with black outline for maximum visibility
+                text_color = "white"
+                outline_color = "black"
 
                 # Draw text with outline for better visibility
                 for dx in [-1, 0, 1]:
@@ -276,7 +401,195 @@ class CollageBuilder:
         except Exception as e:
             print(f"Error saving collage: {str(e)}")
             return False
-    
+
+    def create_merged_collage(self, output_path: str = "collage.jpg", quality: int = 95) -> bool:
+        """
+        Create a collage with merged cells for DSOs sharing the same image.
+
+        Args:
+            output_path: Path where the collage will be saved
+            quality: JPEG quality (1-100, only applies to JPEG format)
+
+        Returns:
+            True if collage was successfully created, False otherwise
+        """
+        if not self.images:
+            print("Error: No images added to the collage")
+            return False
+
+        # Calculate merged layout
+        layout = self._calculate_merged_layout()
+        if not layout:
+            print("Error: No valid layout calculated")
+            return False
+
+        # Calculate canvas size
+        canvas_width = (self.cell_size[0] * self.grid_width) + (self.spacing * (self.grid_width + 1))
+        canvas_height = (self.cell_size[1] * self.grid_height) + (self.spacing * (self.grid_height + 1))
+
+        # Create canvas
+        canvas = Image.new('RGB', (canvas_width, canvas_height), self.background_color)
+        draw = ImageDraw.Draw(canvas)
+
+        # Try to load fonts for labels (base and larger sizes)
+        try:
+            if os.name == 'nt':  # Windows
+                base_font = ImageFont.truetype("arial.ttf", 16)
+                large_font = ImageFont.truetype("arial.ttf", 20)
+            else:  # Linux/Mac
+                base_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+                large_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+        except:
+            base_font = ImageFont.load_default()
+            large_font = ImageFont.load_default()
+
+        # Place images on canvas with merged cells
+        for layout_item in layout:
+            image_path = layout_item['image_path']
+            dso_names = layout_item['dso_names']
+            start_col = layout_item['start_col']
+            start_row = layout_item['start_row']
+            span_cols = layout_item['span_cols']
+            span_rows = layout_item['span_rows']
+
+            # Load and process the image
+            try:
+                image = Image.open(image_path)
+
+                # Calculate merged cell size
+                merged_width = (self.cell_size[0] * span_cols) + (self.spacing * (span_cols - 1))
+                merged_height = (self.cell_size[1] * span_rows) + (self.spacing * (span_rows - 1))
+
+                # Resize image to fit the merged cell
+                image = self._resize_image_to_fit(image, (merged_width, merged_height))
+
+                # Calculate position on canvas
+                x = self.spacing + (start_col * (self.cell_size[0] + self.spacing))
+                y = self.spacing + (start_row * (self.cell_size[1] + self.spacing))
+
+                # Center image within merged cell
+                x_offset = (merged_width - image.width) // 2
+                y_offset = (merged_height - image.height) // 2
+
+                canvas.paste(image, (x + x_offset, y + y_offset))
+
+                # Add DSO name labels if enabled
+                if self.show_labels and dso_names:
+                    # Choose font size based on merged cell size
+                    total_cells = span_cols * span_rows
+                    if total_cells >= 4:  # Large merged cells get larger font
+                        font = large_font
+                    else:
+                        font = base_font
+                    # Create combined label for multiple DSOs
+                    if len(dso_names) == 1:
+                        label_text = dso_names[0]
+                    else:
+                        # For multiple DSOs, display all names for better visibility
+                        if len(dso_names) == 2:
+                            # For 2 DSOs, join with " & " for better readability
+                            label_text = " & ".join(dso_names)
+                        elif len(dso_names) <= 4:
+                            # For 3-4 DSOs, use multi-line format
+                            label_text = "\n".join(dso_names)
+                        else:
+                            # For 5+ DSOs, show first few and count
+                            first_names = dso_names[:3]
+                            remaining_count = len(dso_names) - 3
+                            label_text = "\n".join(first_names) + f"\n+ {remaining_count} more"
+
+                    # Get text bounding box for positioning calculations
+                    bbox = draw.textbbox((0, 0), label_text, font=font)
+                    text_width = bbox[2] - bbox[0]
+                    text_height = bbox[3] - bbox[1]
+
+                    # Calculate text position based on label_position setting
+                    # For merged cells with multiple DSOs, adjust positioning for better visibility
+                    cell_width = span_cols * self.cell_size[0] + (span_cols - 1) * self.spacing
+                    cell_height = span_rows * self.cell_size[1] + (span_rows - 1) * self.spacing
+
+                    if self.label_position == "Bottom Center":
+                        text_x = x + (cell_width // 2) - (text_width // 2)
+                        text_y = y + cell_height + 5
+                    elif self.label_position == "Top Center":
+                        text_x = x + (cell_width // 2) - (text_width // 2)
+                        text_y = y - text_height - 5
+                    elif self.label_position == "Bottom Left":
+                        text_x = x + 5
+                        text_y = y + cell_height + 5
+                    elif self.label_position == "Bottom Right":
+                        text_x = x + cell_width - text_width - 5
+                        text_y = y + cell_height + 5
+                    elif self.label_position == "Top Left":
+                        text_x = x + 5
+                        text_y = y - text_height - 5
+                    elif self.label_position == "Top Right":
+                        text_x = x + cell_width - text_width - 5
+                        text_y = y - text_height - 5
+                    elif self.label_position == "Center Overlay":
+                        text_x = x + (cell_width // 2) - (text_width // 2)
+                        text_y = y + (cell_height // 2) - (text_height // 2)
+                    else:
+                        # Default to bottom center
+                        text_x = x + (cell_width // 2) - (text_width // 2)
+                        text_y = y + cell_height + 5
+
+                    # Ensure text stays within merged cell bounds
+                    min_x = x + 2
+                    max_x = x + cell_width - text_width - 2
+                    text_x = max(min_x, min(text_x, max_x))
+
+                    min_y = y + 2
+                    max_y = y + cell_height - text_height - 2
+                    text_y = max(min_y, min(text_y, max_y))
+
+                    # Draw semi-transparent background box for better text visibility
+                    padding = 4
+                    box_x1 = text_x - padding
+                    box_y1 = text_y - padding
+                    box_x2 = text_x + text_width + padding
+                    box_y2 = text_y + text_height + padding
+
+                    # Create semi-transparent background
+                    box_overlay = Image.new('RGBA', (box_x2 - box_x1, box_y2 - box_y1), (0, 0, 0, 128))
+                    canvas.paste(box_overlay, (box_x1, box_y1), box_overlay)
+
+                    # Use white text with black outline for maximum visibility
+                    text_color = "white"
+                    outline_color = "black"
+
+                    # Add text outline for better visibility
+                    for dx in [-1, 0, 1]:
+                        for dy in [-1, 0, 1]:
+                            if dx != 0 or dy != 0:
+                                draw.text((text_x + dx, text_y + dy), label_text, font=font, fill=outline_color)
+
+                    # Draw main text
+                    draw.text((text_x, text_y), label_text, font=font, fill=text_color)
+
+            except Exception as e:
+                print(f"Error processing image {image_path}: {str(e)}")
+                continue
+
+        # Save collage with appropriate format
+        try:
+            file_ext = output_path.lower().split('.')[-1]
+
+            if file_ext in ['jpg', 'jpeg']:
+                canvas.save(output_path, 'JPEG', quality=quality)
+            elif file_ext == 'png':
+                canvas.save(output_path, 'PNG')
+            elif file_ext in ['tif', 'tiff']:
+                canvas.save(output_path, 'TIFF')
+            else:
+                canvas.save(output_path)
+
+            print(f"Merged collage saved to: {output_path}")
+            return True
+        except Exception as e:
+            print(f"Error saving merged collage: {str(e)}")
+            return False
+
     def preview_layout(self):
         """Print a preview of the current layout."""
         print(f"\nCollage Layout ({self.grid_width}x{self.grid_height}):")
@@ -292,28 +605,33 @@ class CollageBuilder:
                 print(f"  [{row},{col}] {os.path.basename(path)}")
         else:
             print("No images added yet")
-    
-    def resize_grid(self, new_width: int, new_height: int):
-        """
-        Resize the grid dimensions.
-        
-        Args:
-            new_width: New grid width
-            new_height: New grid height
-        """
-        self.grid_width = new_width
-        self.grid_height = new_height
-        
-        # Remove excess images if grid got smaller
-        max_images = new_width * new_height
-        if len(self.images) > max_images:
-            removed_count = len(self.images) - max_images
-            self.images = self.images[:max_images]
-            self.image_paths = self.image_paths[:max_images]
-            self.dso_names = self.dso_names[:max_images]
-            print(f"Grid resized to {new_width}x{new_height}. Removed {removed_count} excess images.")
-        else:
-            print(f"Grid resized to {new_width}x{new_height}")
+
+    def preview_merged_layout(self):
+        """Print a preview of the merged cell layout."""
+        print(f"\nMerged Collage Layout ({self.grid_width}x{self.grid_height}):")
+        print(f"Cell size: {self.cell_size[0]}x{self.cell_size[1]} pixels")
+        print(f"Spacing: {self.spacing} pixels")
+        print(f"Images added: {len(self.images)}")
+
+        if not self.images:
+            print("No images added yet")
+            return
+
+        # Show image groupings
+        image_groups = self._group_images_by_path()
+        print(f"\nImage groups: {len(image_groups)}")
+        for image_path, dso_names in image_groups.items():
+            print(f"  {os.path.basename(image_path)}: {len(dso_names)} DSO(s) - {', '.join(dso_names)}")
+
+        # Show calculated layout
+        layout = self._calculate_merged_layout()
+        print(f"\nMerged layout: {len(layout)} cells")
+        for i, layout_item in enumerate(layout):
+            print(f"  Cell {i+1}: {os.path.basename(layout_item['image_path'])}")
+            print(f"    Position: ({layout_item['start_col']}, {layout_item['start_row']})")
+            print(f"    Span: {layout_item['span_cols']}x{layout_item['span_rows']}")
+            print(f"    DSOs: {', '.join(layout_item['dso_names'])}")
+
 
 # Import required Qt classes
 try:
@@ -351,375 +669,6 @@ try:
 except ImportError as e:
     print(f"Warning: Could not import required Qt modules: {e}")
 
-# --- Visual Grid Layout Widget ---
-class CollageGridWidget(QWidget):
-    """Visual grid widget for arranging collage images with drag-and-drop"""
-
-    images_reordered = Signal(list)  # Signal emitted when images are reordered
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.grid_width = 3
-        self.grid_height = 3
-        self.grid_cells = []  # List to store grid cell widgets
-        self.collage_images = []  # List to store image data in grid order
-
-        self.setAcceptDrops(True)
-        self._setup_ui()
-
-    def _setup_ui(self):
-        """Set up the visual grid UI"""
-        self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(10, 10, 10, 10)
-
-        # Grid container
-        self.grid_widget = QWidget()
-        self.main_layout.addWidget(self.grid_widget)
-        self.main_layout.addStretch()
-
-        self._create_grid()
-
-    def set_grid_size(self, width, height):
-        """Update the grid size"""
-        if width != self.grid_width or height != self.grid_height:
-            self.grid_width = width
-            self.grid_height = height
-            # Preserve existing images when resizing (filter out None values)
-            old_images = [img for img in getattr(self, 'collage_images', []) if img is not None]
-            self._create_grid()
-            self.set_images(old_images)
-
-    def _create_grid(self):
-        """Create the visual grid layout"""
-        # Clear existing grid
-        if hasattr(self, 'grid_layout'):
-            self.grid_layout.setParent(None)
-
-        self.grid_layout = QGridLayout(self.grid_widget)
-        self.grid_layout.setSpacing(5)
-        self.grid_cells = []
-        self.collage_images = [None] * (self.grid_width * self.grid_height)
-
-        for row in range(self.grid_height):
-            for col in range(self.grid_width):
-                cell_index = row * self.grid_width + col
-                cell = GridCell(row, col, cell_index, self)
-                self.grid_cells.append(cell)
-                self.grid_layout.addWidget(cell, row, col)
-
-    def clear_grid(self):
-        """Clear all images from the grid"""
-        self.collage_images = [None] * (self.grid_width * self.grid_height)
-        for cell in self.grid_cells:
-            cell.clear_image()
-
-
-    def set_image_at_position(self, row, col, image_data, dso_name, filename):
-        """Set image at specific grid position"""
-        if 0 <= row < self.grid_height and 0 <= col < self.grid_width:
-            cell_index = row * self.grid_width + col
-            if cell_index < len(self.grid_cells):
-                self.collage_images[cell_index] = image_data
-                self.grid_cells[cell_index].set_image(image_data, dso_name, filename)
-
-    def get_selected_cells(self):
-        """Get list of selected cell positions as (row, col) tuples"""
-        selected = []
-        for cell in self.grid_cells:
-            if cell.is_selected():
-                selected.append((cell.row, cell.col))
-        return selected
-
-    def remove_image_at_position(self, row, col):
-        """Remove image at specific grid position"""
-        if 0 <= row < self.grid_height and 0 <= col < self.grid_width:
-            cell_index = row * self.grid_width + col
-            if cell_index < len(self.grid_cells):
-                self.collage_images[cell_index] = None
-                self.grid_cells[cell_index].clear_image()
-
-    def get_all_images_in_order(self):
-        """Get all images in grid order (left-to-right, top-to-bottom)"""
-        return [img for img in self.collage_images if img is not None]
-
-    def set_images(self, collage_images_list):
-        """Set images in the grid"""
-        # Clear current images
-        self.collage_images = [None] * (self.grid_width * self.grid_height)
-
-        # Place images in order
-        for i, image_data in enumerate(collage_images_list or []):
-            if i < len(self.collage_images):
-                self.collage_images[i] = image_data
-
-        self._update_grid_display()
-
-    def _update_grid_display(self):
-        """Update the visual display of all grid cells"""
-        for i, cell in enumerate(self.grid_cells):
-            image_data = self.collage_images[i] if i < len(self.collage_images) else None
-
-            if image_data:
-                # Get DSO name and filename for the image
-                image_path = image_data.get('image_path', '')
-                filename = os.path.basename(image_path) if image_path else 'Unknown'
-
-                # Get DSO name from parent window
-                parent_window = self.parent()
-                if hasattr(parent_window, '_get_dso_name_for_image'):
-                    dso_name = parent_window._get_dso_name_for_image(image_data)
-                else:
-                    # Try to get dso_name from the image data itself
-                    if 'dso_name' in image_data:
-                        dso_name = image_data['dso_name']
-                    else:
-                        dso_name = "Unknown DSO"
-
-                cell.set_image(image_data, dso_name, filename)
-            else:
-                cell.clear_image()
-
-    def get_images(self):
-        """Get the current images list (in grid order, excluding None)"""
-        return [img for img in self.collage_images if img is not None]
-
-    def drop_image_at_position(self, image_data, target_row, target_col):
-        """Drop an image at a specific grid position"""
-        target_index = target_row * self.grid_width + target_col
-        if target_index < len(self.collage_images):
-            self.collage_images[target_index] = image_data
-            self._update_grid_display()
-            self.images_reordered.emit(self.get_images())
-
-    def move_image(self, source_index, target_index):
-        """Move an image from one grid position to another"""
-        if (0 <= source_index < len(self.collage_images) and
-            0 <= target_index < len(self.collage_images)):
-
-            # Swap images
-            source_image = self.collage_images[source_index]
-            target_image = self.collage_images[target_index]
-
-            self.collage_images[source_index] = target_image
-            self.collage_images[target_index] = source_image
-
-            self._update_grid_display()
-            self.images_reordered.emit(self.get_images())
-
-    def remove_image_at_position(self, row, col):
-        """Remove image at specific grid position"""
-        index = row * self.grid_width + col
-        if index < len(self.collage_images):
-            self.collage_images[index] = None
-            self._update_grid_display()
-            self.images_reordered.emit(self.get_images())
-
-class GridCell(QWidget):
-    """Individual grid cell that can hold an image"""
-
-    def __init__(self, row, col, index, parent_grid):
-        super().__init__()
-        self.row = row
-        self.col = col
-        self.index = index
-        self.parent_grid = parent_grid
-        self.image_data = None
-
-        self.setAcceptDrops(True)
-        self.setMinimumSize(120, 120)
-        self.setMaximumSize(150, 150)
-        self._setup_ui()
-
-    def _setup_ui(self):
-        """Set up the grid cell UI"""
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(5, 5, 5, 5)
-        self.layout.setSpacing(2)
-
-        # Position label
-        self.position_label = QLabel(f"{self.row},{self.col}")
-        self.position_label.setAlignment(Qt.AlignCenter)
-        self.position_label.setStyleSheet("font-size: 10px; color: #666;")
-        self.layout.addWidget(self.position_label)
-
-        # Content area
-        self.content_widget = QWidget()
-        self.content_widget.setStyleSheet("""
-            QWidget {
-                border: 2px dashed #ccc;
-                border-radius: 5px;
-                background-color: #f9f9f9;
-            }
-        """)
-        self.content_layout = QVBoxLayout(self.content_widget)
-        self.content_layout.setContentsMargins(5, 5, 5, 5)
-
-        self.image_label = QLabel("Empty")
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setStyleSheet("border: none; color: #999; font-style: italic;")
-        self.image_label.setWordWrap(True)  # Enable word wrapping for long filenames
-        self.content_layout.addWidget(self.image_label)
-
-        self.layout.addWidget(self.content_widget)
-
-    def set_image(self, image_data, dso_name, filename):
-        """Set the image data for this cell"""
-        self.image_data = image_data
-
-        # Update display with DSO name and filename
-        display_text = f"{dso_name}\n{filename}"
-        self.image_label.setText(display_text)
-        self.image_label.setStyleSheet("border: none; color: #333; font-size: 9px;")
-
-        # Change cell appearance to show it has content
-        self.content_widget.setStyleSheet("""
-            QWidget {
-                border: 2px solid #4CAF50;
-                border-radius: 5px;
-                background-color: #e8f5e8;
-            }
-        """)
-
-    def clear_image(self):
-        """Clear the image from this cell"""
-        self.image_data = None
-        self.image_label.setText("Empty")
-        self.image_label.setStyleSheet("border: none; color: #999; font-style: italic;")
-
-        # Reset cell appearance
-        self.content_widget.setStyleSheet("""
-            QWidget {
-                border: 2px dashed #ccc;
-                border-radius: 5px;
-                background-color: #f9f9f9;
-            }
-        """)
-
-    def is_selected(self):
-        """Check if this cell is selected (placeholder implementation)"""
-        # For now, return False - we could add selection visual state later
-        return False
-
-    def mousePressEvent(self, event):
-        """Handle mouse press for drag operations"""
-        if event.button() == Qt.LeftButton and self.image_data:
-            # Start drag operation
-            drag = QDrag(self)
-            mimeData = QMimeData()
-
-            # Store cell position data
-            mimeData.setText(f"{self.row},{self.col}")
-            drag.setMimeData(mimeData)
-
-            # Execute drag
-            result = drag.exec_(Qt.MoveAction)
-
-        super().mousePressEvent(event)
-
-    def mouseDoubleClickEvent(self, event):
-        """Handle double-click to remove image"""
-        if self.image_data:
-            self.clear_image()
-            # Update parent grid
-            self.parent_grid.collage_images[self.index] = None
-            # Emit reordered signal
-            reordered = self.parent_grid.get_all_images_in_order()
-            self.parent_grid.images_reordered.emit(reordered)
-
-        super().mouseDoubleClickEvent(event)
-
-    def dragEnterEvent(self, event):
-        """Handle drag enter"""
-        if event.mimeData().hasText():
-            event.acceptProposedAction()
-            # Visual feedback for drop zone
-            self.content_widget.setStyleSheet("""
-                QWidget {
-                    border: 3px solid #2196F3;
-                    border-radius: 5px;
-                    background-color: #e3f2fd;
-                }
-            """)
-
-    def dragLeaveEvent(self, event):
-        """Handle drag leave"""
-        # Restore original appearance
-        if self.image_data:
-            self.content_widget.setStyleSheet("""
-                QWidget {
-                    border: 2px solid #4CAF50;
-                    border-radius: 5px;
-                    background-color: #e8f5e8;
-                }
-            """)
-        else:
-            self.content_widget.setStyleSheet("""
-                QWidget {
-                    border: 2px dashed #ccc;
-                    border-radius: 5px;
-                    background-color: #f9f9f9;
-                }
-            """)
-
-    def dropEvent(self, event):
-        """Handle drop event"""
-        if event.mimeData().hasText():
-            # Parse source position
-            source_pos = event.mimeData().text().split(',')
-            if len(source_pos) == 2:
-                source_row, source_col = int(source_pos[0]), int(source_pos[1])
-
-                # Get source cell
-                source_index = source_row * self.parent_grid.grid_width + source_col
-                if source_index < len(self.parent_grid.grid_cells):
-                    source_cell = self.parent_grid.grid_cells[source_index]
-
-                    # Swap images
-                    temp_data = self.image_data
-                    temp_label_text = self.image_label.text()
-
-                    # Move source to this cell
-                    if source_cell.image_data:
-                        self.image_data = source_cell.image_data
-                        self.image_label.setText(source_cell.image_label.text())
-                        self.image_label.setStyleSheet("border: none; color: #333; font-size: 9px;")
-                        self.content_widget.setStyleSheet("""
-                            QWidget {
-                                border: 2px solid #4CAF50;
-                                border-radius: 5px;
-                                background-color: #e8f5e8;
-                            }
-                        """)
-                    else:
-                        self.clear_image()
-
-                    # Move this cell's data to source
-                    if temp_data:
-                        source_cell.image_data = temp_data
-                        source_cell.image_label.setText(temp_label_text)
-                        source_cell.image_label.setStyleSheet("border: none; color: #333; font-size: 9px;")
-                        source_cell.content_widget.setStyleSheet("""
-                            QWidget {
-                                border: 2px solid #4CAF50;
-                                border-radius: 5px;
-                                background-color: #e8f5e8;
-                            }
-                        """)
-                    else:
-                        source_cell.clear_image()
-
-                    # Update grid data
-                    self.parent_grid.collage_images[self.index] = self.image_data
-                    self.parent_grid.collage_images[source_index] = source_cell.image_data
-
-                    # Emit reordered signal
-                    reordered = self.parent_grid.get_all_images_in_order()
-                    self.parent_grid.images_reordered.emit(reordered)
-
-            event.acceptProposedAction()
-        else:
-            # Restore original appearance if drop failed
-            self.dragLeaveEvent(event)
 
 # --- Thumbnail Worker Thread ---
 class ThumbnailWorker(QThread):
@@ -1138,11 +1087,12 @@ class CollageGenerationWorker(QThread):
     progress_updated = Signal(int, str)  # progress percentage, status message
     finished = Signal(bool, str, str)   # success, output_path, error_message
 
-    def __init__(self, collage_images, project_settings, output_path):
+    def __init__(self, collage_images, project_settings, output_path, use_merged_cells=False):
         super().__init__()
         self.collage_images = collage_images
         self.project_settings = project_settings
         self.output_path = output_path
+        self.use_merged_cells = use_merged_cells
         self.cancelled = False
 
     def cancel(self):
@@ -1174,29 +1124,17 @@ class CollageGenerationWorker(QThread):
             max_images = self.project_settings['grid_width'] * self.project_settings['grid_height']
             images_to_process = min(total_images, max_images)
 
-            added_count = 0
-            for i, image_data in enumerate(self.collage_images):
+            # Use the new method to add images from collage data
+            self.progress_updated.emit(20, "Processing collage images...")
+            added_count = collage_builder.add_images_from_collage_data(self.collage_images[:max_images])
+
+            # Update progress for the processing phase
+            for i in range(min(len(self.collage_images), max_images)):
                 if self.cancelled:
                     return
-
-                if i >= max_images:
-                    break  # Don't exceed grid capacity
-
-                image_path = image_data.get('image_path', '')
-                filename = os.path.basename(image_path) if image_path else 'Unknown'
-
-                # Get DSO name from image data (if available)
-                dso_name = image_data.get('dso_name', 'Unknown DSO')
-
-                # Update progress
-                progress = int((i / images_to_process) * 80)  # Use 80% for image loading
-                self.progress_updated.emit(progress, f"Loading image: {filename}")
-
-                if image_path and os.path.exists(image_path):
-                    if collage_builder.add_image(image_path, dso_name):
-                        added_count += 1
-                else:
-                    logger.warning(f"Image not found: {image_path}")
+                progress = 20 + int((i * 60) / min(len(self.collage_images), max_images))
+                filename = os.path.basename(self.collage_images[i].get('image_path', '')) if i < len(self.collage_images) else 'Unknown'
+                self.progress_updated.emit(progress, f"Processing image {i+1}: {filename}")
 
             if self.cancelled:
                 return
@@ -1213,7 +1151,10 @@ class CollageGenerationWorker(QThread):
 
             # Create the collage
             self.progress_updated.emit(90, "Saving collage file...")
-            success = collage_builder.create_collage(self.output_path, quality=95)
+            if self.use_merged_cells:
+                success = collage_builder.create_merged_collage(self.output_path, quality=95)
+            else:
+                success = collage_builder.create_collage(self.output_path, quality=95)
 
             if self.cancelled:
                 return
@@ -1250,14 +1191,13 @@ class ImageSelectionDialog(QDialog):
         self.available_images = unique_images
         self.selected_images = []
 
-        # Debug output
-        if len(available_images) != len(unique_images):
-            logger.debug(f"ImageSelectionDialog: Removed {len(available_images) - len(unique_images)} duplicate images")
 
-        # Debug: Log some image data to see what we have
-        if self.available_images:
-            logger.debug(f"ImageSelectionDialog: First image data keys: {list(self.available_images[0].keys())}")
-            logger.debug(f"ImageSelectionDialog: First image ID: {self.available_images[0].get('id')}")
+        # Also log the first few images to console for easier debugging
+        logger.info(f"ImageSelectionDialog showing {len(unique_images)} images:")
+        for i, img in enumerate(self.available_images[:10]):  # Show first 10
+            dso_name = img.get('dso_name', 'Unknown')
+            filename = os.path.basename(img.get('image_path', '')) or 'No file'
+            logger.info(f"  {i+1}. {dso_name} - {filename}")
 
         self.setWindowTitle("Select Images")
         self.setModal(True)
@@ -1603,6 +1543,13 @@ class CollageBuilderWindow(QDialog):
         if not self.collage_projects:
             self._create_new_project("Default Collage")
 
+    def show(self):
+        """Override show to refresh data when window becomes visible"""
+        # Refresh data to ensure we have the latest image paths and project data
+        if hasattr(self, 'collage_projects') and self.collage_projects:
+            self.refresh_data()
+        super().show()
+
     def _setup_ui(self):
         """Set up the user interface"""
         from PySide6.QtWidgets import (QSplitter, QListWidget, QSpinBox,
@@ -1627,11 +1574,18 @@ class CollageBuilderWindow(QDialog):
 
         toolbar.addStretch()
 
+        # Merge cells checkbox
+        self.merge_cells_checkbox = QCheckBox("Merge cells for shared images")
+        self.merge_cells_checkbox.setToolTip("When checked, DSO objects that share the same image will be merged into larger cells")
+        self.merge_cells_checkbox.setStyleSheet("QCheckBox { color: #ffffff; }")
+        toolbar.addWidget(self.merge_cells_checkbox)
+
         generate_collage_btn = QPushButton("Generate Collage")
         generate_collage_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; }")
         generate_collage_btn.clicked.connect(self._generate_collage)
         generate_collage_btn.setToolTip("Create and save the collage image file")
         toolbar.addWidget(generate_collage_btn)
+
 
         main_layout.addLayout(toolbar)
 
@@ -2080,6 +2034,26 @@ class CollageBuilderWindow(QDialog):
             logger.error(f"Error getting DSO name for image: {str(e)}")
             return "Unknown DSO"
 
+    def refresh_data(self):
+        """Refresh the user images and reload projects - call this when data might have changed"""
+        logger.debug("Refreshing CollageBuilder data...")
+
+        # Clear existing projects to force reload
+        self.collage_projects.clear()
+        self.project_list.clear()
+
+        # Reload projects from database
+        self._load_saved_projects()
+
+        # If we had a current project selected, try to reselect it
+        if hasattr(self, '_last_selected_project') and self._last_selected_project:
+            for i in range(self.project_list.count()):
+                if self.project_list.item(i).text() == self._last_selected_project:
+                    self.project_list.setCurrentRow(i)
+                    break
+
+        logger.debug("CollageBuilder data refresh complete")
+
     def _load_saved_projects(self):
         """Load all saved collage projects from the database for this DSO"""
         if not DatabaseManager:
@@ -2140,7 +2114,18 @@ class CollageBuilderWindow(QDialog):
                     # Load images for this collage
                     cursor.execute("""
                         SELECT ui.id, ui.image_path, ui.integration_time, ui.equipment,
-                               ui.date_taken, ui.notes, uci.position_index
+                               ui.date_taken, ui.notes, uci.position_index,
+                               (SELECT c2.designation FROM cataloguenr c2
+                                WHERE c2.dsodetailid = ui.dsodetailid
+                                ORDER BY
+                                    CASE c2.catalogue
+                                        WHEN 'M' THEN 1
+                                        WHEN 'NGC' THEN 2
+                                        WHEN 'IC' THEN 3
+                                        ELSE 4
+                                    END,
+                                    c2.designation
+                                LIMIT 1) as dso_designation
                         FROM usercollageimages uci
                         JOIN userimages ui ON uci.userimage_id = ui.id
                         WHERE uci.collage_id = ?
@@ -2153,16 +2138,30 @@ class CollageBuilderWindow(QDialog):
 
                     for img_row in image_data:
                         (img_id, img_path, integration_time, equipment,
-                         date_taken, notes, position_index) = img_row
+                         date_taken, notes, position_index, dso_designation) = img_row
 
-                        collage_images.append({
+                        # Check if image file exists and log status
+                        file_exists = img_path and os.path.exists(img_path)
+                        if not file_exists:
+                            logger.warning(f"Missing image file for ID {img_id}: {img_path}")
+                        else:
+                            logger.debug(f"Found image file for ID {img_id}: {os.path.basename(img_path)}")
+
+                        image_data_dict = {
                             'id': img_id,
                             'image_path': img_path,
                             'integration_time': integration_time,
                             'equipment': equipment,
                             'date_taken': date_taken,
-                            'notes': notes
-                        })
+                            'notes': notes,
+                            'dso_name': dso_designation or 'Unknown DSO'
+                        }
+
+                        # Add flag for missing files to help with debugging
+                        if not file_exists:
+                            image_data_dict['missing_file'] = True
+
+                        collage_images.append(image_data_dict)
 
                     # Create project data
                     project_data = {
@@ -2330,6 +2329,7 @@ class CollageBuilderWindow(QDialog):
 
         project_name = current.text()
         self.current_project = project_name
+        self._last_selected_project = project_name  # Remember selection for refresh
         project = self.collage_projects[project_name]
 
         # Update UI with project settings
@@ -2401,12 +2401,11 @@ class CollageBuilderWindow(QDialog):
         project['show_labels'] = self.show_labels_checkbox.isChecked()
         project['label_position'] = self.label_position_combo.currentText()
 
-        # Update grid widget if grid size changed
+        # Update images layout if grid size changed
         new_width = project['grid_width']
         new_height = project['grid_height']
         if old_width != new_width or old_height != new_height:
-            self.grid_widget.set_grid_size(new_width, new_height)
-            # Repopulate to adjust image positions
+            # Repopulate to adjust image positions for the new grid size
             self._populate_collage_images()
 
     def _choose_background_color(self):
@@ -2430,19 +2429,94 @@ class CollageBuilderWindow(QDialog):
             QMessageBox.warning(self, "No Project", "Please select a project first.")
             return
 
-        # Get current collage images to filter them out
+        # Get current collage images to filter them out (by DSO Detail ID, not image path)
         project = self.collage_projects[self.current_project]
-        current_image_paths = set(img.get('image_path') for img in project.get('collage_images', []))
+        current_dso_detail_ids = set()
 
-        # Filter available images (exclude those already in collage)
+        # Get DSO Detail IDs of images already in collage
+        for img in project.get('collage_images', []):
+            img_id = img.get('id')
+            if img_id:
+                try:
+                    with DatabaseManager().get_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT dsodetailid FROM userimages WHERE id = ?", (img_id,))
+                        result = cursor.fetchone()
+                        if result and result[0]:
+                            current_dso_detail_ids.add(result[0])
+                except Exception as e:
+                    logger.error(f"Error getting DSO Detail ID for image {img_id}: {e}")
+
+        # Get fresh image data from database instead of using cached self.user_images
+        fresh_user_images = []
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Get the full data
+                cursor.execute("""
+                    SELECT ui.id, ui.image_path, ui.integration_time, ui.equipment,
+                           ui.date_taken, ui.notes,
+                           (SELECT
+                                CASE
+                                    WHEN c2.catalogue = 'M' THEN 'M ' || c2.designation
+                                    WHEN c2.catalogue = 'NGC' THEN 'NGC ' || c2.designation
+                                    WHEN c2.catalogue = 'IC' THEN 'IC ' || c2.designation
+                                    WHEN c2.catalogue = 'Sh2' THEN 'Sh2-' || c2.designation
+                                    ELSE c2.catalogue || ' ' || c2.designation
+                                END
+                            FROM cataloguenr c2
+                            WHERE c2.dsodetailid = ui.dsodetailid
+                            ORDER BY
+                                CASE c2.catalogue
+                                    WHEN 'M' THEN 1
+                                    WHEN 'NGC' THEN 2
+                                    WHEN 'IC' THEN 3
+                                    WHEN 'Sh2' THEN 4
+                                    ELSE 5
+                                END,
+                                CAST(c2.designation AS INTEGER)
+                            LIMIT 1) as dso_designation
+                    FROM userimages ui
+                    ORDER BY ui.id DESC
+                """)
+                rows = cursor.fetchall()
+
+                for row in rows:
+                    # Get DSO Detail ID for this image
+                    img_id = row[0]
+                    cursor.execute("SELECT dsodetailid FROM userimages WHERE id = ?", (img_id,))
+                    dso_result = cursor.fetchone()
+                    dso_detail_id = dso_result[0] if dso_result else None
+
+                    fresh_user_images.append({
+                        'id': row[0],
+                        'image_path': row[1],
+                        'integration_time': row[2] or '',
+                        'equipment': row[3] or '',
+                        'date_taken': row[4] or '',
+                        'notes': row[5] or '',
+                        'dso_name': row[6] or 'Unknown DSO',
+                        'dso_detail_id': dso_detail_id
+                    })
+        except Exception as e:
+            logger.error(f"Error fetching fresh image data: {str(e)}")
+            QMessageBox.critical(self, "Database Error", f"Failed to load current images: {str(e)}")
+            return
+
+        # Filter available images (exclude DSOs already in collage, but allow same image file)
         available_images = []
-        for image_data in self.user_images:
-            image_path = image_data.get('image_path')
-            if image_path and image_path not in current_image_paths:
+        for image_data in fresh_user_images:
+            dso_detail_id = image_data.get('dso_detail_id')
+            if dso_detail_id not in current_dso_detail_ids:
                 available_images.append(image_data)
 
         if not available_images:
-            QMessageBox.information(self, "No Images", "No additional images available to add.")
+            QMessageBox.information(self, "No Images",
+                f"No additional DSOs available to add.\n\n"
+                f"Total images in database: {len(fresh_user_images)}\n"
+                f"DSOs already in collage: {len(current_dso_detail_ids)}\n"
+                f"DSOs available to add: {len(available_images)}")
             return
 
         # Create selection dialog
@@ -2540,9 +2614,10 @@ class CollageBuilderWindow(QDialog):
             return  # User cancelled
 
         # Start the threaded generation process
-        self._start_generation_thread(collage_images, project, output_path)
+        use_merged_cells = self.merge_cells_checkbox.isChecked()
+        self._start_generation_thread(collage_images, project, output_path, use_merged_cells)
 
-    def _start_generation_thread(self, collage_images, project_settings, output_path):
+    def _start_generation_thread(self, collage_images, project_settings, output_path, use_merged_cells=False):
         """Start the collage generation in a background thread with progress dialog"""
 
         # Create and configure progress dialog
@@ -2554,7 +2629,7 @@ class CollageBuilderWindow(QDialog):
         self.progress_dialog.setAutoReset(False)
 
         # Create worker thread
-        self.worker_thread = CollageGenerationWorker(collage_images, project_settings, output_path)
+        self.worker_thread = CollageGenerationWorker(collage_images, project_settings, output_path, use_merged_cells)
 
         # Connect signals
         self.worker_thread.progress_updated.connect(self._on_progress_updated)
@@ -2886,6 +2961,12 @@ class CollageBuilderWindow(QDialog):
         except Exception as e:
             logger.error(f"Error saving project: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to save project: {str(e)}")
+
+
+
+
+
+
 
     def _load_saved_project(self):
         """Load a saved collage project from database"""
