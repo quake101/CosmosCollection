@@ -450,11 +450,10 @@ class CustomDSOVisibilityWindow(QDialog):
 
 
 # --- Aladin Lite Viewer Window ---
-class AladinLiteWindow(QDialog):
+class AladinLiteWindow(QMainWindow):
     def __init__(self, data: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"{data['name']} - Aladin Lite - Cosmos Collection")
-        self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMaximizeButtonHint)
         self.resize(1200, 800)
         
         self.data = data
@@ -620,7 +619,10 @@ class AladinLiteWindow(QDialog):
         # Add the bottom layout to the main layout
         layout.addLayout(bottom_layout)
 
-        self.setLayout(layout)
+        # Create central widget and set layout for QMainWindow
+        central_widget = QWidget()
+        central_widget.setLayout(layout)
+        self.setCentralWidget(central_widget)
         
         # Initialize overlay data storage
         self.pending_fov_overlay = None
@@ -1725,11 +1727,25 @@ class ImageViewerWindow(QDialog):
 
         self.setLayout(main_layout)
 
-        # Calculate initial zoom to fit window
-        self._fit_to_window()
+        # Flag to track if initial fit has been done
+        self.initial_fit_done = False
 
         # Update status
         self._update_status()
+
+    def showEvent(self, event):
+        """Handle window show event - fit image to window on first show"""
+        super().showEvent(event)
+        if not self.initial_fit_done:
+            # Defer the initial fit to ensure the window is properly sized
+            QTimer.singleShot(50, self._do_initial_fit)
+
+    def _do_initial_fit(self):
+        """Perform initial fit to window and set up initial zoom factor"""
+        if not self.initial_fit_done:
+            self._fit_to_window()
+            self.initial_zoom_factor = self.zoom_factor
+            self.initial_fit_done = True
 
     def eventFilter(self, obj, event):
         """Handle mouse events for zooming and panning"""
@@ -1829,10 +1845,34 @@ class ImageViewerWindow(QDialog):
     def resizeEvent(self, event):
         """Handle window resize event"""
         super().resizeEvent(event)
-        # Only update the zoom if we're at the initial zoom level
-        if self.zoom_factor == self.initial_zoom_factor:
+
+        if not self.initial_fit_done:
+            # If initial fit hasn't been done yet, just update the display
+            self._update_zoom()
+            return
+
+        # Store the current relative position of the image center before resize
+        old_size = event.oldSize() if event.oldSize().isValid() else self.size()
+        new_size = event.size()
+
+        # Only auto-fit if we're at the initial zoom level (user hasn't manually zoomed)
+        if abs(self.zoom_factor - self.initial_zoom_factor) < 0.001:
+            # User is at initial zoom - maintain fit to window behavior
             self._fit_to_window()
-        self._update_zoom()
+            self.initial_zoom_factor = self.zoom_factor
+        else:
+            # User has manually zoomed - preserve zoom level and try to maintain image position
+            if old_size.isValid() and old_size.width() > 0 and old_size.height() > 0:
+                # Calculate the ratio of size change
+                width_ratio = new_size.width() / old_size.width()
+                height_ratio = new_size.height() / old_size.height()
+
+                # Adjust image position proportionally to maintain relative position
+                self.image_position[0] = int(self.image_position[0] * width_ratio)
+                self.image_position[1] = int(self.image_position[1] * height_ratio)
+
+            # Update the display with preserved zoom and adjusted position
+            self._update_zoom()
 
     def _zoom_in(self):
         """Zoom in on the image"""
@@ -2802,10 +2842,32 @@ class ObjectDetailWindow(QDialog):
     def resizeEvent(self, event):
         """Handle window resize event"""
         super().resizeEvent(event)
-        # Only update the zoom if we're at the initial zoom level
-        if self.zoom_factor == self.initial_zoom_factor:
+
+        # If no image is loaded, just return
+        if self.original_pixmap is None:
+            return
+
+        # Store the current relative position of the image center before resize
+        old_size = event.oldSize() if event.oldSize().isValid() else self.size()
+        new_size = event.size()
+
+        # Only auto-fit if we're at the initial zoom level (user hasn't manually zoomed)
+        if abs(self.zoom_factor - self.initial_zoom_factor) < 0.001:
+            # User is at initial zoom - maintain fit to window behavior
             self._fit_to_window()
-        self._update_zoom()
+        else:
+            # User has manually zoomed - preserve zoom level and try to maintain image position
+            if old_size.isValid() and old_size.width() > 0 and old_size.height() > 0:
+                # Calculate the ratio of size change
+                width_ratio = new_size.width() / old_size.width()
+                height_ratio = new_size.height() / old_size.height()
+
+                # Adjust image position proportionally to maintain relative position
+                self.image_position[0] = int(self.image_position[0] * width_ratio)
+                self.image_position[1] = int(self.image_position[1] * height_ratio)
+
+            # Update the display with preserved zoom and adjusted position
+            self._update_zoom()
 
     def _load_telescopes(self):
         """Load user telescopes into the telescope dropdown"""
@@ -3395,7 +3457,6 @@ class ObjectDetailWindow(QDialog):
             # Store reference to prevent garbage collection and manage window lifecycle
             if not hasattr(self, 'aladin_window') or not self.aladin_window.isVisible():
                 self.aladin_window = AladinLiteWindow(data, self)
-                self.aladin_window.setModal(False)  # Make window non-modal
                 self.aladin_window.show()
                 logger.debug(f"Opened Aladin Lite window for {data['name']}")
             else:

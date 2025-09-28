@@ -14,8 +14,8 @@ from datetime import datetime, timedelta
 logger = logging.getLogger(__name__)
 
 # Local fallback version - update this manually or via build process
-__version__ = "1.0.7"
-__build_date__ = "2025-09-20"
+__version__ = "1.0.10"
+__build_date__ = "2025-09-22"
 
 class VersionManager:
     """Manages version information for the application"""
