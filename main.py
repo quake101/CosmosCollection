@@ -627,7 +627,13 @@ class AladinLiteWindow(QMainWindow):
         # Initialize overlay data storage
         self.pending_fov_overlay = None
         self.target_coordinates = None
+        self.fallback_button = None  # Track fallback button to avoid duplicates
         
+        # Add loading timeout
+        self.loading_timeout = QTimer()
+        self.loading_timeout.timeout.connect(self._handle_loading_timeout)
+        self.loading_timeout.setSingleShot(True)
+
         # Defer web view creation to avoid initialization crashes
         QTimer.singleShot(100, self._create_web_view_safely)
 
@@ -647,6 +653,11 @@ class AladinLiteWindow(QMainWindow):
 
             self.web_view = QWebEngineView()
             self.web_view.setMinimumSize(400, 300)
+
+            # Add load progress and error handling
+            self.web_view.loadStarted.connect(self._on_load_started)
+            self.web_view.loadProgress.connect(self._on_load_progress)
+            self.web_view.loadFinished.connect(self._on_load_finished)
 
             # Enable developer tools for debugging (optional)
             try:
@@ -670,19 +681,23 @@ class AladinLiteWindow(QMainWindow):
                 # Continue without developer tools
 
             # Replace the placeholder with the actual web view
-            layout = self.layout()
-            if layout and self.web_placeholder:
+            central_widget = self.centralWidget()
+            if central_widget and central_widget.layout() and self.web_placeholder:
+                layout = central_widget.layout()
                 # Find the placeholder in the layout and replace it
                 for i in range(layout.count()):
                     item = layout.itemAt(i)
                     if item and item.widget() == self.web_placeholder:
                         # Remove placeholder
                         layout.removeWidget(self.web_placeholder)
+                        self.web_placeholder.hide()
                         self.web_placeholder.deleteLater()
                         self.web_placeholder = None
 
                         # Add web view in the same position
                         layout.insertWidget(i, self.web_view)
+                        self.web_view.show()
+                        logger.debug("Replaced placeholder with web view in layout")
                         break
 
             # Now that web view is created, load Aladin
@@ -704,16 +719,23 @@ class AladinLiteWindow(QMainWindow):
     def _add_browser_fallback_button(self):
         """Add a button to open Aladin Lite in the default browser"""
         try:
-            # Find the main layout
-            main_layout = self.layout()
-            if main_layout:
-                # Create a fallback button
-                fallback_button = QPushButton("Open Aladin Lite in Browser")
-                fallback_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; margin: 10px; }")
-                fallback_button.clicked.connect(self._open_in_browser)
+            # Don't add button if it already exists
+            if self.fallback_button is not None:
+                return
 
-                # Insert before the bottom controls
-                main_layout.insertWidget(main_layout.count() - 1, fallback_button)
+            # Find the central widget and its layout
+            central_widget = self.centralWidget()
+            if central_widget and central_widget.layout():
+                main_layout = central_widget.layout()
+
+                # Create a fallback button
+                self.fallback_button = QPushButton("Open Aladin Lite in Browser")
+                self.fallback_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; margin: 10px; padding: 8px; }")
+                self.fallback_button.clicked.connect(self._open_in_browser)
+
+                # Insert before the bottom controls (last item should be the bottom layout)
+                main_layout.insertWidget(main_layout.count() - 1, self.fallback_button)
+                logger.debug("Added browser fallback button")
         except Exception as e:
             logger.error(f"Failed to add browser fallback button: {e}")
 
@@ -986,14 +1008,21 @@ class AladinLiteWindow(QMainWindow):
         # Safely load the URL with error handling
         try:
             if hasattr(self, 'web_view') and self.web_view:
+                logger.debug(f"Loading Aladin URL: {image_url}")
                 self.web_view.setUrl(QUrl(image_url))
+
+                # Test connectivity by trying a simple request first
+                self._test_connectivity_async()
             else:
                 logger.error("Web view not available for URL loading")
+                raise Exception("Web view not available")
         except Exception as e:
             logger.error(f"Error loading Aladin URL: {e}")
-            # Try loading a simple error page instead
-            if hasattr(self, 'web_view') and self.web_view:
-                self.web_view.setHtml("<html><body><h3>Error loading Aladin Lite</h3><p>Please check your internet connection.</p></body></html>")
+            # Show error in placeholder
+            if self.web_placeholder:
+                self.web_placeholder.setText(f"Error loading Aladin Lite\n{str(e)}\n\nClick below to open in browser instead.")
+                self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: #ff6b6b; font-size: 12px; }")
+            self._add_browser_fallback_button()
         
         # Add telescope FOV overlay using JavaScript injection if enabled
         if telescope_fov_data and self.show_telescope_fov.isChecked():
@@ -1001,8 +1030,7 @@ class AladinLiteWindow(QMainWindow):
             # Store the FOV data for injection after page loads
             self.pending_fov_overlay = telescope_fov_data
             self.target_coordinates = target_id
-            # Connect to page load finished signal
-            self.web_view.loadFinished.connect(self._inject_fov_overlay)
+            # The FOV overlay injection will be handled by the main loadFinished handler
         else:
             self.pending_fov_overlay = None
         
@@ -1538,6 +1566,105 @@ class AladinLiteWindow(QMainWindow):
                         info_parts.append(f"Pixel scale: {telescope_fov_data['pixel_scale_arcsec']:.1f}\"/px")
         
         self.fov_info_label.setText(" | ".join(info_parts))
+
+    def _on_load_started(self):
+        """Handle web page load started"""
+        logger.debug("Aladin Lite: Load started")
+        if self.web_placeholder:
+            self.web_placeholder.setText("Loading Aladin Lite...")
+        # Start timeout timer (30 seconds)
+        self.loading_timeout.start(30000)
+
+    def _on_load_progress(self, progress):
+        """Handle web page load progress"""
+        logger.debug(f"Aladin Lite: Load progress {progress}%")
+        if self.web_placeholder:
+            self.web_placeholder.setText(f"Loading Aladin Lite... {progress}%")
+
+    def _on_load_finished(self, success):
+        """Handle web page load finished"""
+        logger.debug(f"Aladin Lite: Load finished, success={success}")
+        self.loading_timeout.stop()
+
+        if not success:
+            logger.error("Failed to load Aladin Lite")
+            if self.web_placeholder:
+                self.web_placeholder.setText("Failed to load Aladin Lite\nCheck your internet connection\n\nClick below to open in browser instead.")
+                self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: #ff6b6b; font-size: 12px; }")
+            self._add_browser_fallback_button()
+        else:
+            logger.debug("Aladin Lite loaded successfully")
+            # Ensure the web view is visible and placeholder is hidden
+            self._ensure_web_view_visible()
+
+            # Handle FOV overlay injection if needed
+            if self.pending_fov_overlay and self.target_coordinates:
+                self._inject_fov_overlay(True)
+
+    def _handle_loading_timeout(self):
+        """Handle loading timeout"""
+        logger.warning("Aladin Lite loading timed out after 30 seconds")
+        if self.web_placeholder:
+            self.web_placeholder.setText("Loading timed out\nAladin Lite may be slow to respond\n\nClick below to open in browser instead.")
+            self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: #ffaa00; font-size: 12px; }")
+        self._add_browser_fallback_button()
+
+    def _ensure_web_view_visible(self):
+        """Ensure the web view is visible and replace placeholder if needed"""
+        try:
+            if self.web_view and self.web_placeholder:
+                logger.debug("Replacing placeholder with web view after successful load")
+
+                # Find the central widget and its layout
+                central_widget = self.centralWidget()
+                if central_widget and central_widget.layout():
+                    main_layout = central_widget.layout()
+
+                    # Find the placeholder in the layout and replace it
+                    for i in range(main_layout.count()):
+                        item = main_layout.itemAt(i)
+                        if item and item.widget() == self.web_placeholder:
+                            # Remove placeholder
+                            main_layout.removeWidget(self.web_placeholder)
+                            self.web_placeholder.hide()
+                            self.web_placeholder.deleteLater()
+                            self.web_placeholder = None
+
+                            # Add web view in the same position
+                            main_layout.insertWidget(i, self.web_view)
+                            self.web_view.show()
+                            logger.debug("Successfully replaced placeholder with web view")
+                            break
+
+            elif self.web_view:
+                # Just make sure web view is visible
+                self.web_view.show()
+                logger.debug("Made web view visible")
+
+        except Exception as e:
+            logger.error(f"Error ensuring web view visibility: {e}")
+
+    def _test_connectivity_async(self):
+        """Test connectivity to Aladin Lite server asynchronously"""
+        try:
+            import urllib.request
+            import threading
+
+            def test_connection():
+                try:
+                    with urllib.request.urlopen("https://aladin.u-strasbg.fr", timeout=10) as response:
+                        if response.status == 200:
+                            logger.debug("Aladin server connectivity test successful")
+                        else:
+                            logger.warning(f"Aladin server responded with status {response.status}")
+                except Exception as e:
+                    logger.warning(f"Aladin server connectivity test failed: {e}")
+                    # Don't show error here as it might succeed anyway
+
+            # Run test in background thread
+            threading.Thread(target=test_connection, daemon=True).start()
+        except Exception as e:
+            logger.debug(f"Could not perform connectivity test: {e}")
 
 
 # --- Image Viewer Window ---
@@ -5300,7 +5427,6 @@ class MainWindow(QMainWindow):
             # Store reference to prevent garbage collection and manage window lifecycle
             if not hasattr(self, 'aladin_window') or not self.aladin_window.isVisible():
                 self.aladin_window = AladinLiteWindow(default_data, self)
-                self.aladin_window.setModal(False)  # Make window non-modal
                 self.aladin_window.show()
                 logger.debug("Opened Aladin Lite window from toolbar")
             else:
@@ -5711,7 +5837,6 @@ class MainWindow(QMainWindow):
             # Store reference to prevent garbage collection and manage window lifecycle
             if not hasattr(self, 'aladin_window') or not self.aladin_window.isVisible():
                 self.aladin_window = AladinLiteWindow(detail_data, self)
-                self.aladin_window.setModal(False)
                 self.aladin_window.show()
             else:
                 # If window is already open, bring it to front
