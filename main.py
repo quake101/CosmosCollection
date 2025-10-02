@@ -3,30 +3,29 @@ import os
 import sys
 from typing import Optional, Dict
 
+# Core PySide6 imports (always needed)
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread
-from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush
-from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
     QVBoxLayout, QWidget, QLabel, QDialog,
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
     QToolBar, QMessageBox, QMenu, QScrollArea
 )
-from PySide6.QtGui import QAction
-from astroplan import Observer, FixedTarget
-from astropy import units as u
-from astropy.coordinates import SkyCoord
-# Astropy and astroplan imports for visibility calculations
-from astropy.time import Time
 
-# Import DatabaseManager and ResourceManager
+# Local imports (always needed)
 from DatabaseManager import DatabaseManager
 from ResourceManager import ResourceManager
 from CollageBuilder import CollageBuilder, CollageBuilderWindow
 
-# Import the DSO Visibility Calculator
+# Heavy imports - lazy loaded when needed:
+# - QWebEngineView (only loaded when Aladin window is created)
+# - astroplan/astropy (only loaded when visibility calculations are needed)
+# - DSOVisibilityApp (only loaded when visibility calculator is used)
+
+# Check for optional DSO Visibility Calculator availability
 try:
-    from DSOVisibilityCalculator import DSOVisibilityApp
+    import DSOVisibilityCalculator
     VISIBILITY_AVAILABLE = True
 except ImportError:
     VISIBILITY_AVAILABLE = False
@@ -178,30 +177,24 @@ class VisibilityCalculationWorker(QObject):
                 self.error.emit("Visibility calculator not available. Please ensure DSOVisibilityCalculator.py is properly installed.")
                 return
             
-            # Create DSO coordinate
+            # Import required libraries for visibility calculations
             from astropy.coordinates import SkyCoord
             import astropy.units as u
+            from datetime import datetime, timedelta
+            import numpy as np
+
+            # Create DSO coordinate
             dso_coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
-            
+
             # Use a more thorough seasonal visibility check that matches Best DSO Tonight logic
             # Check multiple nights throughout the year using the same method as Best DSO Tonight
             seasons = []
-            from datetime import datetime, timedelta
-            import numpy as np
-            
             current_year = datetime.now().year
             min_altitude = 30  # Use 30° minimum altitude for seasonal visibility
-            
+
             # Sample dates throughout the year (every 15 days for better coverage)
             sample_dates = []
             visibility_results = []
-            
-            # Import required libraries once outside the loop
-            from astropy.coordinates import SkyCoord
-            import astropy.units as u
-            
-            # Create coordinate object once from stored RA/Dec
-            dso_coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
             
             for day_offset in range(0, 365, 15):
                 try:
@@ -744,7 +737,8 @@ class CustomDSOVisibilityWindow(QDialog):
         # Create layout
         layout = QVBoxLayout()
 
-        # Create the visibility app widget
+        # Create the visibility app widget (lazy-loaded)
+        from DSOVisibilityCalculator import DSOVisibilityApp
         self.visibility_app = DSOVisibilityApp()
 
         # Pre-populate with the DSO name
