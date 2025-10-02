@@ -1703,8 +1703,8 @@ class CollageBuilderWindow(QDialog):
         # Simple grid for collage arrangement
         self.scroll_area = QScrollArea()
         self.images_widget = QWidget()
-        self.images_layout = QGridLayout(self.images_widget)  # Use grid layout instead of vertical
-        self.images_layout.setSpacing(15)  # Increased spacing to show borders better
+        self.images_layout = QGridLayout(self.images_widget)
+        self.images_layout.setSpacing(0)
         self.scroll_area.setWidget(self.images_widget)
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -2961,11 +2961,6 @@ class CollageBuilderWindow(QDialog):
         except Exception as e:
             logger.error(f"Error saving project: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to save project: {str(e)}")
-
-
-
-
-
 
 
     def _load_saved_project(self):

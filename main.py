@@ -263,9 +263,102 @@ class VisibilityCalculationWorker(QObject):
             self.error.emit(f"Error calculating viewing season information:<br>{str(e)}")
 
 
+# --- Lazy Loading Worker Thread ---
+class DataLoadWorker(QThread):
+    """Worker thread for loading additional DSO data in background"""
+    data_loaded = Signal(list)  # Signal with new data batch
+    progress_updated = Signal(int, int)  # loaded count, total count
+
+    def __init__(self, offset, limit, parent=None):
+        super().__init__(parent)
+        self.offset = offset
+        self.limit = limit
+
+    def run(self):
+        """Load data batch in background thread"""
+        try:
+            # Create a direct SQLite connection for this thread (avoiding singleton DatabaseManager)
+            import sqlite3
+            from ResourceManager import ResourceManager
+
+            # Use the same database path logic as DatabaseManager
+            # ResourceManager is a global instance, not a class
+            db_path = ResourceManager.get_database_path()
+
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
+                           CAST(d.sizemin/60.0 AS REAL) as sizemin,
+                           CAST(d.sizemax/60.0 AS REAL) as sizemax,
+                           d.constellation, d.dsotype, d.dsoclass,
+                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ') as designations,
+                           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+                           (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
+                    FROM dsodetail d
+                    JOIN cataloguenr c ON d.id = c.dsodetailid
+                    LEFT JOIN userimages ui ON d.id = ui.dsodetailid
+                    GROUP BY d.id
+                    ORDER BY c.catalogue, CAST(c.designation AS INTEGER)
+                    LIMIT ? OFFSET ?
+                """, (self.limit, self.offset))
+
+            dso_data = []
+            for row in cursor.fetchall():
+                obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
+                    constellation, dso_type, dso_class, designations, image_path, integration_time, \
+                    equipment, date_taken, notes, image_count = row
+
+                # Get the primary designation
+                primary_designation = designations.split(',')[0]
+                catalogue, designation = primary_designation.split(' ', 1)
+
+                # Handle size values
+                size_min_arcmin = float(size_min) if size_min is not None else 0.0
+                size_max_arcmin = float(size_max) if size_max is not None else 0.0
+
+                dso_data.append({
+                    "id": designation,
+                    "ra_deg": ra,
+                    "dec_deg": dec,
+                    "catalogue": catalogue,
+                    "name": f"{catalogue} {designation}",
+                    "magnitude": magnitude,
+                    "surface_brightness": surface_brightness,
+                    "size_min": size_min_arcmin,
+                    "size_max": size_max_arcmin,
+                    "constellation": constellation,
+                    "dso_type": dso_type,
+                    "dso_class": dso_class,
+                    "designations": designations,
+                    "image_path": image_path,
+                    "integration_time": integration_time,
+                    "equipment": equipment,
+                    "date_taken": date_taken,
+                    "notes": notes,
+                    "image_count": image_count
+                })
+
+            self.data_loaded.emit(dso_data)
+            logger.debug(f"Loaded {len(dso_data)} DSOs from offset {self.offset}")
+
+            # Clean up the direct connection
+            conn.close()
+
+        except Exception as e:
+            logger.error(f"Error loading data batch: {e}")
+            # Clean up on error too
+            try:
+                conn.close()
+            except:
+                pass
+
+
 # --- Model for displaying DSO data in table ---
 class DSOTableModel(QAbstractTableModel):
-    def __init__(self, dso_data, parent=None):
+    def __init__(self, dso_data, parent=None, db_manager=None, total_count=None):
         super().__init__(parent)
         self.dso_data = dso_data
         self.filtered_data = dso_data.copy()  # For filtering
@@ -273,6 +366,15 @@ class DSOTableModel(QAbstractTableModel):
         self.selected_catalog = None
         self.highlight_no_images = False
         self._cached_formatted_data = {}  # Cache for formatted data
+
+        # Lazy loading support
+        self.db_manager = db_manager
+        self.total_count = total_count or len(dso_data)
+        self.load_offset = len(dso_data)
+        self.loading = False
+        self.load_worker = None
+        self.load_batch_size = 2000
+        self.startup_mode = True  # Prevent sort-triggered loading during startup
 
     def rowCount(self, index=QModelIndex()):
         return len(self.filtered_data)
@@ -331,6 +433,19 @@ class DSOTableModel(QAbstractTableModel):
 
     def sort(self, column, order):
         """Sort the data by the specified column"""
+        logger.debug(f"Sort requested: column={column}, order={order}, loaded={len(self.dso_data)}, offset={self.load_offset}, total={self.total_count}, startup_mode={getattr(self, 'startup_mode', False)}")
+
+        # During startup, only sort loaded data to maintain lazy loading performance
+        if getattr(self, 'startup_mode', False):
+            logger.debug("Startup mode: sorting only currently loaded data")
+            # Continue with normal sort of loaded data
+        # Check if we need to load all data for proper sorting (only after startup)
+        elif self.load_offset < self.total_count:
+            logger.debug(f"Sorting requested with partial data ({len(self.dso_data)}/{self.total_count}). Loading all data first...")
+            self._load_all_data_for_sort(column, order)
+            return
+
+        logger.debug(f"All data loaded, proceeding with sort on {len(self.filtered_data)} items")
         self.layoutAboutToBeChanged.emit()
 
         # Get the sort key function based on the column
@@ -354,6 +469,44 @@ class DSOTableModel(QAbstractTableModel):
         self._cached_formatted_data.clear()
 
         self.layoutChanged.emit()
+        logger.debug(f"Sorted {len(self.filtered_data)} items by column {column}")
+
+    def _load_all_data_for_sort(self, column, order):
+        """Load all remaining data before sorting"""
+        if self.loading:
+            logger.debug("Already loading data, sort will be applied when complete")
+            # Store the sort request to apply after loading
+            self._pending_sort = (column, order)
+            return
+
+        # Prevent recursive calls by checking if we already have a pending sort
+        if hasattr(self, '_pending_sort') and self._pending_sort:
+            logger.debug(f"Sort already pending: {self._pending_sort}, ignoring new request")
+            return
+
+        logger.debug(f"Loading all remaining data for sort by column {column}")
+        self._pending_sort = (column, order)
+
+        # Load remaining data in larger batches for faster completion
+        remaining = self.total_count - self.load_offset
+        if remaining > 0:
+            # Temporarily increase batch size for faster loading
+            old_batch_size = self.load_batch_size
+            self.load_batch_size = min(remaining, 5000)  # Load up to 5000 at a time
+            logger.debug(f"Starting to load {remaining} remaining items for sort")
+            self.load_more_data()
+            self.load_batch_size = old_batch_size
+        else:
+            logger.debug("No remaining data to load, applying sort immediately")
+            self._apply_pending_sort()
+
+    def _apply_pending_sort(self):
+        """Apply any pending sort after data loading completes"""
+        if hasattr(self, '_pending_sort') and self._pending_sort:
+            column, order = self._pending_sort
+            self._pending_sort = None
+            logger.debug(f"Applying pending sort by column {column}")
+            self.sort(column, order)
 
     def filter_data(self, search_text, selected_catalog=None, show_images_only=False, selected_type=None):
         """Filter the data based on search text, catalog, image presence, and DSO type"""
@@ -361,6 +514,10 @@ class DSOTableModel(QAbstractTableModel):
 
         # Store the selected catalog for use in data() method
         self.selected_catalog = selected_catalog
+        # Track current search for lazy loading
+        self._current_search = search_text or ''
+        self._current_show_images_only = show_images_only
+        self._current_selected_type = selected_type
 
         if not search_text and not selected_catalog and not show_images_only and not selected_type:
             self.filtered_data = self.dso_data.copy()
@@ -412,6 +569,165 @@ class DSOTableModel(QAbstractTableModel):
         """Set whether to highlight objects without images"""
         self.highlight_no_images = highlight
         self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1))
+
+    def check_and_load_more_data(self, view_bottom_row):
+        """Check if we need to load more data and trigger loading if needed"""
+        filtered_len = len(self.filtered_data)
+        loaded_len = len(self.dso_data)
+
+        # FILTER-AWARE LOADING: If we have active filters and very few results, keep loading
+        has_active_filters = (hasattr(self, '_current_search') and
+                            (self._current_search or self.selected_catalog or
+                             getattr(self, '_current_show_images_only', False) or
+                             getattr(self, '_current_selected_type', None)))
+
+        # If filters are active and we have very few results, keep loading more aggressively
+        # For sparse results (like "show images only"), we need to load much more data
+        if has_active_filters and loaded_len < self.total_count:
+            if filtered_len < 100:  # Very few results - load aggressively
+                filter_needs_more_data = True
+            elif filtered_len < 500:  # Moderate results - load when nearing end
+                # Load more if we're showing most of what we found
+                filter_needs_more_data = view_bottom_row > filtered_len * 0.7
+            else:
+                # Normal threshold for larger result sets
+                filter_needs_more_data = False
+        else:
+            filter_needs_more_data = False
+
+        # MAJOR FIX: If view_bottom_row seems capped (~2000), use the actual visible rows as reference
+        max_visible_rows = max(view_bottom_row + 1, 2000)
+
+        # Use much more aggressive triggering when we hit apparent view limits
+        if view_bottom_row >= 1900:  # Near the apparent view limit
+            trigger_point = max_visible_rows - 100  # Very aggressive
+        else:
+            # Normal triggering logic
+            trigger_point_rows = filtered_len - 200
+            trigger_point_percent = int(filtered_len * 0.8)
+            trigger_point = min(trigger_point_rows, trigger_point_percent)
+
+        # Multiple trigger conditions
+        near_end_of_visible = view_bottom_row > trigger_point
+        displayed_most_data = view_bottom_row > len(self.dso_data) * 0.75
+        near_view_limit = view_bottom_row >= 1950  # Emergency trigger when hitting view limits
+
+        if (self.db_manager and
+            not self.loading and
+            self.load_offset < self.total_count and
+            (near_end_of_visible or displayed_most_data or near_view_limit or filter_needs_more_data)):
+
+            # Log only when loading is actually triggered
+            trigger_reason = []
+            if near_end_of_visible: trigger_reason.append("near end of visible")
+            if displayed_most_data: trigger_reason.append("75% of loaded data")
+            if near_view_limit: trigger_reason.append("emergency trigger")
+            if filter_needs_more_data:
+                if filtered_len < 100:
+                    trigger_reason.append("sparse filter results - loading more")
+                else:
+                    trigger_reason.append("filter needs more data")
+            logger.debug(f"Triggering lazy load: {', '.join(trigger_reason)} (filtered: {filtered_len}, loaded: {loaded_len}, total: {self.total_count})")
+            self.load_more_data()
+        else:
+            # Reduced debug logging for non-trigger cases
+            pass
+
+    def load_more_data(self):
+        """Load the next batch of data in background"""
+        if self.loading or self.load_offset >= self.total_count:
+            logger.debug(f"Load blocked: loading={self.loading}, offset={self.load_offset}, total={self.total_count}")
+            return
+
+        logger.debug(f"Loading more data from offset {self.load_offset}, batch size {self.load_batch_size}")
+        self.loading = True
+
+        # Emit signal to update UI loading state
+        if hasattr(self.parent(), '_on_loading_started'):
+            self.parent()._on_loading_started()
+
+        self.load_worker = DataLoadWorker(self.load_offset, self.load_batch_size)
+        self.load_worker.data_loaded.connect(self._on_data_loaded)
+        self.load_worker.start()
+
+    def _on_data_loaded(self, new_data):
+        """Handle new data batch loaded from background thread"""
+        if new_data:
+            # Add new data to existing data
+            self.beginInsertRows(QModelIndex(), len(self.dso_data), len(self.dso_data) + len(new_data) - 1)
+            self.dso_data.extend(new_data)
+            self.endInsertRows()
+
+            # Apply current filters to new data if filters are active
+            if (hasattr(self, '_current_search') and
+                (self._current_search or self.selected_catalog or
+                 getattr(self, '_current_show_images_only', False) or
+                 getattr(self, '_current_selected_type', None))):
+                # Re-apply current filters to include new data
+                old_filtered_len = len(self.filtered_data)
+                self.filter_data(
+                    self._current_search,
+                    self.selected_catalog,
+                    getattr(self, '_current_show_images_only', False),
+                    getattr(self, '_current_selected_type', None)
+                )
+                new_filtered_len = len(self.filtered_data)
+                new_matches = new_filtered_len - old_filtered_len
+                logger.debug(f"After filtering: filtered data grew from {old_filtered_len} to {new_filtered_len} (+{new_matches} new matches from {len(new_data)} loaded)")
+            else:
+                # No filters, so add all new data to filtered view
+                self.filtered_data.extend(new_data)
+                logger.debug(f"No filters: added all {len(new_data)} items to filtered data")
+
+            self.load_offset += len(new_data)
+            logger.debug(f"Added {len(new_data)} DSOs, total now: {len(self.dso_data)}")
+
+        self.loading = False
+
+        # Emit signal to update UI loading state
+        if hasattr(self.parent(), '_on_loading_finished'):
+            self.parent()._on_loading_finished()
+
+        # Clean up worker
+        if self.load_worker:
+            self.load_worker.deleteLater()
+            self.load_worker = None
+
+        # Apply pending sort if all data is now loaded
+        if (self.load_offset >= self.total_count and
+            hasattr(self, '_pending_sort') and self._pending_sort):
+            logger.debug("All data loaded, applying pending sort")
+            # Import QTimer locally to avoid circular imports
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(100, self._apply_pending_sort)
+            return  # Don't trigger more loading if we're done
+
+        # Check if we need to load more data immediately (for sparse filter results)
+        filtered_len = len(self.filtered_data)
+        if (filtered_len < 100 and
+            self.load_offset < self.total_count and
+            hasattr(self, '_current_show_images_only') and
+            getattr(self, '_current_show_images_only', False)):
+
+            logger.debug(f"Auto-triggering next load: only {filtered_len} images found, continuing search...")
+            # Use a timer to avoid recursive loading
+            if hasattr(self.parent(), '_schedule_next_load'):
+                self.parent()._schedule_next_load()
+        # Continue loading if we have a pending sort
+        elif (hasattr(self, '_pending_sort') and self._pending_sort and
+              self.load_offset < self.total_count):
+            logger.debug(f"Continuing to load data for pending sort ({self.load_offset}/{self.total_count})")
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(50, self.load_more_data)
+
+    def get_load_progress(self):
+        """Get current loading progress for status display"""
+        return len(self.dso_data), self.total_count
+
+    def exit_startup_mode(self):
+        """Exit startup mode to enable full sorting functionality"""
+        logger.debug("Exiting startup mode - full sorting now available")
+        self.startup_mode = False
 
 
 # --- Custom Visibility Window Class ---
@@ -520,7 +836,7 @@ class AladinLiteWindow(QMainWindow):
         self.camera_combo.addItem("Sony Full Frame (35.8x23.8mm)", {"type": "camera", "sensor_width": 35.8, "sensor_height": 23.8})
         self.camera_combo.addItem("Sony APS-C (23.5x15.6mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.6})
         
-        # ZWO ASI cameras (popular for astrophotography)
+        # ZWO ASI cameras
         self.camera_combo.addItem("--- ZWO ASI CAMERAS ---", None)
         self.camera_combo.addItem("ASI6200MM Pro (36x24mm)", {"type": "camera", "sensor_width": 36.0, "sensor_height": 24.0})
         self.camera_combo.addItem("ASI2600MM Pro (23.5x15.7mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.7})
@@ -4231,11 +4547,33 @@ class CustomTableView(QTableView):
         self.model = model
         # Connect the header's sort indicator change to the model's sort method
         self.horizontalHeader().sortIndicatorChanged.connect(self._on_sort_indicator_changed)
+        # Connect scroll events for lazy loading
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
     def _on_sort_indicator_changed(self, logical_index, order):
         """Handle sort indicator changes by calling the model's sort method"""
         if self.model:
             self.model.sort(logical_index, order)
+
+    def _on_scroll(self, value):
+        """Handle scroll events to trigger lazy loading"""
+        if hasattr(self.model, 'check_and_load_more_data'):
+            # Calculate which row is at the bottom of the visible area
+            viewport_height = self.viewport().height()
+            row_height = self.rowHeight(0) if self.model.rowCount() > 0 else 25
+            visible_rows = viewport_height // row_height if row_height > 0 else 0
+            current_top_row = self.rowAt(0)
+            bottom_visible_row = current_top_row + visible_rows
+
+            # Get the actual last visible row from viewport
+            last_visible_index = self.indexAt(self.viewport().rect().bottomLeft())
+            actual_last_visible_row = last_visible_index.row() if last_visible_index.isValid() else -1
+
+            # Use the actual visible row for better accuracy
+            effective_bottom_row = max(bottom_visible_row, actual_last_visible_row)
+
+            # Trigger lazy loading if needed
+            self.model.check_and_load_more_data(effective_bottom_row)
 
 
 # --- Settings Dialog ---
@@ -5094,9 +5432,13 @@ class AboutDialog(QDialog):
 
 # --- Main App Window ---
 class MainWindow(QMainWindow):
-    def __init__(self, dso_data, catalogs):
+    def __init__(self, dso_data, catalogs, total_count=None):
         super().__init__()
         logger.debug("Initializing MainWindow")
+
+        self.total_dso_count = total_count or len(dso_data)
+        self.loaded_count = len(dso_data)
+        self.load_offset = self.loaded_count
 
         # Set window title with version
         try:
@@ -5111,6 +5453,10 @@ class MainWindow(QMainWindow):
         self.db_manager = DatabaseManager()
         self._cached_dso_data = None
         self._cached_catalogs = None
+
+        # Store original data for lazy loading
+        self.initial_dso_data = dso_data
+        self.all_catalogs = catalogs
 
         # Create toolbar
         self._create_toolbar()
@@ -5206,7 +5552,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.status_label)
 
         # Setup model and table
-        self.model = DSOTableModel(dso_data)
+        self.model = DSOTableModel(dso_data, parent=self, db_manager=self.db_manager, total_count=self.total_dso_count)
         self.table_view = CustomTableView()
         self.table_view.setModel(self.model)
         self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -5214,6 +5560,9 @@ class MainWindow(QMainWindow):
         self.table_view.setSelectionBehavior(QTableView.SelectRows)
         self.table_view.setSelectionMode(QTableView.SingleSelection)
         self.table_view.setSortingEnabled(True)
+
+        # Set default sort by catalog (column 0) in ascending order
+        self.table_view.sortByColumn(0, Qt.AscendingOrder)
 
         # Enable context menu
         self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -5247,6 +5596,10 @@ class MainWindow(QMainWindow):
 
         # Update status
         self._update_status()
+
+        # Exit startup mode after initialization to enable full sorting
+        QTimer.singleShot(1000, self._exit_startup_mode)  # Small delay to ensure everything is loaded
+
         logger.debug("MainWindow initialization complete")
 
     def _create_toolbar(self):
@@ -5448,6 +5801,29 @@ class MainWindow(QMainWindow):
         )
         self._update_status()
 
+        # Check if we need to load more data due to filter reducing visible results
+        self._check_filter_needs_more_data()
+
+    def _check_filter_needs_more_data(self):
+        """Check if current filter results are too sparse and trigger loading more data"""
+        if hasattr(self.model, 'check_and_load_more_data'):
+            # For sparse results, keep loading until we have enough or reach the end
+            filtered_len = len(self.model.filtered_data)
+            loaded_len = len(self.model.dso_data)
+
+            logger.debug(f"Filter check: {filtered_len} filtered, {loaded_len} loaded, {self.model.total_count} total")
+
+            # If we have very few results and more data available, trigger loading immediately
+            if (filtered_len < 100 and
+                loaded_len < self.model.total_count and
+                not getattr(self.model, 'loading', False)):
+
+                logger.debug(f"Triggering immediate load due to sparse filter results ({filtered_len} < 100)")
+                self.model.load_more_data()
+            else:
+                # Normal check with any view position to evaluate all trigger conditions
+                self.model.check_and_load_more_data(0)
+
     def _on_highlight_no_images_changed(self, state):
         self.model.setHighlightNoImages(state != 0)
 
@@ -5470,6 +5846,8 @@ class MainWindow(QMainWindow):
             self._get_selected_type()
         )
         self._update_status()
+        # Check if we need more data for this filter
+        self._check_filter_needs_more_data()
 
     def _on_catalog_changed(self, catalog):
         """Handle catalog selection changes"""
@@ -5480,6 +5858,8 @@ class MainWindow(QMainWindow):
             self._get_selected_type()
         )
         self._update_status()
+        # Check if we need more data for this filter
+        self._check_filter_needs_more_data()
 
     def _on_type_changed(self, type_text):
         """Handle DSO type selection changes"""
@@ -5500,12 +5880,41 @@ class MainWindow(QMainWindow):
 
     def _update_status(self):
         """Update the status label"""
-        total = len(self.model.dso_data)
+        loaded, total_available = self.model.get_load_progress()
         filtered = len(self.model.filtered_data)
-        if filtered == total:
-            self.status_label.setText(f"Showing all {total} objects")
+
+        if filtered == loaded:
+            if loaded < total_available:
+                self.status_label.setText(f"Showing all {loaded} loaded objects ({total_available} total available)")
+            else:
+                self.status_label.setText(f"Showing all {loaded} objects")
         else:
-            self.status_label.setText(f"Showing {filtered} of {total} objects")
+            if loaded < total_available:
+                self.status_label.setText(f"Showing {filtered} of {loaded} loaded objects ({total_available} total available)")
+            else:
+                self.status_label.setText(f"Showing {filtered} of {loaded} objects")
+
+    def _on_loading_started(self):
+        """Handle when background data loading starts"""
+        # Update status to show loading
+        current_text = self.status_label.text()
+        self.status_label.setText(f"{current_text} - Loading more data...")
+
+    def _on_loading_finished(self):
+        """Handle when background data loading finishes"""
+        # Refresh status display
+        self._update_status()
+
+    def _schedule_next_load(self):
+        """Schedule the next load after a short delay to avoid recursive loading"""
+        # Use a timer to schedule the next load check
+        QTimer.singleShot(100, self._check_filter_needs_more_data)
+
+    def _exit_startup_mode(self):
+        """Exit startup mode for the model to enable full sorting"""
+        if hasattr(self.model, 'exit_startup_mode'):
+            self.model.exit_startup_mode()
+
 
     def _on_double_click(self, index):
         try:
@@ -5960,9 +6369,14 @@ if __name__ == "__main__":
             cursor.execute("SELECT DISTINCT catalogue FROM cataloguenr ORDER BY catalogue")
             catalogs = [row[0] for row in cursor.fetchall()]
 
-            # Query all objects from the database with additional fields
+            # Get total count for progress indication
+            cursor.execute("SELECT COUNT(DISTINCT d.id) FROM dsodetail d JOIN cataloguenr c ON d.id = c.dsodetailid")
+            total_count = cursor.fetchone()[0]
+            logger.debug(f"Total DSO count: {total_count}")
+
+            # Load initial batch of objects (first 2000 for faster startup)
             cursor.execute("""
-                SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness, 
+                SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
                        CAST(d.sizemin/60.0 AS REAL) as sizemin,
                        CAST(d.sizemax/60.0 AS REAL) as sizemax,
                        d.constellation, d.dsotype, d.dsoclass,
@@ -5974,6 +6388,7 @@ if __name__ == "__main__":
                 LEFT JOIN userimages ui ON d.id = ui.dsodetailid
                 GROUP BY d.id
                 ORDER BY c.catalogue, CAST(c.designation AS INTEGER)
+                LIMIT 2000
             """)
 
             dso_data = []
@@ -6013,13 +6428,15 @@ if __name__ == "__main__":
                     "image_count": image_count
                 })
 
+            logger.debug(f"Loaded initial batch: {len(dso_data)} of {total_count} DSOs")
+
         if not dso_data:
             from PySide6.QtWidgets import QMessageBox
 
             QMessageBox.critical(None, "Error", "Failed to load DSO data from database")
             sys.exit(1)
 
-        window = MainWindow(dso_data, catalogs)
+        window = MainWindow(dso_data, catalogs, total_count)
         window.show()
         sys.exit(app.exec())
 
