@@ -6265,7 +6265,8 @@ class MainWindow(QMainWindow):
                 'size_max': entry.get('size_max', 0),
                 'constellation': entry.get('constellation', ''),
                 'dso_type': entry.get('dso_type', ''),
-                'dso_class': entry.get('dso_class', '')
+                'dso_class': entry.get('dso_class', ''),
+                'designations': entry.get('designations', '')
             }
 
             # Import and open Target List window, then add the DSO

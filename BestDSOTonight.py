@@ -1177,7 +1177,8 @@ class BestDSOTonightWindow(QMainWindow):
                         'size_max': dso_data["dso_info"]["size_max"],
                         'constellation': dso_data["dso_info"]["constellation"],
                         'dso_type': dso_data["dso_info"]["type"],
-                        'dso_class': dso_data["dso_info"]["dso_class"]
+                        'dso_class': dso_data["dso_info"]["dso_class"],
+                        'designations': dso_data["dso_info"].get("designations", "")
                     }
 
                     # Import and open Target List window, then add the DSO

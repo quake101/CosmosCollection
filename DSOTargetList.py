@@ -446,7 +446,10 @@ class DSOTargetListWindow(QMainWindow):
             "Name", "Type", "Constellation", "Magnitude", "Size",
             "Priority", "Status", "Direction", "Best Months", "Date Added"
         ])
-        
+
+        # Enable sorting and disable editing
+        self.targets_table.setSortingEnabled(True)
+
         # Set column widths
         header = self.targets_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)  # Name
@@ -496,11 +499,16 @@ class DSOTargetListWindow(QMainWindow):
     def _edit_selected_target(self):
         """Edit the selected target"""
         current_row = self.targets_table.currentRow()
-        if current_row < 0 or current_row >= len(self.targets_data):
+        if current_row < 0:
             QMessageBox.warning(self, "No Selection", "Please select a target to edit.")
             return
-        
-        target_data = self.targets_data[current_row]
+
+        # Get target data from the name item (column 0) to handle sorting
+        name_item = self.targets_table.item(current_row, 0)
+        if not name_item:
+            return
+
+        target_data = name_item.data(Qt.UserRole)
         dialog = AddTargetDialog(dso_data=target_data, parent=self)
         dialog.setWindowTitle("Edit Target")
         dialog.set_edit_mode(target_data["id"])  # Change button text to "Save Changes" and set target ID
@@ -559,11 +567,16 @@ class DSOTargetListWindow(QMainWindow):
     def _remove_selected_target(self):
         """Remove the selected target from the list"""
         current_row = self.targets_table.currentRow()
-        if current_row < 0 or current_row >= len(self.targets_data):
+        if current_row < 0:
             QMessageBox.warning(self, "No Selection", "Please select a target to remove.")
             return
-        
-        target_data = self.targets_data[current_row]
+
+        # Get target data from the name item (column 0) to handle sorting
+        name_item = self.targets_table.item(current_row, 0)
+        if not name_item:
+            return
+
+        target_data = name_item.data(Qt.UserRole)
         target_name = target_data.get("name", "Unknown")
         
         reply = QMessageBox.question(
@@ -597,12 +610,17 @@ class DSOTargetListWindow(QMainWindow):
     def _view_target_details(self):
         """Open ObjectDetailWindow for the selected target"""
         current_row = self.targets_table.currentRow()
-        if current_row < 0 or current_row >= len(self.targets_data):
+        if current_row < 0:
             QMessageBox.warning(self, "No Selection", "Please select a target to view details.")
             return
-        
+
+        # Get target data from the name item (column 0) to handle sorting
+        name_item = self.targets_table.item(current_row, 0)
+        if not name_item:
+            return
+
         try:
-            target_data = self.targets_data[current_row]
+            target_data = name_item.data(Qt.UserRole)
             target_name = target_data.get("name", "")
             
             # Import ObjectDetailWindow from main.py
@@ -853,36 +871,49 @@ class DSOTargetListWindow(QMainWindow):
     
     def _populate_table(self):
         """Populate the targets table with loaded data"""
+        # Disable sorting temporarily while populating
+        self.targets_table.setSortingEnabled(False)
+
         self.targets_table.setRowCount(len(self.targets_data))
-        
+
         for row, target in enumerate(self.targets_data):
-            # Name
-            self.targets_table.setItem(row, 0, QTableWidgetItem(target.get("name", "")))
-            
+            # Name - store target data in item
+            name_item = QTableWidgetItem(target.get("name", ""))
+            name_item.setData(Qt.UserRole, target)  # Store full target data
+            self.targets_table.setItem(row, 0, name_item)
+
             # Type - use friendly name
             dso_type = target.get("dso_type", "")
             friendly_type = self._get_friendly_type_name(dso_type)
             self.targets_table.setItem(row, 1, QTableWidgetItem(friendly_type))
-            
+
             # Constellation
             self.targets_table.setItem(row, 2, QTableWidgetItem(target.get("constellation", "")))
-            
-            # Magnitude
+
+            # Magnitude - use numeric sorting
             magnitude = target.get("magnitude", 0)
-            mag_item = QTableWidgetItem(f"{magnitude:.1f}" if magnitude > 0 else "")
+            mag_item = QTableWidgetItem()
+            mag_item.setData(Qt.DisplayRole, f"{magnitude:.1f}" if magnitude > 0 else "")
+            mag_item.setData(Qt.UserRole, magnitude if magnitude > 0 else 999)  # Store numeric value for sorting
             mag_item.setTextAlignment(Qt.AlignCenter)
             self.targets_table.setItem(row, 3, mag_item)
-            
+
             # Size
             self.targets_table.setItem(row, 4, QTableWidgetItem(target.get("size_info", "")))
-            
-            # Priority
-            priority_item = QTableWidgetItem(target.get("priority", ""))
+
+            # Priority - use priority order for sorting
+            priority = target.get("priority", "")
+            priority_item = QTableWidgetItem(priority)
+            priority_order = {"Urgent": 4, "High": 3, "Medium": 2, "Low": 1}
+            priority_item.setData(Qt.UserRole, priority_order.get(priority, 0))  # Store numeric value for sorting
             priority_item.setTextAlignment(Qt.AlignCenter)
             self.targets_table.setItem(row, 5, priority_item)
-            
-            # Status
-            status_item = QTableWidgetItem(target.get("status", ""))
+
+            # Status - use status order for sorting
+            status = target.get("status", "")
+            status_item = QTableWidgetItem(status)
+            status_order = {"Not Observed": 1, "Observed": 2, "Imaged": 3, "Completed": 4}
+            status_item.setData(Qt.UserRole, status_order.get(status, 0))  # Store numeric value for sorting
             status_item.setTextAlignment(Qt.AlignCenter)
             self.targets_table.setItem(row, 6, status_item)
 
@@ -900,21 +931,28 @@ class DSOTargetListWindow(QMainWindow):
             # Best Months
             self.targets_table.setItem(row, 8, QTableWidgetItem(target.get("best_months", "")))
 
-            # Date Added
+            # Date Added - use date object for sorting
             date_added = target.get("date_added", "")
             if date_added:
                 try:
                     # Format date for display
                     date_obj = datetime.strptime(date_added, "%Y-%m-%d %H:%M:%S")
                     formatted_date = date_obj.strftime("%Y-%m-%d")
+                    date_timestamp = date_obj.timestamp()
                 except:
                     formatted_date = date_added
+                    date_timestamp = 0
             else:
                 formatted_date = ""
-            
+                date_timestamp = 0
+
             date_item = QTableWidgetItem(formatted_date)
+            date_item.setData(Qt.UserRole, date_timestamp)  # Store timestamp for sorting
             date_item.setTextAlignment(Qt.AlignCenter)
             self.targets_table.setItem(row, 9, date_item)
+
+        # Re-enable sorting
+        self.targets_table.setSortingEnabled(True)
     
     def _calculate_best_months_for_all(self):
         """Calculate best viewing months for all targets based on user location"""
@@ -1085,6 +1123,36 @@ class DSOTargetListWindow(QMainWindow):
         
         return ", ".join(ranges)
 
+    def _get_preferred_catalog_name(self, designations):
+        """Extract the most common/preferred catalog name from designations string
+
+        Priority: M > NGC > IC > others
+
+        Args:
+            designations: String of catalog designations (e.g., "M 42, NGC 1976, LBN 974")
+
+        Returns:
+            The preferred catalog name (e.g., "M 42")
+        """
+        if not designations:
+            return ""
+
+        # Split designations by comma
+        designation_list = [d.strip() for d in designations.split(',')]
+
+        # Priority order for catalogs
+        priority_catalogs = ['M', 'NGC', 'IC']
+
+        # Search for each priority catalog in order
+        for catalog in priority_catalogs:
+            for designation in designation_list:
+                # Check if this designation starts with the catalog name
+                if designation.startswith(catalog + ' '):
+                    return designation
+
+        # If no priority catalog found, return the first designation
+        return designation_list[0] if designation_list else ""
+
     def _get_friendly_type_name(self, dso_type):
         """Convert DSO type code to user-friendly name"""
         type_mapping = {
@@ -1186,7 +1254,7 @@ class DSOTargetListWindow(QMainWindow):
 
         # Get the row number
         row = item.row()
-        if row < 0 or row >= len(self.targets_data):
+        if row < 0:
             return
 
         # Create context menu
@@ -1250,7 +1318,12 @@ class DSOTargetListWindow(QMainWindow):
     def _context_open_visibility(self, row):
         """Open DSO Visibility Calculator from context menu"""
         try:
-            target_data = self.targets_data[row]
+            # Get target data from the name item (column 0) to handle sorting
+            name_item = self.targets_table.item(row, 0)
+            if not name_item:
+                return
+
+            target_data = name_item.data(Qt.UserRole)
             target_name = target_data.get("name", "")
             ra_deg = target_data.get("ra_deg", 0)
             dec_deg = target_data.get("dec_deg", 0)
@@ -1299,7 +1372,12 @@ class DSOTargetListWindow(QMainWindow):
     def _context_open_aladin(self, row):
         """Open Aladin Lite from context menu"""
         try:
-            target_data = self.targets_data[row]
+            # Get target data from the name item (column 0) to handle sorting
+            name_item = self.targets_table.item(row, 0)
+            if not name_item:
+                return
+
+            target_data = name_item.data(Qt.UserRole)
             target_name = target_data.get("name", "")
 
             # Get full DSO data for Aladin Lite
@@ -1333,6 +1411,12 @@ class DSOTargetListWindow(QMainWindow):
 
     def add_target_from_dso(self, dso_data):
         """Add a target from DSO data (called from ObjectDetailWindow)"""
+        # If designations are available, use the preferred catalog name
+        if "designations" in dso_data and dso_data["designations"]:
+            preferred_name = self._get_preferred_catalog_name(dso_data["designations"])
+            if preferred_name:
+                dso_data["name"] = preferred_name
+
         dialog = AddTargetDialog(dso_data=dso_data, parent=self)
         if dialog.exec() == QDialog.Accepted:
             self._load_targets()
