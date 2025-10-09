@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMutex
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
-                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QMenu)
+                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QMenu, QCheckBox)
 
 from astropy import units as u
 from astropy.time import Time
@@ -36,13 +36,14 @@ class DSOCalculationThread(QThread):
     result_ready = Signal(object)
     error_occurred = Signal(str)
 
-    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None):
+    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None, use_target_list=False):
         super().__init__()
         self.min_altitude = min_altitude
         self.max_magnitude = max_magnitude
         self.selected_catalogs = selected_catalogs or []
         self.selected_dso_types = selected_dso_types or []
         self.dso_limit = dso_limit
+        self.use_target_list = use_target_list
         
         # Use centralized calculator
         try:
@@ -252,6 +253,79 @@ class DSOCalculationThread(QThread):
             print(f"Error getting catalogs: {e}")
             return []
 
+    def load_dsos_from_target_list(self):
+        """Load DSOs from the user's target list"""
+        try:
+            from ResourceManager import ResourceManager
+            import sqlite3
+
+            # Create a new database connection in this thread
+            db_path = ResourceManager.get_database_path()
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+
+            cursor = conn.cursor()
+
+            # Query target list entries - we'll match coordinates separately
+            query = """
+                SELECT name, dso_type, constellation, magnitude, ra_deg, dec_deg, size_info
+                FROM usertargetlist
+                WHERE ra_deg IS NOT NULL
+                    AND dec_deg IS NOT NULL
+                    AND magnitude IS NOT NULL
+                    AND magnitude <= ?
+                ORDER BY magnitude ASC
+            """
+
+            cursor.execute(query, [self.max_magnitude])
+
+            rows = cursor.fetchall()
+            dsos = []
+            for row in rows:
+                name, dso_type, constellation, magnitude, ra_deg, dec_deg, size_info = row
+                if name and magnitude is not None and ra_deg is not None and dec_deg is not None:
+                    # Query designations from main database by matching coordinates
+                    cursor.execute("""
+                        SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
+                            CASE c.catalogue
+                                WHEN 'M' THEN 1
+                                WHEN 'NGC' THEN 2
+                                WHEN 'IC' THEN 3
+                                ELSE 4
+                            END, c.designation) as designations
+                        FROM dsodetail d
+                        JOIN cataloguenr c ON d.id = c.dsodetailid
+                        WHERE ABS(d.ra - ?) < 0.001
+                          AND ABS(d.dec - ?) < 0.001
+                        GROUP BY d.id
+                        ORDER BY ABS(d.ra - ?) + ABS(d.dec - ?) ASC
+                        LIMIT 1
+                    """, (ra_deg, dec_deg, ra_deg, dec_deg))
+
+                    desig_row = cursor.fetchone()
+                    designations = desig_row[0] if desig_row and desig_row[0] else name
+
+                    dsos.append({
+                        "name": name,
+                        "type": dso_type or "Unknown",
+                        "constellation": constellation or "Unknown",
+                        "magnitude": float(magnitude),
+                        "surface_brightness": 0.0,
+                        "size_min": 0.0,
+                        "size_max": 0.0,
+                        "dso_class": "Unknown",
+                        "ra_deg": float(ra_deg),
+                        "dec_deg": float(dec_deg),
+                        "designations": designations
+                    })
+
+            conn.close()
+            return dsos
+
+        except Exception as e:
+            print(f"Error loading DSOs from target list: {e}")
+            return []
+
     def load_dsos_from_database(self):
         """Load DSOs from the database with thread-safe connection"""
         try:
@@ -268,12 +342,18 @@ class DSOCalculationThread(QThread):
             
             # Build the query with catalog filtering if specified
             base_query = """
-                SELECT DISTINCT
+                SELECT
+                    d.id,
                     (
-                        SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ')
+                        SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
+                            CASE c.catalogue
+                                WHEN 'M' THEN 1
+                                WHEN 'NGC' THEN 2
+                                WHEN 'IC' THEN 3
+                                ELSE 4
+                            END, c.designation)
                         FROM cataloguenr c
                         WHERE c.dsodetailid = d.id
-                        LIMIT 1
                     ) as name,
                     d.dsotype as type,
                     d.constellation,
@@ -285,13 +365,18 @@ class DSOCalculationThread(QThread):
                     d.ra as ra_deg,
                     d.dec as dec_deg,
                     (
-                        SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ')
+                        SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
+                            CASE c.catalogue
+                                WHEN 'M' THEN 1
+                                WHEN 'NGC' THEN 2
+                                WHEN 'IC' THEN 3
+                                ELSE 4
+                            END, c.designation)
                         FROM cataloguenr c
                         WHERE c.dsodetailid = d.id
                     ) as designations
                 FROM dsodetail d
-                JOIN cataloguenr c ON d.id = c.dsodetailid
-                WHERE d.magnitude IS NOT NULL 
+                WHERE d.magnitude IS NOT NULL
                     AND d.magnitude <= ?
                     AND d.constellation IS NOT NULL
                     AND d.dsotype IS NOT NULL
@@ -300,19 +385,24 @@ class DSOCalculationThread(QThread):
             """
             
             params = [self.max_magnitude]
-            
+
             # Add catalog filtering if catalogs are selected
             if self.selected_catalogs:
                 catalog_placeholders = ','.join('?' * len(self.selected_catalogs))
-                base_query += f" AND c.catalogue IN ({catalog_placeholders})"
+                base_query += f"""
+                    AND d.id IN (
+                        SELECT dsodetailid FROM cataloguenr
+                        WHERE catalogue IN ({catalog_placeholders})
+                    )
+                """
                 params.extend(self.selected_catalogs)
-            
+
             # Add DSO type filtering if types are selected
             if self.selected_dso_types:
                 type_placeholders = ','.join('?' * len(self.selected_dso_types))
                 base_query += f" AND d.dsotype IN ({type_placeholders})"
                 params.extend(self.selected_dso_types)
-            
+
             base_query += f" ORDER BY d.magnitude ASC LIMIT {self.dso_limit}"
             
             cursor.execute(base_query, params)
@@ -320,7 +410,7 @@ class DSOCalculationThread(QThread):
             rows = cursor.fetchall()
             dsos = []
             for row in rows:
-                name, dso_type, constellation, magnitude, surface_brightness, size_min, size_max, dso_class, ra_deg, dec_deg, designations = row
+                dso_id, name, dso_type, constellation, magnitude, surface_brightness, size_min, size_max, dso_class, ra_deg, dec_deg, designations = row
                 if name and magnitude is not None and ra_deg is not None and dec_deg is not None:
                     # Take the first designation as the primary name
                     primary_name = name.split(',')[0].strip()
@@ -361,10 +451,13 @@ class DSOCalculationThread(QThread):
             if self.location is None:
                 self.error_occurred.emit("Observer location not configured")
                 return
-            
-            # Load DSOs from database
-            dso_catalog = self.load_dsos_from_database()
-            
+
+            # Load DSOs from database or target list
+            if self.use_target_list:
+                dso_catalog = self.load_dsos_from_target_list()
+            else:
+                dso_catalog = self.load_dsos_from_database()
+
             if not dso_catalog:
                 self.error_occurred.emit("No DSOs found in database")
                 return
@@ -594,7 +687,16 @@ class BestDSOTonightWindow(QMainWindow):
         
         catalog_row.addStretch()
         settings_layout.addLayout(catalog_row)
-        
+
+        # Third row - Use Target List checkbox
+        target_list_row = QHBoxLayout()
+        self.use_target_list_checkbox = QCheckBox("Use My Target List")
+        self.use_target_list_checkbox.setToolTip("Calculate visibility only for DSOs in your target list")
+        self.use_target_list_checkbox.stateChanged.connect(self._on_target_list_checkbox_changed)
+        target_list_row.addWidget(self.use_target_list_checkbox)
+        target_list_row.addStretch()
+        settings_layout.addLayout(target_list_row)
+
         main_layout.addWidget(settings_group)
         
         # Progress bar
@@ -617,17 +719,17 @@ class BestDSOTonightWindow(QMainWindow):
         self.results_table.setSortingEnabled(True)
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
 
-        # Set column widths
+        # Set column widths - allow user resizing
         header = self.results_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.Fixed)
-        header.setSectionResizeMode(4, QHeaderView.Fixed)
-        header.setSectionResizeMode(5, QHeaderView.Fixed)
-        header.setSectionResizeMode(6, QHeaderView.Fixed)
-        header.setSectionResizeMode(7, QHeaderView.Fixed)
-        
+        header.setSectionResizeMode(3, QHeaderView.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.Interactive)
+        header.setSectionResizeMode(6, QHeaderView.Interactive)
+        header.setSectionResizeMode(7, QHeaderView.Interactive)
+
         self.results_table.setColumnWidth(0, 80)
         self.results_table.setColumnWidth(3, 70)
         self.results_table.setColumnWidth(4, 70)
@@ -739,21 +841,30 @@ class BestDSOTonightWindow(QMainWindow):
             self.dso_type_combo.addItem("All Types")
     
 
+    def _on_target_list_checkbox_changed(self, state):
+        """Handle target list checkbox state change"""
+        use_target_list = (state == Qt.Checked)
+
+        # Disable catalog and type filters when using target list
+        self.catalog_combo.setEnabled(not use_target_list)
+        self.dso_type_combo.setEnabled(not use_target_list)
+
     def calculate_best_dsos(self):
         """Start the calculation of best DSOs for tonight"""
         if self.calc_thread and self.calc_thread.isRunning():
             return
-        
+
         # Get settings
         min_altitude = self.min_altitude_spin.value()
         max_magnitude = float(self.max_magnitude_combo.currentText())
         dso_limit = self.dso_limit_spin.value()
-        
-        # Get selected catalog
+        use_target_list = self.use_target_list_checkbox.isChecked()
+
+        # Get selected catalog (ignored if using target list)
         selected_catalog = self.catalog_combo.currentText()
         selected_catalogs = [] if selected_catalog == "All Catalogs" else [selected_catalog]
-        
-        # Get selected DSO type
+
+        # Get selected DSO type (ignored if using target list)
         selected_dso_type_text = self.dso_type_combo.currentText()
         if selected_dso_type_text == "All Types":
             selected_dso_types = []
@@ -761,20 +872,23 @@ class BestDSOTonightWindow(QMainWindow):
             # Get the database code from the combo box data
             selected_dso_type = self.dso_type_combo.currentData()
             selected_dso_types = [selected_dso_type] if selected_dso_type else []
-        
+
         # Show progress
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.calculate_btn.setEnabled(False)
         self.calculate_btn.setText("Calculating...")
-        
+
         # Create status text
-        catalog_text = "all catalogs" if not selected_catalogs else f"{selected_catalog} catalog"
-        type_text = "all types" if not selected_dso_types else f"{selected_dso_type} objects"
-        self.status_label.setText(f"Calculating visibility for {type_text} from {catalog_text}...")
-        
+        if use_target_list:
+            self.status_label.setText(f"Calculating visibility for DSOs in your target list...")
+        else:
+            catalog_text = "all catalogs" if not selected_catalogs else f"{selected_catalog} catalog"
+            type_text = "all types" if not selected_dso_types else f"{selected_dso_type} objects"
+            self.status_label.setText(f"Calculating visibility for {type_text} from {catalog_text}...")
+
         # Start calculation thread
-        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit, selected_dso_types)
+        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit, selected_dso_types, use_target_list)
         self.calc_thread.progress.connect(self.progress_bar.setValue)
         self.calc_thread.result_ready.connect(self.display_results)
         self.calc_thread.error_occurred.connect(self.handle_error)
@@ -898,6 +1012,12 @@ class BestDSOTonightWindow(QMainWindow):
                     ra_deg = 0.0
                     dec_deg = 0.0
             
+            # Debug: log designations
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(f"BestDSO opening detail for: {dso_data['dso_info']['name']}")
+            logger.debug(f"Designations from dso_info: {dso_data['dso_info']['designations']}")
+
             # Create the data dictionary expected by ObjectDetailWindow
             detail_data = {
                 "name": dso_data["dso_info"]["name"],
@@ -1136,7 +1256,6 @@ class BestDSOTonightWindow(QMainWindow):
                     # Import and open Aladin Lite window
                     from main import AladinLiteWindow
                     aladin_window = AladinLiteWindow(detail_data, self)
-                    aladin_window.setModal(False)
                     aladin_window.show()
                 else:
                     QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")

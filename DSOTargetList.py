@@ -1392,7 +1392,6 @@ class DSOTargetListWindow(QMainWindow):
             # Import and open Aladin Lite window
             from main import AladinLiteWindow
             aladin_window = AladinLiteWindow(detail_data, self)
-            aladin_window.setModal(False)
             aladin_window.show()
 
         except Exception as e:

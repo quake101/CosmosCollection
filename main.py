@@ -389,7 +389,14 @@ class DataLoadWorker(QThread):
 
                 # Get the primary designation
                 primary_designation = designations.split(',')[0].strip()
-                catalogue, designation = primary_designation.split(' ', 1)
+
+                # Handle cases where designation might not have a space
+                if ' ' in primary_designation:
+                    catalogue, designation = primary_designation.split(' ', 1)
+                else:
+                    # No space in designation, use entire string as catalogue
+                    catalogue = primary_designation
+                    designation = ""
 
                 # Debug: log first few entries when catalog filter is active
                 if self.catalog_filter and len(dso_data) < 5:
@@ -6036,13 +6043,40 @@ class MainWindow(QMainWindow):
 
     def _clear_filters(self):
         """Clear all filters"""
+        logger.debug("Clear filters button pressed")
+        logger.debug(f"Current state: catalog={self.model.selected_catalog}, type={getattr(self.model, '_current_selected_type', None)}")
+        logger.debug(f"Current data: dso_data={len(self.model.dso_data)}, filtered_data={len(self.model.filtered_data)}")
+
+        # Block signals to prevent multiple filter triggers
+        self.search_input.blockSignals(True)
+        self.catalog_combo.blockSignals(True)
+        self.show_images_only.blockSignals(True)
+        self.highlight_no_images.blockSignals(True)
+        self.type_combo.blockSignals(True)
+
         self.search_input.clear()
         self.catalog_combo.setCurrentIndex(0)
         self.show_images_only.setChecked(False)
         self.highlight_no_images.setChecked(False)
         self.type_combo.setCurrentIndex(0)
+
+        # Unblock signals
+        self.search_input.blockSignals(False)
+        self.catalog_combo.blockSignals(False)
+        self.show_images_only.blockSignals(False)
+        self.highlight_no_images.blockSignals(False)
+        self.type_combo.blockSignals(False)
+
+        logger.debug("Calling filter_data with all filters cleared")
+        # Manually trigger filter update once
         self.model.filter_data("", None, False, None)
+
+        # Re-apply default sort after clearing filters
+        self.table_view.sortByColumn(0, Qt.AscendingOrder)
+
         self._update_status()
+
+        logger.debug(f"After clear: dso_data={len(self.model.dso_data)}, filtered_data={len(self.model.filtered_data)}")
 
     def _on_search(self, text):
         """Handle search text changes"""
@@ -6144,15 +6178,17 @@ class MainWindow(QMainWindow):
                         JOIN cataloguenr c ON d.id = c.dsodetailid
                         WHERE c.catalogue = ? AND c.designation = ?
                     )
-                    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness, 
+                    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
                            CAST(d.sizemin/60.0 AS REAL) as sizemin,
                            CAST(d.sizemax/60.0 AS REAL) as sizemax,
                            d.constellation, d.dsotype, d.dsoclass,
-                           (
-                               SELECT GROUP_CONCAT(c2.catalogue || ' ' || c2.designation, ', ')
-                               FROM cataloguenr c2
-                               WHERE c2.dsodetailid = d.id
-                           ) as designations,
+                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
+                               CASE c.catalogue
+                                   WHEN 'M' THEN 1
+                                   WHEN 'NGC' THEN 2
+                                   WHEN 'IC' THEN 3
+                                   ELSE 4
+                               END, c.designation) as designations,
                            ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
                            (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
                     FROM dsodetail d
