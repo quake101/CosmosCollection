@@ -262,10 +262,12 @@ class DataLoadWorker(QThread):
     data_loaded = Signal(list)  # Signal with new data batch
     progress_updated = Signal(int, int)  # loaded count, total count
 
-    def __init__(self, offset, limit, parent=None):
+    def __init__(self, offset, limit, catalog_filter=None, type_filter=None, parent=None):
         super().__init__(parent)
         self.offset = offset
         self.limit = limit
+        self.catalog_filter = catalog_filter
+        self.type_filter = type_filter
 
     def run(self):
         """Load data batch in background thread"""
@@ -282,21 +284,102 @@ class DataLoadWorker(QThread):
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
-            cursor.execute("""
+            # Build query with optional catalog and type filters
+            if self.catalog_filter:
+                # When catalog filter is active, filter DSOs that have that catalog
+                # Special handling for Messier catalog - only numeric designations (M 1 - M 110)
+                if self.catalog_filter == 'M':
+                    query = """
+                        SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
+                               CAST(d.sizemin/60.0 AS REAL) as sizemin,
+                               CAST(d.sizemax/60.0 AS REAL) as sizemax,
+                               d.constellation, d.dsotype, d.dsoclass,
+                               GROUP_CONCAT(c2.catalogue || ' ' || c2.designation, ', ' ORDER BY
+                                   CASE c2.catalogue
+                                       WHEN 'M' THEN 1
+                                       WHEN 'NGC' THEN 2
+                                       WHEN 'IC' THEN 3
+                                       ELSE 4
+                                   END, c2.designation) as designations,
+                               ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+                               (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
+                        FROM dsodetail d
+                        JOIN cataloguenr c ON d.id = c.dsodetailid
+                            AND c.catalogue = ?
+                            AND c.designation NOT LIKE '%-%'
+                            AND c.designation NOT LIKE '% %'
+                            AND LENGTH(TRIM(c.designation)) <= 3
+                            AND CAST(c.designation AS INTEGER) > 0
+                            AND CAST(c.designation AS INTEGER) <= 110
+                        JOIN cataloguenr c2 ON d.id = c2.dsodetailid
+                        LEFT JOIN userimages ui ON d.id = ui.dsodetailid
+                    """
+                else:
+                    query = """
+                        SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
+                               CAST(d.sizemin/60.0 AS REAL) as sizemin,
+                               CAST(d.sizemax/60.0 AS REAL) as sizemax,
+                               d.constellation, d.dsotype, d.dsoclass,
+                               GROUP_CONCAT(c2.catalogue || ' ' || c2.designation, ', ' ORDER BY
+                                   CASE c2.catalogue
+                                       WHEN 'M' THEN 1
+                                       WHEN 'NGC' THEN 2
+                                       WHEN 'IC' THEN 3
+                                       ELSE 4
+                                   END, c2.designation) as designations,
+                               ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+                               (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
+                        FROM dsodetail d
+                        JOIN cataloguenr c ON d.id = c.dsodetailid AND c.catalogue = ?
+                        JOIN cataloguenr c2 ON d.id = c2.dsodetailid
+                        LEFT JOIN userimages ui ON d.id = ui.dsodetailid
+                    """
+                params = [self.catalog_filter]
+
+                if self.type_filter:
+                    query += " WHERE d.dsotype = ?"
+                    params.append(self.type_filter)
+
+            else:
+                # No catalog filter - get all objects
+                query = """
                     SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
                            CAST(d.sizemin/60.0 AS REAL) as sizemin,
                            CAST(d.sizemax/60.0 AS REAL) as sizemax,
                            d.constellation, d.dsotype, d.dsoclass,
-                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ') as designations,
+                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
+                               CASE c.catalogue
+                                   WHEN 'M' THEN 1
+                                   WHEN 'NGC' THEN 2
+                                   WHEN 'IC' THEN 3
+                                   ELSE 4
+                               END, c.designation) as designations,
                            ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
                            (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
                     FROM dsodetail d
                     JOIN cataloguenr c ON d.id = c.dsodetailid
                     LEFT JOIN userimages ui ON d.id = ui.dsodetailid
+                """
+                params = []
+
+                if self.type_filter:
+                    query += " WHERE d.dsotype = ?"
+                    params.append(self.type_filter)
+
+            query += """
                     GROUP BY d.id
                     ORDER BY c.catalogue, CAST(c.designation AS INTEGER)
                     LIMIT ? OFFSET ?
-                """, (self.limit, self.offset))
+            """
+
+            params.extend([self.limit, self.offset])
+
+            # Debug: log query and params when catalog filter is active
+            if self.catalog_filter:
+                logger.debug(f"SQL Query with catalog_filter='{self.catalog_filter}'")
+                logger.debug(f"Params: {params}")
+
+            cursor.execute(query, params)
 
             dso_data = []
             for row in cursor.fetchall():
@@ -305,8 +388,12 @@ class DataLoadWorker(QThread):
                     equipment, date_taken, notes, image_count = row
 
                 # Get the primary designation
-                primary_designation = designations.split(',')[0]
+                primary_designation = designations.split(',')[0].strip()
                 catalogue, designation = primary_designation.split(' ', 1)
+
+                # Debug: log first few entries when catalog filter is active
+                if self.catalog_filter and len(dso_data) < 5:
+                    logger.debug(f"Loaded DSO: {primary_designation} (all: {designations})")
 
                 # Handle size values
                 size_min_arcmin = float(size_min) if size_min is not None else 0.0
@@ -380,6 +467,7 @@ class DSOTableModel(QAbstractTableModel):
             return None
         row = index.row()
         col = index.column()
+
         entry = self.filtered_data[row]
 
         if role == Qt.ItemDataRole.BackgroundRole:
@@ -505,12 +593,26 @@ class DSOTableModel(QAbstractTableModel):
         """Filter the data based on search text, catalog, image presence, and DSO type"""
         self.layoutAboutToBeChanged.emit()
 
+        # Check if catalog or type filter changed - if so, reset lazy loading
+        catalog_changed = self.selected_catalog != selected_catalog
+        type_changed = getattr(self, '_current_selected_type', None) != selected_type
+
         # Store the selected catalog for use in data() method
         self.selected_catalog = selected_catalog
         # Track current search for lazy loading
         self._current_search = search_text or ''
         self._current_show_images_only = show_images_only
         self._current_selected_type = selected_type
+
+        if catalog_changed or type_changed:
+            # Reset lazy loading state for new filter
+            self._reset_lazy_loading_for_filter(selected_catalog, selected_type)
+            # Trigger immediate load of data for the new filter
+            self.load_more_data()
+            # Data will be empty until load completes, so set filtered_data to empty
+            self.filtered_data = []
+            self.layoutChanged.emit()
+            return
 
         if not search_text and not selected_catalog and not show_images_only and not selected_type:
             self.filtered_data = self.dso_data.copy()
@@ -557,6 +659,99 @@ class DSOTableModel(QAbstractTableModel):
         dec_m = int(dec_remaining)
         dec_s = (dec_remaining - dec_m) * 60
         return f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
+
+    def _reset_lazy_loading_for_filter(self, catalog_filter, type_filter):
+        """Reset lazy loading state when filter changes and query filtered count"""
+        if not self.db_manager:
+            return
+
+        try:
+            import sqlite3
+            from ResourceManager import ResourceManager
+
+            # Query the total count for this specific filter
+            db_path = ResourceManager.get_database_path()
+            conn = sqlite3.connect(str(db_path))
+            cursor = conn.cursor()
+
+            # Build count query with filters - must match the data loading query logic
+            if catalog_filter == 'M':
+                # Special handling for Messier catalog - only numeric designations
+                query = """
+                    SELECT COUNT(DISTINCT d.id)
+                    FROM dsodetail d
+                    JOIN cataloguenr c ON d.id = c.dsodetailid
+                        AND c.catalogue = ?
+                        AND c.designation NOT LIKE '%-%'
+                        AND c.designation NOT LIKE '% %'
+                        AND LENGTH(TRIM(c.designation)) <= 3
+                        AND CAST(c.designation AS INTEGER) > 0
+                        AND CAST(c.designation AS INTEGER) <= 110
+                """
+                params = [catalog_filter]
+
+                if type_filter:
+                    query += " WHERE d.dsotype = ?"
+                    params.append(type_filter)
+
+            elif catalog_filter:
+                # Other catalog filters
+                query = """
+                    SELECT COUNT(DISTINCT d.id)
+                    FROM dsodetail d
+                    JOIN cataloguenr c ON d.id = c.dsodetailid
+                    WHERE c.catalogue = ?
+                """
+                params = [catalog_filter]
+
+                if type_filter:
+                    query += " AND d.dsotype = ?"
+                    params.append(type_filter)
+
+            else:
+                # No catalog filter
+                query = """
+                    SELECT COUNT(DISTINCT d.id)
+                    FROM dsodetail d
+                    JOIN cataloguenr c ON d.id = c.dsodetailid
+                """
+                params = []
+
+                if type_filter:
+                    query += " WHERE d.dsotype = ?"
+                    params.append(type_filter)
+
+            cursor.execute(query, params)
+            filtered_total = cursor.fetchone()[0]
+            conn.close()
+
+            # Cancel any pending load worker
+            if hasattr(self, 'load_worker') and self.load_worker:
+                try:
+                    self.load_worker.disconnect()
+                    self.load_worker.terminate()
+                    self.load_worker.wait(1000)  # Wait up to 1 second
+                    self.load_worker.deleteLater()
+                except:
+                    pass
+                self.load_worker = None
+
+            # Clear existing data and reset offset
+            self.loading = False
+
+            # Notify view that we're about to clear all data
+            self.beginResetModel()
+            self.dso_data = []
+            self.filtered_data = []
+            self.load_offset = 0
+            self.total_count = filtered_total
+            self._cached_formatted_data.clear()
+            self.endResetModel()
+
+            logger.debug(f"Reset lazy loading for filter: catalog={catalog_filter}, type={type_filter}, total={filtered_total}")
+
+        except Exception as e:
+            logger.error(f"Error resetting lazy loading for filter: {e}")
 
     def setHighlightNoImages(self, highlight):
         """Set whether to highlight objects without images"""
@@ -632,14 +827,18 @@ class DSOTableModel(QAbstractTableModel):
             logger.debug(f"Load blocked: loading={self.loading}, offset={self.load_offset}, total={self.total_count}")
             return
 
-        logger.debug(f"Loading more data from offset {self.load_offset}, batch size {self.load_batch_size}")
+        # Get current filters
+        catalog_filter = self.selected_catalog if self.selected_catalog else None
+        type_filter = getattr(self, '_current_selected_type', None)
+
+        logger.debug(f"Loading more data from offset {self.load_offset}, batch size {self.load_batch_size}, catalog={catalog_filter}, type={type_filter}")
         self.loading = True
 
         # Emit signal to update UI loading state
         if hasattr(self.parent(), '_on_loading_started'):
             self.parent()._on_loading_started()
 
-        self.load_worker = DataLoadWorker(self.load_offset, self.load_batch_size)
+        self.load_worker = DataLoadWorker(self.load_offset, self.load_batch_size, catalog_filter, type_filter)
         self.load_worker.data_loaded.connect(self._on_data_loaded)
         self.load_worker.start()
 
@@ -651,26 +850,40 @@ class DSOTableModel(QAbstractTableModel):
             self.dso_data.extend(new_data)
             self.endInsertRows()
 
-            # Apply current filters to new data if filters are active
-            if (hasattr(self, '_current_search') and
-                (self._current_search or self.selected_catalog or
-                 getattr(self, '_current_show_images_only', False) or
-                 getattr(self, '_current_selected_type', None))):
-                # Re-apply current filters to include new data
-                old_filtered_len = len(self.filtered_data)
-                self.filter_data(
-                    self._current_search,
-                    self.selected_catalog,
-                    getattr(self, '_current_show_images_only', False),
-                    getattr(self, '_current_selected_type', None)
-                )
-                new_filtered_len = len(self.filtered_data)
-                new_matches = new_filtered_len - old_filtered_len
-                logger.debug(f"After filtering: filtered data grew from {old_filtered_len} to {new_filtered_len} (+{new_matches} new matches from {len(new_data)} loaded)")
+            # Re-apply current filters to include new data
+            # Catalog and type filters are already applied at SQL level, so we only need to filter by:
+            # - search text
+            # - show_images_only
+            old_filtered_len = len(self.filtered_data)
+
+            search_text = getattr(self, '_current_search', '').lower() if hasattr(self, '_current_search') else ""
+            show_images_only = getattr(self, '_current_show_images_only', False)
+
+            # Notify view that data is about to change
+            self.layoutAboutToBeChanged.emit()
+
+            # Rebuild filtered data from all loaded data
+            if search_text or show_images_only:
+                self.filtered_data = [
+                    item for item in self.dso_data
+                    if ((not show_images_only or item["image_count"] > 0) and
+                        (not search_text or
+                         search_text in item["catalogue"].lower() or
+                         search_text in item["id"].lower() or
+                         search_text in item["designations"].lower()))
+                ]
+                logger.debug(f"Applied search/image filters: filtered data is now {len(self.filtered_data)} items from {len(self.dso_data)} loaded")
             else:
-                # No filters, so add all new data to filtered view
-                self.filtered_data.extend(new_data)
-                logger.debug(f"No filters: added all {len(new_data)} items to filtered data")
+                # No additional filters, so all loaded data is visible
+                self.filtered_data = self.dso_data.copy()
+                logger.debug(f"No additional filters: showing all {len(self.filtered_data)} loaded items")
+
+            new_filtered_len = len(self.filtered_data)
+            new_matches = new_filtered_len - old_filtered_len
+            logger.debug(f"After filtering: filtered data grew from {old_filtered_len} to {new_filtered_len} (+{new_matches} new matches from {len(new_data)} loaded)")
+
+            # Notify view that layout has changed
+            self.layoutChanged.emit()
 
             self.load_offset += len(new_data)
             logger.debug(f"Added {len(new_data)} DSOs, total now: {len(self.dso_data)}")
@@ -5864,6 +6077,8 @@ class MainWindow(QMainWindow):
             self._get_selected_type()
         )
         self._update_status()
+        # Check if we need more data for this filter
+        self._check_filter_needs_more_data()
 
     def _get_selected_type(self):
         """Get the currently selected DSO type code"""
@@ -6021,8 +6236,14 @@ class MainWindow(QMainWindow):
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
 
-                # Get all available catalogs
-                cursor.execute("SELECT DISTINCT catalogue FROM cataloguenr ORDER BY catalogue")
+                # Get major catalogs (with at least 50 objects to filter out minor catalogs)
+                cursor.execute("""
+                    SELECT catalogue, COUNT(DISTINCT dsodetailid) as count
+                    FROM cataloguenr
+                    GROUP BY catalogue
+                    HAVING count >= 50
+                    ORDER BY catalogue
+                """)
                 self._cached_catalogs = [row[0] for row in cursor.fetchall()]
 
                 # Query all objects from the database with additional fields
@@ -6360,8 +6581,14 @@ if __name__ == "__main__":
                 """)
                 conn.commit()
 
-            # Get all available catalogs
-            cursor.execute("SELECT DISTINCT catalogue FROM cataloguenr ORDER BY catalogue")
+            # Get major catalogs (with at least 50 objects to filter out minor catalogs)
+            cursor.execute("""
+                SELECT catalogue, COUNT(DISTINCT dsodetailid) as count
+                FROM cataloguenr
+                GROUP BY catalogue
+                HAVING count >= 50
+                ORDER BY catalogue
+            """)
             catalogs = [row[0] for row in cursor.fetchall()]
 
             # Get total count for progress indication

@@ -465,9 +465,9 @@ class DSOTargetListWindow(QMainWindow):
 
         self.targets_table.setColumnWidth(0, 120)
         self.targets_table.setColumnWidth(2, 100)
-        self.targets_table.setColumnWidth(3, 70)
+        self.targets_table.setColumnWidth(3, 90)
         self.targets_table.setColumnWidth(4, 80)
-        self.targets_table.setColumnWidth(5, 70)
+        self.targets_table.setColumnWidth(5, 90)
         self.targets_table.setColumnWidth(6, 100)
         self.targets_table.setColumnWidth(7, 70)
         self.targets_table.setColumnWidth(9, 100)
@@ -953,6 +953,9 @@ class DSOTargetListWindow(QMainWindow):
 
         # Re-enable sorting
         self.targets_table.setSortingEnabled(True)
+
+        # Set default sort by Priority (column 5) in descending order (Urgent first)
+        self.targets_table.sortItems(5, Qt.DescendingOrder)
     
     def _calculate_best_months_for_all(self):
         """Calculate best viewing months for all targets based on user location"""
