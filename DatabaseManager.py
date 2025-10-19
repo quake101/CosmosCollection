@@ -65,10 +65,19 @@ class DatabaseManager:
                         equipment TEXT,
                         date_taken TEXT,
                         notes TEXT,
+                        is_favorite BOOLEAN DEFAULT 0,
                         created_date TEXT DEFAULT CURRENT_TIMESTAMP,
                         FOREIGN KEY (dsodetailid) REFERENCES dso_detail (id)
                     )
                 """)
+
+                # Add is_favorite column if it doesn't exist (for existing databases)
+                try:
+                    cursor.execute("ALTER TABLE userimages ADD COLUMN is_favorite BOOLEAN DEFAULT 0")
+                    logger.debug("Added is_favorite column to userimages table")
+                except sqlite3.OperationalError:
+                    # Column already exists, ignore
+                    pass
                 
                 # Create usertargetlist table for user's observing target list
                 cursor.execute("""

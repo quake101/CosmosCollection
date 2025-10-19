@@ -3088,9 +3088,8 @@ class ObjectDetailWindow(QDialog):
             self.season_label.setText("Enter your location above and press Save to see viewing season/dates.")
         
         # Load user images after window is shown and other calculations are done
+        # Note: _load_user_images() will call _load_current_image_info() to populate the form
         QTimer.singleShot(300, self._load_user_images)
-        if self.data.get('image_path'):
-            self._load_image_info()
 
     def _format_coordinates(self, ra_deg, dec_deg):
         """Format RA and Dec coordinates efficiently"""
@@ -3152,7 +3151,7 @@ class ObjectDetailWindow(QDialog):
             nav_separator.setStyleSheet("font-size: 14pt; color: #666666; padding: 0 5px;")
             zoom_layout.addWidget(nav_separator)
 
-            self.prev_image_button = QPushButton("◀")
+            self.prev_image_button = QPushButton("⬅️")
             self.prev_image_button.setFixedSize(30, 30)
             self.prev_image_button.clicked.connect(self._previous_image)
             self.prev_image_button.setToolTip("Previous image")
@@ -3164,7 +3163,7 @@ class ObjectDetailWindow(QDialog):
             self.image_counter_label.setAlignment(Qt.AlignCenter)
             zoom_layout.addWidget(self.image_counter_label)
 
-            self.next_image_button = QPushButton("▶")
+            self.next_image_button = QPushButton("➡️")
             self.next_image_button.setFixedSize(30, 30)
             self.next_image_button.clicked.connect(self._next_image)
             self.next_image_button.setToolTip("Next image")
@@ -3189,6 +3188,14 @@ class ObjectDetailWindow(QDialog):
             self.delete_image_button.setToolTip("Delete current image")
             self.delete_image_button.setStyleSheet("QPushButton { color: #ff6b6b; font-size: 12pt; }")
             zoom_layout.addWidget(self.delete_image_button)
+
+            # Favorite image button
+            self.favorite_button = QPushButton("⭐")
+            self.favorite_button.setFixedSize(30, 30)
+            self.favorite_button.clicked.connect(self._toggle_favorite)
+            self.favorite_button.setToolTip("Mark as favorite")
+            self.favorite_button.setStyleSheet("QPushButton { font-size: 12pt; }")
+            zoom_layout.addWidget(self.favorite_button)
 
             zoom_layout.addStretch()
             image_container_layout.addLayout(zoom_layout)
@@ -3759,19 +3766,22 @@ class ObjectDetailWindow(QDialog):
 
                         logger.debug(f"Found {len(all_designations)} designations for this object")
 
-                        # Insert new image record
+                        # Insert new image record with blank metadata (user will fill in after)
                         cursor.execute("""
                             INSERT INTO userimages (
-                                dsodetailid, image_path, integration_time, 
+                                dsodetailid, image_path, integration_time,
                                 equipment, date_taken, notes
                             ) VALUES (?, ?, ?, ?, ?, ?)
                         """, (
                             dsodetailid, file_name,
-                            self.integration_edit.text().strip(),
-                            self.telescope_combo.currentText().strip(),
-                            self.date_edit.text().strip(),
-                            self.notes_edit.toPlainText().strip()
+                            '',  # Blank integration time
+                            '',  # Blank equipment
+                            '',  # Blank date
+                            ''   # Blank notes
                         ))
+
+                        # Get the ID of the newly inserted image
+                        new_image_id = cursor.lastrowid
 
                         # Log all designations that will share this image
                         for catalogue, designation in all_designations:
@@ -3782,11 +3792,16 @@ class ObjectDetailWindow(QDialog):
                         # Reload all user images to get the updated list
                         self._load_user_images()
 
-                        # Clear the form for the next image
-                        self.integration_edit.clear()
-                        self.telescope_combo.setCurrentText("")
-                        self.date_edit.clear()
-                        self.notes_edit.clear()
+                        # Navigate to the newly added image (it will be the last one)
+                        if self.user_images:
+                            # Find the index of the newly added image
+                            for i, img in enumerate(self.user_images):
+                                if img['id'] == new_image_id:
+                                    self.current_image_index = i
+                                    self._load_user_image(img['image_path'])
+                                    self._load_current_image_info()
+                                    self._update_image_navigation()
+                                    break
 
                         # Show the image information form
                         self.info_form_container.setVisible(True)
@@ -4248,26 +4263,28 @@ class ObjectDetailWindow(QDialog):
                 if result:
                     dsodetailid = result[0]
 
-                    # Get all images for this object
+                    # Get all images for this object, ordering by favorite first, then by id
                     cursor.execute("""
-                        SELECT id, image_path, integration_time, equipment, date_taken, notes
-                        FROM userimages 
+                        SELECT id, image_path, integration_time, equipment, date_taken, notes, is_favorite
+                        FROM userimages
                         WHERE dsodetailid = ?
-                        ORDER BY id ASC
+                        ORDER BY is_favorite DESC, id ASC
                     """, (dsodetailid,))
-                    
+
                     images = cursor.fetchall()
-                    
+
                     # Store images in our list
                     self.user_images = []
-                    for img_id, image_path, integration_time, equipment, date_taken, notes in images:
+                    for img_id, image_path, integration_time, equipment, date_taken, notes, is_favorite in images:
                         self.user_images.append({
                             'id': img_id,
+                            'dsodetailid': dsodetailid,
                             'image_path': image_path,
                             'integration_time': integration_time,
                             'equipment': equipment,
                             'date_taken': date_taken,
-                            'notes': notes
+                            'notes': notes,
+                            'is_favorite': is_favorite
                         })
 
                     logger.debug(f"Loaded {len(self.user_images)} images for {self.data['name']}")
@@ -4275,7 +4292,7 @@ class ObjectDetailWindow(QDialog):
                     # Update navigation controls
                     self._update_image_navigation()
 
-                    # Load the first image if available
+                    # Load the first image if available (will be favorite if one exists)
                     if self.user_images:
                         self.current_image_index = 0
                         current_image = self.user_images[self.current_image_index]
@@ -4342,6 +4359,85 @@ class ObjectDetailWindow(QDialog):
             self.telescope_combo.setCurrentText(current_image.get('equipment', ''))
             self.date_edit.setText(current_image.get('date_taken', ''))
             self.notes_edit.setText(current_image.get('notes', ''))
+
+            # Update favorite button appearance
+            is_favorite = current_image.get('is_favorite', 0)
+            if is_favorite:
+                self.favorite_button.setText("⭐")
+                self.favorite_button.setStyleSheet("QPushButton { color: #FFD700; font-size: 12pt; }")
+                self.favorite_button.setToolTip("Unmark as favorite")
+            else:
+                self.favorite_button.setText("☆")
+                self.favorite_button.setStyleSheet("QPushButton { color: #888888; font-size: 12pt; }")
+                self.favorite_button.setToolTip("Mark as favorite")
+
+    def _toggle_favorite(self):
+        """Toggle the favorite status of the current image"""
+        if not self.user_images or self.current_image_index < 0 or self.current_image_index >= len(self.user_images):
+            return
+
+        current_image = self.user_images[self.current_image_index]
+        image_id = current_image.get('id')
+
+        if not image_id:
+            logger.error("Cannot toggle favorite: image has no ID")
+            return
+
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Get current favorite status
+                current_favorite = current_image.get('is_favorite', 0)
+                new_favorite = 1 if not current_favorite else 0
+
+                # If setting as favorite, unfavorite all other images for this DSO
+                if new_favorite == 1:
+                    dsodetailid = current_image.get('dsodetailid')
+                    if not dsodetailid:
+                        # Get dsodetailid from the database
+                        cursor.execute("""
+                            SELECT dsodetailid FROM userimages WHERE id = ?
+                        """, (image_id,))
+                        result = cursor.fetchone()
+                        if result:
+                            dsodetailid = result[0]
+
+                    if dsodetailid:
+                        # Unfavorite all other images for this DSO
+                        cursor.execute("""
+                            UPDATE userimages
+                            SET is_favorite = 0
+                            WHERE dsodetailid = ? AND id != ?
+                        """, (dsodetailid, image_id))
+
+                # Toggle favorite status for this image
+                cursor.execute("""
+                    UPDATE userimages
+                    SET is_favorite = ?
+                    WHERE id = ?
+                """, (new_favorite, image_id))
+
+                conn.commit()
+
+                # Update the local cache
+                current_image['is_favorite'] = new_favorite
+
+                # Update all images in the list if we unfavorited others
+                if new_favorite == 1:
+                    for img in self.user_images:
+                        if img['id'] != image_id:
+                            img['is_favorite'] = 0
+
+                # Update button appearance
+                self._load_current_image_info()
+
+                logger.debug(f"Toggled favorite status for image {image_id} to {new_favorite}")
+
+        except Exception as e:
+            logger.error(f"Error toggling favorite: {str(e)}", exc_info=True)
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Error", f"Failed to toggle favorite: {str(e)}")
 
     def _show_relocate_button(self):
         """Show the relocate button when an image cannot be found"""
