@@ -3091,6 +3091,9 @@ class ObjectDetailWindow(QDialog):
         # Note: _load_user_images() will call _load_current_image_info() to populate the form
         QTimer.singleShot(300, self._load_user_images)
 
+        # Query SIMBAD for emission line data (deferred to avoid blocking)
+        QTimer.singleShot(400, self._query_emission_data)
+
     def _format_coordinates(self, ra_deg, dec_deg):
         """Format RA and Dec coordinates efficiently"""
         # Convert RA from degrees to hours (1 hour = 15 degrees)
@@ -3109,8 +3112,134 @@ class ObjectDetailWindow(QDialog):
         dec_m = int(dec_remaining)
         dec_s = (dec_remaining - dec_m) * 60
         dec_str = f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
-        
+
         return ra_str, dec_str
+
+    def _query_emission_data(self):
+        """Query SIMBAD for emission line and spectral information"""
+        try:
+            # Only query for nebulae (emission regions)
+            dso_type = self.data.get('dso_type', '')
+            if dso_type not in ['BRTNB', 'CL+NB', 'PLNNB', 'SNREM']:
+                self.emission_label.setText("Not applicable (not an emission nebula)")
+                self.emission_label.setStyleSheet("color: gray;")
+                return
+
+            from astroquery.simbad import Simbad
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+
+            # Get object coordinates and name
+            object_name = self.data.get('name', '')
+            ra_deg = self.data.get('ra_deg')
+            dec_deg = self.data.get('dec_deg')
+
+            logger.debug(f"Querying SIMBAD for emission data: {object_name} at RA={ra_deg}, Dec={dec_deg}")
+
+            # Configure SIMBAD to return flux measurements and spectral type
+            custom_simbad = Simbad()
+            custom_simbad.add_votable_fields('flux(U)', 'flux(B)', 'flux(V)', 'flux(R)', 'flux(I)', 'sp', 'otype')
+
+            # Query SIMBAD using coordinates (more reliable than name)
+            try:
+                if ra_deg is not None and dec_deg is not None:
+                    # Create coordinate object
+                    coords = SkyCoord(ra=ra_deg*u.degree, dec=dec_deg*u.degree, frame='icrs')
+                    # Query region around coordinates (3 arcmin radius)
+                    result = custom_simbad.query_region(coords, radius=3*u.arcmin)
+                    if result is not None and len(result) > 0:
+                        logger.debug(f"SIMBAD data found for {object_name} at coordinates")
+                    else:
+                        logger.debug(f"No SIMBAD data found for {object_name} at coordinates")
+                else:
+                    logger.debug(f"No coordinates available for {object_name}, skipping SIMBAD query")
+                    result = None
+            except Exception as query_error:
+                logger.debug(f"SIMBAD query failed for {object_name}: {str(query_error)}")
+                result = None
+
+            # Parse and display emission line info based on object type
+            # (We have built-in knowledge even if SIMBAD doesn't return data)
+            emission_info = self._parse_emission_info(dso_type, result)
+
+            if emission_info:
+                self.emission_label.setText(emission_info)
+                self.emission_label.setStyleSheet("color: white;")
+            else:
+                self.emission_label.setText("No specific emission line data available")
+                self.emission_label.setStyleSheet("color: gray;")
+
+        except Exception as e:
+            logger.error(f"Error querying SIMBAD for emission data: {str(e)}", exc_info=True)
+            self.emission_label.setText(f"Error querying SIMBAD (check internet connection)")
+            self.emission_label.setStyleSheet("color: #ff6b6b;")
+
+    def _parse_emission_info(self, dso_type, simbad_result):
+        """Parse emission line information based on DSO type"""
+        # Common emission lines for different nebula types
+        emission_lines = {
+            'BRTNB': {  # Bright nebula (emission/reflection)
+                'primary': ['Hα (656.3 nm)', 'Hβ (486.1 nm)'],
+                'secondary': ['OIII (495.9, 500.7 nm)', 'SII (671.6, 673.1 nm)', 'NII (658.3 nm)'],
+                'description': 'Emission nebula - typically rich in hydrogen and oxygen'
+            },
+            'CL+NB': {  # Cluster + nebula
+                'primary': ['Hα (656.3 nm)'],
+                'secondary': ['OIII (495.9, 500.7 nm)', 'Hβ (486.1 nm)'],
+                'description': 'Star cluster with associated emission nebulosity'
+            },
+            'PLNNB': {  # Planetary nebula
+                'primary': ['OIII (495.9, 500.7 nm)', 'Hα (656.3 nm)'],
+                'secondary': ['Hβ (486.1 nm)', 'NII (658.3 nm)'],
+                'description': 'Planetary nebula - strong in oxygen and hydrogen'
+            },
+            'SNREM': {  # Supernova remnant
+                'primary': ['OIII (495.9, 500.7 nm)', 'SII (671.6, 673.1 nm)'],
+                'secondary': ['Hα (656.3 nm)', 'Hβ (486.1 nm)'],
+                'description': 'Supernova remnant - often oxygen and sulfur rich'
+            }
+        }
+
+        if dso_type not in emission_lines:
+            return None
+
+        info = emission_lines[dso_type]
+
+        # Build the emission info text
+        text = f"<b>{info['description']}</b><br><br>"
+        text += "<b>Primary Emission Lines:</b><br>"
+        for line in info['primary']:
+            # Color code the lines
+            if 'Hα' in line or 'Hβ' in line:
+                color = '#ff6b6b'  # Red for hydrogen
+            elif 'OIII' in line:
+                color = '#6bcdff'  # Blue-green for oxygen
+            elif 'SII' in line:
+                color = '#ff9966'  # Orange-red for sulfur
+            elif 'NII' in line:
+                color = '#ff8888'  # Light red for nitrogen
+            else:
+                color = 'white'
+            text += f"<span style='color: {color};'>• {line}</span><br>"
+
+        text += "<br><b>Secondary Lines:</b><br>"
+        for line in info['secondary']:
+            # Color code the lines
+            if 'Hα' in line or 'Hβ' in line:
+                color = '#ff6b6b'
+            elif 'OIII' in line:
+                color = '#6bcdff'
+            elif 'SII' in line:
+                color = '#ff9966'
+            elif 'NII' in line:
+                color = '#ff8888'
+            else:
+                color = 'white'
+            text += f"<span style='color: {color};'>• {line}</span><br>"
+
+        text += "<br><i>Useful for Hα, OIII, and SII narrowband imaging</i>"
+
+        return text
 
     def _setup_ui(self):
         """Set up the UI components - called after window is shown"""
@@ -3351,6 +3480,21 @@ class ObjectDetailWindow(QDialog):
 
             object_info_groupbox.setLayout(object_info_layout)
             right_layout.addWidget(object_info_groupbox)
+
+            # --- Emission Lines / Gases GroupBox ---
+            self.emission_groupbox = QGroupBox("Emission Lines / Gases")
+            self.emission_groupbox.setStyleSheet(
+                "QGroupBox:title { subcontrol-position: top center; font-size: 16pt; font-weight: bold; }")
+            emission_layout = QVBoxLayout()
+
+            self.emission_label = QLabel("Loading emission data from SIMBAD...")
+            self.emission_label.setAlignment(Qt.AlignLeft)
+            self.emission_label.setWordWrap(True)
+            self.emission_label.setStyleSheet("color: gray; font-style: italic;")
+            emission_layout.addWidget(self.emission_label)
+
+            self.emission_groupbox.setLayout(emission_layout)
+            right_layout.addWidget(self.emission_groupbox)
 
             # --- Observer Location GroupBox (NEW or Conditional) ---
             self.location_groupbox = QGroupBox("Observer Location")
