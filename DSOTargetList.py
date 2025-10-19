@@ -450,27 +450,21 @@ class DSOTargetListWindow(QMainWindow):
         # Enable sorting and disable editing
         self.targets_table.setSortingEnabled(True)
 
-        # Set column widths
+        # Set column widths - Allow manual resizing
         header = self.targets_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Fixed)  # Name
-        header.setSectionResizeMode(1, QHeaderView.Stretch)  # Type
-        header.setSectionResizeMode(2, QHeaderView.Fixed)  # Constellation
-        header.setSectionResizeMode(3, QHeaderView.Fixed)  # Magnitude
-        header.setSectionResizeMode(4, QHeaderView.Fixed)  # Size
-        header.setSectionResizeMode(5, QHeaderView.Fixed)  # Priority
-        header.setSectionResizeMode(6, QHeaderView.Fixed)  # Status
-        header.setSectionResizeMode(7, QHeaderView.Fixed)  # Direction
-        header.setSectionResizeMode(8, QHeaderView.Stretch)  # Best Months
-        header.setSectionResizeMode(9, QHeaderView.Fixed)  # Date Added
+        header.setSectionResizeMode(QHeaderView.Interactive)  # Allow all columns to be resized
 
-        self.targets_table.setColumnWidth(0, 120)
-        self.targets_table.setColumnWidth(2, 100)
-        self.targets_table.setColumnWidth(3, 90)
-        self.targets_table.setColumnWidth(4, 80)
-        self.targets_table.setColumnWidth(5, 90)
-        self.targets_table.setColumnWidth(6, 100)
-        self.targets_table.setColumnWidth(7, 70)
-        self.targets_table.setColumnWidth(9, 100)
+        # Set initial default widths
+        self.targets_table.setColumnWidth(0, 120)  # Name
+        self.targets_table.setColumnWidth(1, 120)  # Type
+        self.targets_table.setColumnWidth(2, 100)  # Constellation
+        self.targets_table.setColumnWidth(3, 90)   # Magnitude
+        self.targets_table.setColumnWidth(4, 80)   # Size
+        self.targets_table.setColumnWidth(5, 90)   # Priority
+        self.targets_table.setColumnWidth(6, 100)  # Status
+        self.targets_table.setColumnWidth(7, 70)   # Direction
+        self.targets_table.setColumnWidth(8, 150)  # Best Months
+        self.targets_table.setColumnWidth(9, 100)  # Date Added
         
         self.targets_table.setAlternatingRowColors(True)
         self.targets_table.setSelectionBehavior(QTableWidget.SelectRows)
