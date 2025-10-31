@@ -6885,37 +6885,6 @@ if __name__ == "__main__":
             if not os.path.exists(catalogs_dir):
                 os.makedirs(catalogs_dir)
 
-            # Check if the userimages table exists and create if needed
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='userimages'")
-            table_exists = cursor.fetchone() is not None
-
-            if table_exists:
-                # Check if the new columns exist
-                cursor.execute("PRAGMA table_info(userimages)")
-                columns = [column[1] for column in cursor.fetchall()]
-                new_columns = ['integration_time', 'equipment', 'date_taken', 'notes']
-
-                # Add any missing columns
-                for column in new_columns:
-                    if column not in columns:
-                        cursor.execute(f"ALTER TABLE userimages ADD COLUMN {column} TEXT")
-                conn.commit()
-            else:
-                # Create userimages table if it doesn't exist
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS userimages (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        dsodetailid INTEGER,
-                        image_path TEXT,
-                        integration_time TEXT,
-                        equipment TEXT,
-                        date_taken TEXT,
-                        notes TEXT,
-                        FOREIGN KEY (dsodetailid) REFERENCES dsodetail(id)
-                    )
-                """)
-                conn.commit()
-
             # Get major catalogs (with at least 50 objects to filter out minor catalogs)
             cursor.execute("""
                 SELECT catalogue, COUNT(DISTINCT dsodetailid) as count
