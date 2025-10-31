@@ -3175,7 +3175,7 @@ class ObjectDetailWindow(QDialog):
             self.emission_label.setStyleSheet("color: #ff6b6b;")
 
     def _parse_emission_info(self, dso_type, simbad_result):
-        """Parse emission line information based on DSO type"""
+        """Parse emission line information based on DSO type and SIMBAD data"""
         # Common emission lines for different nebula types
         emission_lines = {
             'BRTNB': {  # Bright nebula (emission/reflection)
@@ -3204,9 +3204,57 @@ class ObjectDetailWindow(QDialog):
             return None
 
         info = emission_lines[dso_type]
+        text = ""
 
-        # Build the emission info text
-        text = f"<b>{info['description']}</b><br><br>"
+        # Add SIMBAD data if available
+        simbad_data_available = False
+        if simbad_result is not None and len(simbad_result) > 0:
+            simbad_data_available = True
+            row = simbad_result[0]  # Get first result
+
+            text += "<b>SIMBAD Data:</b><br>"
+            text += "<span style='color: #90EE90;'>✓ Successfully retrieved from database</span><br>"
+
+            # Object type from SIMBAD
+            if 'OTYPE' in row.colnames and row['OTYPE']:
+                otype = str(row['OTYPE']).strip()
+                text += f"<b>Object Type:</b> {otype}<br>"
+
+            # Spectral type
+            if 'SP_TYPE' in row.colnames and row['SP_TYPE']:
+                sp_type = str(row['SP_TYPE']).strip()
+                if sp_type and sp_type != '--':
+                    text += f"<b>Spectral Type:</b> {sp_type}<br>"
+
+            # Flux measurements (photometry)
+            flux_data = []
+            flux_bands = [
+                ('FLUX_U', 'U'),
+                ('FLUX_B', 'B'),
+                ('FLUX_V', 'V'),
+                ('FLUX_R', 'R'),
+                ('FLUX_I', 'I')
+            ]
+
+            for flux_col, band in flux_bands:
+                if flux_col in row.colnames and row[flux_col] is not None:
+                    try:
+                        flux_val = float(row[flux_col])
+                        if not (flux_val == 0 or str(flux_val) == 'nan'):
+                            flux_data.append(f"{band}={flux_val:.2f}")
+                    except (ValueError, TypeError):
+                        pass
+
+            if flux_data:
+                text += f"<b>Photometry:</b> {', '.join(flux_data)} mag<br>"
+
+            text += "<br>"
+        else:
+            # Indicate fallback to built-in data
+            text += "<span style='color: #FFA500;'>⚠ SIMBAD data unavailable - using built-in emission data</span><br><br>"
+
+        # Always show built-in emission line data
+        text += f"<b>{info['description']}</b><br><br>"
         text += "<b>Primary Emission Lines:</b><br>"
         for line in info['primary']:
             # Color code the lines
