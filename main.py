@@ -3493,6 +3493,17 @@ class ObjectDetailWindow(QDialog):
             self.emission_label.setStyleSheet("color: gray; font-style: italic;")
             emission_layout.addWidget(self.emission_label)
 
+            # Add SIMBAD link using coordinates
+            ra_deg = self.data.get('ra_deg')
+            dec_deg = self.data.get('dec_deg')
+            if ra_deg is not None and dec_deg is not None:
+                # Format coordinates for SIMBAD URL (decimal degrees)
+                simbad_url = f"https://simbad.u-strasbg.fr/simbad/sim-coo?Coord={ra_deg}+{dec_deg}&Radius=3&Radius.unit=arcmin"
+                simbad_link_label = QLabel(f"<br><a href='{simbad_url}'>View more details in SIMBAD</a>")
+                simbad_link_label.setAlignment(Qt.AlignLeft)
+                simbad_link_label.setOpenExternalLinks(True)  # Enable clickable links
+                emission_layout.addWidget(simbad_link_label)
+
             self.emission_groupbox.setLayout(emission_layout)
             right_layout.addWidget(self.emission_groupbox)
 
