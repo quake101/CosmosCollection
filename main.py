@@ -625,23 +625,54 @@ class DSOTableModel(QAbstractTableModel):
             self.filtered_data = self.dso_data.copy()
         else:
             search_text = search_text.lower() if search_text else ""
-            self.filtered_data = [
-                item for item in self.dso_data
-                if ((not selected_catalog or
-                     selected_catalog == "All Catalogs" or
-                     any(designation.startswith(selected_catalog + " ")
-                         for designation in item["designations"].split(", "))) and
-                    (not selected_type or
-                     selected_type == "All Types" or
-                     item.get("dso_type", "") == selected_type) and
-                    (not show_images_only or item["image_count"] > 0) and
-                    (not search_text or
-                     search_text in item["catalogue"].lower() or
-                     search_text in item["id"].lower() or
-                     self._format_ra(item["ra_deg"]).lower() in search_text or
-                     self._format_dec(item["dec_deg"]).lower() in search_text or
-                     search_text in item["designations"].lower()))
-            ]
+
+            # Improved search logic with priority for exact catalog matches
+            matches = []
+            for item in self.dso_data:
+                # Apply catalog and type filters
+                if selected_catalog and selected_catalog != "All Catalogs":
+                    if not any(designation.startswith(selected_catalog + " ")
+                             for designation in item["designations"].split(", ")):
+                        continue
+
+                if selected_type and selected_type != "All Types":
+                    if item.get("dso_type", "") != selected_type:
+                        continue
+
+                if show_images_only and item["image_count"] == 0:
+                    continue
+
+                # Apply search text filter
+                if search_text:
+                    # If we have a catalog filter, prioritize exact catalog+designation matches
+                    if selected_catalog and selected_catalog != "All Catalogs":
+                        # Check for exact match: catalog filter + search text = designation
+                        designations = item["designations"].split(", ")
+                        exact_match = any(
+                            designation.lower() == f"{selected_catalog.lower()} {search_text}"
+                            for designation in designations
+                        )
+
+                        # Also check if the item's ID matches the search
+                        id_match = search_text in item["id"].lower()
+
+                        if exact_match or id_match:
+                            matches.append((item, 0))  # Priority 0 = exact match
+                            continue
+
+                    # Otherwise do regular substring matching
+                    if (search_text in item["catalogue"].lower() or
+                        search_text in item["id"].lower() or
+                        self._format_ra(item["ra_deg"]).lower() in search_text or
+                        self._format_dec(item["dec_deg"]).lower() in search_text or
+                        search_text in item["designations"].lower()):
+                        matches.append((item, 1))  # Priority 1 = substring match
+                else:
+                    matches.append((item, 1))
+
+            # Sort by priority (exact matches first) and extract items
+            matches.sort(key=lambda x: x[1])
+            self.filtered_data = [item for item, priority in matches]
 
         # Clear the cache when data changes
         self._cached_formatted_data.clear()
@@ -941,6 +972,205 @@ class DSOTableModel(QAbstractTableModel):
         """Exit startup mode to enable full sorting functionality"""
         logger.debug("Exiting startup mode - full sorting now available")
         self.startup_mode = False
+
+
+# --- SIMBAD Query Worker Thread ---
+class SimbadQueryWorker(QThread):
+    """Worker thread for querying SIMBAD and adding object to database"""
+    object_found = Signal(dict)  # Signal with object data
+    object_not_found = Signal()  # Signal when object not found
+    error_occurred = Signal(str)  # Signal with error message
+
+    def __init__(self, search_term, parent=None):
+        super().__init__(parent)
+        self.search_term = search_term
+
+    def run(self):
+        """Query SIMBAD in background thread"""
+        try:
+            from astroquery.simbad import Simbad
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+
+            logger.debug(f"Querying SIMBAD for: {self.search_term}")
+
+            # Configure SIMBAD to return comprehensive data
+            custom_simbad = Simbad()
+            custom_simbad.add_votable_fields(
+                'otype',  # Object type
+                'dim',  # Dimensions
+                'flux(V)',  # V magnitude
+                'flux(B)',  # B magnitude
+            )
+
+            # Try to query by identifier
+            result = custom_simbad.query_object(self.search_term)
+
+            if result is None or len(result) == 0:
+                logger.debug(f"No SIMBAD data found for {self.search_term}")
+                self.object_not_found.emit()
+                return
+
+            # Parse the first result
+            row = result[0]
+
+            # Debug: print column names
+            logger.debug(f"SIMBAD columns: {result.colnames}")
+
+            # Extract coordinates - try different column name variations
+            ra_str = None
+            dec_str = None
+
+            # Try common RA/DEC column names
+            for ra_col in ['RA', 'ra', 'RA_d', 'ra_d', 'RA_ICRS', 'ra_icrs']:
+                if ra_col in row.colnames:
+                    ra_str = row[ra_col]
+                    logger.debug(f"Found RA in column: {ra_col} = {ra_str}")
+                    break
+
+            for dec_col in ['DEC', 'dec', 'DEC_d', 'dec_d', 'DEC_ICRS', 'dec_icrs']:
+                if dec_col in row.colnames:
+                    dec_str = row[dec_col]
+                    logger.debug(f"Found DEC in column: {dec_col} = {dec_str}")
+                    break
+
+            if ra_str is None or dec_str is None:
+                logger.error(f"Could not find RA/DEC in SIMBAD result. Available columns: {result.colnames}")
+                self.error_occurred.emit(f"Could not extract coordinates from SIMBAD result")
+                return
+
+            # Extract coordinates - SIMBAD returns RA/DEC in degrees
+            coords = SkyCoord(
+                ra=ra_str,
+                dec=dec_str,
+                unit=(u.deg, u.deg),
+                frame='icrs'
+            )
+
+            ra_deg = coords.ra.degree
+            dec_deg = coords.dec.degree
+
+            # Extract other fields - use lowercase column names
+            main_id = str(row['main_id']) if 'main_id' in row.colnames else str(row.get('MAIN_ID', 'Unknown'))
+            obj_type = str(row['otype']) if 'otype' in row.colnames else (str(row['OTYPE']) if 'OTYPE' in row.colnames else None)
+
+            # Get magnitude - try V magnitude first, then B
+            magnitude = None
+            for mag_col in ['V', 'FLUX_V', 'v', 'flux_v']:
+                if mag_col in row.colnames and row[mag_col] is not None:
+                    try:
+                        magnitude = float(row[mag_col])
+                        logger.debug(f"Found magnitude in column {mag_col}: {magnitude}")
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+            # Get dimensions (in arcminutes)
+            size_maj = None
+            size_min = None
+            for maj_col in ['galdim_majaxis', 'GALDIM_MAJAXIS']:
+                if maj_col in row.colnames and row[maj_col] is not None:
+                    try:
+                        size_maj = float(row[maj_col])
+                        logger.debug(f"Found major axis in column {maj_col}: {size_maj}")
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+            for min_col in ['galdim_minaxis', 'GALDIM_MINAXIS']:
+                if min_col in row.colnames and row[min_col] is not None:
+                    try:
+                        size_min = float(row[min_col])
+                        logger.debug(f"Found minor axis in column {min_col}: {size_min}")
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+            # Map SIMBAD object type to DSO type
+            dso_type = self._map_simbad_type(obj_type)
+
+            logger.debug(f"SIMBAD found: {main_id} at RA={ra_deg}, Dec={dec_deg}, Type={obj_type}")
+
+            # Create object data dictionary
+            object_data = {
+                'main_id': main_id,
+                'ra_deg': ra_deg,
+                'dec_deg': dec_deg,
+                'magnitude': magnitude,
+                'size_maj': size_maj,
+                'size_min': size_min,
+                'dso_type': dso_type,
+                'obj_type': obj_type
+            }
+
+            self.object_found.emit(object_data)
+
+        except Exception as e:
+            logger.error(f"Error querying SIMBAD: {str(e)}", exc_info=True)
+            self.error_occurred.emit(f"Error querying SIMBAD: {str(e)}")
+
+    def _map_simbad_type(self, simbad_type):
+        """Map SIMBAD object type to DSO type used in database"""
+        if not simbad_type:
+            return None
+
+        simbad_type = simbad_type.upper()
+
+        # Galaxy types
+        if any(t in simbad_type for t in ['G', 'GAL', 'SEYFERT', 'LINER', 'AGN', 'QSO']):
+            return 'GALXY'
+        # Nebula types
+        elif any(t in simbad_type for t in ['PN', 'PLNNB']):
+            return 'PLNNB'
+        elif any(t in simbad_type for t in ['SNREM', 'SNR']):
+            return 'SNREM'
+        elif any(t in simbad_type for t in ['HII', 'BRTNB', 'EMOBJ']):
+            return 'BRTNB'
+        elif any(t in simbad_type for t in ['RNE', 'REFNB']):
+            return 'REFNB'
+        # Cluster types
+        elif any(t in simbad_type for t in ['OPNCL', 'CL*']):
+            return 'OPNCL'
+        elif any(t in simbad_type for t in ['GLOBC', 'GLOCL']):
+            return 'GLOCL'
+        elif any(t in simbad_type for t in ['ASSC', 'ASSOC']):
+            return 'ASSC'
+        # Combined types
+        elif 'NEB' in simbad_type and 'CL' in simbad_type:
+            return 'CL+NB'
+        else:
+            return None
+
+
+# --- Loading Dialog ---
+class SimbadLoadingDialog(QDialog):
+    """Simple loading dialog to show while querying SIMBAD"""
+
+    def __init__(self, search_term, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Searching SIMBAD")
+        self.setModal(True)
+        self.setFixedSize(400, 100)
+
+        # Remove close button
+        self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+
+        layout = QVBoxLayout()
+
+        # Message label
+        message = QLabel(f"Searching for '{search_term}' in SIMBAD database...\n\nPlease wait...")
+        message.setAlignment(Qt.AlignCenter)
+        message.setStyleSheet("font-size: 12pt; color: white;")
+        layout.addWidget(message)
+
+        self.setLayout(layout)
+
+        # Apply dark theme
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2d2d2d;
+            }
+        """)
 
 
 # --- Custom Visibility Window Class ---
@@ -6168,6 +6398,14 @@ class MainWindow(QMainWindow):
         toolbar.addAction(aladin_lite_action)
 
         toolbar.addSeparator()
+
+        # SIMBAD Search action
+        simbad_action = QAction("Search SIMBAD", self)
+        simbad_action.setToolTip("Search for an object in SIMBAD and add to database")
+        simbad_action.triggered.connect(self._show_simbad_search_dialog)
+        toolbar.addAction(simbad_action)
+
+        toolbar.addSeparator()
         
         # About action
         about_action = QAction("About", self)
@@ -6326,6 +6564,24 @@ class MainWindow(QMainWindow):
 
             logger.debug(f"Filter check: {filtered_len} filtered, {loaded_len} loaded, {self.model.total_count} total")
 
+            # Check if we're searching for a specific object with catalog filter
+            search_text = self.search_input.text()
+            catalog = self.catalog_combo.currentText()
+            is_specific_search = (search_text and
+                                 catalog != "All Catalogs" and
+                                 len(self.model.filtered_data) == 0)
+
+            # If searching for a specific object and found nothing, be very aggressive about loading
+            if (is_specific_search and
+                loaded_len < self.model.total_count and
+                not getattr(self.model, 'loading', False)):
+
+                logger.debug(f"Specific search for {catalog} {search_text} - loading all data...")
+                # Schedule continuous loading until we find it or run out
+                QTimer.singleShot(100, lambda: self._continue_loading_for_search(search_text, catalog))
+                self.model.load_more_data()
+                return
+
             # If we have very few results and more data available, trigger loading immediately
             if (filtered_len < 100 and
                 loaded_len < self.model.total_count and
@@ -6379,15 +6635,112 @@ class MainWindow(QMainWindow):
 
     def _on_search(self, text):
         """Handle search text changes"""
+        selected_catalog = None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText()
+
         self.model.filter_data(
             text,
-            None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
+            selected_catalog,
             self.show_images_only.isChecked(),
             self._get_selected_type()
         )
         self._update_status()
-        # Check if we need more data for this filter
-        self._check_filter_needs_more_data()
+
+        # If searching for a specific designation with a catalog filter, keep loading until we find it or run out of data
+        if text and selected_catalog and self.model.load_offset < self.model.total_count:
+            # Check if we found an exact match
+            found_exact_match = False
+            search_lower = text.lower()
+            for item in self.model.filtered_data:
+                designations = item["designations"].split(", ")
+                if any(designation.lower() == f"{selected_catalog.lower()} {search_lower}" for designation in designations):
+                    found_exact_match = True
+                    break
+
+            # If no exact match and more data available, trigger loading
+            if not found_exact_match:
+                logger.debug(f"No exact match for {selected_catalog} {text} yet, continuing to load data...")
+                self._check_filter_needs_more_data()
+        else:
+            # Check if we need more data for this filter
+            self._check_filter_needs_more_data()
+
+        # Check if we should query SIMBAD for this object
+        # Only trigger if:
+        # 1. Search text is not empty and looks like an object designation
+        # 2. No results found in local database
+        # 3. All data has been loaded (not still in lazy loading)
+        # 4. No other filters are active (catalog/type filters should be "All")
+        if (text and
+            len(self.model.filtered_data) == 0 and
+            self.model.load_offset >= self.model.total_count and
+            self.catalog_combo.currentText() == "All Catalogs" and
+            self._get_selected_type() is None and
+            not self.show_images_only.isChecked() and
+            self._looks_like_object_designation(text)):
+
+            # Use a timer to delay the SIMBAD query slightly
+            # This prevents triggering during rapid typing
+            if hasattr(self, '_simbad_query_timer'):
+                self._simbad_query_timer.stop()
+
+            self._simbad_query_timer = QTimer()
+            self._simbad_query_timer.setSingleShot(True)
+            self._simbad_query_timer.timeout.connect(lambda: self._prompt_simbad_query(text))
+            self._simbad_query_timer.start(1000)  # Wait 1 second after user stops typing
+
+    def _looks_like_object_designation(self, text):
+        """Check if text looks like an object designation"""
+        text = text.strip()
+
+        # Skip if too long (likely a coordinate or description)
+        if len(text) > 30:
+            return False
+
+        # Skip if it looks like coordinates (contains ° or : or multiple spaces)
+        if any(char in text for char in ['°', ':', '+', '-']) and ' ' in text:
+            return False
+
+        # Check if it starts with a common catalog prefix
+        common_prefixes = ['M', 'NGC', 'IC', 'Abell', 'UGC', 'PGC', 'Barnard', 'Sharpless', 'LDN', 'Arp', 'VdB']
+        for prefix in common_prefixes:
+            if text.upper().startswith(prefix.upper() + ' ') or text.upper().startswith(prefix.upper()):
+                return True
+
+        # Also accept if it's a simple designation pattern (letters followed by numbers)
+        import re
+        if re.match(r'^[A-Za-z]+\s*\d+', text):
+            return True
+
+        return False
+
+    def _prompt_simbad_query(self, search_term):
+        """Prompt user to search SIMBAD for the object"""
+        reply = QMessageBox.question(
+            self,
+            "Object Not Found",
+            f"'{search_term}' was not found in the local database.\n\n"
+            f"Would you like to search for it in the SIMBAD astronomical database?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+
+        if reply == QMessageBox.Yes:
+            self._query_simbad_for_object(search_term)
+
+    def _show_simbad_search_dialog(self):
+        """Show dialog to manually search SIMBAD for an object"""
+        from PySide6.QtWidgets import QInputDialog
+
+        text, ok = QInputDialog.getText(
+            self,
+            "Search SIMBAD",
+            "Enter object designation to search in SIMBAD\n(e.g., M 31, NGC 7789, Andromeda Galaxy):",
+            QLineEdit.Normal,
+            self.search_input.text()  # Pre-populate with current search text
+        )
+
+        if ok and text.strip():
+            self._query_simbad_for_object(text.strip())
 
     def _on_catalog_changed(self, catalog):
         """Handle catalog selection changes"""
@@ -6452,10 +6805,259 @@ class MainWindow(QMainWindow):
         # Use a timer to schedule the next load check
         QTimer.singleShot(100, self._check_filter_needs_more_data)
 
+    def _continue_loading_for_search(self, search_text, catalog):
+        """Continue loading data until we find a specific object or run out of data"""
+        # Check if the search parameters are still the same
+        if (self.search_input.text() != search_text or
+            self.catalog_combo.currentText() != catalog):
+            logger.debug("Search changed, stopping continuous load")
+            return
+
+        # Check if we found the object
+        found_exact_match = False
+        search_lower = search_text.lower()
+        for item in self.model.filtered_data:
+            designations = item["designations"].split(", ")
+            if any(designation.lower() == f"{catalog.lower()} {search_lower}" for designation in designations):
+                found_exact_match = True
+                logger.debug(f"Found exact match for {catalog} {search_text}!")
+                break
+
+        # If found or no more data, stop
+        if found_exact_match or self.model.load_offset >= self.model.total_count:
+            if not found_exact_match:
+                logger.debug(f"Reached end of data without finding {catalog} {search_text}")
+            return
+
+        # Otherwise, continue loading
+        if not getattr(self.model, 'loading', False):
+            logger.debug(f"Continuing to load for {catalog} {search_text}...")
+            self.model.load_more_data()
+            # Schedule next check
+            QTimer.singleShot(200, lambda: self._continue_loading_for_search(search_text, catalog))
+
     def _exit_startup_mode(self):
         """Exit startup mode for the model to enable full sorting"""
         if hasattr(self.model, 'exit_startup_mode'):
             self.model.exit_startup_mode()
+
+    def _save_simbad_object_to_database(self, object_data):
+        """Save SIMBAD object data to the database"""
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Parse main_id to extract catalog and designation for the ID
+                # SIMBAD main_id can be like "M 42", "NGC  7789", etc.
+                main_id = object_data['main_id'].strip()
+
+                # Remove extra spaces
+                main_id_clean = ' '.join(main_id.split())
+
+                # Try to split by common catalog prefixes to create the database ID
+                catalog_entries = []
+                dso_id = None
+
+                # Common catalogs to look for
+                common_catalogs = ['M', 'NGC', 'IC', 'Abell', 'UGC', 'PGC', 'Barnard', 'Sharpless', 'LDN', 'Arp', 'VdB']
+
+                for catalog in common_catalogs:
+                    # Check if main_id starts with this catalog
+                    if main_id_clean.upper().startswith(catalog.upper() + ' '):
+                        designation = main_id_clean[len(catalog)+1:].strip()
+                        catalog_entries.append((catalog, designation))
+                        # Create database ID (e.g., "NGC7789")
+                        dso_id = f"{catalog}{designation.replace(' ', '')}"
+                        break
+
+                # If no match found, create a generic ID
+                if not catalog_entries:
+                    # Try to split on first space
+                    parts = main_id_clean.split(' ', 1)
+                    if len(parts) == 2:
+                        catalog_entries.append((parts[0], parts[1]))
+                        dso_id = f"{parts[0]}{parts[1].replace(' ', '')}"
+                    else:
+                        catalog_entries.append(('SIMBAD', main_id_clean))
+                        dso_id = f"SIMBAD{main_id_clean.replace(' ', '')}"
+
+                logger.debug(f"Generated database ID: {dso_id} for {main_id}")
+
+                # Check if object already exists
+                cursor.execute("SELECT id FROM dsodetail WHERE id = ?", (dso_id,))
+                existing = cursor.fetchone()
+                if existing:
+                    logger.info(f"Object {dso_id} already exists in database")
+
+                    # Extract catalog and designation for searching
+                    catalog, designation = catalog_entries[0] if catalog_entries else (None, None)
+
+                    # Show message and offer to search for it
+                    reply = QMessageBox.question(
+                        self,
+                        "Object Already Exists",
+                        f"'{main_id_clean}' (ID: {dso_id}) already exists in the database.\n\n"
+                        f"Would you like to search for it and display it?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes
+                    )
+
+                    if reply == QMessageBox.Yes and catalog:
+                        # Clear filters and search for the object
+                        self.catalog_combo.setCurrentText(catalog)
+                        self.search_input.setText(designation)
+
+                    return dso_id
+
+                # Get constellation from coordinates using astropy
+                try:
+                    from astropy.coordinates import SkyCoord
+                    import astropy.units as u
+                    from astropy.coordinates import get_constellation
+
+                    coords = SkyCoord(
+                        ra=object_data['ra_deg']*u.degree,
+                        dec=object_data['dec_deg']*u.degree,
+                        frame='icrs'
+                    )
+                    constellation = get_constellation(coords)
+                except Exception as e:
+                    logger.warning(f"Could not determine constellation: {e}")
+                    constellation = None
+
+                # Convert size from arcminutes to arcseconds for database storage
+                size_maj_arcsec = object_data['size_maj'] * 60.0 if object_data['size_maj'] else None
+                size_min_arcsec = object_data['size_min'] * 60.0 if object_data['size_min'] else None
+
+                # Insert into dsodetail table with explicit ID
+                cursor.execute("""
+                    INSERT INTO dsodetail (
+                        id, ra, dec, magnitude, surfacebrightness,
+                        sizemin, sizemax, constellation, dsotype, dsoclass
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    dso_id,
+                    object_data['ra_deg'],
+                    object_data['dec_deg'],
+                    object_data['magnitude'],
+                    None,  # surfacebrightness
+                    size_min_arcsec,
+                    size_maj_arcsec,
+                    constellation,
+                    object_data['dso_type'],
+                    None  # dsoclass
+                ))
+
+                logger.debug(f"Inserted DSO with ID {dso_id}")
+
+                # Insert catalog entries
+                for catalog, designation in catalog_entries:
+                    cursor.execute("""
+                        INSERT INTO cataloguenr (dsodetailid, catalogue, designation)
+                        VALUES (?, ?, ?)
+                    """, (dso_id, catalog, designation))
+                    logger.debug(f"Inserted catalog entry: {catalog} {designation}")
+
+                conn.commit()
+                logger.info(f"Successfully saved SIMBAD object: {main_id} with ID {dso_id}")
+                return dso_id
+
+        except Exception as e:
+            logger.error(f"Error saving SIMBAD object to database: {str(e)}", exc_info=True)
+            raise
+
+    def _query_simbad_for_object(self, search_term):
+        """Query SIMBAD for an object and add it to the database if found"""
+        # Show loading dialog
+        self.simbad_loading_dialog = SimbadLoadingDialog(search_term, self)
+        self.simbad_loading_dialog.show()
+
+        # Create and start worker thread
+        self.simbad_worker = SimbadQueryWorker(search_term, self)
+        self.simbad_worker.object_found.connect(self._on_simbad_object_found)
+        self.simbad_worker.object_not_found.connect(self._on_simbad_object_not_found)
+        self.simbad_worker.error_occurred.connect(self._on_simbad_error)
+        self.simbad_worker.start()
+
+    def _on_simbad_object_found(self, object_data):
+        """Handle when SIMBAD finds an object"""
+        try:
+            # Close loading dialog
+            if hasattr(self, 'simbad_loading_dialog'):
+                self.simbad_loading_dialog.close()
+
+            # Save to database
+            self._save_simbad_object_to_database(object_data)
+
+            # Show success message
+            QMessageBox.information(
+                self,
+                "Object Added",
+                f"Found '{object_data['main_id']}' in SIMBAD and added it to the database.\n\n"
+                f"The object will now appear in your search results."
+            )
+
+            # Reload data to show the new object
+            self._reload_data()
+
+        except Exception as e:
+            logger.error(f"Error handling SIMBAD object: {str(e)}", exc_info=True)
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Found object in SIMBAD but failed to add to database:\n{str(e)}"
+            )
+        finally:
+            # Clean up worker
+            if hasattr(self, 'simbad_worker'):
+                self.simbad_worker.deleteLater()
+                self.simbad_worker = None
+
+    def _on_simbad_object_not_found(self):
+        """Handle when SIMBAD doesn't find an object"""
+        # Close loading dialog
+        if hasattr(self, 'simbad_loading_dialog'):
+            self.simbad_loading_dialog.close()
+
+        QMessageBox.information(
+            self,
+            "Object Not Found",
+            "The object was not found in the SIMBAD database.\n\n"
+            "Please check the designation and try again."
+        )
+
+        # Clean up worker
+        if hasattr(self, 'simbad_worker'):
+            self.simbad_worker.deleteLater()
+            self.simbad_worker = None
+
+    def _on_simbad_error(self, error_message):
+        """Handle SIMBAD query errors"""
+        # Close loading dialog
+        if hasattr(self, 'simbad_loading_dialog'):
+            self.simbad_loading_dialog.close()
+
+        QMessageBox.warning(
+            self,
+            "SIMBAD Query Error",
+            f"Error querying SIMBAD:\n\n{error_message}\n\n"
+            "Please check your internet connection and try again."
+        )
+
+        # Clean up worker
+        if hasattr(self, 'simbad_worker'):
+            self.simbad_worker.deleteLater()
+            self.simbad_worker = None
+
+    def _reload_data(self):
+        """Reload all data from database"""
+        # Reset the model's data
+        self.model.dso_data.clear()
+        self.model.filtered_data.clear()
+        self.model.load_offset = 0
+
+        # Reload first batch
+        self.model.load_more_data()
 
 
     def _on_double_click(self, index):
