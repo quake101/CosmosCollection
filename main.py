@@ -946,6 +946,14 @@ class DSOTableModel(QAbstractTableModel):
             QTimer.singleShot(100, self._apply_pending_sort)
             return  # Don't trigger more loading if we're done
 
+        # Check if parent is doing a specific catalog search and needs more data
+        if hasattr(self.parent(), '_check_search_needs_continue'):
+            if self.parent()._check_search_needs_continue():
+                logger.debug("Continuing load for specific search...")
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(100, self.load_more_data)
+                return
+
         # Check if we need to load more data immediately (for sparse filter results)
         filtered_len = len(self.filtered_data)
         if (filtered_len < 100 and
@@ -6577,8 +6585,9 @@ class MainWindow(QMainWindow):
                 not getattr(self.model, 'loading', False)):
 
                 logger.debug(f"Specific search for {catalog} {search_text} - loading all data...")
-                # Schedule continuous loading until we find it or run out
-                QTimer.singleShot(100, lambda: self._continue_loading_for_search(search_text, catalog))
+                # Mark this as an active catalog search
+                self._active_catalog_search = (search_text, catalog)
+                # Start loading - the model's _on_data_loaded will check _check_search_needs_continue
                 self.model.load_more_data()
                 return
 
@@ -6811,6 +6820,7 @@ class MainWindow(QMainWindow):
         if (self.search_input.text() != search_text or
             self.catalog_combo.currentText() != catalog):
             logger.debug("Search changed, stopping continuous load")
+            self._active_catalog_search = None
             return
 
         # Check if we found the object
@@ -6821,12 +6831,14 @@ class MainWindow(QMainWindow):
             if any(designation.lower() == f"{catalog.lower()} {search_lower}" for designation in designations):
                 found_exact_match = True
                 logger.debug(f"Found exact match for {catalog} {search_text}!")
+                self._active_catalog_search = None
                 break
 
         # If found or no more data, stop
         if found_exact_match or self.model.load_offset >= self.model.total_count:
             if not found_exact_match:
                 logger.debug(f"Reached end of data without finding {catalog} {search_text}")
+            self._active_catalog_search = None
             return
 
         # Otherwise, continue loading
@@ -6835,6 +6847,31 @@ class MainWindow(QMainWindow):
             self.model.load_more_data()
             # Schedule next check
             QTimer.singleShot(200, lambda: self._continue_loading_for_search(search_text, catalog))
+
+    def _check_search_needs_continue(self):
+        """Check if we need to continue loading for an active catalog search"""
+        if not hasattr(self, '_active_catalog_search') or not self._active_catalog_search:
+            return False
+
+        search_text, catalog = self._active_catalog_search
+
+        # Check if search still matches
+        if (self.search_input.text() != search_text or
+            self.catalog_combo.currentText() != catalog):
+            self._active_catalog_search = None
+            return False
+
+        # Check if we found it
+        search_lower = search_text.lower()
+        for item in self.model.filtered_data:
+            designations = item["designations"].split(", ")
+            if any(designation.lower() == f"{catalog.lower()} {search_lower}" for designation in designations):
+                logger.debug(f"Found exact match for {catalog} {search_text}!")
+                self._active_catalog_search = None
+                return False
+
+        # Still need more data
+        return self.model.load_offset < self.model.total_count
 
     def _exit_startup_mode(self):
         """Exit startup mode for the model to enable full sorting"""
