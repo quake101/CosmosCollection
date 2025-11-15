@@ -721,16 +721,14 @@ class BestDSOTonightWindow(QMainWindow):
 
         # Set column widths - allow user resizing
         header = self.results_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Interactive)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.Interactive)
         header.setSectionResizeMode(4, QHeaderView.Interactive)
         header.setSectionResizeMode(5, QHeaderView.Interactive)
         header.setSectionResizeMode(6, QHeaderView.Interactive)
         header.setSectionResizeMode(7, QHeaderView.Interactive)
-
-        self.results_table.setColumnWidth(0, 80)
         self.results_table.setColumnWidth(3, 70)
         self.results_table.setColumnWidth(4, 70)
         self.results_table.setColumnWidth(5, 80)

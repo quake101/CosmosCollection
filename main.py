@@ -38,6 +38,24 @@ logger = logging.getLogger(__name__)
 # Get the application directory
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Configure SSL certificates for PyInstaller
+if getattr(sys, 'frozen', False):
+    # Running in a PyInstaller bundle
+    import certifi
+    cert_path = os.path.join(sys._MEIPASS, 'certifi', 'cacert.pem')
+    if os.path.exists(cert_path):
+        os.environ['SSL_CERT_FILE'] = cert_path
+        os.environ['REQUESTS_CA_BUNDLE'] = cert_path
+        logger.debug(f"SSL certificate path set to: {cert_path}")
+    else:
+        # Fallback to certifi's default path
+        os.environ['SSL_CERT_FILE'] = certifi.where()
+        os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+        logger.debug(f"SSL certificate path set to certifi default: {certifi.where()}")
+else:
+    # Running in normal Python environment
+    logger.debug("Running in normal Python environment")
+
 
 class ImageCache:
     _instance = None
@@ -3450,8 +3468,7 @@ class ObjectDetailWindow(QDialog):
             simbad_data_available = True
             row = simbad_result[0]  # Get first result
 
-            text += "<b>SIMBAD Data:</b><br>"
-            text += "<span style='color: #90EE90;'>✓ Successfully retrieved from database</span><br>"
+            text += "<b>SIMBAD Data:</b>"
 
             # Object type from SIMBAD
             if 'OTYPE' in row.colnames and row['OTYPE']:

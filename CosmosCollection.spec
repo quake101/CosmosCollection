@@ -1,6 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
+import certifi
+import os
 
 block_cipher = None
+
+# Get certifi certificate bundle path
+cert_file = certifi.where()
+cert_dir = os.path.dirname(cert_file)
 
 a = Analysis(
     ['main.py'],
@@ -9,6 +15,7 @@ a = Analysis(
     datas=[
         ('catalogs', 'catalogs'),
         ('images', 'images'),
+        (cert_file, 'certifi'),
     ],
     hiddenimports=[
         'astroquery',

@@ -452,10 +452,11 @@ class DSOTargetListWindow(QMainWindow):
 
         # Set column widths - Allow manual resizing
         header = self.targets_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)  # Allow all columns to be resized
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Name column autosizes to content
+        for col in range(1, 10):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)  # Other columns allow manual resizing
 
-        # Set initial default widths
-        self.targets_table.setColumnWidth(0, 120)  # Name
+        # Set initial default widths for manually resizable columns
         self.targets_table.setColumnWidth(1, 120)  # Type
         self.targets_table.setColumnWidth(2, 100)  # Constellation
         self.targets_table.setColumnWidth(3, 90)   # Magnitude
