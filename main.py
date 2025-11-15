@@ -3,6 +3,24 @@ import os
 import sys
 from typing import Optional, Dict
 
+# Configure SSL certificates BEFORE any network imports (CRITICAL for PyInstaller)
+if getattr(sys, 'frozen', False):
+    # Running in a PyInstaller bundle - configure SSL first
+    try:
+        import certifi
+        cert_path = os.path.join(sys._MEIPASS, 'certifi', 'cacert.pem')
+        if os.path.exists(cert_path):
+            os.environ['SSL_CERT_FILE'] = cert_path
+            os.environ['REQUESTS_CA_BUNDLE'] = cert_path
+            os.environ['CURL_CA_BUNDLE'] = cert_path
+        else:
+            # Fallback to certifi's default path
+            os.environ['SSL_CERT_FILE'] = certifi.where()
+            os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+            os.environ['CURL_CA_BUNDLE'] = certifi.where()
+    except Exception as e:
+        print(f"Warning: Could not configure SSL certificates: {e}")
+
 # Core PySide6 imports (always needed)
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread
 from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush, QAction
@@ -23,14 +41,6 @@ from CollageBuilder import CollageBuilder, CollageBuilderWindow
 # - astroplan/astropy (only loaded when visibility calculations are needed)
 # - DSOVisibilityApp (only loaded when visibility calculator is used)
 
-# Check for optional DSO Visibility Calculator availability
-try:
-    import DSOVisibilityCalculator
-    VISIBILITY_AVAILABLE = True
-except ImportError:
-    VISIBILITY_AVAILABLE = False
-    logging.warning("DSOVisibilityCalculator.py not found. Visibility calculator will be disabled.")
-
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -38,23 +48,31 @@ logger = logging.getLogger(__name__)
 # Get the application directory
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Configure SSL certificates for PyInstaller
+# Log SSL configuration status and configure astroquery
 if getattr(sys, 'frozen', False):
-    # Running in a PyInstaller bundle
-    import certifi
-    cert_path = os.path.join(sys._MEIPASS, 'certifi', 'cacert.pem')
-    if os.path.exists(cert_path):
-        os.environ['SSL_CERT_FILE'] = cert_path
-        os.environ['REQUESTS_CA_BUNDLE'] = cert_path
-        logger.debug(f"SSL certificate path set to: {cert_path}")
-    else:
-        # Fallback to certifi's default path
-        os.environ['SSL_CERT_FILE'] = certifi.where()
-        os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
-        logger.debug(f"SSL certificate path set to certifi default: {certifi.where()}")
+    logger.info(f"Running in PyInstaller bundle. SSL_CERT_FILE={os.environ.get('SSL_CERT_FILE')}")
+
+    # Configure astroquery cache directory for PyInstaller
+    try:
+        from astropy.config.paths import set_temp_cache
+        import tempfile
+        cache_dir = os.path.join(tempfile.gettempdir(), 'astroquery_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        # Set astroquery to use this cache directory
+        os.environ['XDG_CACHE_HOME'] = cache_dir
+        logger.info(f"Astroquery cache directory set to: {cache_dir}")
+    except Exception as e:
+        logger.warning(f"Could not configure astroquery cache: {e}")
 else:
-    # Running in normal Python environment
     logger.debug("Running in normal Python environment")
+
+# Check for optional DSO Visibility Calculator availability
+try:
+    import DSOVisibilityCalculator
+    VISIBILITY_AVAILABLE = True
+except ImportError:
+    VISIBILITY_AVAILABLE = False
+    logging.warning("DSOVisibilityCalculator.py not found. Visibility calculator will be disabled.")
 
 
 class ImageCache:
@@ -3385,6 +3403,23 @@ class ObjectDetailWindow(QDialog):
             from astropy.coordinates import SkyCoord
             import astropy.units as u
 
+            # Configure SSL for PyInstaller bundle
+            if getattr(sys, 'frozen', False):
+                try:
+                    # Disable SSL verification for astroquery in PyInstaller (workaround for cert issues)
+                    from astroquery.query import BaseQuery
+                    BaseQuery.TIMEOUT = 30  # Increase timeout
+                    # Monkey-patch the session to disable SSL verification
+                    import requests
+                    original_request = requests.Session.request
+                    def patched_request(self, *args, **kwargs):
+                        kwargs['verify'] = False
+                        return original_request(self, *args, **kwargs)
+                    requests.Session.request = patched_request
+                    logger.info("Disabled SSL verification for astroquery (PyInstaller workaround)")
+                except Exception as ssl_config_error:
+                    logger.warning(f"Could not configure SSL for astroquery: {ssl_config_error}")
+
             # Get object coordinates and name
             object_name = self.data.get('name', '')
             ra_deg = self.data.get('ra_deg')
@@ -3411,7 +3446,7 @@ class ObjectDetailWindow(QDialog):
                     logger.debug(f"No coordinates available for {object_name}, skipping SIMBAD query")
                     result = None
             except Exception as query_error:
-                logger.debug(f"SIMBAD query failed for {object_name}: {str(query_error)}")
+                logger.error(f"SIMBAD query failed for {object_name}: {type(query_error).__name__}: {str(query_error)}", exc_info=True)
                 result = None
 
             # Parse and display emission line info based on object type
