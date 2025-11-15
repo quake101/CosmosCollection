@@ -1032,6 +1032,20 @@ class SimbadQueryWorker(QThread):
     def run(self):
         """Query SIMBAD in background thread"""
         try:
+            # Configure SSL for PyInstaller bundle before imports
+            if getattr(sys, 'frozen', False):
+                try:
+                    # Disable SSL verification for astroquery in PyInstaller (workaround for cert issues)
+                    import requests
+                    original_request = requests.Session.request
+                    def patched_request(self, *args, **kwargs):
+                        kwargs['verify'] = False
+                        return original_request(self, *args, **kwargs)
+                    requests.Session.request = patched_request
+                    logger.info("Disabled SSL verification for astroquery in worker thread (PyInstaller workaround)")
+                except Exception as ssl_config_error:
+                    logger.warning(f"Could not configure SSL for astroquery in worker: {ssl_config_error}")
+
             from astroquery.simbad import Simbad
             from astropy.coordinates import SkyCoord
             import astropy.units as u
@@ -2453,10 +2467,13 @@ class AladinLiteWindow(QMainWindow):
         try:
             import urllib.request
             import threading
+            import ssl
 
             def test_connection():
                 try:
-                    with urllib.request.urlopen("https://aladin.u-strasbg.fr", timeout=10) as response:
+                    # Disable SSL verification for PyInstaller builds
+                    context = ssl._create_unverified_context() if getattr(sys, 'frozen', False) else None
+                    with urllib.request.urlopen("https://aladin.u-strasbg.fr", timeout=10, context=context) as response:
                         if response.status == 200:
                             logger.debug("Aladin server connectivity test successful")
                         else:

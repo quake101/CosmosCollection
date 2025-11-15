@@ -52,7 +52,10 @@ class VersionManager:
                 'User-Agent': 'CosmosCollection'
             }
 
-            response = requests.get(url, headers=headers, timeout=10)
+            # Disable SSL verification for PyInstaller builds
+            import sys
+            verify_ssl = not getattr(sys, 'frozen', False)
+            response = requests.get(url, headers=headers, timeout=10, verify=verify_ssl)
             response.raise_for_status()
 
             release_data = response.json()
