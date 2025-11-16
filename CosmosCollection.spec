@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 import certifi
 import os
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 
@@ -8,58 +9,25 @@ block_cipher = None
 cert_file = certifi.where()
 cert_dir = os.path.dirname(cert_file)
 
-# Get astroquery and astropy paths dynamically (works in GitHub Actions)
-try:
-    import astroquery
-    astroquery_path = os.path.dirname(astroquery.__file__)
-    astroquery_data = (astroquery_path, 'astroquery')
-except ImportError:
-    astroquery_data = None
-    print("Warning: astroquery not found, will not be bundled")
+# Collect all astroquery and astropy modules, data, and binaries
+astroquery_datas, astroquery_binaries, astroquery_hiddenimports = collect_all('astroquery')
+astropy_datas, astropy_binaries, astropy_hiddenimports = collect_all('astropy')
 
-try:
-    import astropy
-    astropy_path = os.path.dirname(astropy.__file__)
-    astropy_data = (astropy_path, 'astropy')
-except ImportError:
-    astropy_data = None
-    print("Warning: astropy not found, will not be bundled")
-
-# Build datas list
+# Combine with existing data files
 datas_list = [
     ('catalogs', 'catalogs'),
     ('images', 'images'),
     (cert_file, 'certifi'),
-]
+] + astroquery_datas + astropy_datas
 
-if astroquery_data:
-    datas_list.append(astroquery_data)
-if astropy_data:
-    datas_list.append(astropy_data)
+binaries_list = astroquery_binaries + astropy_binaries
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
+    binaries=binaries_list,
     datas=datas_list,
-    hiddenimports=[
-        'astroquery',
-        'astroquery.simbad',
-        'astroquery.simbad.core',
-        'astroquery.query',
-        'astroquery.utils',
-        'astroquery.utils.tap',
-        'astroquery.utils.tap.core',
-        'astroquery.utils.commons',
-        'astroquery.exceptions',
-        'astropy',
-        'astropy.coordinates',
-        'astropy.units',
-        'astropy.table',
-        'astropy.io.votable',
-        'astropy.io.ascii',
-        'astropy.config',
-        'astropy.config.paths',
+    hiddenimports=astroquery_hiddenimports + astropy_hiddenimports + [
         'pyvo',
         'pyvo.dal',
         'bs4',
