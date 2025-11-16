@@ -3821,15 +3821,17 @@ class ObjectDetailWindow(QDialog):
             if designations_str and designations_str.strip():
                 designations = [d.strip() for d in designations_str.split(',') if d.strip()]
                 logger.debug(f"Split designations: {designations}")
-                
+
                 # Get the current primary designation (as shown in the title)
                 primary_name = self.data.get('name', '').strip()
-                
+
                 # Show all designations except the current primary one
                 other_designations = []
+                seen = set()
                 for designation in designations:
-                    if designation and designation != primary_name:
+                    if designation and designation != primary_name and designation not in seen:
                         other_designations.append(designation)
+                        seen.add(designation)
                 
                 # Display other designations
                 if other_designations:
