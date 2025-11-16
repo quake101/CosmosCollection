@@ -1,7 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import certifi
 import os
-from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 
@@ -9,44 +8,38 @@ block_cipher = None
 cert_file = certifi.where()
 cert_dir = os.path.dirname(cert_file)
 
-# Collect all astroquery and astropy modules, data, and binaries
-astroquery_datas, astroquery_binaries, astroquery_hiddenimports = collect_all('astroquery')
-astropy_datas, astropy_binaries, astropy_hiddenimports = collect_all('astropy')
-
-# Combine with existing data files
-datas_list = [
-    ('catalogs', 'catalogs'),
-    ('images', 'images'),
-    (cert_file, 'certifi'),
-] + astroquery_datas + astropy_datas
-
-binaries_list = astroquery_binaries + astropy_binaries
-
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=binaries_list,
-    datas=datas_list,
-    hiddenimports=astroquery_hiddenimports + astropy_hiddenimports + [
+    binaries=[],
+    datas=[
+        ('catalogs', 'catalogs'),
+        ('images', 'images'),
+        (cert_file, 'certifi'),
+    ],
+    hiddenimports=[
+        # Astroquery - top-level import in main.py should auto-detect, but list key modules as backup
+        'astroquery',
+        'astroquery.simbad',
+        'astroquery.query',
+        # Astropy - top-level import in main.py should auto-detect, but list key modules as backup
+        'astropy',
+        'astropy.coordinates',
+        'astropy.units',
+        # Other dependencies
         'pyvo',
-        'pyvo.dal',
         'bs4',
         'certifi',
         'html.parser',
         'requests',
-        'requests.adapters',
-        'requests.packages',
-        'requests.packages.urllib3',
         'urllib3',
-        'urllib3.util',
-        'urllib3.util.ssl_',
         'keyring',
         'BestDSOTonight',
         'DSOVisibilityCalculator',
         'DSOTargetList',
         'concurrent.futures',
     ],
-    hookspath=[],
+    hookspath=['.'],  # Look for hook files in current directory
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
