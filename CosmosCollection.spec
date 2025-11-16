@@ -8,15 +8,40 @@ block_cipher = None
 cert_file = certifi.where()
 cert_dir = os.path.dirname(cert_file)
 
+# Get astroquery and astropy paths dynamically (works in GitHub Actions)
+try:
+    import astroquery
+    astroquery_path = os.path.dirname(astroquery.__file__)
+    astroquery_data = (astroquery_path, 'astroquery')
+except ImportError:
+    astroquery_data = None
+    print("Warning: astroquery not found, will not be bundled")
+
+try:
+    import astropy
+    astropy_path = os.path.dirname(astropy.__file__)
+    astropy_data = (astropy_path, 'astropy')
+except ImportError:
+    astropy_data = None
+    print("Warning: astropy not found, will not be bundled")
+
+# Build datas list
+datas_list = [
+    ('catalogs', 'catalogs'),
+    ('images', 'images'),
+    (cert_file, 'certifi'),
+]
+
+if astroquery_data:
+    datas_list.append(astroquery_data)
+if astropy_data:
+    datas_list.append(astropy_data)
+
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[
-        ('catalogs', 'catalogs'),
-        ('images', 'images'),
-        (cert_file, 'certifi'),
-    ],
+    datas=datas_list,
     hiddenimports=[
         'astroquery',
         'astroquery.simbad',
