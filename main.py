@@ -1066,9 +1066,9 @@ class SimbadQueryWorker(QThread):
             custom_simbad = Simbad()
             custom_simbad.add_votable_fields(
                 'otype',  # Object type
-                'dim',  # Dimensions
-                'flux(V)',  # V magnitude
-                'flux(B)',  # B magnitude
+                'dimensions',  # Dimensions
+                'V',  # V magnitude
+                'B',  # B magnitude
             )
 
             # Try to query by identifier
@@ -1124,7 +1124,7 @@ class SimbadQueryWorker(QThread):
 
             # Get magnitude - try V magnitude first, then B
             magnitude = None
-            for mag_col in ['V', 'FLUX_V', 'v', 'flux_v']:
+            for mag_col in ['V', 'v', 'B', 'b', 'FLUX_V', 'flux_V', 'FLUX_B', 'flux_B']:
                 if mag_col in row.colnames and row[mag_col] is not None:
                     try:
                         magnitude = float(row[mag_col])
@@ -3456,7 +3456,7 @@ class ObjectDetailWindow(QDialog):
 
             # Configure SIMBAD to return flux measurements and spectral type
             custom_simbad = Simbad()
-            custom_simbad.add_votable_fields('flux(U)', 'flux(B)', 'flux(V)', 'flux(R)', 'flux(I)', 'sp', 'otype')
+            custom_simbad.add_votable_fields('U', 'B', 'V', 'R', 'I', 'sp', 'otype')
 
             # Query SIMBAD using coordinates (more reliable than name)
             try:
@@ -3546,21 +3546,25 @@ class ObjectDetailWindow(QDialog):
             # Flux measurements (photometry)
             flux_data = []
             flux_bands = [
-                ('FLUX_U', 'U'),
-                ('FLUX_B', 'B'),
-                ('FLUX_V', 'V'),
-                ('FLUX_R', 'R'),
-                ('FLUX_I', 'I')
+                (['U', 'FLUX_U', 'flux_U'], 'U'),
+                (['B', 'FLUX_B', 'flux_B'], 'B'),
+                (['V', 'FLUX_V', 'flux_V'], 'V'),
+                (['R', 'FLUX_R', 'flux_R'], 'R'),
+                (['I', 'FLUX_I', 'flux_I'], 'I')
             ]
 
-            for flux_col, band in flux_bands:
-                if flux_col in row.colnames and row[flux_col] is not None:
-                    try:
-                        flux_val = float(row[flux_col])
-                        if not (flux_val == 0 or str(flux_val) == 'nan'):
-                            flux_data.append(f"{band}={flux_val:.2f}")
-                    except (ValueError, TypeError):
-                        pass
+            for flux_cols, band in flux_bands:
+                flux_val = None
+                for flux_col in flux_cols:
+                    if flux_col in row.colnames and row[flux_col] is not None:
+                        try:
+                            flux_val = float(row[flux_col])
+                            if not (flux_val == 0 or str(flux_val) == 'nan'):
+                                break
+                        except (ValueError, TypeError):
+                            pass
+                if flux_val is not None and not (flux_val == 0 or str(flux_val) == 'nan'):
+                    flux_data.append(f"{band}={flux_val:.2f}")
 
             if flux_data:
                 text += f"<b>Photometry:</b> {', '.join(flux_data)} mag<br>"
