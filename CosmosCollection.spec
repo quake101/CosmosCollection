@@ -39,7 +39,7 @@ a = Analysis(
         'DSOTargetList',
         'concurrent.futures',
     ],
-    hookspath=['.'],  # Look for hook files in current directory
+    hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[

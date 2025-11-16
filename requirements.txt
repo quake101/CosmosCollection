@@ -7,6 +7,8 @@ PySide6==6.9.0
 # Astronomy Libraries
 astropy==7.0.2
 astroplan==0.10.1
+astroquery==0.4.8
+pyvo==1.6
 astropy-iers-data==0.2025.5.12.0.38.29
 
 # Scientific Computing
