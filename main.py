@@ -36,6 +36,16 @@ from DatabaseManager import DatabaseManager
 from ResourceManager import ResourceManager
 from CollageBuilder import CollageBuilder, CollageBuilderWindow
 
+# Import astroquery at module level so PyInstaller detects it
+try:
+    from astroquery.simbad import Simbad
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    ASTROQUERY_AVAILABLE = True
+except ImportError as e:
+    ASTROQUERY_AVAILABLE = False
+    print(f"Warning: astroquery not available: {e}")
+
 # Heavy imports - lazy loaded when needed:
 # - QWebEngineView (only loaded when Aladin window is created)
 # - astroplan/astropy (only loaded when visibility calculations are needed)
