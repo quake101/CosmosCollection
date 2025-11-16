@@ -1,12 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 import certifi
 import os
+from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
 
 # Get certifi certificate bundle path
 cert_file = certifi.where()
 cert_dir = os.path.dirname(cert_file)
+
+# Collect astroquery data files (CITATION, configs, etc.)
+astroquery_datas = collect_data_files('astroquery')
 
 a = Analysis(
     ['main.py'],
@@ -16,7 +20,7 @@ a = Analysis(
         ('catalogs', 'catalogs'),
         ('images', 'images'),
         (cert_file, 'certifi'),
-    ],
+    ] + astroquery_datas,
     hiddenimports=[
         # Astroquery - top-level import in main.py should auto-detect, but list key modules as backup
         'astroquery',
