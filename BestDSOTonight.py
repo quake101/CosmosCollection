@@ -507,10 +507,11 @@ class DSOCalculationThread(QThread):
 class BestDSOTonightWindow(QMainWindow):
     """Main window for Best DSO Tonight calculator"""
 
-    def __init__(self):
+    def __init__(self, use_target_list=False):
         super().__init__()
         self.setWindowTitle("Best DSO Tonight - Cosmos Collection")
         self.setGeometry(100, 100, 1000, 700)
+        self.auto_use_target_list = use_target_list
         
         # Set dark theme
         self.setStyleSheet("""
@@ -603,6 +604,12 @@ class BestDSOTonightWindow(QMainWindow):
         self.visible_dsos_data = []  # Store DSO data for detail window
         self.init_ui()
         self.load_location_info()
+
+        # Auto-select target list and calculate if requested
+        if self.auto_use_target_list:
+            self.use_target_list_checkbox.setChecked(True)
+            # Use QTimer to trigger calculation after UI is fully initialized
+            QTimer.singleShot(100, self.calculate_best_dsos)
 
     def init_ui(self):
         """Initialize the user interface"""

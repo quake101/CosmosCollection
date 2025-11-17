@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
 from PySide6.QtGui import QFont
 
 from DatabaseManager import DatabaseManager
+from BestDSOTonight import BestDSOTonightWindow
 import logging
 
 # Set up logging
@@ -407,11 +408,11 @@ class DSOTargetListWindow(QMainWindow):
         self.remove_target_btn.setEnabled(False)
         control_layout.addWidget(self.remove_target_btn)
         
-        # Calculate best months button
-        calc_months_btn = QPushButton("Calculate Best Months")
-        calc_months_btn.clicked.connect(self._calculate_best_months_for_all)
-        calc_months_btn.setToolTip("Calculate best viewing months for all targets based on your location")
-        control_layout.addWidget(calc_months_btn)
+        # Best DSO Tonight button
+        best_tonight_btn = QPushButton("Best DSO Tonight")
+        best_tonight_btn.clicked.connect(self._open_best_dso_tonight)
+        best_tonight_btn.setToolTip("Open Best DSO Tonight window to find the best objects to observe tonight")
+        control_layout.addWidget(best_tonight_btn)
         
         control_layout.addStretch()
         
@@ -601,7 +602,20 @@ class DSOTargetListWindow(QMainWindow):
         self.edit_target_btn.setEnabled(has_selection)
         self.view_details_btn.setEnabled(has_selection)
         self.remove_target_btn.setEnabled(has_selection)
-    
+
+    def _open_best_dso_tonight(self):
+        """Open the Best DSO Tonight window"""
+        try:
+            # Create and show the Best DSO Tonight window with target list auto-selected
+            self.best_dso_window = BestDSOTonightWindow(use_target_list=True)
+            self.best_dso_window.show()
+            self.best_dso_window.raise_()
+            self.best_dso_window.activateWindow()
+            logger.debug("Best DSO Tonight window opened successfully with target list selected")
+        except Exception as e:
+            logger.error(f"Error opening Best DSO Tonight window: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Best DSO Tonight window: {str(e)}")
+
     def _view_target_details(self):
         """Open ObjectDetailWindow for the selected target"""
         current_row = self.targets_table.currentRow()
