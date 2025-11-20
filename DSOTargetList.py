@@ -24,6 +24,23 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class PriorityTableWidgetItem(QTableWidgetItem):
+    """Custom QTableWidgetItem that sorts priorities correctly"""
+
+    PRIORITY_ORDER = {"Urgent": 4, "High": 3, "Medium": 2, "Low": 1}
+
+    def __init__(self, priority_text):
+        super().__init__(priority_text)
+        self.priority_value = self.PRIORITY_ORDER.get(priority_text, 0)
+        self.setTextAlignment(Qt.AlignCenter)
+
+    def __lt__(self, other):
+        """Override less-than operator for proper sorting"""
+        if isinstance(other, PriorityTableWidgetItem):
+            return self.priority_value < other.priority_value
+        return super().__lt__(other)
+
+
 class AddTargetDialog(QDialog):
     """Dialog for adding a new target to the list"""
     
@@ -910,12 +927,9 @@ class DSOTargetListWindow(QMainWindow):
             # Size
             self.targets_table.setItem(row, 4, QTableWidgetItem(target.get("size_info", "")))
 
-            # Priority - use priority order for sorting
+            # Priority - use custom PriorityTableWidgetItem for proper sorting
             priority = target.get("priority", "")
-            priority_item = QTableWidgetItem(priority)
-            priority_order = {"Urgent": 4, "High": 3, "Medium": 2, "Low": 1}
-            priority_item.setData(Qt.UserRole, priority_order.get(priority, 0))  # Store numeric value for sorting
-            priority_item.setTextAlignment(Qt.AlignCenter)
+            priority_item = PriorityTableWidgetItem(priority)
             self.targets_table.setItem(row, 5, priority_item)
 
             # Status - use status order for sorting
