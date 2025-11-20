@@ -1482,6 +1482,24 @@ class AladinLiteWindow(QMainWindow):
             self.web_view = QWebEngineView()
             self.web_view.setMinimumSize(400, 300)
 
+            # Enable WebGL and hardware acceleration for Aladin Lite
+            try:
+                from PySide6.QtWebEngineCore import QWebEngineSettings
+                settings = self.web_view.settings()
+                # Enable WebGL - critical for Aladin Lite rendering
+                settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
+                settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True)
+                settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanvasAccessEnabled, True)
+                # Enable JavaScript (required for Aladin Lite)
+                settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+                settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, True)
+                settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, True)
+                # Enable local storage and other web features
+                settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
+                logger.debug("WebGL, JavaScript, and hardware acceleration enabled for Aladin window")
+            except Exception as e:
+                logger.warning(f"Could not enable WebGL settings: {e}")
+
             # Add load progress and error handling
             self.web_view.loadStarted.connect(self._on_load_started)
             self.web_view.loadProgress.connect(self._on_load_progress)
@@ -2425,9 +2443,55 @@ class AladinLiteWindow(QMainWindow):
             # Ensure the web view is visible and placeholder is hidden
             self._ensure_web_view_visible()
 
+            # Check WebGL availability for diagnostics
+            self._check_webgl_support()
+
             # Handle FOV overlay injection if needed
             if self.pending_fov_overlay and self.target_coordinates:
                 self._inject_fov_overlay(True)
+
+    def _check_webgl_support(self):
+        """Check if WebGL is available in the browser context"""
+        if not self.web_view:
+            return
+
+        # JavaScript to check WebGL support
+        js_code = """
+        (function() {
+            var canvas = document.createElement('canvas');
+            var gl = canvas.getContext('webgl') || canvas.getContext('webgl2') || canvas.getContext('experimental-webgl');
+            if (gl) {
+                var debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+                var vendor = debugInfo ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : 'Unknown';
+                var renderer = debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : 'Unknown';
+                return JSON.stringify({
+                    available: true,
+                    version: gl instanceof WebGL2RenderingContext ? 'WebGL2' : 'WebGL1',
+                    vendor: vendor,
+                    renderer: renderer
+                });
+            } else {
+                return JSON.stringify({available: false, error: 'WebGL not available'});
+            }
+        })();
+        """
+
+        def handle_webgl_result(result):
+            try:
+                import json
+                webgl_info = json.loads(result)
+                if webgl_info.get('available'):
+                    logger.info(f"WebGL is available: {webgl_info.get('version', 'Unknown')} - Vendor: {webgl_info.get('vendor', 'Unknown')}, Renderer: {webgl_info.get('renderer', 'Unknown')}")
+                else:
+                    logger.error(f"WebGL is NOT available: {webgl_info.get('error', 'Unknown error')}")
+                    logger.error("Aladin Lite will not render properly without WebGL support")
+            except Exception as e:
+                logger.error(f"Failed to parse WebGL info: {e}, result: {result}")
+
+        try:
+            self.web_view.page().runJavaScript(js_code, handle_webgl_result)
+        except Exception as e:
+            logger.error(f"Failed to check WebGL support: {e}")
 
     def _handle_loading_timeout(self):
         """Handle loading timeout"""
@@ -7592,7 +7656,45 @@ class MainWindow(QMainWindow):
 
 # --- Entry Point ---
 if __name__ == "__main__":
+    # Set environment variables for QtWebEngine to enable WebGL
+    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--ignore-gpu-blocklist --enable-webgl --enable-webgl2 --enable-gpu-rasterization'
+
+    # Enable WebGL and hardware acceleration for Qt WebEngine (required for Aladin Lite)
+    # MUST be done BEFORE QApplication is created
+    webgl_args = [
+        '--ignore-gpu-blocklist',
+        '--enable-gpu-rasterization',
+        '--enable-webgl',
+        '--enable-webgl2',
+        '--disable-software-rasterizer',
+        '--use-gl=desktop',
+    ]
+    # Add WebGL arguments if not already present
+    for arg in webgl_args:
+        if arg not in sys.argv:
+            sys.argv.append(arg)
+
+    # Initialize QtWebEngine BEFORE QApplication to ensure WebGL settings are applied
+    try:
+        from PySide6.QtWebEngineCore import QtWebEngineCore, QWebEngineProfile
+        # This ensures QtWebEngine is initialized with the command-line arguments
+        logger.debug("QtWebEngine initialized with WebGL support")
+    except ImportError:
+        logger.warning("QtWebEngineCore not available - WebGL may not work")
+
     app = QApplication(sys.argv)
+
+    # Set global WebEngine profile settings
+    try:
+        from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
+        profile = QWebEngineProfile.defaultProfile()
+        settings = profile.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        logger.debug("Global WebEngine profile configured with WebGL support")
+    except Exception as e:
+        logger.warning(f"Could not configure global WebEngine profile: {e}")
     # Set application icon
     icon_path = os.path.join(APP_DIR, 'images', 'CosmosCollection.png')
     app_icon = QIcon(icon_path)
