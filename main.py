@@ -1245,7 +1245,7 @@ class SimbadLoadingDialog(QDialog):
 class CustomDSOVisibilityWindow(QDialog):
     """Custom wrapper for the DSO Visibility Calculator"""
 
-    def __init__(self, dso_name: str, parent=None):
+    def __init__(self, dso_name: str, parent=None, ra_deg=None, dec_deg=None):
         super().__init__(parent)
         self.setWindowTitle(f"{dso_name} - DSO Visibility Calculator - Cosmos Collection")
         self.setWindowFlags(
@@ -1261,6 +1261,10 @@ class CustomDSOVisibilityWindow(QDialog):
 
         # Pre-populate with the DSO name
         self.visibility_app.dso_input.setText(dso_name)
+
+        # If coordinates are provided, set them for direct calculation
+        if ra_deg is not None and dec_deg is not None:
+            self.visibility_app.set_dso_coordinates(ra_deg, dec_deg)
 
         # Remove the window frame from the visibility app and add its central widget
         central_widget = self.visibility_app.centralWidget()
@@ -4063,11 +4067,15 @@ class ObjectDetailWindow(QDialog):
             # Create a formatted object name for the visibility calculator
             object_name = self.data['name']
 
-            # Create new visibility window
-            self.visibility_window = CustomDSOVisibilityWindow(object_name, self)
+            # Get coordinates from the data
+            ra_deg = self.data.get('ra_deg')
+            dec_deg = self.data.get('dec_deg')
+
+            # Create new visibility window with coordinates
+            self.visibility_window = CustomDSOVisibilityWindow(object_name, self, ra_deg, dec_deg)
             self.visibility_window.show()
 
-            logger.debug(f"Opened visibility calculator for {object_name}")
+            logger.debug(f"Opened visibility calculator for {object_name} with coordinates RA={ra_deg}, Dec={dec_deg}")
 
         except Exception as e:
             logger.error(f"Error opening visibility calculator: {str(e)}", exc_info=True)

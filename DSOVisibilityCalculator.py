@@ -13,8 +13,7 @@ import numpy as np
 from PySide6.QtCore import Qt, QDate, QThread, Signal
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLineEdit, QLabel, QTextEdit,
-                               QDateEdit, QSpinBox, QGroupBox, QMessageBox, QDialog,
-                               QComboBox)
+                               QDateEdit, QSpinBox, QGroupBox, QMessageBox)
 
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -506,13 +505,15 @@ class CalculationThread(QThread):
     finished = Signal(object)
     error = Signal(str)
 
-    def __init__(self, dso_name, date, hours, min_altitude):
+    def __init__(self, dso_name, date, hours, min_altitude, ra_deg=None, dec_deg=None):
         super().__init__()
         self.dso_name = dso_name
         self.date = date
         self.hours = hours
         self.min_altitude = min_altitude
-        
+        self.ra_deg = ra_deg
+        self.dec_deg = dec_deg
+
         # Use centralized calculator
         self.calculator = DSOVisibilityCalculator()
         self.location = self.calculator.location
@@ -524,18 +525,27 @@ class CalculationThread(QThread):
             if self.location is None:
                 self.error.emit("Observer location not configured. Please set your location in settings.")
                 return
-            
-            # Use centralized calculator for all calculations
-            results = self.calculator.calculate_visibility_for_date(
-                self.dso_name, self.date, self.hours, self.min_altitude)
-            
+
+            # If coordinates are provided, use them directly to avoid name resolution
+            if self.ra_deg is not None and self.dec_deg is not None:
+                from astropy.coordinates import SkyCoord
+                from astropy import units as u
+
+                dso_coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
+                results = self.calculator.calculate_visibility_for_coordinates(
+                    dso_coord, self.date, self.hours, self.min_altitude, self.dso_name)
+            else:
+                # Use name-based calculation (original behavior)
+                results = self.calculator.calculate_visibility_for_date(
+                    self.dso_name, self.date, self.hours, self.min_altitude)
+
             if "error" in results:
                 self.error.emit(results["error"])
                 return
-            
+
             # Add local timezone for compatibility with existing UI code
             results['local_tz'] = self.local_tz
-            
+
             self.finished.emit(results)
 
         except Exception as e:
@@ -788,194 +798,6 @@ class VisibilityPlot(FigureCanvas):
         self.draw_idle()
 
 
-class LocationSettingsDialog(QDialog):
-    """Dialog for setting observer location when none is configured"""
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Set Observer Location - DSO Visibility Calculator")
-        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
-        self.setModal(True)
-        self.resize(500, 350)
-        
-        self._setup_ui()
-        
-    def _setup_ui(self):
-        """Set up the location settings dialog UI"""
-        layout = QVBoxLayout()
-        
-        # Info message
-        info_label = QLabel("""<b>Location Required</b><br>
-        To calculate DSO visibility, please set your observer location.""")
-        info_label.setStyleSheet("QLabel { margin-bottom: 10px; }")
-        layout.addWidget(info_label)
-        
-        # Location group
-        location_group = QGroupBox("Observer Location")
-        location_group_layout = QVBoxLayout(location_group)
-        
-        # Latitude input
-        lat_layout = QHBoxLayout()
-        lat_label = QLabel("Latitude (degrees):")
-        lat_label.setMinimumWidth(120)
-        self.latitude_input = QLineEdit()
-        self.latitude_input.setPlaceholderText("e.g., 40.7128 (positive for North, negative for South)")
-        lat_layout.addWidget(lat_label)
-        lat_layout.addWidget(self.latitude_input)
-        location_group_layout.addLayout(lat_layout)
-        
-        # Longitude input
-        lon_layout = QHBoxLayout()
-        lon_label = QLabel("Longitude (degrees):")
-        lon_label.setMinimumWidth(120)
-        self.longitude_input = QLineEdit()
-        self.longitude_input.setPlaceholderText("e.g., -74.0060 (positive for East, negative for West)")
-        lon_layout.addWidget(lon_label)
-        lon_layout.addWidget(self.longitude_input)
-        location_group_layout.addLayout(lon_layout)
-        
-        # Location name (optional)
-        name_layout = QHBoxLayout()
-        name_label = QLabel("Location Name:")
-        name_label.setMinimumWidth(120)
-        self.location_name_input = QLineEdit()
-        self.location_name_input.setPlaceholderText("e.g., New York City (optional)")
-        name_layout.addWidget(name_label)
-        name_layout.addWidget(self.location_name_input)
-        location_group_layout.addLayout(name_layout)
-        
-        layout.addWidget(location_group)
-        
-        # Timezone settings group
-        timezone_group = QGroupBox("Time Zone Settings")
-        timezone_group_layout = QVBoxLayout(timezone_group)
-        
-        tz_layout = QHBoxLayout()
-        tz_label = QLabel("Time Zone:")
-        tz_label.setMinimumWidth(120)
-        self.timezone_combo = QComboBox()
-        self.timezone_combo.setEditable(True)
-        
-        # Add common timezones
-        common_timezones = [
-            "America/New_York",
-            "America/Chicago", 
-            "America/Denver",
-            "America/Los_Angeles",
-            "America/Phoenix",
-            "America/Anchorage",
-            "Pacific/Honolulu",
-            "UTC",
-            "Europe/London",
-            "Europe/Paris",
-            "Europe/Berlin",
-            "Asia/Tokyo",
-            "Australia/Sydney"
-        ]
-        self.timezone_combo.addItems(common_timezones)
-        self.timezone_combo.setCurrentText("America/New_York")  # Default selection
-        tz_layout.addWidget(tz_label)
-        tz_layout.addWidget(self.timezone_combo)
-        timezone_group_layout.addLayout(tz_layout)
-        
-        layout.addWidget(timezone_group)
-        
-        # Help text
-        help_text = QLabel("""
-<b>Tips:</b>
-• Latitude: Positive values for Northern Hemisphere, negative for Southern
-• Longitude: Positive values for Eastern Hemisphere, negative for Western  
-• You can find coordinates using online tools like Google Maps
-        """)
-        help_text.setWordWrap(True)
-        help_text.setStyleSheet("QLabel { color: #888888; font-size: 9pt; margin: 10px 0; }")
-        layout.addWidget(help_text)
-        
-        # Buttons
-        button_layout = QHBoxLayout()
-        
-        self.save_button = QPushButton("Save Location")
-        self.save_button.clicked.connect(self._save_settings)
-        self.save_button.setDefault(True)
-        
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.clicked.connect(self.reject)
-        
-        button_layout.addStretch()
-        button_layout.addWidget(self.save_button)
-        button_layout.addWidget(self.cancel_button)
-        
-        layout.addLayout(button_layout)
-        self.setLayout(layout)
-        
-    def _save_settings(self):
-        """Save the location settings to database"""
-        try:
-            lat_text = self.latitude_input.text().strip()
-            lon_text = self.longitude_input.text().strip()
-            
-            if not lat_text or not lon_text:
-                QMessageBox.warning(self, "Invalid Input", "Please enter both latitude and longitude.")
-                return
-                
-            try:
-                lat = float(lat_text)
-                lon = float(lon_text)
-            except ValueError:
-                QMessageBox.warning(self, "Invalid Input", "Please enter valid numeric values for latitude and longitude.")
-                return
-                
-            if not (-90 <= lat <= 90):
-                QMessageBox.warning(self, "Invalid Input", "Latitude must be between -90 and 90 degrees.")
-                return
-                
-            if not (-180 <= lon <= 180):
-                QMessageBox.warning(self, "Invalid Input", "Longitude must be between -180 and 180 degrees.")
-                return
-            
-            location_name = self.location_name_input.text().strip() or None
-            timezone = self.timezone_combo.currentText().strip() or None
-            
-            # Validate timezone
-            if timezone:
-                try:
-                    pytz.timezone(timezone)
-                except pytz.UnknownTimeZoneError:
-                    QMessageBox.warning(self, "Invalid Timezone", f"Unknown timezone: {timezone}")
-                    return
-            
-            # Save to database
-            db_manager = DatabaseManager()
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Check if settings exist
-                cursor.execute("SELECT id FROM usersettings LIMIT 1")
-                exists = cursor.fetchone()
-                
-                if exists:
-                    # Update existing settings
-                    cursor.execute("""
-                        UPDATE usersettings 
-                        SET location_lat = ?, location_lon = ?, location_name = ?, timezone = ?
-                        WHERE id = (SELECT id FROM usersettings ORDER BY id DESC LIMIT 1)
-                    """, (lat, lon, location_name, timezone))
-                else:
-                    # Insert new settings
-                    cursor.execute("""
-                        INSERT INTO usersettings (location_lat, location_lon, location_name, timezone) 
-                        VALUES (?, ?, ?, ?)
-                    """, (lat, lon, location_name, timezone))
-                
-                conn.commit()
-                
-            QMessageBox.information(self, "Success", "Location settings saved successfully!")
-            self.accept()
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save settings: {str(e)}")
-
-
 class DSOVisibilityApp(QMainWindow):
     """Main application window"""
 
@@ -1064,6 +886,9 @@ class DSOVisibilityApp(QMainWindow):
         """)
 
         self.calc_thread = None
+        # Store optional coordinates for direct calculation (bypassing name resolution)
+        self.dso_ra_deg = None
+        self.dso_dec_deg = None
         self.init_ui()
 
     def init_ui(self):
@@ -1087,12 +912,7 @@ class DSOVisibilityApp(QMainWindow):
         location_layout.addWidget(self.location_name_label)
         location_layout.addWidget(self.location_coords_label)
         left_layout.addWidget(self.location_group)
-        
-        # Add Set Location button
-        self.set_location_btn = QPushButton("Set Location")
-        self.set_location_btn.clicked.connect(self._show_location_dialog)
-        left_layout.addWidget(self.set_location_btn)
-        
+
         # Load location from database
         self._load_location_from_database()
 
@@ -1311,13 +1131,6 @@ class DSOVisibilityApp(QMainWindow):
 
         self.results_text.setText(text)
 
-    def _show_location_dialog(self):
-        """Show the location settings dialog"""
-        dialog = LocationSettingsDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            # Reload location data after successful save
-            self._load_location_from_database()
-            
     def _show_location_required(self):
         """Show message that location is required for calculations"""
         # Disable calculate button when no location is set
@@ -1333,9 +1146,8 @@ class DSOVisibilityApp(QMainWindow):
         # Check if location is configured
         calc_thread_test = CalculationThread("M1", "2024-01-01", 24, 30)
         if calc_thread_test.location is None:
-            QMessageBox.warning(self, "Location Required", 
-                              "Please set your observer location before calculating visibility.")
-            self._show_location_dialog()
+            QMessageBox.warning(self, "Location Required",
+                              "Please set your observer location from the main window's Settings menu.")
             return
 
         # Disable button during calculation
@@ -1349,8 +1161,20 @@ class DSOVisibilityApp(QMainWindow):
         hours = self.hours_input.value()
         min_altitude = self.min_alt_input.value()
 
-        # Start calculation thread
-        self.calc_thread = CalculationThread(dso_name, date, hours, min_altitude)
+        # Start calculation thread with optional coordinates
+        self.calc_thread = CalculationThread(dso_name, date, hours, min_altitude,
+                                            self.dso_ra_deg, self.dso_dec_deg)
         self.calc_thread.finished.connect(self.on_calculation_finished)
         self.calc_thread.error.connect(self.on_calculation_error)
         self.calc_thread.start()
+
+    def set_dso_coordinates(self, ra_deg, dec_deg):
+        """
+        Set DSO coordinates for direct calculation (bypassing name resolution).
+
+        Args:
+            ra_deg (float): Right Ascension in degrees
+            dec_deg (float): Declination in degrees
+        """
+        self.dso_ra_deg = ra_deg
+        self.dso_dec_deg = dec_deg
