@@ -540,43 +540,9 @@ class DSOTargetListWindow(QMainWindow):
         dialog.notes_edit.setPlainText(target_data.get("notes", ""))
         
         if dialog.exec() == QDialog.Accepted:
-            # Update the existing target instead of creating new one
-            self._update_target(target_data["id"], dialog)
-    
-    def _update_target(self, target_id, dialog):
-        """Update an existing target in the database"""
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE usertargetlist SET
-                        name = ?, dso_type = ?, constellation = ?, ra_deg = ?, 
-                        dec_deg = ?, magnitude = ?, size_info = ?, priority = ?, 
-                        status = ?, best_months = ?, notes = ?
-                    WHERE id = ?
-                """, (
-                    dialog.name_edit.text().strip(),
-                    dialog.type_edit.text().strip(),
-                    dialog.constellation_edit.text().strip(),
-                    float(dialog.ra_edit.text()) if dialog.ra_edit.text() else 0.0,
-                    float(dialog.dec_edit.text()) if dialog.dec_edit.text() else 0.0,
-                    float(dialog.magnitude_edit.text()) if dialog.magnitude_edit.text() else 0.0,
-                    dialog.size_edit.text().strip(),
-                    dialog.priority_combo.currentText(),
-                    dialog.status_combo.currentText(),
-                    dialog.months_edit.text().strip(),
-                    dialog.notes_edit.toPlainText().strip(),
-                    target_id
-                ))
-                conn.commit()
-            
-            QMessageBox.information(self, "Success", "Target updated successfully.")
+            # Reload targets to reflect the changes (dialog already handles the database update)
             self._load_targets()
-            
-        except Exception as e:
-            logger.error(f"Error updating target: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to update target: {str(e)}")
-    
+
     def _remove_selected_target(self):
         """Remove the selected target from the list"""
         current_row = self.targets_table.currentRow()
