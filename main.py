@@ -2624,6 +2624,12 @@ class ImageViewerWindow(QDialog):
             open_location_button.clicked.connect(self._open_file_location)
             toolbar.addWidget(open_location_button)
 
+            # Add set as background button
+            set_bg_button = QPushButton("Set as Background")
+            set_bg_button.setFixedSize(130, 30)
+            set_bg_button.clicked.connect(self._set_as_background)
+            toolbar.addWidget(set_bg_button)
+
         toolbar.addStretch()
 
         # Add file info toggle button (if file path is available)
@@ -2929,6 +2935,88 @@ class ImageViewerWindow(QDialog):
             if not success:
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.critical(self, "Error", "Failed to open file location")
+
+    def _set_as_background(self):
+        """Set the current image as the desktop background"""
+        if not self.file_path:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Warning", "No file path available")
+            return
+
+        try:
+            import platform
+            import ctypes
+            from pathlib import Path
+
+            # Check if file is a FITS file
+            file_ext = Path(self.file_path).suffix.lower()
+            if file_ext in ['.fits', '.fit', '.fts']:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Unsupported Format",
+                                  "FITS files cannot be set as desktop background.\n"
+                                  "Please export to a standard image format (PNG, JPG, etc.) first.")
+                return
+
+            # Ensure the file path is absolute
+            abs_path = str(Path(self.file_path).resolve())
+
+            if platform.system() == "Windows":
+                # Windows implementation using ctypes
+                SPI_SETDESKWALLPAPER = 20
+                SPIF_UPDATEINIFILE = 0x01
+                SPIF_SENDCHANGE = 0x02
+
+                # Call SystemParametersInfoW to set the wallpaper
+                result = ctypes.windll.user32.SystemParametersInfoW(
+                    SPI_SETDESKWALLPAPER,
+                    0,
+                    abs_path,
+                    SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
+                )
+
+                if result:
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.information(self, "Success", "Desktop background updated successfully!")
+                else:
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.critical(self, "Error", "Failed to set desktop background")
+
+            elif platform.system() == "Darwin":
+                # macOS implementation
+                import subprocess
+                script = f'''
+                tell application "Finder"
+                    set desktop picture to POSIX file "{abs_path}"
+                end tell
+                '''
+                subprocess.run(["osascript", "-e", script], check=True)
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "Success", "Desktop background updated successfully!")
+
+            elif platform.system() == "Linux":
+                # Linux implementation (works with GNOME)
+                import subprocess
+                try:
+                    # Try GNOME
+                    subprocess.run([
+                        "gsettings", "set", "org.gnome.desktop.background",
+                        "picture-uri", f"file://{abs_path}"
+                    ], check=True)
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.information(self, "Success", "Desktop background updated successfully!")
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    # Try other desktop environments if needed
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.warning(self, "Warning",
+                                      "Could not set background. This feature may not be supported on your desktop environment.")
+            else:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Warning",
+                                  f"Setting desktop background is not supported on {platform.system()}")
+
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Error", f"Failed to set desktop background: {str(e)}")
 
     def _toggle_file_info(self):
         """Toggle the visibility of the file information panel"""
