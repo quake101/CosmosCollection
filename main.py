@@ -22,7 +22,7 @@ if getattr(sys, 'frozen', False):
         print(f"Warning: Could not configure SSL certificates: {e}")
 
 # Core PySide6 imports (always needed)
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings
 from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
@@ -1327,7 +1327,7 @@ class AladinLiteWindow(QMainWindow):
         # FOV display controls
         self.show_telescope_fov = QCheckBox("Show Telescope FOV")
         self.show_telescope_fov.setChecked(False)
-        self.show_telescope_fov.toggled.connect(self._update_aladin_view)
+        self.show_telescope_fov.toggled.connect(self._on_show_fov_toggled)
         
         # Camera/Eyepiece selection (for different FOVs)
         camera_label = QLabel("Camera/Eyepiece:")
@@ -1465,6 +1465,9 @@ class AladinLiteWindow(QMainWindow):
         self.loading_timeout = QTimer()
         self.loading_timeout.timeout.connect(self._handle_loading_timeout)
         self.loading_timeout.setSingleShot(True)
+
+        # Load persistent settings before creating web view
+        self._load_aladin_settings()
 
         # Defer web view creation to avoid initialization crashes
         QTimer.singleShot(100, self._create_web_view_safely)
@@ -1671,7 +1674,93 @@ class AladinLiteWindow(QMainWindow):
                 
         except Exception as e:
             logger.error(f"Error loading telescopes: {str(e)}")
-    
+
+    def _load_aladin_settings(self):
+        """Load persistent Aladin Lite settings from QSettings"""
+        try:
+            settings = QSettings("CosmosCollection", "AladinLite")
+
+            # Block signals during loading to prevent save being triggered
+            self.telescope_combo.blockSignals(True)
+            self.show_telescope_fov.blockSignals(True)
+            self.camera_combo.blockSignals(True)
+            self.barlow_combo.blockSignals(True)
+
+            # Load telescope selection
+            saved_telescope_name = settings.value("telescope_name", None)
+            if saved_telescope_name:
+                # Find the telescope in the combo box
+                for i in range(self.telescope_combo.count()):
+                    data = self.telescope_combo.itemData(i)
+                    if data and data.get('name') == saved_telescope_name:
+                        self.telescope_combo.setCurrentIndex(i)
+                        self.selected_telescope = data
+                        logger.debug(f"Restored telescope selection: {saved_telescope_name}")
+                        break
+
+            # Load show telescope FOV checkbox
+            show_fov = settings.value("show_telescope_fov", False, type=bool)
+            self.show_telescope_fov.setChecked(show_fov)
+            logger.debug(f"Restored show telescope FOV: {show_fov}")
+
+            # Load camera/eyepiece selection
+            saved_camera_text = settings.value("camera_eyepiece", None)
+            if saved_camera_text:
+                index = self.camera_combo.findText(saved_camera_text)
+                if index >= 0:
+                    self.camera_combo.setCurrentIndex(index)
+                    logger.debug(f"Restored camera/eyepiece selection: {saved_camera_text}")
+
+            # Load barlow/reducer selection
+            saved_barlow_text = settings.value("barlow_reducer", None)
+            if saved_barlow_text:
+                index = self.barlow_combo.findText(saved_barlow_text)
+                if index >= 0:
+                    self.barlow_combo.setCurrentIndex(index)
+                    logger.debug(f"Restored barlow/reducer selection: {saved_barlow_text}")
+
+            # Unblock signals
+            self.telescope_combo.blockSignals(False)
+            self.show_telescope_fov.blockSignals(False)
+            self.camera_combo.blockSignals(False)
+            self.barlow_combo.blockSignals(False)
+
+            logger.debug("Aladin Lite settings loaded successfully")
+
+        except Exception as e:
+            logger.error(f"Error loading Aladin settings: {str(e)}")
+            # Make sure to unblock signals even if there's an error
+            self.telescope_combo.blockSignals(False)
+            self.show_telescope_fov.blockSignals(False)
+            self.camera_combo.blockSignals(False)
+            self.barlow_combo.blockSignals(False)
+
+    def _save_aladin_settings(self):
+        """Save persistent Aladin Lite settings to QSettings"""
+        try:
+            settings = QSettings("CosmosCollection", "AladinLite")
+
+            # Save telescope selection
+            telescope_data = self.telescope_combo.currentData()
+            if telescope_data:
+                settings.setValue("telescope_name", telescope_data.get('name'))
+            else:
+                settings.setValue("telescope_name", None)
+
+            # Save show telescope FOV checkbox
+            settings.setValue("show_telescope_fov", self.show_telescope_fov.isChecked())
+
+            # Save camera/eyepiece selection
+            settings.setValue("camera_eyepiece", self.camera_combo.currentText())
+
+            # Save barlow/reducer selection
+            settings.setValue("barlow_reducer", self.barlow_combo.currentText())
+
+            logger.debug("Aladin Lite settings saved successfully")
+
+        except Exception as e:
+            logger.error(f"Error saving Aladin settings: {str(e)}")
+
     def _on_telescope_changed(self):
         """Handle telescope selection change"""
         current_data = self.telescope_combo.currentData()
@@ -1681,15 +1770,23 @@ class AladinLiteWindow(QMainWindow):
         else:
             self.selected_telescope = None
             logger.debug("Selected default view")
-        
+
+        self._save_aladin_settings()
         self._update_aladin_view()
-    
+
     def _on_camera_changed(self):
         """Handle camera/sensor selection change"""
+        self._save_aladin_settings()
         self._update_aladin_view()
 
     def _on_barlow_changed(self):
         """Handle barlow/reducer selection change"""
+        self._save_aladin_settings()
+        self._update_aladin_view()
+
+    def _on_show_fov_toggled(self):
+        """Handle show telescope FOV checkbox toggle"""
+        self._save_aladin_settings()
         self._update_aladin_view()
 
     def _calculate_telescope_fov(self):
