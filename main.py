@@ -3825,7 +3825,7 @@ class ObjectDetailWindow(QDialog):
             text += "<br>"
         else:
             # Indicate fallback to built-in data
-            text += "<span style='color: #FFA500;'>⚠ SIMBAD data unavailable - using built-in emission data</span><br><br>"
+            text += "<span style='color: #FFA500;'>SIMBAD data unavailable - using built-in emission data</span><br><br>"
 
         # Always show built-in emission line data
         text += f"<b>{info['description']}</b><br><br>"
@@ -4580,6 +4580,10 @@ class ObjectDetailWindow(QDialog):
                             # Find the index of the newly added image
                             for i, img in enumerate(self.user_images):
                                 if img['id'] == new_image_id:
+                                    # Show loading state
+                                    self.image_label.setText("Loading image...")
+                                    self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+
                                     self.current_image_index = i
                                     self._load_user_image(img['image_path'])
                                     self._load_current_image_info()
@@ -5077,13 +5081,17 @@ class ObjectDetailWindow(QDialog):
 
                     # Load the first image if available (will be favorite if one exists)
                     if self.user_images:
+                        # Update text to show loading state
+                        self.image_label.setText("Loading image...")
+                        self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+
                         self.current_image_index = 0
                         current_image = self.user_images[self.current_image_index]
                         self._load_user_image(current_image['image_path'])
                         self._load_current_image_info()
                         self.info_form_container.setVisible(True)
                     else:
-                        # No images available
+                        # No images available - keep the default "No image attached" message
                         self.info_form_container.setVisible(False)
                 else:
                     logger.error(f"Could not find dsodetailid for {self.data['name']}")
@@ -5117,6 +5125,10 @@ class ObjectDetailWindow(QDialog):
     def _previous_image(self):
         """Navigate to the previous image"""
         if self.user_images and self.current_image_index > 0:
+            # Show loading state
+            self.image_label.setText("Loading image...")
+            self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+
             self.current_image_index -= 1
             current_image = self.user_images[self.current_image_index]
             self._load_user_image(current_image['image_path'])
@@ -5127,6 +5139,10 @@ class ObjectDetailWindow(QDialog):
     def _next_image(self):
         """Navigate to the next image"""
         if self.user_images and self.current_image_index < len(self.user_images) - 1:
+            # Show loading state
+            self.image_label.setText("Loading image...")
+            self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+
             self.current_image_index += 1
             current_image = self.user_images[self.current_image_index]
             self._load_user_image(current_image['image_path'])
@@ -5270,9 +5286,12 @@ class ObjectDetailWindow(QDialog):
                     # Update current path and reload image
                     self.current_image_path = new_image_path
                     current_image['image_path'] = new_image_path
-                    
+
                     # Hide relocate button and reload the image
                     self.relocate_button.setVisible(False)
+                    # Show loading state
+                    self.image_label.setText("Loading image...")
+                    self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
                     self._load_user_image(new_image_path)
                     
                     QMessageBox.information(self, "Success", f"Image location updated successfully!\n\nNew path: {new_image_path}")

@@ -25,6 +25,26 @@ warnings.filterwarnings('ignore')
 
 from DatabaseManager import DatabaseManager
 
+class NumericTableWidgetItem(QTableWidgetItem):
+    """Custom QTableWidgetItem that sorts by numeric value stored in UserRole"""
+    def __lt__(self, other):
+        """Override less-than operator for proper numeric sorting"""
+        self_value = self.data(Qt.UserRole)
+        other_value = other.data(Qt.UserRole)
+
+        # Handle None values
+        if self_value is None:
+            return True
+        if other_value is None:
+            return False
+
+        # Compare numeric values
+        try:
+            return float(self_value) < float(other_value)
+        except (ValueError, TypeError):
+            # Fallback to string comparison if conversion fails
+            return super().__lt__(other)
+
 class DSOCalculationThread(QThread):
     """
     Thread for calculating best DSOs for tonight.
@@ -736,11 +756,11 @@ class BestDSOTonightWindow(QMainWindow):
         header.setSectionResizeMode(5, QHeaderView.Interactive)
         header.setSectionResizeMode(6, QHeaderView.Interactive)
         header.setSectionResizeMode(7, QHeaderView.Interactive)
-        self.results_table.setColumnWidth(3, 70)
+        self.results_table.setColumnWidth(3, 80)
         self.results_table.setColumnWidth(4, 70)
         self.results_table.setColumnWidth(5, 80)
         self.results_table.setColumnWidth(6, 70)
-        self.results_table.setColumnWidth(7, 90)
+        self.results_table.setColumnWidth(7, 110)
         
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -937,41 +957,44 @@ class BestDSOTonightWindow(QMainWindow):
             self.results_table.setItem(row, 2, QTableWidgetItem(dso_info["constellation"]))
             
             # Magnitude - use numeric sorting
-            mag_item = QTableWidgetItem()
+            mag_item = NumericTableWidgetItem()
             mag_item.setData(Qt.DisplayRole, f"{dso_info['magnitude']:.1f}")
             mag_item.setData(Qt.UserRole, dso_info['magnitude'])  # Store numeric value for sorting
             mag_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 3, mag_item)
-            
+
             # Maximum altitude - use numeric sorting
-            alt_item = QTableWidgetItem()
+            alt_item = NumericTableWidgetItem()
             alt_item.setData(Qt.DisplayRole, f"{dso_data['max_altitude']:.0f}°")
             alt_item.setData(Qt.UserRole, dso_data['max_altitude'])  # Store numeric value for sorting
             alt_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 4, alt_item)
-            
+
             # Best time - store time as sortable value
             time_str = dso_data["optimal_time"].strftime("%H:%M")
-            time_item = QTableWidgetItem()
+            time_item = NumericTableWidgetItem()
             time_item.setData(Qt.DisplayRole, time_str)
             time_item.setData(Qt.UserRole, dso_data["optimal_time"].hour * 60 + dso_data["optimal_time"].minute)
             time_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 5, time_item)
-            
+
             # Direction
             dir_item = QTableWidgetItem(dso_data["direction"])
             dir_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 6, dir_item)
-            
+
             # Visible hours - use numeric sorting
-            hours_item = QTableWidgetItem()
+            hours_item = NumericTableWidgetItem()
             hours_item.setData(Qt.DisplayRole, f"{dso_data['visible_hours']:.1f}h")
             hours_item.setData(Qt.UserRole, dso_data['visible_hours'])  # Store numeric value for sorting
             hours_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 7, hours_item)
-        
+
         # Re-enable sorting
         self.results_table.setSortingEnabled(True)
+
+        # Sort by visible hours (column 7) in descending order by default
+        self.results_table.sortByColumn(7, Qt.DescendingOrder)
 
     def on_item_double_clicked(self, item):
         """Handle double-click on table item to show object details"""
