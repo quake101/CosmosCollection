@@ -3952,7 +3952,7 @@ class ObjectDetailWindow(QDialog):
             image_container_layout.addLayout(zoom_layout)
 
             # Image label
-            self.image_label = QLabel("No image attached to this DSO.")
+            self.image_label = QLabel("Loading...")
             self.image_label.setAlignment(Qt.AlignCenter)
             self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
             self.image_label.setMinimumSize(600, 400)  # Increased minimum size
@@ -5091,13 +5091,21 @@ class ObjectDetailWindow(QDialog):
                         self._load_current_image_info()
                         self.info_form_container.setVisible(True)
                     else:
-                        # No images available - keep the default "No image attached" message
+                        # No images available - update to show no image message
+                        self.image_label.setText("No image attached to this DSO.")
+                        self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
                         self.info_form_container.setVisible(False)
                 else:
                     logger.error(f"Could not find dsodetailid for {self.data['name']}")
+                    self.image_label.setText("No image attached to this DSO.")
+                    self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+                    self.info_form_container.setVisible(False)
 
         except Exception as e:
             logger.error(f"Error loading user images: {str(e)}", exc_info=True)
+            self.image_label.setText("Error loading images.")
+            self.image_label.setStyleSheet("font-size: 14pt; color: #ff6b6b;")
+            self.info_form_container.setVisible(False)
 
     def _update_image_navigation(self):
         """Update the image navigation controls based on current state"""
