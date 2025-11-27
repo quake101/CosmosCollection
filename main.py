@@ -85,6 +85,268 @@ except ImportError:
     logging.warning("DSOVisibilityCalculator.py not found. Visibility calculator will be disabled.")
 
 
+class SimbadQueryThread(QThread):
+    """Background thread for querying SIMBAD without blocking the UI"""
+    query_complete = Signal(object, str, float, float)  # Signal(result, object_name, ra_deg, dec_deg)
+    query_failed = Signal(str, str)  # Signal(object_name, error_message)
+
+    def __init__(self, object_name, ra_deg, dec_deg, dso_type):
+        super().__init__()
+        self.object_name = object_name
+        self.ra_deg = ra_deg
+        self.dec_deg = dec_deg
+        self.dso_type = dso_type
+
+    def run(self):
+        """Query SIMBAD in background thread"""
+        try:
+            from astroquery.simbad import Simbad
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            import sys
+
+            # Configure SSL for PyInstaller bundle
+            if getattr(sys, 'frozen', False):
+                try:
+                    from astroquery.query import BaseQuery
+                    BaseQuery.TIMEOUT = 30
+                    import requests
+                    original_request = requests.Session.request
+                    def patched_request(self, *args, **kwargs):
+                        kwargs['verify'] = False
+                        return original_request(self, *args, **kwargs)
+                    requests.Session.request = patched_request
+                    logger.info("Disabled SSL verification for astroquery (PyInstaller workaround)")
+                except Exception as ssl_config_error:
+                    logger.warning(f"Could not configure SSL for astroquery: {ssl_config_error}")
+
+            logger.debug(f"Querying SIMBAD for emission data: {self.object_name} at RA={self.ra_deg}, Dec={self.dec_deg}")
+
+            # Configure SIMBAD to return flux measurements and spectral type
+            custom_simbad = Simbad()
+            custom_simbad.add_votable_fields('U', 'B', 'V', 'R', 'I', 'sp', 'otype')
+
+            # Query SIMBAD using coordinates (more reliable than name)
+            result = None
+            if self.ra_deg is not None and self.dec_deg is not None:
+                # Create coordinate object
+                coords = SkyCoord(ra=self.ra_deg*u.degree, dec=self.dec_deg*u.degree, frame='icrs')
+                # Query region around coordinates (3 arcmin radius)
+                result = custom_simbad.query_region(coords, radius=3*u.arcmin)
+                if result is not None and len(result) > 0:
+                    logger.debug(f"SIMBAD data found for {self.object_name} at coordinates")
+                else:
+                    logger.debug(f"No SIMBAD data found for {self.object_name} at coordinates")
+            else:
+                logger.debug(f"No coordinates available for {self.object_name}, skipping SIMBAD query")
+
+            # Emit success signal with result
+            self.query_complete.emit(result, self.object_name, self.ra_deg, self.dec_deg)
+
+        except Exception as e:
+            logger.error(f"SIMBAD query failed for {self.object_name}: {type(e).__name__}: {str(e)}", exc_info=True)
+            self.query_failed.emit(self.object_name, str(e))
+
+
+class ImageLoaderThread(QThread):
+    """Background thread for loading large images without blocking the UI"""
+    image_loaded = Signal(object, str)  # Signal(QImage, image_path)
+    load_failed = Signal(str, str)  # Signal(image_path, error_message)
+
+    def __init__(self, image_path, is_fits=False, fits_colormap='gray'):
+        super().__init__()
+        self.image_path = image_path
+        self.is_fits = is_fits
+        self.fits_colormap = fits_colormap
+
+    def run(self):
+        """Load image in background thread with progressive loading"""
+        try:
+            import os
+            from PySide6.QtGui import QImage, QImageReader
+            from PySide6.QtCore import QSize
+
+            if not os.path.exists(self.image_path):
+                self.load_failed.emit(self.image_path, "File not found")
+                return
+
+            # Check if PNG and try Pillow for faster loading
+            file_ext = os.path.splitext(self.image_path)[1].lower()
+            file_size_mb = os.path.getsize(self.image_path) / (1024 * 1024)
+
+            logger.info(f"Image loading: {os.path.basename(self.image_path)} - {file_size_mb:.1f}MB - Format: {file_ext}")
+
+            # Use Pillow for PNG files > 2MB (much faster than Qt)
+            if file_ext == '.png' and file_size_mb > 2:
+                logger.info(f"Using Pillow loader for PNG file ({file_size_mb:.1f}MB)")
+                try:
+                    success = self._load_with_pillow()
+                    if success:
+                        logger.info("Pillow load completed successfully")
+                        return
+                    else:
+                        logger.warning("Pillow load failed, falling back to Qt")
+                except Exception as e:
+                    logger.warning(f"Pillow not available or failed: {e}, using Qt")
+
+            if self.is_fits:
+                # Load FITS file - returns QImage (after QPixmap conversion for data safety)
+                qimage = self._load_fits_image(self.image_path, self.fits_colormap)
+                if qimage and not qimage.isNull():
+                    self.image_loaded.emit(qimage, self.image_path)
+                else:
+                    self.load_failed.emit(self.image_path, "Failed to load FITS file")
+            else:
+                # Use QImageReader for optimized loading
+                # Increase allocation limit for large images
+                QImageReader.setAllocationLimit(1024)  # 1GB limit
+
+                reader = QImageReader(self.image_path)
+                reader.setAutoTransform(True)  # Handle EXIF rotation
+                reader.setQuality(100)  # Maximum quality
+
+                if not reader.canRead():
+                    self.load_failed.emit(self.image_path, f"Cannot read image: {reader.errorString()}")
+                    return
+
+                # Get original image size
+                original_size = reader.size()
+                logger.debug(f"Loading full resolution with Qt: {original_size.width()}x{original_size.height()}")
+
+                # Load the image at full resolution
+                qimage = reader.read()
+
+                if qimage.isNull():
+                    error_msg = reader.errorString() or "Unknown error"
+                    self.load_failed.emit(self.image_path, f"Failed to load image: {error_msg}")
+                else:
+                    self.image_loaded.emit(qimage, self.image_path)
+
+        except Exception as e:
+            logger.error(f"Error loading image in thread: {str(e)}")
+            self.load_failed.emit(self.image_path, str(e))
+
+    def _load_with_pillow(self):
+        """Load image using Pillow (much faster for PNG) - returns True if successful"""
+        try:
+            from PIL import Image
+            from PySide6.QtGui import QImage
+            from PySide6.QtCore import QSize
+            import io
+
+            logger.debug(f"Loading PNG with Pillow: {self.image_path}")
+
+            # Open image with Pillow
+            with Image.open(self.image_path) as pil_image:
+                original_width, original_height = pil_image.size
+                logger.info(f"Pillow opened image: {original_width}x{original_height}, mode: {pil_image.mode}")
+
+                # Load full resolution image (no downsampling for zoom capability)
+                full_image = pil_image
+                logger.info(f"Converting full resolution to QImage: {original_width}x{original_height}")
+
+                # Convert all images to RGB for consistent color handling (no alpha channel)
+                if full_image.mode != 'RGB':
+                    logger.info(f"Converting {full_image.mode} to RGB for consistent color handling")
+                    full_image = full_image.convert('RGB')
+
+                # Create QImage in RGB888 format (same as FITS images)
+                img_data = full_image.tobytes()
+                qimage = QImage(
+                    img_data,
+                    full_image.size[0],
+                    full_image.size[1],
+                    full_image.size[0] * 3,
+                        QImage.Format_RGB888
+                    ).copy()
+
+                if not qimage.isNull():
+                    logger.info(f"Emitting full resolution image: {full_image.size[0]}x{full_image.size[1]}")
+                    self.image_loaded.emit(qimage, self.image_path)
+                    logger.info("Pillow load completed successfully")
+                    return True
+                else:
+                    return False
+
+        except ImportError:
+            logger.debug("Pillow not installed")
+            return False
+        except Exception as e:
+            logger.error(f"Error loading with Pillow: {str(e)}")
+            return False
+
+    def _load_fits_image(self, fits_path, colormap='viridis'):
+        """Load a FITS image file and convert to QImage"""
+        try:
+            from astropy.io import fits
+            from astropy.visualization import simple_norm
+            import numpy as np
+            from PySide6.QtGui import QImage
+            import io
+
+            with fits.open(fits_path) as hdul:
+                data = hdul[0].data
+
+                if data is None:
+                    return None
+
+                # Handle 3D data (take first slice if needed)
+                if len(data.shape) == 3:
+                    if data.shape[0] == 3:
+                        data = np.transpose(data, (1, 2, 0))
+                    elif data.shape[0] <= 10:
+                        data = data[0]
+
+                # Check if RGB
+                is_rgb = len(data.shape) == 3 and data.shape[2] == 3
+
+                if is_rgb:
+                    # RGB FITS - no colormap
+                    norm = simple_norm(data, 'linear', percent=99.5)
+                    normalized_data = norm(data)
+                    rgb_data = (normalized_data * 255).astype(np.uint8)
+                else:
+                    # Grayscale - apply colormap
+                    try:
+                        import matplotlib.pyplot as plt
+                        norm = simple_norm(data, 'linear', percent=99.5)
+                        normalized_data = norm(data)
+                        cmap = plt.get_cmap(colormap)
+                        rgba_data = cmap(normalized_data)
+                        rgb_data = (rgba_data[:, :, :3] * 255).astype(np.uint8)
+                    except ImportError:
+                        # Fallback without matplotlib
+                        norm = simple_norm(data, 'linear', percent=99.5)
+                        normalized_data = norm(data)
+                        gray_data = (normalized_data * 255).astype(np.uint8)
+                        rgb_data = np.stack([gray_data] * 3, axis=-1)
+
+                # Flip vertically for correct orientation
+                rgb_data = np.flipud(rgb_data)
+
+                # Ensure data is C-contiguous for QImage
+                rgb_data = np.ascontiguousarray(rgb_data)
+
+                height, width = rgb_data.shape[:2]
+                bytes_per_line = 3 * width
+                qimage = QImage(rgb_data.data, width, height, bytes_per_line, QImage.Format_RGB888)
+
+                # Convert to QPixmap immediately while numpy data is in scope
+                # QPixmap.fromImage() does a deep copy, ensuring data persists
+                pixmap = QPixmap.fromImage(qimage)
+
+                if not pixmap.isNull():
+                    # Convert back to QImage for thread - this ensures data is properly owned
+                    # and avoids color corruption from multiple conversions
+                    return pixmap.toImage()
+                else:
+                    return None
+
+        except Exception as e:
+            logger.error(f"Error loading FITS file {fits_path}: {str(e)}")
+            return None
+
+
 class ImageCache:
     _instance = None
     _cache: Dict[str, QPixmap] = {}
@@ -3609,7 +3871,11 @@ class ObjectDetailWindow(QDialog):
         self.drag_start_image_position = None  # Image position when drag started
         self.image_cache = ImageCache()
         self.db_manager = DatabaseManager()  # Initialize database manager
-        
+
+        # Background threads
+        self.image_loader_thread = None  # Background thread for async image loading
+        self.simbad_query_thread = None  # Background thread for SIMBAD queries
+
         # Multiple images support
         self.user_images = []  # List of image data dictionaries
         self.current_image_index = 0  # Current image index
@@ -3670,7 +3936,7 @@ class ObjectDetailWindow(QDialog):
         return ra_str, dec_str
 
     def _query_emission_data(self):
-        """Query SIMBAD for emission line and spectral information"""
+        """Query SIMBAD for emission line and spectral information in background thread"""
         try:
             # Only query for nebulae (emission regions)
             dso_type = self.data.get('dso_type', '')
@@ -3679,58 +3945,39 @@ class ObjectDetailWindow(QDialog):
                 self.emission_label.setStyleSheet("color: gray;")
                 return
 
-            from astroquery.simbad import Simbad
-            from astropy.coordinates import SkyCoord
-            import astropy.units as u
-
-            # Configure SSL for PyInstaller bundle
-            if getattr(sys, 'frozen', False):
-                try:
-                    # Disable SSL verification for astroquery in PyInstaller (workaround for cert issues)
-                    from astroquery.query import BaseQuery
-                    BaseQuery.TIMEOUT = 30  # Increase timeout
-                    # Monkey-patch the session to disable SSL verification
-                    import requests
-                    original_request = requests.Session.request
-                    def patched_request(self, *args, **kwargs):
-                        kwargs['verify'] = False
-                        return original_request(self, *args, **kwargs)
-                    requests.Session.request = patched_request
-                    logger.info("Disabled SSL verification for astroquery (PyInstaller workaround)")
-                except Exception as ssl_config_error:
-                    logger.warning(f"Could not configure SSL for astroquery: {ssl_config_error}")
-
             # Get object coordinates and name
             object_name = self.data.get('name', '')
             ra_deg = self.data.get('ra_deg')
             dec_deg = self.data.get('dec_deg')
 
-            logger.debug(f"Querying SIMBAD for emission data: {object_name} at RA={ra_deg}, Dec={dec_deg}")
+            # Show querying status
+            self.emission_label.setText("Querying SIMBAD...")
+            self.emission_label.setStyleSheet("color: gray;")
 
-            # Configure SIMBAD to return flux measurements and spectral type
-            custom_simbad = Simbad()
-            custom_simbad.add_votable_fields('U', 'B', 'V', 'R', 'I', 'sp', 'otype')
+            # Stop any existing SIMBAD query thread
+            if self.simbad_query_thread and self.simbad_query_thread.isRunning():
+                self.simbad_query_thread.quit()
+                self.simbad_query_thread.wait()
 
-            # Query SIMBAD using coordinates (more reliable than name)
-            try:
-                if ra_deg is not None and dec_deg is not None:
-                    # Create coordinate object
-                    coords = SkyCoord(ra=ra_deg*u.degree, dec=dec_deg*u.degree, frame='icrs')
-                    # Query region around coordinates (3 arcmin radius)
-                    result = custom_simbad.query_region(coords, radius=3*u.arcmin)
-                    if result is not None and len(result) > 0:
-                        logger.debug(f"SIMBAD data found for {object_name} at coordinates")
-                    else:
-                        logger.debug(f"No SIMBAD data found for {object_name} at coordinates")
-                else:
-                    logger.debug(f"No coordinates available for {object_name}, skipping SIMBAD query")
-                    result = None
-            except Exception as query_error:
-                logger.error(f"SIMBAD query failed for {object_name}: {type(query_error).__name__}: {str(query_error)}", exc_info=True)
-                result = None
+            # Start background SIMBAD query thread
+            self.simbad_query_thread = SimbadQueryThread(object_name, ra_deg, dec_deg, dso_type)
+            self.simbad_query_thread.query_complete.connect(self._on_simbad_query_complete)
+            self.simbad_query_thread.query_failed.connect(self._on_simbad_query_failed)
+            self.simbad_query_thread.start()
+
+            logger.debug(f"Started background SIMBAD query for {object_name}")
+
+        except Exception as e:
+            logger.error(f"Error initiating SIMBAD query: {str(e)}", exc_info=True)
+            self.emission_label.setText(f"Error querying SIMBAD (check internet connection)")
+            self.emission_label.setStyleSheet("color: #ff6b6b;")
+
+    def _on_simbad_query_complete(self, result, object_name, ra_deg, dec_deg):
+        """Handle SIMBAD query completion"""
+        try:
+            dso_type = self.data.get('dso_type', '')
 
             # Parse and display emission line info based on object type
-            # (We have built-in knowledge even if SIMBAD doesn't return data)
             emission_info = self._parse_emission_info(dso_type, result)
 
             if emission_info:
@@ -3741,9 +3988,15 @@ class ObjectDetailWindow(QDialog):
                 self.emission_label.setStyleSheet("color: gray;")
 
         except Exception as e:
-            logger.error(f"Error querying SIMBAD for emission data: {str(e)}", exc_info=True)
-            self.emission_label.setText(f"Error querying SIMBAD (check internet connection)")
+            logger.error(f"Error processing SIMBAD result: {str(e)}", exc_info=True)
+            self.emission_label.setText("Error processing SIMBAD data")
             self.emission_label.setStyleSheet("color: #ff6b6b;")
+
+    def _on_simbad_query_failed(self, object_name, error_message):
+        """Handle SIMBAD query failure"""
+        logger.warning(f"SIMBAD query failed for {object_name}: {error_message}")
+        self.emission_label.setText(f"SIMBAD query failed (check internet connection)")
+        self.emission_label.setStyleSheet("color: #ff6b6b;")
 
     def _parse_emission_info(self, dso_type, simbad_result):
         """Parse emission line information based on DSO type and SIMBAD data"""
@@ -4695,7 +4948,7 @@ class ObjectDetailWindow(QDialog):
                     # Create QImage from RGB array
                     height, width, channels = rgb_data.shape
                     bytes_per_line = width * channels
-                    
+
                     qimage = QImage(rgb_data.data, width, height, bytes_per_line, QImage.Format_RGB888)
                     logger.debug("Created RGB QImage from FITS data")
                     
@@ -4755,7 +5008,7 @@ class ObjectDetailWindow(QDialog):
                             # Create QImage from RGB array
                             height, width, channels = rgb_data.shape
                             bytes_per_line = width * channels
-                            
+
                             qimage = QImage(rgb_data.data, width, height, bytes_per_line, QImage.Format_RGB888)
                             logger.debug(f"Created color-mapped QImage using {colormap}")
                             
@@ -4767,7 +5020,7 @@ class ObjectDetailWindow(QDialog):
                             # Ensure the array is C-contiguous for QImage
                             if not image_8bit.flags['C_CONTIGUOUS']:
                                 image_8bit = np.ascontiguousarray(image_8bit)
-                            
+
                             height, width = image_8bit.shape
                             bytes_per_line = width
                             qimage = QImage(image_8bit.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
@@ -4775,18 +5028,18 @@ class ObjectDetailWindow(QDialog):
                             logger.warning(f"Color mapping failed, using grayscale: {e}")
                             # Fallback to grayscale
                             image_8bit = (normalized_data * 255).astype(np.uint8)
-                            
+
                             # Ensure the array is C-contiguous for QImage
                             if not image_8bit.flags['C_CONTIGUOUS']:
                                 image_8bit = np.ascontiguousarray(image_8bit)
-                            
+
                             height, width = image_8bit.shape
                             bytes_per_line = width
                             qimage = QImage(image_8bit.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
                 
                 # Convert to QPixmap
                 pixmap = QPixmap.fromImage(qimage)
-                
+
                 if not pixmap.isNull():
                     logger.debug(f"Successfully loaded FITS image: {width}x{height}")
                     return pixmap
@@ -4802,16 +5055,15 @@ class ObjectDetailWindow(QDialog):
             return None
     
     def _load_user_image(self, image_path):
-        """Load and display a user image with caching (supports FITS files)"""
+        """Load and display a user image with caching (supports FITS files) - async version"""
         try:
-            from PySide6.QtGui import QImageReader
             import os
-            
+
             # Store the current image path
             self.current_image_path = image_path
-            
+
             logger.debug(f"Attempting to load image: {image_path}")
-            
+
             # Check if file exists
             if not os.path.exists(image_path):
                 logger.error(f"Image file does not exist: {image_path}")
@@ -4819,7 +5071,7 @@ class ObjectDetailWindow(QDialog):
                 self.image_label.setToolTip(f"File path: {image_path}")
                 self._show_relocate_button()
                 return
-            
+
             # Check file size
             try:
                 file_size = os.path.getsize(image_path)
@@ -4835,80 +5087,114 @@ class ObjectDetailWindow(QDialog):
                 self.image_label.setToolTip(f"File path: {image_path}\nError: {str(e)}")
                 return
 
-            # Increase maximum allocation limit for large images (in MB)
-            QImageReader.setAllocationLimit(512)
-
             # Check cache first
             cached_pixmap = self.image_cache.get(image_path)
             if cached_pixmap:
                 logger.debug("Using cached image")
                 self.original_pixmap = cached_pixmap
-            else:
-                # Check if this is a FITS file
-                file_ext = os.path.splitext(image_path)[1].lower()
-                if file_ext in ['.fits', '.fit', '.fts']:
-                    # Load FITS file
-                    logger.debug("Loading FITS image")
-                    self.original_pixmap = self._load_fits_image(image_path, self.FITS_COLORMAP)
+                self._display_loaded_image()
+                return
+
+            # Stop any existing loading thread
+            if self.image_loader_thread and self.image_loader_thread.isRunning():
+                self.image_loader_thread.quit()
+                self.image_loader_thread.wait()
+
+            # Determine if FITS file
+            file_ext = os.path.splitext(image_path)[1].lower()
+            is_fits = file_ext in ['.fits', '.fit', '.fts']
+
+            # FITS files load synchronously on main thread to avoid
+            # color corruption from thread-based QPixmap/QImage conversions
+            if is_fits:
+                logger.debug("Loading FITS file synchronously on main thread")
+                pixmap = self._load_fits_image(image_path, self.FITS_COLORMAP)
+                if pixmap and not pixmap.isNull():
+                    self.original_pixmap = pixmap
+                    self.image_cache.put(image_path, pixmap)
+                    self._display_loaded_image()
+                    logger.info("FITS image loaded successfully")
                 else:
-                    # Create QPixmap from regular image file
-                    logger.debug("Loading regular image from file")
-                    self.original_pixmap = QPixmap(image_path)
-                
-                if self.original_pixmap is None or self.original_pixmap.isNull():
-                    logger.error(f"Failed to load image: {image_path}")
-                    
-                    if file_ext in ['.fits', '.fit', '.fts']:
-                        # FITS file failed to load
-                        self.image_label.setText(f"Failed to load FITS file:\n{os.path.basename(image_path)}\n\nRequires astropy library for FITS support")
-                    else:
-                        # Try to get more specific error information for regular images
-                        try:
-                            reader = QImageReader(image_path)
-                            if reader.canRead():
-                                logger.debug(f"QImageReader can read the file, format: {reader.format()}")
-                            else:
-                                logger.error(f"QImageReader cannot read file, error: {reader.errorString()}")
-                        except Exception as e:
-                            logger.error(f"Error checking image readability: {e}")
-                        
-                        self.image_label.setText(f"Failed to load image:\n{os.path.basename(image_path)}\n\nCheck if file is a valid image format")
-                    
-                    self.image_label.setToolTip(f"File path: {image_path}")
-                    return
-                
-                logger.debug(f"Successfully loaded image: {self.original_pixmap.width()}x{self.original_pixmap.height()}")
-                # Cache the loaded image
-                self.image_cache.put(image_path, self.original_pixmap)
-
-            # Calculate the appropriate size for the image
-            label_size = self.image_label.size()
-            scaled_pixmap = self.original_pixmap.scaled(
-                label_size,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-
-            # Calculate initial zoom factor based on the scaled image
-            self.initial_zoom_factor = min(
-                label_size.width() / self.original_pixmap.width(),
-                label_size.height() / self.original_pixmap.height()
-            )
-            self.zoom_factor = self.initial_zoom_factor
-            self.image_position = [0, 0]
-
-            # Update the display
-            self.image_label.setPixmap(scaled_pixmap)
-            self.image_label.setAlignment(Qt.AlignCenter)
-
-            # Add tooltip for image viewer
-            self.image_label.setToolTip("Double click to open in the image viewer")
-            logger.debug("Image loaded and displayed successfully")
+                    self._on_image_load_failed(image_path, "Failed to load FITS file")
+            else:
+                # Use background thread for non-FITS images (PNG, JPG, etc.)
+                self.image_loader_thread = ImageLoaderThread(image_path, is_fits, self.FITS_COLORMAP)
+                self.image_loader_thread.image_loaded.connect(self._on_image_loaded)
+                self.image_loader_thread.load_failed.connect(self._on_image_load_failed)
+                self.image_loader_thread.start()
+                logger.debug(f"Started background loading for: {image_path}")
 
         except Exception as e:
-            logger.error(f"Error loading user image: {str(e)}", exc_info=True)
-            self.image_label.setText(f"Error loading image:\n{os.path.basename(image_path) if image_path else 'Unknown'}")
-            self.image_label.setToolTip(f"File path: {image_path}\nError: {str(e)}")  # Clear tooltip on error
+            logger.error(f"Error initiating image load: {str(e)}", exc_info=True)
+            self.image_label.setText(f"Error loading image:\n{str(e)}")
+
+    def _on_image_loaded(self, qimage, image_path):
+        """Handle image loaded signal from background thread"""
+        try:
+            logger.info(f"Full image received: {qimage.width()}x{qimage.height()}")
+
+            # Convert QImage to QPixmap (must be done on main thread)
+            self.original_pixmap = QPixmap.fromImage(qimage)
+
+            if self.original_pixmap.isNull():
+                logger.error(f"Failed to convert QImage to QPixmap for: {image_path}")
+                self._on_image_load_failed(image_path, "Failed to convert image")
+                return
+
+            logger.info(f"Full resolution image converted to pixmap: {self.original_pixmap.width()}x{self.original_pixmap.height()}")
+
+            # Cache the loaded image
+            self.image_cache.put(image_path, self.original_pixmap)
+
+            # Display the image
+            self._display_loaded_image()
+            logger.info("Full resolution image displayed")
+
+        except Exception as e:
+            logger.error(f"Error handling loaded image: {str(e)}", exc_info=True)
+            self._on_image_load_failed(image_path, str(e))
+
+    def _on_image_load_failed(self, image_path, error_message):
+        """Handle image load failure from background thread"""
+        import os
+        file_ext = os.path.splitext(image_path)[1].lower()
+
+        if file_ext in ['.fits', '.fit', '.fts']:
+            self.image_label.setText(f"Failed to load FITS file:\n{os.path.basename(image_path)}\n\nRequires astropy library for FITS support\nError: {error_message}")
+        else:
+            self.image_label.setText(f"Failed to load image:\n{os.path.basename(image_path)}\n\nError: {error_message}")
+
+        self.image_label.setToolTip(f"File path: {image_path}")
+        logger.error(f"Image load failed: {image_path} - {error_message}")
+
+    def _display_loaded_image(self):
+        """Display the loaded image with appropriate scaling"""
+        if self.original_pixmap is None or self.original_pixmap.isNull():
+            return
+
+        # Calculate the appropriate size for the image
+        label_size = self.image_label.size()
+        scaled_pixmap = self.original_pixmap.scaled(
+            label_size,
+            Qt.KeepAspectRatio,
+            Qt.FastTransformation  # Use fast transformation for quicker display
+        )
+
+        # Calculate initial zoom factor based on the scaled image
+        self.initial_zoom_factor = min(
+            label_size.width() / self.original_pixmap.width(),
+            label_size.height() / self.original_pixmap.height()
+        )
+        self.zoom_factor = self.initial_zoom_factor
+        self.image_position = [0, 0]
+
+        # Update the display
+        self.image_label.setPixmap(scaled_pixmap)
+        self.image_label.setAlignment(Qt.AlignCenter)
+
+        # Add tooltip for image viewer
+        self.image_label.setToolTip("Double click to open in the image viewer")
+        logger.debug("Image loaded and displayed successfully")
 
     def _open_aladin_lite(self, data):
         """Open Aladin Lite in a new window"""
