@@ -10,10 +10,12 @@ import sys
 import os
 import matplotlib
 import numpy as np
+from datetime import datetime
 from PySide6.QtCore import Qt, QDate, QThread, Signal
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLineEdit, QLabel, QTextEdit,
-                               QDateEdit, QSpinBox, QGroupBox, QMessageBox)
+                               QDateEdit, QSpinBox, QGroupBox, QMessageBox, QCalendarWidget)
+from PySide6.QtGui import QTextCharFormat, QColor
 
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -40,15 +42,15 @@ from DatabaseManager import DatabaseManager
 class DSOVisibilityCalculator:
     """
     Centralized class for all DSO visibility calculations.
-    
+
     This class provides a single interface for calculating DSO visibility, altitude,
     azimuth, optimal viewing times, and seasonal visibility across the application.
     """
-    
+
     def __init__(self, location_lat=None, location_lon=None, timezone=None, height=250):
         """
         Initialize the visibility calculator.
-        
+
         Args:
             location_lat (float): Observer latitude in degrees (+ for North, - for South)
             location_lon (float): Observer longitude in degrees (+ for East, - for West)
@@ -57,28 +59,28 @@ class DSOVisibilityCalculator:
         """
         self.location = None
         self.timezone = pytz.UTC  # Default to UTC
-        
+
         if location_lat is not None and location_lon is not None:
             self.set_location(location_lat, location_lon, height)
         else:
             self._load_location_from_database()
-            
+
         if timezone:
             self.set_timezone(timezone)
         else:
             self._load_timezone_from_database()
-    
+
     def set_location(self, lat, lon, height=250):
         """Set observer location."""
         self.location = EarthLocation(lat=lat*u.deg, lon=lon*u.deg, height=height*u.m)
-    
+
     def set_timezone(self, timezone_str):
         """Set timezone for local time calculations."""
         try:
             self.timezone = pytz.timezone(timezone_str)
         except pytz.UnknownTimeZoneError:
             self.timezone = pytz.UTC
-    
+
     def _load_location_from_database(self):
         """Load observer location from database."""
         try:
@@ -91,7 +93,7 @@ class DSOVisibilityCalculator:
                     self.set_location(row[0], row[1])
         except Exception:
             pass
-    
+
     def _load_timezone_from_database(self):
         """Load timezone from database."""
         try:
@@ -104,14 +106,14 @@ class DSOVisibilityCalculator:
                     self.set_timezone(row[0])
         except Exception:
             pass
-    
+
     def get_dso_coordinates(self, dso_name):
         """
         Get coordinates for a DSO by name.
-        
+
         Args:
             dso_name (str): Name of the DSO (e.g., 'M31', 'NGC 7000')
-            
+
         Returns:
             tuple: (SkyCoord object, error_message) - error_message is None if successful
         """
@@ -120,16 +122,16 @@ class DSOVisibilityCalculator:
             return coord, None
         except Exception as e:
             return None, str(e)
-    
+
     def get_dso_coordinates_enhanced(self, dso_name):
         """
         Get coordinates for a DSO by name with enhanced name resolution.
-        
+
         Tries multiple name variations and also attempts database lookup for coordinates.
-        
+
         Args:
             dso_name (str): Name of the DSO (e.g., 'M31', 'NGC 7000', 'sh2 142')
-            
+
         Returns:
             tuple: (SkyCoord object, error_message) - error_message is None if successful
         """
@@ -137,14 +139,14 @@ class DSOVisibilityCalculator:
         coord, error = self.get_dso_coordinates(dso_name)
         if coord is not None:
             return coord, None
-        
+
         # Try various name formatting variations
         name_variations = [dso_name.strip()]
         original_name = dso_name.strip().upper()
-        
+
         # Common variations for different naming patterns
         variations_to_try = []
-        
+
         # Handle spaces vs hyphens (e.g., "sh2 142" vs "sh2-142")
         if ' ' in original_name:
             variations_to_try.append(original_name.replace(' ', '-'))
@@ -152,7 +154,7 @@ class DSOVisibilityCalculator:
         if '-' in original_name:
             variations_to_try.append(original_name.replace('-', ' '))
             variations_to_try.append(original_name.replace('-', ''))
-        
+
         # Handle common catalog prefixes
         catalog_mappings = {
             'SH2': 'SHARPLESS',
@@ -166,13 +168,13 @@ class DSOVisibilityCalculator:
             'BARNARD': 'B',
             'B': 'BARNARD'
         }
-        
+
         # Extract catalog prefix and number
         import re
         match = re.match(r'^([A-Z]+)[\s-]?(\d+)', original_name)
         if match:
             prefix, number = match.groups()
-            
+
             # Try different catalog name formats
             for alt_prefix in catalog_mappings.get(prefix, [prefix]):
                 if alt_prefix != prefix:
@@ -181,7 +183,7 @@ class DSOVisibilityCalculator:
                         f"{alt_prefix}-{number}",
                         f"{alt_prefix}{number}"
                     ])
-        
+
         # Try all variations
         for variation in variations_to_try:
             if variation not in name_variations:  # Avoid duplicates
@@ -189,109 +191,109 @@ class DSOVisibilityCalculator:
                 coord, _ = self.get_dso_coordinates(variation)
                 if coord is not None:
                     return coord, None
-        
+
         # If name resolution fails, try database lookup
         try:
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                
+
                 # Try exact name match first
                 cursor.execute("""
-                    SELECT ra_deg, dec_deg FROM dso 
-                    WHERE UPPER(TRIM(name)) = ? 
+                    SELECT ra_deg, dec_deg FROM dso
+                    WHERE UPPER(TRIM(name)) = ?
                     OR UPPER(TRIM(alternate_names)) LIKE ?
                     LIMIT 1
                 """, (original_name, f"%{original_name}%"))
-                
+
                 row = cursor.fetchone()
                 if row and row[0] is not None and row[1] is not None:
                     coord = SkyCoord(ra=row[0] * u.deg, dec=row[1] * u.deg)
                     return coord, None
-                
+
                 # Try partial matches with variations
                 for variation in name_variations:
                     cursor.execute("""
-                        SELECT ra_deg, dec_deg FROM dso 
-                        WHERE UPPER(TRIM(name)) LIKE ? 
+                        SELECT ra_deg, dec_deg FROM dso
+                        WHERE UPPER(TRIM(name)) LIKE ?
                         OR UPPER(TRIM(alternate_names)) LIKE ?
                         LIMIT 1
                     """, (f"%{variation}%", f"%{variation}%"))
-                    
+
                     row = cursor.fetchone()
                     if row and row[0] is not None and row[1] is not None:
                         coord = SkyCoord(ra=row[0] * u.deg, dec=row[1] * u.deg)
                         return coord, None
-                        
+
         except Exception:
             pass  # Database lookup failed, continue with original error
-        
+
         # If all attempts fail, return the original error with helpful message
         error_msg = f"Could not resolve coordinates for '{dso_name}'. Tried variations: {', '.join(name_variations[:5])}"
         if len(name_variations) > 5:
             error_msg += f" (and {len(name_variations)-5} more)"
-        
+
         return None, error_msg
-    
+
     def calculate_altaz_over_time(self, dso_coord, start_time, duration_hours, time_resolution=4):
         """
         Calculate altitude and azimuth for a DSO over a time period.
-        
+
         Args:
             dso_coord (SkyCoord): DSO coordinates
             start_time (str or Time): Start time (ISO format string or astropy Time)
             duration_hours (float): Duration in hours
             time_resolution (int): Time points per hour (default: 4, i.e., every 15 minutes)
-            
+
         Returns:
             tuple: (time_range, dso_altaz, sun_altaz)
         """
         if self.location is None:
             raise ValueError("Observer location not set")
-        
+
         if isinstance(start_time, str):
             start_time = Time(start_time)
-        
+
         # Create time range
         time_range = start_time + np.linspace(0, duration_hours, int(duration_hours * time_resolution)) * u.hour
-        
+
         # Calculate DSO altitude/azimuth
         altaz_frame = AltAz(obstime=time_range, location=self.location)
         dso_altaz = dso_coord.transform_to(altaz_frame)
-        
+
         # Calculate sun altitude/azimuth
         sun = get_sun(time_range)
         sun_altaz = sun.transform_to(altaz_frame)
-        
+
         return time_range, dso_altaz, sun_altaz
-    
+
     def find_optimal_viewing_times(self, dso_altaz, sun_altaz, min_altitude=30, max_sun_altitude=-12):
         """
         Find optimal viewing times based on altitude and darkness criteria.
-        
+
         Args:
             dso_altaz: DSO altitude/azimuth data
             sun_altaz: Sun altitude/azimuth data
             min_altitude (float): Minimum DSO altitude in degrees (default: 30)
             max_sun_altitude (float): Maximum sun altitude for dark sky (default: -12)
-            
+
         Returns:
             numpy array: Boolean array indicating optimal viewing times
         """
         dso_visible = dso_altaz.alt.deg > min_altitude
         dark_sky = sun_altaz.alt.deg < max_sun_altitude
         return dso_visible & dark_sky
-    
+
     def calculate_visibility_for_date(self, dso_name, date, duration_hours=24, min_altitude=30):
         """
         Calculate complete visibility information for a DSO on a specific date.
-        
+
         Args:
             dso_name (str): Name of the DSO
             date (str): Date in ISO format (YYYY-MM-DD)
             duration_hours (float): Duration to calculate (default: 24 hours)
             min_altitude (float): Minimum altitude threshold (default: 30 degrees)
-            
+
         Returns:
             dict: Complete visibility results or None if error
         """
@@ -301,18 +303,18 @@ class DSOVisibilityCalculator:
             return {"error": f"Could not find coordinates for {dso_name}: {error}"}
 
         return self.calculate_visibility_for_coordinates(dso_coord, date, duration_hours, min_altitude, dso_name)
-    
+
     def calculate_visibility_for_coordinates(self, dso_coord, date, duration_hours=24, min_altitude=30, dso_name=None):
         """
         Calculate complete visibility information for DSO coordinates on a specific date.
-        
+
         Args:
             dso_coord (SkyCoord): Coordinates of the DSO
             date (str): Date in ISO format (YYYY-MM-DD)
             duration_hours (float): Duration to calculate (default: 24 hours)
             min_altitude (float): Minimum altitude threshold (default: 30 degrees)
             dso_name (str, optional): Name of the DSO for display purposes
-            
+
         Returns:
             dict: Complete visibility results or None if error
         """
@@ -320,19 +322,19 @@ class DSOVisibilityCalculator:
             # Calculate altitude/azimuth over time
             time_range, dso_altaz, sun_altaz = self.calculate_altaz_over_time(
                 dso_coord, date, duration_hours)
-            
+
             # Find optimal viewing times
             optimal_times = self.find_optimal_viewing_times(dso_altaz, sun_altaz, min_altitude)
-            
+
             # Calculate summary statistics
             max_altitude = np.max(dso_altaz.alt.deg)
             max_alt_idx = np.argmax(dso_altaz.alt.deg)
             max_alt_time = time_range[max_alt_idx]
             max_alt_azimuth = dso_altaz.az.deg[max_alt_idx]
-            
+
             # Find viewing windows
             viewing_windows = self._find_viewing_windows(time_range, optimal_times, dso_altaz)
-            
+
             return {
                 "dso_name": dso_name or f"RA {dso_coord.ra.deg:.4f}° DEC {dso_coord.dec.deg:.4f}°",
                 "dso_coord": dso_coord,
@@ -346,83 +348,111 @@ class DSOVisibilityCalculator:
                 "viewing_windows": viewing_windows,
                 "timezone": self.timezone
             }
-            
+
         except Exception as e:
             return {"error": f"Calculation error: {str(e)}"}
-    
+
+    def calculate_visibility_hours_for_day(self, dso_coord, date, min_altitude=30):
+        """
+        Calculate total visibility hours for a DSO on a specific day.
+
+        Args:
+            dso_coord (SkyCoord): Coordinates of the DSO
+            date (str): Date in ISO format (YYYY-MM-DD)
+            min_altitude (float): Minimum altitude threshold (default: 30 degrees)
+
+        Returns:
+            float: Total hours the DSO is optimally visible on this day
+        """
+        try:
+            # Calculate for full 24 hours
+            time_range, dso_altaz, sun_altaz = self.calculate_altaz_over_time(
+                dso_coord, date, 24, time_resolution=4)
+
+            # Find optimal viewing times
+            optimal_times = self.find_optimal_viewing_times(dso_altaz, sun_altaz, min_altitude)
+
+            # Calculate total hours (each time point represents 15 minutes = 0.25 hours)
+            total_hours = np.sum(optimal_times) * 0.25
+
+            return total_hours
+
+        except Exception:
+            return 0.0
+
     def calculate_seasonal_visibility(self, dso_coord, year=None, min_altitude=30):
         """
         Calculate when a DSO is optimally visible throughout a year.
-        
+
         Args:
             dso_coord (SkyCoord): DSO coordinates
             year (int): Year to calculate (default: current year)
             min_altitude (float): Minimum altitude threshold (default: 30 degrees)
-            
+
         Returns:
             list: List of date ranges when DSO is optimally visible
         """
         if self.location is None:
             return []
-        
+
         if year is None:
             from datetime import datetime
             year = datetime.now().year
-        
+
         try:
             # Sample dates throughout the year (every 10 days)
             dates = []
             visibility_data = []
-            
+
             for day_of_year in range(1, 366, 10):  # Every 10 days
                 try:
                     date = Time(f"{year}-01-01") + (day_of_year - 1) * u.day
-                    
+
                     # Calculate for midnight (when most DSOs are best visible)
                     midnight = date + 12 * u.hour  # Approximate local midnight
-                    
+
                     altaz_frame = AltAz(obstime=midnight, location=self.location)
                     dso_altaz = dso_coord.transform_to(altaz_frame)
                     sun = get_sun(midnight)
                     sun_altaz = sun.transform_to(altaz_frame)
-                    
+
                     # Check if object is well-visible (above min altitude and sun is down)
-                    is_visible = (dso_altaz.alt.deg > min_altitude and 
+                    is_visible = (dso_altaz.alt.deg > min_altitude and
                                 sun_altaz.alt.deg < -12)
-                    
+
                     dates.append(date)
                     visibility_data.append(is_visible)
-                    
+
                 except Exception:
                     continue
-            
+
             # Find continuous visibility periods
             return self._group_visibility_seasons(dates, visibility_data)
-            
+
         except Exception:
             return []
-    
+
     def _find_viewing_windows(self, time_range, optimal_times, dso_altaz):
         """Find continuous viewing windows from optimal times array."""
         if not np.any(optimal_times):
             return []
-        
+
         # Find continuous windows
         diff = np.diff(np.concatenate(([False], optimal_times, [False])).astype(int))
         starts = np.where(diff == 1)[0]
         ends = np.where(diff == -1)[0]
-        
+
         windows = []
         for start_idx, end_idx in zip(starts, ends):
             start_time = time_range[start_idx]
             end_time = time_range[end_idx - 1]
             duration = (end_time - start_time).to(u.hour).value
-            
+
             # Calculate mid-window statistics
             mid_idx = (start_idx + end_idx) // 2
             mid_altitude = dso_altaz.alt.deg[mid_idx]
             mid_azimuth = dso_altaz.az.deg[mid_idx]
-            
+
             windows.append({
                 "start_time": start_time,
                 "end_time": end_time,
@@ -430,17 +460,17 @@ class DSOVisibilityCalculator:
                 "mid_altitude": mid_altitude,
                 "mid_azimuth": mid_azimuth
             })
-        
+
         return windows
-    
+
     def _group_visibility_seasons(self, dates, visibility_data):
         """Group contiguous visibility dates into seasons."""
         if not dates or not any(visibility_data):
             return []
-        
+
         seasons = []
         current_season_start = None
-        
+
         for i, (date, is_visible) in enumerate(zip(dates, visibility_data)):
             if is_visible and current_season_start is None:
                 current_season_start = date
@@ -451,24 +481,24 @@ class DSOVisibilityCalculator:
                     "end_date": dates[i-1] if i > 0 else current_season_start,
                 })
                 current_season_start = None
-        
+
         # Handle case where season extends to end of year
         if current_season_start is not None:
             seasons.append({
                 "start_date": current_season_start,
                 "end_date": dates[-1],
             })
-        
+
         return seasons
-    
+
     @staticmethod
     def azimuth_to_direction(azimuth):
         """
         Convert azimuth angle to cardinal direction.
-        
+
         Args:
             azimuth (float): Azimuth in degrees (0-360)
-            
+
         Returns:
             str: Cardinal direction (e.g., 'N', 'NE', 'SSW')
         """
@@ -476,15 +506,15 @@ class DSOVisibilityCalculator:
                       'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
         idx = int((azimuth + 11.25) / 22.5) % 16
         return directions[idx]
-    
+
     @staticmethod
     def get_twilight_condition(sun_altitude):
         """
         Get twilight condition based on sun altitude.
-        
+
         Args:
             sun_altitude (float): Sun altitude in degrees
-            
+
         Returns:
             str: Twilight condition
         """
@@ -498,6 +528,165 @@ class DSOVisibilityCalculator:
             return "Astronomical Twilight"
         else:
             return "Night"
+
+
+class MonthlyVisibilityThread(QThread):
+    """Thread for calculating visibility hours for all days in a month"""
+    progress = Signal(int, float)  # day, hours
+    finished = Signal(object)  # day -> hours mapping (use object instead of dict)
+    error = Signal(str)
+
+    def __init__(self, dso_coord, dso_name, year, month, min_altitude, ra_deg=None, dec_deg=None):
+        super().__init__()
+        self.dso_coord = dso_coord
+        self.dso_name = dso_name
+        self.year = year
+        self.month = month
+        self.min_altitude = min_altitude
+        self.ra_deg = ra_deg
+        self.dec_deg = dec_deg
+        self.calculator = DSOVisibilityCalculator()
+
+    def run(self):
+        """Calculate visibility for each day in the month"""
+        try:
+            if self.calculator.location is None:
+                self.error.emit("Observer location not configured.")
+                return
+
+            # Get coordinates if not already provided
+            if self.dso_coord is None:
+                if self.ra_deg is not None and self.dec_deg is not None:
+                    self.dso_coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
+                else:
+                    self.dso_coord, error = self.calculator.get_dso_coordinates_enhanced(self.dso_name)
+                    if self.dso_coord is None:
+                        self.error.emit(f"Could not find coordinates: {error}")
+                        return
+
+            # Calculate for each day in the month
+            visibility_hours = {}
+            import calendar
+            days_in_month = calendar.monthrange(self.year, self.month)[1]
+
+            for day in range(1, days_in_month + 1):
+                date_str = f"{self.year:04d}-{self.month:02d}-{day:02d}"
+                hours = self.calculator.calculate_visibility_hours_for_day(
+                    self.dso_coord, date_str, self.min_altitude)
+                visibility_hours[day] = hours
+                self.progress.emit(day, hours)
+
+            self.finished.emit(visibility_hours)
+
+        except Exception as e:
+            self.error.emit(f"Calculation error: {str(e)}")
+
+
+class VisibilityCalendar(QCalendarWidget):
+    """Custom calendar widget that displays visibility hours for each day"""
+    # Signal to notify when month changes (so parent can recalculate)
+    monthChanged = Signal(int, int)  # year, month
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.visibility_hours = {}  # day -> hours mapping
+        self.setGridVisible(True)
+        self.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+
+        # Set today as selected date
+        self.setSelectedDate(QDate.currentDate())
+
+        # Connect to date change
+        self.currentPageChanged.connect(self.on_month_changed)
+
+    def set_visibility_hours(self, visibility_hours):
+        """Set visibility hours for days in the current month"""
+        self.visibility_hours = visibility_hours
+        self._update_tooltips()
+        # Force a complete repaint of the calendar
+        self.updateCells()
+        self.update()
+
+    def clear_visibility_hours(self):
+        """Clear all visibility hour data"""
+        self.visibility_hours = {}
+        self._update_tooltips()
+        # Force a complete repaint of the calendar
+        self.updateCells()
+        self.update()
+
+    def _update_tooltips(self):
+        """Update tooltips for all days with visibility data"""
+        date = QDate(self.yearShown(), self.monthShown(), 1)
+        for day in range(1, date.daysInMonth() + 1):
+            cell_date = QDate(self.yearShown(), self.monthShown(), day)
+            if day in self.visibility_hours:
+                hours = self.visibility_hours[day]
+                # Set tooltip with exact hours
+                format = QTextCharFormat()
+                format.setToolTip(f"{hours:.1f} hours visible")
+                self.setDateTextFormat(cell_date, format)
+            else:
+                # Clear tooltip
+                self.setDateTextFormat(cell_date, QTextCharFormat())
+
+    def get_color_for_hours(self, hours):
+        """Get background and foreground colors for given visibility hours"""
+        if hours >= 8:
+            return QColor(0, 150, 0), QColor(255, 255, 255)
+        elif hours >= 6:
+            return QColor(0, 120, 0), QColor(255, 255, 255)
+        elif hours >= 4:
+            return QColor(100, 120, 0), QColor(255, 255, 255)
+        elif hours >= 2:
+            return QColor(150, 100, 0), QColor(255, 255, 255)
+        elif hours >= 1:
+            return QColor(150, 60, 0), QColor(255, 255, 255)
+        elif hours > 0:
+            return QColor(120, 40, 0), QColor(255, 255, 255)
+        else:
+            return QColor(80, 0, 0), QColor(180, 180, 180)
+
+    def paintCell(self, painter, rect, date):
+        """Override to paint custom cell backgrounds"""
+        from PySide6.QtGui import QPen, QBrush
+
+        # Check if this date is in the current month
+        if date.month() == self.monthShown() and date.year() == self.yearShown():
+            day = date.day()
+
+            # Determine colors based on visibility data
+            if day in self.visibility_hours:
+                hours = self.visibility_hours[day]
+                bg_color, fg_color = self.get_color_for_hours(hours)
+            else:
+                # Default gray for dates without visibility data
+                bg_color = QColor(64, 64, 64)
+                fg_color = QColor(200, 200, 200)
+
+            # Fill background
+            painter.fillRect(rect, QBrush(bg_color))
+
+            # Draw text
+            painter.setPen(QPen(fg_color))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(day))
+
+            # Draw selection highlight if this is the selected date
+            if date == self.selectedDate():
+                painter.setPen(QPen(QColor(255, 255, 0), 2))
+                painter.drawRect(rect.adjusted(1, 1, -1, -1))
+
+            return
+
+        # Default painting for dates outside current month (grayed out)
+        super().paintCell(painter, rect, date)
+
+    def on_month_changed(self, year, month):
+        """Called when the displayed month changes"""
+        # Clear visibility data when month changes (will need to recalculate)
+        self.clear_visibility_hours()
+        # Notify parent to recalculate for this month
+        self.monthChanged.emit(year, month)
 
 
 class CalculationThread(QThread):
@@ -561,13 +750,13 @@ class VisibilityPlot(FigureCanvas):
         self.setParent(parent)
         # Set dark background for the canvas
         self.setStyleSheet("background-color: #2e2e2e;")
-        
+
         # Initialize hover data storage
         self.hover_data = None
         self.annotation = None
         self.cursor_lines = []
         self.last_idx = None  # Cache last index for performance
-        
+
         # Connect mouse motion event
         self.mpl_connect('motion_notify_event', self.on_mouse_move)
 
@@ -581,7 +770,7 @@ class VisibilityPlot(FigureCanvas):
         optimal_times = results['optimal_times']
         dso_name = results['dso_name']
         local_tz = results['local_tz']
-        
+
         # Store data for hover functionality
         self.hover_data = {
             'time_range': time_range,
@@ -682,16 +871,16 @@ class VisibilityPlot(FigureCanvas):
         ax3.set_xticklabels(time_labels)
 
         self.figure.tight_layout()
-        
+
         # Store additional data needed for hover
         self.hover_data['local_times'] = local_times
         self.hover_data['hours_from_start'] = hours_from_start
         self.hover_data['axes'] = [ax1, ax2, ax3]
-        
+
         # Reset cursor lines and cached index
         self.cursor_lines = []
         self.last_idx = None
-        
+
         self.draw()
 
     def azimuth_to_direction(self, az):
@@ -706,7 +895,7 @@ class VisibilityPlot(FigureCanvas):
         """Find the nearest data point to the mouse position"""
         if not self.hover_data or 'hours_from_start' not in self.hover_data:
             return None
-            
+
         hours_from_start = self.hover_data['hours_from_start']
         idx = np.argmin(np.abs(np.array(hours_from_start) - x_pos))
         return idx
@@ -720,7 +909,7 @@ class VisibilityPlot(FigureCanvas):
             except (ValueError, NotImplementedError):
                 pass  # Already removed or cannot be removed
         self.cursor_lines = []
-        
+
         # Remove annotation - set visibility to False instead of removing
         if self.annotation:
             try:
@@ -740,7 +929,7 @@ class VisibilityPlot(FigureCanvas):
         idx = self.find_nearest_data_point(event.xdata)
         if idx is None:
             return
-            
+
         # Performance optimization: skip if same data point as last time
         if idx == self.last_idx:
             return
@@ -752,7 +941,7 @@ class VisibilityPlot(FigureCanvas):
         # Get the x-position from our data (for precise alignment)
         hours_from_start = self.hover_data['hours_from_start']
         x_pos = hours_from_start[idx]
-        
+
         # Add vertical cursor line to all subplots
         axes = self.hover_data.get('axes', [])
         for ax in axes:
@@ -766,12 +955,12 @@ class VisibilityPlot(FigureCanvas):
         sun_alt = self.hover_data['sun_altaz'].alt.deg[idx]
         optimal = self.hover_data['optimal_times'][idx]
         dso_name = self.hover_data['dso_name']
-        
+
         # Pre-calculate values (avoiding repeated function calls)
         direction = self.azimuth_to_direction(dso_az)
         twilight = self.get_twilight_condition(sun_alt)
         tz_name = local_time.strftime('%Z')
-        
+
         # Create hover text
         hover_text = (
             f"Time: {local_time.strftime('%H:%M:%S')} {tz_name}\n"
@@ -793,7 +982,7 @@ class VisibilityPlot(FigureCanvas):
             fontfamily='monospace',
             zorder=1000
         )
-        
+
         # Use draw_idle for better performance
         self.draw_idle()
 
@@ -804,7 +993,7 @@ class DSOVisibilityApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DSO Visibility Calculator - Cosmos Collection")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1400, 900)
 
         # Set dark theme for the application
         self.setStyleSheet("""
@@ -868,27 +1057,38 @@ class DSOVisibilityApp(QMainWindow):
                 color: #ffffff;
             }
             QCalendarWidget {
-                background-color: #404040;
-                color: #ffffff;
+                background-color: #353535;
             }
             QCalendarWidget QToolButton {
-                background-color: #555555;
+                background-color: #505050;
                 color: #ffffff;
+                border: none;
+                border-radius: 3px;
+                padding: 5px;
+            }
+            QCalendarWidget QToolButton:hover {
+                background-color: #606060;
             }
             QCalendarWidget QMenu {
                 background-color: #404040;
                 color: #ffffff;
             }
             QCalendarWidget QSpinBox {
-                background-color: #555555;
+                background-color: #505050;
                 color: #ffffff;
+                border: 1px solid #666666;
+            }
+            QCalendarWidget QAbstractItemView {
+                selection-background-color: #ffff00;
             }
         """)
 
         self.calc_thread = None
+        self.monthly_calc_thread = None
         # Store optional coordinates for direct calculation (bypassing name resolution)
         self.dso_ra_deg = None
         self.dso_dec_deg = None
+        self.current_dso_coord = None  # Store current DSO coordinates for calendar
         self.init_ui()
 
     def init_ui(self):
@@ -962,14 +1162,52 @@ class DSOVisibilityApp(QMainWindow):
 
         left_layout.addStretch()
 
-        # Right panel for plot
+        # Right panel with calendar and plot
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+
+        # Calendar widget
+        calendar_group = QGroupBox("Monthly Visibility")
+        calendar_layout = QVBoxLayout(calendar_group)
+
+        self.calendar = VisibilityCalendar()
+        self.calendar.setMaximumHeight(250)
+        self.calendar.clicked.connect(self.on_calendar_date_selected)
+        self.calendar.monthChanged.connect(self.on_calendar_month_changed)
+        calendar_layout.addWidget(self.calendar)
+
+        # Calendar legend
+        legend_layout = QHBoxLayout()
+        legend_labels = [
+            ("8+ hrs", QColor(0, 150, 0)),
+            ("6-8 hrs", QColor(0, 120, 0)),
+            ("4-6 hrs", QColor(100, 120, 0)),
+            ("2-4 hrs", QColor(150, 100, 0)),
+            ("1-2 hrs", QColor(150, 60, 0)),
+            ("<1 hr", QColor(120, 40, 0)),
+            ("None", QColor(80, 0, 0))
+        ]
+        for text, color in legend_labels:
+            legend_label = QLabel(text)
+            legend_label.setStyleSheet(f"background-color: rgb({color.red()}, {color.green()}, {color.blue()}); padding: 3px; border-radius: 2px;")
+            legend_layout.addWidget(legend_label)
+        legend_layout.addStretch()
+        calendar_layout.addLayout(legend_layout)
+
+        # Calendar status label
+        self.calendar_status_label = QLabel("Select a DSO and calculate to see monthly visibility")
+        self.calendar_status_label.setStyleSheet("color: #aaaaaa; font-style: italic;")
+        calendar_layout.addWidget(self.calendar_status_label)
+
+        right_layout.addWidget(calendar_group)
+
+        # Plot widget
         self.plot_widget = VisibilityPlot()
+        right_layout.addWidget(self.plot_widget, stretch=1)
 
         # Add panels to main layout
         main_layout.addWidget(left_panel)
-        main_layout.addWidget(self.plot_widget, stretch=1)
-
-        # No initial calculation - wait for location to be set
+        main_layout.addWidget(right_panel, stretch=1)
 
     def _load_location_from_database(self):
         """Load observer location from the database"""
@@ -1008,17 +1246,17 @@ class DSOVisibilityApp(QMainWindow):
                         else:
                             lat, lon, location_name = None, None, None
                             self.user_timezone = None
-                
+
                 if lat is not None and lon is not None:
                     # Format coordinates nicely
                     lat_str = f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'}"
                     lon_str = f"{abs(lon):.2f}°{'W' if lon < 0 else 'E'}"
-                    
+
                     # Use the location name if available, otherwise fall back to "User Location"
                     display_name = location_name if location_name else "User Location"
                     self.location_name_label.setText(display_name)
                     self.location_coords_label.setText(f"Lat: {lat_str}, Lon: {lon_str}")
-                    
+
                     # Update window title with the location name and timezone
                     if self.user_timezone:
                         try:
@@ -1052,11 +1290,17 @@ class DSOVisibilityApp(QMainWindow):
         self.calculate_btn.setEnabled(True)
         self.calculate_btn.setText("Calculate Visibility")
 
+        # Store DSO coordinates for calendar calculations
+        self.current_dso_coord = results.get('dso_coord')
+
         # Update plot
         self.plot_widget.plot_visibility(results)
 
         # Generate text results
         self.update_results_text(results)
+
+        # Start monthly visibility calculation for calendar
+        self.start_monthly_visibility_calculation()
 
     def on_calculation_error(self, error_msg):
         """Handle calculation error"""
@@ -1137,12 +1381,12 @@ class DSOVisibilityApp(QMainWindow):
         self.calculate_btn.setEnabled(False)
         self.calculate_btn.setText("Location Required")
         self.results_text.setText("Please set your observer location to calculate DSO visibility.")
-        
+
     def calculate_visibility(self):
         """Start visibility calculation"""
         if self.calc_thread and self.calc_thread.isRunning():
             return
-            
+
         # Check if location is configured
         calc_thread_test = CalculationThread("M1", "2024-01-01", 24, 30)
         if calc_thread_test.location is None:
@@ -1167,6 +1411,65 @@ class DSOVisibilityApp(QMainWindow):
         self.calc_thread.finished.connect(self.on_calculation_finished)
         self.calc_thread.error.connect(self.on_calculation_error)
         self.calc_thread.start()
+
+    def start_monthly_visibility_calculation(self):
+        """Start calculating visibility hours for all days in the current month"""
+        if not self.current_dso_coord:
+            return
+
+        if self.monthly_calc_thread and self.monthly_calc_thread.isRunning():
+            self.monthly_calc_thread.quit()
+            self.monthly_calc_thread.wait()
+
+        # Get current month from calendar
+        year = self.calendar.yearShown()
+        month = self.calendar.monthShown()
+
+        dso_name = self.dso_input.text().strip() or "M100"
+        min_altitude = self.min_alt_input.value()
+
+        # Clear existing data
+        self.calendar.clear_visibility_hours()
+        self.calendar_status_label.setText(f"Calculating monthly visibility for {dso_name}...")
+
+        # Start calculation thread
+        self.monthly_calc_thread = MonthlyVisibilityThread(
+            self.current_dso_coord, dso_name, year, month, min_altitude,
+            self.dso_ra_deg, self.dso_dec_deg)
+        self.monthly_calc_thread.progress.connect(self.on_monthly_calc_progress)
+        self.monthly_calc_thread.finished.connect(self.on_monthly_calc_finished)
+        self.monthly_calc_thread.error.connect(self.on_monthly_calc_error)
+        self.monthly_calc_thread.start()
+
+    def on_monthly_calc_progress(self, day, hours):
+        """Handle progress updates from monthly calculation"""
+        dso_name = self.dso_input.text().strip() or "M100"
+        self.calendar_status_label.setText(f"Calculating {dso_name}: Day {day}...")
+
+    def on_monthly_calc_finished(self, visibility_hours):
+        """Handle completion of monthly visibility calculation"""
+        self.calendar.set_visibility_hours(visibility_hours)
+        dso_name = self.dso_input.text().strip() or "M100"
+        self.calendar_status_label.setText(f"Monthly visibility for {dso_name} (click a day to view details)")
+
+    def on_monthly_calc_error(self, error_msg):
+        """Handle error in monthly visibility calculation"""
+        self.calendar_status_label.setText(f"Error: {error_msg}")
+
+    def on_calendar_date_selected(self, date):
+        """Handle calendar date selection"""
+        # Update the date input
+        self.date_input.setDate(date)
+
+        # If we have DSO data, recalculate for this date
+        if self.current_dso_coord:
+            self.calculate_visibility()
+
+    def on_calendar_month_changed(self, year, month):
+        """Handle calendar month navigation"""
+        if self.current_dso_coord:
+            # Trigger monthly calculation for the new month
+            self.start_monthly_visibility_calculation()
 
     def set_dso_coordinates(self, ra_deg, dec_deg):
         """
