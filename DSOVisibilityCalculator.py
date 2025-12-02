@@ -18,6 +18,11 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
 from PySide6.QtGui import QTextCharFormat, QColor
 
 matplotlib.use('Qt5Agg')
+
+# Suppress matplotlib font_manager debug messages
+import logging
+logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
