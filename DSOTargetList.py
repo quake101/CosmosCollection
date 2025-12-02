@@ -271,7 +271,7 @@ class DSOTargetListWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DSO Target List - Cosmos Collection")
-        self.setGeometry(100, 100, 1200, 700)
+        self.setGeometry(100, 100, 1210, 850)
         
         # Set dark theme
         self.setStyleSheet("""

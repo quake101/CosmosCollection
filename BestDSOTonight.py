@@ -530,7 +530,7 @@ class BestDSOTonightWindow(QMainWindow):
     def __init__(self, use_target_list=False):
         super().__init__()
         self.setWindowTitle("Best DSO Tonight - Cosmos Collection")
-        self.setGeometry(100, 100, 1000, 700)
+        self.setGeometry(100, 100, 930, 920)
         self.auto_use_target_list = use_target_list
         
         # Set dark theme
