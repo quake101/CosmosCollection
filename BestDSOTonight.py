@@ -1177,8 +1177,24 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         context_menu.addSeparator()
 
-        target_action = context_menu.addAction("Add to Target List")
-        target_action.triggered.connect(lambda: self._context_add_to_target_list(row))
+        # Check if DSO is already in target list
+        name_item = self.results_table.item(row, 0)
+        if name_item:
+            dso_data = name_item.data(Qt.UserRole)
+            if dso_data:
+                dso_name = dso_data["dso_info"]["name"]
+
+                # Check if in target list
+                is_in_target_list = self._is_dso_in_target_list(dso_name)
+
+                if is_in_target_list:
+                    # Show "Open from Target List" option
+                    open_target_action = context_menu.addAction("Open from Target List")
+                    open_target_action.triggered.connect(lambda: self._context_open_from_target_list(row))
+                else:
+                    # Show "Add to Target List" option
+                    target_action = context_menu.addAction("Add to Target List")
+                    target_action.triggered.connect(lambda: self._context_add_to_target_list(row))
 
         # Show the menu at the clicked position
         context_menu.exec(self.results_table.mapToGlobal(position))
@@ -1346,6 +1362,54 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                     QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to add to target list: {str(e)}")
+
+    def _is_dso_in_target_list(self, dso_name):
+        """Check if a DSO is in the target list
+
+        Args:
+            dso_name: Name of the DSO to check
+
+        Returns:
+            bool: True if DSO is in target list, False otherwise
+        """
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM usertargetlist WHERE name = ?", (dso_name,))
+                count = cursor.fetchone()[0]
+                return count > 0
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error checking if DSO is in target list: {str(e)}")
+            return False
+
+    def _context_open_from_target_list(self, row):
+        """Open DSO from target list to view notes"""
+        try:
+            # Get DSO data from the name item (column 0) of the selected row
+            name_item = self.results_table.item(row, 0)
+            if name_item:
+                dso_data = name_item.data(Qt.UserRole)
+                if dso_data:
+                    dso_name = dso_data["dso_info"]["name"]
+
+                    # Import and open Target List window
+                    from DSOTargetList import DSOTargetListWindow
+                    if not hasattr(self, 'target_list_window') or not self.target_list_window.isVisible():
+                        self.target_list_window = DSOTargetListWindow()
+
+                    # Open and select the target
+                    success = self.target_list_window.open_and_select_target(dso_name)
+
+                    if not success:
+                        QMessageBox.warning(self, "Not Found",
+                                          f"Could not find '{dso_name}' in your target list.")
+                else:
+                    QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open from target list: {str(e)}")
 
 
 def main():

@@ -1415,6 +1415,93 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             self._load_targets()
 
+    def is_dso_in_target_list(self, dso_name):
+        """Check if a DSO is in the target list by name
+
+        Args:
+            dso_name: Name of the DSO to check
+
+        Returns:
+            bool: True if the DSO is in the target list, False otherwise
+        """
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM usertargetlist WHERE name = ?", (dso_name,))
+                count = cursor.fetchone()[0]
+                return count > 0
+        except Exception as e:
+            logger.error(f"Error checking if DSO is in target list: {str(e)}")
+            return False
+
+    def open_and_select_target(self, dso_name):
+        """Open the target list window and select the target with the given name
+
+        Args:
+            dso_name: Name of the DSO to select
+
+        Returns:
+            bool: True if target was found and selected, False otherwise
+        """
+        try:
+            # Ensure the window is visible
+            if not self.isVisible():
+                self.show()
+            self.raise_()
+            self.activateWindow()
+
+            # Reload targets to ensure we have current data
+            self._load_targets()
+
+            # Find the row with the matching DSO name
+            for row in range(self.targets_table.rowCount()):
+                name_item = self.targets_table.item(row, 0)
+                if name_item and name_item.text() == dso_name:
+                    # Select the row
+                    self.targets_table.selectRow(row)
+                    self.targets_table.scrollToItem(name_item)
+
+                    # Open the edit dialog to show the notes
+                    target_data = name_item.data(Qt.UserRole)
+                    if target_data:
+                        self._edit_target_with_data(target_data)
+                    return True
+
+            return False
+        except Exception as e:
+            logger.error(f"Error opening and selecting target: {str(e)}")
+            return False
+
+    def _edit_target_with_data(self, target_data):
+        """Open the edit target dialog with the given target data
+
+        Args:
+            target_data: Dictionary containing target information
+        """
+        try:
+            dialog = AddTargetDialog(dso_data=target_data, parent=self)
+            dialog.setWindowTitle("Edit Target")
+            dialog.set_edit_mode(target_data["id"])  # Enable edit mode and set target ID
+
+            # Pre-populate with target data
+            dialog.name_edit.setText(target_data.get("name", ""))
+            dialog.type_edit.setText(target_data.get("dso_type", ""))
+            dialog.constellation_edit.setText(target_data.get("constellation", ""))
+            dialog.ra_edit.setText(str(target_data.get("ra_deg", "")))
+            dialog.dec_edit.setText(str(target_data.get("dec_deg", "")))
+            dialog.magnitude_edit.setText(str(target_data.get("magnitude", "")))
+            dialog.size_edit.setText(target_data.get("size_info", ""))
+            dialog.priority_combo.setCurrentText(target_data.get("priority", "Medium"))
+            dialog.status_combo.setCurrentText(target_data.get("status", "Not Observed"))
+            dialog.months_edit.setText(target_data.get("best_months", ""))
+            dialog.notes_edit.setPlainText(target_data.get("notes", ""))
+
+            if dialog.exec() == QDialog.Accepted:
+                self._load_targets()
+        except Exception as e:
+            logger.error(f"Error opening edit target dialog: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to open target details: {str(e)}")
+
 
 def main():
     """Main entry point for the application"""
