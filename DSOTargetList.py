@@ -18,6 +18,7 @@ from PySide6.QtGui import QFont
 
 from DatabaseManager import DatabaseManager
 from BestDSOTonight import BestDSOTonightWindow
+from WindowPositionManager import WindowPositionMixin
 import logging
 
 # Set up logging
@@ -265,13 +266,15 @@ class AddTargetDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Failed to save target: {str(e)}")
 
 
-class DSOTargetListWindow(QMainWindow):
+class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
+    WINDOW_POSITION_KEY = "DSOTargetList"
     """Main window for DSO target list management"""
     
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DSO Target List - Cosmos Collection")
-        self.setGeometry(100, 100, 1210, 850)
+        self.resize(1210, 850)
+        self.setup_window_position()
         
         # Set dark theme
         self.setStyleSheet("""

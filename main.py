@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 
 # Local imports (always needed)
 from DatabaseManager import DatabaseManager
+from WindowPositionManager import WindowPositionManager, WindowPositionMixin
 from ResourceManager import ResourceManager
 from CollageBuilder import CollageBuilder, CollageBuilderWindow
 
@@ -1513,6 +1514,7 @@ class CustomDSOVisibilityWindow(QDialog):
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.resize(1200, 800)
+        WindowPositionManager.restore_window_position(self, "CustomDSOVisibility")
 
         # Create layout
         layout = QVBoxLayout()
@@ -1542,14 +1544,21 @@ class CustomDSOVisibilityWindow(QDialog):
         # Calculate visibility immediately
         QTimer.singleShot(100, self.visibility_app.calculate_visibility)
 
+    def closeEvent(self, event):
+        """Save window position when closing"""
+        WindowPositionManager.save_window_position(self, "CustomDSOVisibility")
+        event.accept()
+
 
 # --- Aladin Lite Viewer Window ---
-class AladinLiteWindow(QMainWindow):
+class AladinLiteWindow(WindowPositionMixin, QMainWindow):
+    WINDOW_POSITION_KEY = "AladinLite"
     def __init__(self, data: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"{data['name']} - Aladin Lite - Cosmos Collection")
         self.resize(1200, 800)
-        
+        self.setup_window_position()
+
         self.data = data
         self.telescopes = []
         self.selected_telescope = None
@@ -2936,6 +2945,7 @@ class ImageViewerWindow(QDialog):
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.resize(800, 600)
+        WindowPositionManager.restore_window_position(self, "ImageViewer")
 
         self.setMinimumSize(300, 300)
 
@@ -3652,6 +3662,11 @@ class ImageViewerWindow(QDialog):
             # Any other error reading FITS
             return None
 
+    def closeEvent(self, event):
+        """Save window position when closing"""
+        WindowPositionManager.save_window_position(self, "ImageViewer")
+        event.accept()
+
 
 # --- Collage Selection Dialog ---
 class CollageSelectionDialog(QDialog):
@@ -3861,6 +3876,8 @@ class ObjectDetailWindow(QDialog):
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.setWindowModality(Qt.NonModal)  # Ensure it's non-modal
         self.resize(1000, 800)
+        WindowPositionManager.restore_window_position(self, "ObjectDetail")
+
         self.data = data  # Store data for later use
         self.current_image_path = None  # Store current image path
         self.zoom_factor = 1.0  # Current zoom level
@@ -5942,6 +5959,11 @@ class ObjectDetailWindow(QDialog):
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Error", f"Failed to open collage builder: {str(e)}")
 
+    def closeEvent(self, event):
+        """Save window position when closing"""
+        WindowPositionManager.save_window_position(self, "ObjectDetail")
+        event.accept()
+
 
 class CustomTableView(QTableView):
     def __init__(self, parent=None):
@@ -6837,7 +6859,8 @@ class AboutDialog(QDialog):
 
 
 # --- Main App Window ---
-class MainWindow(QMainWindow):
+class MainWindow(WindowPositionMixin, QMainWindow):
+    WINDOW_POSITION_KEY = "MainWindow"
     def __init__(self, dso_data, catalogs, total_count=None):
         super().__init__()
         logger.debug("Initializing MainWindow")
@@ -6854,8 +6877,9 @@ class MainWindow(QMainWindow):
             window_title = "Cosmos Collection"
 
         self.setWindowTitle(window_title)
-        self.setGeometry(100, 100, 1200, 800)
+        self.resize(1200, 800)
         self.setWindowFlags(Qt.Window)
+        self.setup_window_position()
         self.db_manager = DatabaseManager()
         self._cached_dso_data = None
         self._cached_catalogs = None

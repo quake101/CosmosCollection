@@ -37,6 +37,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Import DatabaseManager from separate file
 from DatabaseManager import DatabaseManager
+from WindowPositionManager import WindowPositionMixin
 
 
 class DSOVisibilityCalculator:
@@ -987,13 +988,15 @@ class VisibilityPlot(FigureCanvas):
         self.draw_idle()
 
 
-class DSOVisibilityApp(QMainWindow):
+class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
     """Main application window"""
+    WINDOW_POSITION_KEY = "DSOVisibilityApp"
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DSO Visibility Calculator - Cosmos Collection")
-        self.setGeometry(100, 100, 1400, 900)
+        self.resize(1400, 900)
+        self.setup_window_position()
 
         # Set dark theme for the application
         self.setStyleSheet("""

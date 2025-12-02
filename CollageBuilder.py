@@ -644,6 +644,7 @@ try:
     from PySide6.QtGui import QColor, QDrag, QPixmap
     from PySide6.QtCore import QMimeData
     from PySide6.QtWidgets import QApplication
+    from WindowPositionManager import WindowPositionMixin
 
     # Import DatabaseManager (assuming it's available in the main application)
     try:
@@ -1494,8 +1495,9 @@ class ImageSelectionDialog(QDialog):
         return self.selected_images
 
 # --- Collage Builder Window ---
-class CollageBuilderWindow(QDialog):
+class CollageBuilderWindow(WindowPositionMixin, QDialog):
     """Window for creating and managing multiple collages"""
+    WINDOW_POSITION_KEY = "CollageBuilder"
 
     def __init__(self, user_images: list, dso_name: str, dsodetailid: int, parent=None):
         super().__init__(parent)
@@ -1534,6 +1536,8 @@ class CollageBuilderWindow(QDialog):
         self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint |
                             Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.resize(1400, 900)
+        self.setup_window_position()
+
         self.setMinimumSize(800, 600)
 
         self._setup_ui()

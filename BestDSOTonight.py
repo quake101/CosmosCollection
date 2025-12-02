@@ -24,6 +24,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from DatabaseManager import DatabaseManager
+from WindowPositionManager import WindowPositionMixin
 
 class NumericTableWidgetItem(QTableWidgetItem):
     """Custom QTableWidgetItem that sorts by numeric value stored in UserRole"""
@@ -524,14 +525,16 @@ class DSOCalculationThread(QThread):
             self.error_occurred.emit(f"Calculation error: {str(e)}")
 
 
-class BestDSOTonightWindow(QMainWindow):
+class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
     """Main window for Best DSO Tonight calculator"""
+    WINDOW_POSITION_KEY = "BestDSOTonight"
 
     def __init__(self, use_target_list=False):
         super().__init__()
         self.setWindowTitle("Best DSO Tonight - Cosmos Collection")
-        self.setGeometry(100, 100, 930, 920)
+        self.resize(930, 920)
         self.auto_use_target_list = use_target_list
+        self.setup_window_position()
         
         # Set dark theme
         self.setStyleSheet("""
