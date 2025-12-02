@@ -14,7 +14,7 @@ from datetime import datetime
 from PySide6.QtCore import Qt, QDate, QThread, Signal
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLineEdit, QLabel, QTextEdit,
-                               QDateEdit, QSpinBox, QGroupBox, QMessageBox, QCalendarWidget)
+                               QDateEdit, QSpinBox, QGroupBox, QMessageBox, QCalendarWidget, QSizePolicy)
 from PySide6.QtGui import QTextCharFormat, QColor
 
 matplotlib.use('Qt5Agg')
@@ -1159,11 +1159,14 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         results_group = QGroupBox("Viewing Windows")
         results_layout = QVBoxLayout(results_group)
         self.results_text = QTextEdit()
-        self.results_text.setMaximumHeight(200)
-        results_layout.addWidget(self.results_text)
-        left_layout.addWidget(results_group)
+        self.results_text.setMinimumHeight(200)
+        self.results_text.setReadOnly(True)
 
-        left_layout.addStretch()
+        # Set size policy to expand vertically
+        self.results_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        results_layout.addWidget(self.results_text)
+        left_layout.addWidget(results_group, stretch=1)  # Give it a stretch factor to expand
 
         # Right panel with calendar and plot
         right_panel = QWidget()
