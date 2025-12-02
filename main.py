@@ -4469,10 +4469,16 @@ class ObjectDetailWindow(QDialog):
             self.remove_target_button = QPushButton("Remove from Target List")
             self.remove_target_button.clicked.connect(self._remove_from_target_list)
             self.remove_target_button.setVisible(False)
-            
+
+            # Open from Target List button (initially hidden, shown when DSO is in target list)
+            self.open_target_button = QPushButton("Open from Target List")
+            self.open_target_button.clicked.connect(self._open_from_target_list)
+            self.open_target_button.setVisible(False)
+
             buttons_layout.addWidget(self.target_list_button)
             buttons_layout.addWidget(self.remove_target_button)
-            
+            buttons_layout.addWidget(self.open_target_button)
+
             # Check if DSO is already in target list and update button visibility
             self._update_target_list_buttons()
 
@@ -5701,58 +5707,107 @@ class ObjectDetailWindow(QDialog):
         """Update target list button visibility based on whether DSO is already in target list"""
         try:
             is_in_target_list = self._check_if_in_target_list()
-            
+
             if is_in_target_list:
                 self.target_list_button.setVisible(False)
                 self.remove_target_button.setVisible(True)
+                self.open_target_button.setVisible(True)
             else:
                 self.target_list_button.setVisible(True)
                 self.remove_target_button.setVisible(False)
-                
+                self.open_target_button.setVisible(False)
+
         except Exception as e:
             logger.error(f"Error updating target list buttons: {str(e)}")
             # Show add button as fallback
             self.target_list_button.setVisible(True)
             self.remove_target_button.setVisible(False)
+            self.open_target_button.setVisible(False)
     
     def _check_if_in_target_list(self):
         """Check if current DSO is already in the target list"""
         try:
             with DatabaseManager().get_connection() as conn:
                 cursor = conn.cursor()
-                
+
                 # Check by DSO name and coordinates (to handle different name formats)
                 dso_name = self.data.get('name', '').strip()
                 ra_deg = self.data.get('ra_deg')
                 dec_deg = self.data.get('dec_deg')
-                
+
                 if not dso_name:
                     return False
-                
+
                 # First check by exact name match
                 cursor.execute("""
-                    SELECT COUNT(*) FROM usertargetlist 
+                    SELECT COUNT(*) FROM usertargetlist
                     WHERE UPPER(TRIM(name)) = ?
                 """, (dso_name.upper(),))
-                
+
                 if cursor.fetchone()[0] > 0:
                     return True
-                
+
                 # If coordinates are available, also check by coordinates (within small tolerance)
                 if ra_deg is not None and dec_deg is not None:
                     cursor.execute("""
-                        SELECT COUNT(*) FROM usertargetlist 
+                        SELECT COUNT(*) FROM usertargetlist
                         WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001
                     """, (ra_deg, dec_deg))
-                    
+
                     if cursor.fetchone()[0] > 0:
                         return True
-                
+
                 return False
-                
+
         except Exception as e:
             logger.error(f"Error checking target list status: {str(e)}")
             return False
+
+    def _find_target_list_name(self):
+        """Find the actual name used in the target list for this DSO
+
+        Returns:
+            str: The name as stored in the target list, or None if not found
+        """
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+
+                dso_name = self.data.get('name', '').strip()
+                ra_deg = self.data.get('ra_deg')
+                dec_deg = self.data.get('dec_deg')
+
+                if not dso_name:
+                    return None
+
+                # First try exact name match
+                cursor.execute("""
+                    SELECT name FROM usertargetlist
+                    WHERE UPPER(TRIM(name)) = ?
+                    LIMIT 1
+                """, (dso_name.upper(),))
+
+                result = cursor.fetchone()
+                if result:
+                    return result[0]
+
+                # If coordinates are available, search by coordinates
+                if ra_deg is not None and dec_deg is not None:
+                    cursor.execute("""
+                        SELECT name FROM usertargetlist
+                        WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001
+                        LIMIT 1
+                    """, (ra_deg, dec_deg))
+
+                    result = cursor.fetchone()
+                    if result:
+                        return result[0]
+
+                return None
+
+        except Exception as e:
+            logger.error(f"Error finding target list name: {str(e)}")
+            return None
     
     def _add_to_target_list(self):
         """Add this DSO to the target list with pre-calculated visibility information"""
@@ -5871,11 +5926,42 @@ class ObjectDetailWindow(QDialog):
                 
                 QMessageBox.information(self, "Success", f"'{dso_name}' removed from target list")
                 logger.debug(f"Removed {dso_name} from target list")
-                
+
         except Exception as e:
             logger.error(f"Error removing from target list: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to remove from target list: {str(e)}")
-    
+
+    def _open_from_target_list(self):
+        """Open DSO from target list to view notes"""
+        try:
+            dso_name = self.data.get('name', '').strip()
+            if not dso_name:
+                QMessageBox.warning(self, "Error", "DSO name not found")
+                return
+
+            # First, try to find the actual name in the target list
+            target_name = self._find_target_list_name()
+            if not target_name:
+                QMessageBox.warning(self, "Not Found",
+                                  f"Could not find '{dso_name}' in your target list.")
+                return
+
+            # Import and open Target List window
+            from DSOTargetList import DSOTargetListWindow
+            if not hasattr(self, 'target_list_window') or not self.target_list_window.isVisible():
+                self.target_list_window = DSOTargetListWindow()
+
+            # Open and select the target using the actual name from target list
+            success = self.target_list_window.open_and_select_target(target_name)
+
+            if not success:
+                QMessageBox.warning(self, "Not Found",
+                                  f"Could not find '{target_name}' in your target list.")
+
+        except Exception as e:
+            logger.error(f"Error opening from target list: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open from target list:\n{str(e)}")
+
     def _create_collage(self):
         """Open the CollageBuilder window for this DSO with option to create new or add to existing collage"""
         try:
