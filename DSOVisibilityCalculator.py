@@ -11,7 +11,7 @@ import os
 import matplotlib
 import numpy as np
 from datetime import datetime
-from PySide6.QtCore import Qt, QDate, QThread, Signal
+from PySide6.QtCore import Qt, QDate, QThread, Signal, QTimer
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLineEdit, QLabel, QTextEdit,
                                QDateEdit, QSpinBox, QGroupBox, QMessageBox, QCalendarWidget, QSizePolicy)
@@ -258,7 +258,28 @@ class DSOVisibilityCalculator:
             raise ValueError("Observer location not set")
 
         if isinstance(start_time, str):
-            start_time = Time(start_time)
+            # Parse date string and interpret as midnight in LOCAL timezone, not UTC
+            from datetime import datetime, timedelta
+            date_parts = start_time.split('-')
+            if len(date_parts) == 3:
+                # Create datetime at midnight in local timezone
+                year, month, day = int(date_parts[0]), int(date_parts[1]), int(date_parts[2])
+                local_midnight = self.timezone.localize(datetime(year, month, day, 0, 0, 0))
+
+                # If the selected midnight is in the past and it's after 6 PM local time,
+                # use the NEXT midnight instead (tonight's midnight, not last night's)
+                current_local = datetime.now(self.timezone)
+                if local_midnight < current_local and current_local.hour >= 18:
+                    local_midnight += timedelta(days=1)
+
+                # Shift back by half the duration to center on midnight
+                local_start = local_midnight - timedelta(hours=duration_hours / 2)
+                # Convert to UTC for astropy
+                utc_start = local_start.astimezone(pytz.UTC)
+                start_time = Time(utc_start)
+            else:
+                # Fallback to original behavior for non-date strings
+                start_time = Time(start_time)
 
         # Create time range
         time_range = start_time + np.linspace(0, duration_hours, int(duration_hours * time_resolution)) * u.hour
@@ -763,6 +784,14 @@ class VisibilityPlot(FigureCanvas):
         self.cursor_lines = []
         self.last_idx = None  # Cache last index for performance
 
+        # Initialize current time line storage
+        self.current_time_lines = []
+
+        # Set up timer for live current time updates (every 30 seconds)
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self.update_current_time_line)
+        self.update_timer.setInterval(30000)  # 30 seconds in milliseconds
+
         # Connect mouse motion event
         self.mpl_connect('motion_notify_event', self.on_mouse_move)
 
@@ -878,16 +907,81 @@ class VisibilityPlot(FigureCanvas):
 
         self.figure.tight_layout()
 
-        # Store additional data needed for hover
+        # Store additional data needed for hover and current time updates
         self.hover_data['local_times'] = local_times
         self.hover_data['hours_from_start'] = hours_from_start
         self.hover_data['axes'] = [ax1, ax2, ax3]
+        self.hover_data['start_local'] = start_local
 
         # Reset cursor lines and cached index
         self.cursor_lines = []
         self.last_idx = None
 
+        # Clear old current time lines
+        for line in self.current_time_lines:
+            try:
+                line.remove()
+            except:
+                pass
+        self.current_time_lines = []
+
+        # Add initial current time line
+        self.update_current_time_line()
+
+        # Start the timer for live updates
+        self.update_timer.start()
+
         self.draw()
+
+    def update_current_time_line(self):
+        """Update the current time line to reflect the actual current time"""
+        if not self.hover_data or 'start_local' not in self.hover_data:
+            return
+
+        from astropy.time import Time as AstropyTime
+
+        # Get current time using astropy (same as plotted data)
+        current_astropy_time = AstropyTime.now()
+
+        # Convert to local time using same process as plotted times
+        local_tz = self.hover_data.get('local_tz')
+        if not local_tz:
+            return
+
+        current_utc_dt = current_astropy_time.datetime.replace(tzinfo=pytz.UTC)
+        current_local_dt = current_utc_dt.astimezone(local_tz)
+
+        # Calculate current time position in hours from start
+        start_local = self.hover_data['start_local']
+        current_hours_from_start = (current_local_dt - start_local).total_seconds() / 3600
+
+        hours_from_start = self.hover_data.get('hours_from_start', [])
+        if not hours_from_start:
+            return
+
+        # Remove old current time lines
+        for line in self.current_time_lines:
+            try:
+                line.remove()
+            except:
+                pass
+        self.current_time_lines = []
+
+        # Draw the line if within a reasonable range of the plot
+        if -1 <= current_hours_from_start <= hours_from_start[-1] + 1:
+            axes = self.hover_data.get('axes', [])
+            # Draw vertical line on all three subplots
+            for ax in axes:
+                line = ax.axvline(x=current_hours_from_start, color='#00ff00', linestyle='--',
+                          linewidth=2.5, alpha=0.9, label='Current Time', zorder=100)
+                self.current_time_lines.append(line)
+
+            # Update legend on first subplot to include current time (only if lines were drawn)
+            if axes and self.current_time_lines:
+                axes[0].legend(facecolor='#404040', edgecolor='#666666', loc='upper right')
+
+            # Redraw the canvas
+            self.draw_idle()
 
     def azimuth_to_direction(self, az):
         """Convert azimuth to cardinal direction using centralized method"""
