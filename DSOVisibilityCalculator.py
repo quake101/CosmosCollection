@@ -266,10 +266,18 @@ class DSOVisibilityCalculator:
                 year, month, day = int(date_parts[0]), int(date_parts[1]), int(date_parts[2])
                 local_midnight = self.timezone.localize(datetime(year, month, day, 0, 0, 0))
 
-                # If the selected midnight is in the past and it's after 6 PM local time,
-                # use the NEXT midnight instead (tonight's midnight, not last night's)
+                # Smart midnight selection: choose the midnight that keeps current time in range
                 current_local = datetime.now(self.timezone)
-                if local_midnight < current_local and current_local.hour >= 18:
+
+                # Calculate where current time would be relative to this midnight
+                hours_from_this_midnight = (current_local - local_midnight).total_seconds() / 3600
+
+                # Choose the midnight that puts current time closest to the center of the range
+                # For a 24-hour plot centered on midnight, we want current time between -12 and +12 hours
+                half_duration = duration_hours / 2
+
+                # If using this midnight would put current time way outside the range, use next midnight
+                if hours_from_this_midnight > half_duration:
                     local_midnight += timedelta(days=1)
 
                 # Shift back by half the duration to center on midnight
