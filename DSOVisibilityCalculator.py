@@ -1078,11 +1078,22 @@ class VisibilityPlot(FigureCanvas):
             f"Optimal: {'Yes' if optimal else 'No'}"
         )
 
+        # Smart positioning: place box on left when near right edge, on right when near left edge
+        # Get the axis x-limits to determine position
+        x_min, x_max = event.inaxes.get_xlim()
+        x_range = x_max - x_min
+
+        # If we're in the right 25% of the plot, put the box on the left
+        if x_pos > (x_min + 0.75 * x_range):
+            x_offset = -120  # Place box to the left
+        else:
+            x_offset = 10  # Place box to the right (default)
+
         # Create new annotation on the current axis
         self.annotation = event.inaxes.annotate(
             hover_text,
             xy=(x_pos, event.ydata),
-            xytext=(10, 10),
+            xytext=(x_offset, 10),
             textcoords='offset points',
             bbox=dict(boxstyle='round,pad=0.5', fc='#404040', alpha=0.9, edgecolor='#666666'),
             fontsize=9,
