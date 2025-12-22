@@ -57,7 +57,7 @@ class DSOCalculationThread(QThread):
     result_ready = Signal(object)
     error_occurred = Signal(str)
 
-    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None, use_target_list=False):
+    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None, use_target_list=False, start_hour=18, duration_hours=12):
         super().__init__()
         self.min_altitude = min_altitude
         self.max_magnitude = max_magnitude
@@ -65,6 +65,8 @@ class DSOCalculationThread(QThread):
         self.selected_dso_types = selected_dso_types or []
         self.dso_limit = dso_limit
         self.use_target_list = use_target_list
+        self.start_hour = start_hour
+        self.duration_hours = duration_hours
         
         # Use centralized calculator
         try:
@@ -119,20 +121,24 @@ class DSOCalculationThread(QThread):
                 # Fallback to original method if centralized calculator not available
                 return self._calculate_tonight_visibility_fallback(dso_info)
             
-            # Get tonight's date
+            # Build start datetime from user-specified start hour
             now = datetime.now(self.local_tz)
-            tonight_date = now.strftime('%Y-%m-%d')
-            
+            start_datetime = now.replace(hour=self.start_hour, minute=0, second=0, microsecond=0)
+
+            # Convert to astropy Time object (in UTC)
+            start_datetime_utc = start_datetime.astimezone(pytz.UTC).replace(tzinfo=None)
+            start_time = Time(start_datetime_utc)
+
             # Use coordinate-based calculation for reliability (avoids name resolution issues)
             from astropy.coordinates import SkyCoord
             import astropy.units as u
-            
+
             # Create coordinate object from DSO data
             dso_coord = SkyCoord(ra=dso_info["ra_deg"] * u.deg, dec=dso_info["dec_deg"] * u.deg)
-            
-            # Use coordinate-based calculation
+
+            # Use coordinate-based calculation with user-specified duration
             time_range, dso_altaz, sun_altaz = self.calculator.calculate_altaz_over_time(
-                dso_coord, tonight_date, 12)
+                dso_coord, start_time, self.duration_hours)
             
             # Find optimal viewing times using same criteria
             optimal_times = self.calculator.find_optimal_viewing_times(
@@ -186,13 +192,15 @@ class DSOCalculationThread(QThread):
     def _calculate_tonight_visibility_fallback(self, dso_info):
         """Fallback method using original calculations if centralized calculator unavailable"""
         try:
-            # Get tonight's date range (sunset to sunrise)
+            # Get tonight's date range with user-specified start and duration
             now = datetime.now(self.local_tz)
-            tonight_start = now.replace(hour=18, minute=0, second=0, microsecond=0)
-            
+            tonight_start = now.replace(hour=self.start_hour, minute=0, second=0, microsecond=0)
+
             # Convert to astropy Time objects
             start_time = Time(tonight_start.astimezone(pytz.UTC).replace(tzinfo=None))
-            time_range = start_time + np.linspace(0, 12, 48) * u.hour  # Every 15 minutes
+            # Calculate intervals: 4 per hour (every 15 minutes)
+            num_intervals = int(self.duration_hours * 4)
+            time_range = start_time + np.linspace(0, self.duration_hours, num_intervals) * u.hour
             
             # Get DSO coordinates from database data (coordinate-based for reliability)
             try:
@@ -628,6 +636,11 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.init_ui()
         self.load_location_info()
 
+        # Set time frame defaults based on twilight calculation
+        start_hour, duration = self.calculate_twilight_times()
+        self.start_hour_spin.setValue(start_hour)
+        self.duration_hours_spin.setValue(duration)
+
         # Auto-select target list and calculate if requested
         if self.auto_use_target_list:
             self.use_target_list_checkbox.setChecked(True)
@@ -683,14 +696,32 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.dso_limit_spin.setValue(200)
         self.dso_limit_spin.setSingleStep(50)
         settings_row1.addWidget(self.dso_limit_spin)
-        
+
+        # Time Frame: Start Hour
+        settings_row1.addWidget(QLabel("Start Hour:"))
+        self.start_hour_spin = QSpinBox()
+        self.start_hour_spin.setRange(0, 23)
+        self.start_hour_spin.setValue(18)  # Default, will be updated
+        self.start_hour_spin.setSuffix(":00")
+        self.start_hour_spin.setToolTip("Observation start time (24-hour format)")
+        settings_row1.addWidget(self.start_hour_spin)
+
+        # Time Frame: Duration
+        settings_row1.addWidget(QLabel("Duration:"))
+        self.duration_hours_spin = QSpinBox()
+        self.duration_hours_spin.setRange(1, 24)
+        self.duration_hours_spin.setValue(12)  # Default, will be updated
+        self.duration_hours_spin.setSuffix(" hrs")
+        self.duration_hours_spin.setToolTip("Observation window duration")
+        settings_row1.addWidget(self.duration_hours_spin)
+
         settings_row1.addStretch()
-        
+
         # Calculate button
         self.calculate_btn = QPushButton("Calculate Best DSOs Tonight")
         self.calculate_btn.clicked.connect(self.calculate_best_dsos)
         settings_row1.addWidget(self.calculate_btn)
-        
+
         settings_layout.addLayout(settings_row1)
         
         # Second row - Catalog and DSO Type selection
@@ -820,6 +851,81 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self.location_label.setText("Error loading location")
             self.calculate_btn.setEnabled(False)
 
+    def calculate_twilight_times(self):
+        """
+        Calculate astronomical twilight start and end times for tonight.
+        Returns (start_hour, duration_hours) based on when sun altitude < -12 degrees.
+        Falls back to (18, 12) if calculation fails.
+        """
+        try:
+            # Get observer location from database
+            db_manager = DatabaseManager()
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                location_row = cursor.fetchone()
+
+                if not location_row or None in location_row:
+                    # No location configured, use default
+                    return (18, 12)
+
+                lat, lon, tz_str = location_row
+
+            # Set up observer location
+            observer_location = EarthLocation(lat=lat*u.deg, lon=lon*u.deg)
+            local_tz = pytz.timezone(tz_str)
+
+            # Create 24-hour time range starting at noon today (to capture both twilights)
+            now = datetime.now(local_tz)
+            noon_today = now.replace(hour=12, minute=0, second=0, microsecond=0)
+            noon_utc = Time(noon_today.astimezone(pytz.UTC).replace(tzinfo=None))
+
+            # Calculate sun position every 15 minutes for 24 hours
+            time_range = noon_utc + np.linspace(0, 24, 96) * u.hour
+            altaz_frame = AltAz(obstime=time_range, location=observer_location)
+            sun = get_sun(time_range)
+            sun_altaz = sun.transform_to(altaz_frame)
+
+            # Find when sun is below -12 degrees (astronomical twilight)
+            dark_periods = sun_altaz.alt.deg < -12
+
+            if not np.any(dark_periods):
+                # No dark period (e.g., polar day) - use default
+                return (18, 12)
+
+            # Find first dark period start (evening twilight)
+            dark_indices = np.where(dark_periods)[0]
+            first_dark_idx = dark_indices[0]
+            last_dark_idx = dark_indices[-1]
+
+            # Convert indices to times
+            evening_twilight = time_range[first_dark_idx]
+            morning_twilight = time_range[last_dark_idx]
+
+            # Convert to local time
+            evening_local = evening_twilight.to_datetime(timezone=pytz.UTC).astimezone(local_tz)
+            morning_local = morning_twilight.to_datetime(timezone=pytz.UTC).astimezone(local_tz)
+
+            # Extract start hour (round to nearest hour)
+            start_hour = evening_local.hour
+
+            # Calculate duration (handle day crossing)
+            duration_td = morning_local - evening_local
+            duration_hours = int(duration_td.total_seconds() / 3600)
+
+            # Ensure reasonable values
+            if duration_hours < 1:
+                duration_hours = 12
+            elif duration_hours > 24:
+                duration_hours = 12
+
+            return (start_hour, duration_hours)
+
+        except Exception as e:
+            # If anything fails, use default values
+            print(f"Error calculating twilight times: {e}")
+            return (18, 12)
+
     def load_catalog_options(self):
         """Load available catalogs from database"""
         try:
@@ -915,8 +1021,12 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             type_text = "all types" if not selected_dso_types else f"{selected_dso_type} objects"
             self.status_label.setText(f"Calculating visibility for {type_text} from {catalog_text}...")
 
+        # Get time frame settings from UI
+        start_hour = self.start_hour_spin.value()
+        duration_hours = self.duration_hours_spin.value()
+
         # Start calculation thread
-        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit, selected_dso_types, use_target_list)
+        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit, selected_dso_types, use_target_list, start_hour, duration_hours)
         self.calc_thread.progress.connect(self.progress_bar.setValue)
         self.calc_thread.result_ready.connect(self.display_results)
         self.calc_thread.error_occurred.connect(self.handle_error)
