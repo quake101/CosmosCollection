@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QGroupBox,
                                QMessageBox, QScrollArea, QComboBox, QLineEdit,
-                               QFrame, QGridLayout)
+                               QFrame, QGridLayout, QMenu)
 from PySide6.QtGui import QPixmap, QImage
 
 from DatabaseManager import DatabaseManager
@@ -101,46 +101,78 @@ class ThumbnailWorker(QThread):
                     return None
 
                 # Handle different dimensionalities
+                is_rgb = False
                 if len(image_data.shape) > 2:
-                    if len(image_data.shape) == 3 and image_data.shape[0] == 3:
+                    # Check if this is an RGB image (3 color planes)
+                    if len(image_data.shape) == 3 and image_data.shape[2] == 3:
+                        is_rgb = True
+                    elif len(image_data.shape) == 3 and image_data.shape[0] == 3:
+                        # RGB planes in first dimension, transpose
                         image_data = np.transpose(image_data, (1, 2, 0))
-                    else:
+                        is_rgb = True
+                    elif len(image_data.shape) == 3:
+                        # Take first 2D slice
                         image_data = image_data[0]
+                    elif len(image_data.shape) == 4:
+                        image_data = image_data[0, 0]
+                    else:
+                        return None
 
                 # Normalize the data
                 image_data = np.nan_to_num(image_data, nan=0.0, posinf=0.0, neginf=0.0)
 
-                # Apply normalization
-                try:
-                    norm = simple_norm(image_data, stretch='linear', percent=99.5)
-                    normalized_data = norm(image_data)
-                except Exception:
-                    # Fallback normalization
-                    data_min, data_max = np.percentile(image_data, [0.5, 99.5])
-                    if data_max > data_min:
-                        normalized_data = (image_data - data_min) / (data_max - data_min)
-                    else:
-                        normalized_data = image_data
+                if is_rgb:
+                    # Handle RGB FITS - normalize each channel separately
+                    normalized_data = np.zeros_like(image_data)
+                    for channel in range(3):
+                        channel_data = image_data[:, :, channel]
+                        try:
+                            norm = simple_norm(channel_data, stretch='linear', percent=99.5)
+                            normalized_data[:, :, channel] = norm(channel_data)
+                        except Exception:
+                            data_min, data_max = np.percentile(channel_data, [0.5, 99.5])
+                            if data_max > data_min:
+                                normalized_data[:, :, channel] = (channel_data - data_min) / (data_max - data_min)
+                            else:
+                                normalized_data[:, :, channel] = channel_data
 
-                # Clip to valid range
-                normalized_data = np.clip(normalized_data, 0, 1)
+                    # Clip and convert to 8-bit RGB
+                    normalized_data = np.clip(normalized_data, 0, 1)
+                    rgb_data = (normalized_data * 255).astype(np.uint8)
 
-                # Convert to 8-bit
-                image_8bit = (normalized_data * 255).astype(np.uint8)
+                    if not rgb_data.flags['C_CONTIGUOUS']:
+                        rgb_data = np.ascontiguousarray(rgb_data)
 
-                # Ensure C-contiguous
-                if not image_8bit.flags['C_CONTIGUOUS']:
-                    image_8bit = np.ascontiguousarray(image_8bit)
+                    height, width, channels = rgb_data.shape
+                    bytes_per_line = width * channels
+                    qimage = QImage(rgb_data.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                else:
+                    # Handle grayscale FITS
+                    try:
+                        norm = simple_norm(image_data, stretch='linear', percent=99.5)
+                        normalized_data = norm(image_data)
+                    except Exception:
+                        data_min, data_max = np.percentile(image_data, [0.5, 99.5])
+                        if data_max > data_min:
+                            normalized_data = (image_data - data_min) / (data_max - data_min)
+                        else:
+                            normalized_data = image_data
+                        normalized_data = np.clip(normalized_data, 0, 1)
 
-                # Create QImage
-                height, width = image_8bit.shape
-                bytes_per_line = width
-                qimage = QImage(image_8bit.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
+                    # Convert to 8-bit grayscale
+                    image_8bit = (normalized_data * 255).astype(np.uint8)
+
+                    if not image_8bit.flags['C_CONTIGUOUS']:
+                        image_8bit = np.ascontiguousarray(image_8bit)
+
+                    height, width = image_8bit.shape
+                    bytes_per_line = width
+                    qimage = QImage(image_8bit.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
 
                 # Convert to QPixmap
                 return QPixmap.fromImage(qimage)
 
-        except Exception:
+        except Exception as e:
             return None
 
     def run(self):
@@ -225,7 +257,8 @@ class ThumbnailWorker(QThread):
 class GalleryCard(QFrame):
     """Individual card widget displaying a DSO thumbnail and info"""
 
-    clicked = Signal(dict)  # Emits item_data when clicked
+    double_clicked = Signal(dict)  # Emits item_data when double-clicked
+    context_menu_requested = Signal(dict, object)  # Emits item_data and position
 
     def __init__(self, item_data, parent=None):
         """
@@ -313,11 +346,16 @@ class GalleryCard(QFrame):
             }
         """)
 
-    def mousePressEvent(self, event):
-        """Handle mouse click - emit clicked signal"""
+    def mouseDoubleClickEvent(self, event):
+        """Handle mouse double-click - emit signal"""
         if event.button() == Qt.LeftButton:
-            self.clicked.emit(self.item_data)
-        super().mousePressEvent(event)
+            self.double_clicked.emit(self.item_data)
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        """Handle right-click context menu"""
+        self.context_menu_requested.emit(self.item_data, event.globalPos())
+        event.accept()
 
 
 class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
@@ -671,7 +709,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
             # Create card
             card = GalleryCard(item)
-            card.clicked.connect(self._on_card_clicked)
+            card.double_clicked.connect(self._on_card_double_clicked)
+            card.context_menu_requested.connect(self._show_card_context_menu)
 
             # Add to grid
             self.grid_layout.addWidget(card, row, col)
@@ -740,8 +779,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             # Card was deleted, ignore
             pass
 
-    def _on_card_clicked(self, item_data):
-        """Handle card click - open image viewer"""
+    def _on_card_double_clicked(self, item_data):
+        """Handle card double-click - open image viewer"""
         try:
             # Import ImageViewerWindow from main
             from main import ImageViewerWindow
@@ -754,8 +793,101 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                                   f"The file may have been moved or deleted.")
                 return
 
-            # Create and show image viewer window
-            self.image_viewer = ImageViewerWindow(image_path, item_data['name'])
+            # Load the image into a QPixmap
+            pixmap = QPixmap(image_path)
+
+            # Check if image loaded successfully
+            if pixmap.isNull():
+                # Try FITS format if standard loading failed
+                _, ext = os.path.splitext(image_path.lower())
+                if ext in ['.fits', '.fit', '.fts']:
+                    # Use FITS loader
+                    from astropy.io import fits
+                    from astropy.visualization import simple_norm
+
+                    try:
+                        with fits.open(image_path) as hdul:
+                            image_data = None
+                            for hdu in hdul:
+                                if hdu.data is not None and len(hdu.data.shape) >= 2:
+                                    image_data = hdu.data
+                                    break
+
+                            if image_data is None:
+                                raise ValueError("No valid image data in FITS file")
+
+                            # Handle different dimensionalities
+                            is_rgb = False
+                            if len(image_data.shape) > 2:
+                                if len(image_data.shape) == 3 and image_data.shape[2] == 3:
+                                    is_rgb = True
+                                elif len(image_data.shape) == 3 and image_data.shape[0] == 3:
+                                    image_data = np.transpose(image_data, (1, 2, 0))
+                                    is_rgb = True
+                                elif len(image_data.shape) == 3:
+                                    image_data = image_data[0]
+                                elif len(image_data.shape) == 4:
+                                    image_data = image_data[0, 0]
+
+                            # Normalize
+                            image_data = np.nan_to_num(image_data, nan=0.0, posinf=0.0, neginf=0.0)
+
+                            if is_rgb:
+                                # RGB FITS - normalize each channel
+                                normalized_data = np.zeros_like(image_data)
+                                for channel in range(3):
+                                    channel_data = image_data[:, :, channel]
+                                    try:
+                                        norm = simple_norm(channel_data, stretch='linear', percent=99.5)
+                                        normalized_data[:, :, channel] = norm(channel_data)
+                                    except Exception:
+                                        data_min, data_max = np.percentile(channel_data, [0.5, 99.5])
+                                        if data_max > data_min:
+                                            normalized_data[:, :, channel] = (channel_data - data_min) / (data_max - data_min)
+                                        else:
+                                            normalized_data[:, :, channel] = channel_data
+
+                                normalized_data = np.clip(normalized_data, 0, 1)
+                                rgb_data = (normalized_data * 255).astype(np.uint8)
+                                if not rgb_data.flags['C_CONTIGUOUS']:
+                                    rgb_data = np.ascontiguousarray(rgb_data)
+
+                                height, width, channels = rgb_data.shape
+                                bytes_per_line = width * channels
+                                qimage = QImage(rgb_data.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                            else:
+                                # Grayscale FITS
+                                try:
+                                    norm = simple_norm(image_data, stretch='linear', percent=99.5)
+                                    normalized_data = norm(image_data)
+                                except Exception:
+                                    data_min, data_max = np.percentile(image_data, [0.5, 99.5])
+                                    if data_max > data_min:
+                                        normalized_data = (image_data - data_min) / (data_max - data_min)
+                                    else:
+                                        normalized_data = image_data
+                                    normalized_data = np.clip(normalized_data, 0, 1)
+
+                                image_8bit = (normalized_data * 255).astype(np.uint8)
+                                if not image_8bit.flags['C_CONTIGUOUS']:
+                                    image_8bit = np.ascontiguousarray(image_8bit)
+
+                                height, width = image_8bit.shape
+                                qimage = QImage(image_8bit.data, width, height, width, QImage.Format_Grayscale8)
+
+                            pixmap = QPixmap.fromImage(qimage)
+                    except Exception as fits_error:
+                        QMessageBox.critical(self, "Error",
+                                           f"Failed to load FITS image:\n{str(fits_error)}")
+                        return
+                else:
+                    QMessageBox.critical(self, "Error",
+                                       f"Failed to load image:\n{image_path}\n\n"
+                                       f"The file may be corrupted or in an unsupported format.")
+                    return
+
+            # Create and show image viewer window (pixmap, title, file_path, parent)
+            self.image_viewer = ImageViewerWindow(pixmap, item_data['name'], image_path, self)
             self.image_viewer.show()
             self.image_viewer.raise_()
             self.image_viewer.activateWindow()
@@ -766,6 +898,147 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error",
                                f"Failed to open image viewer:\n{str(e)}")
+
+    def _open_dso_details(self, item_data):
+        """Open DSO detail window for the selected object"""
+        try:
+            from main import ObjectDetailWindow
+
+            dsodetailid = item_data['dsodetailid']
+
+            # Query database for full DSO details
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                query = """
+                    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
+                           CAST(d.sizemin/60.0 AS REAL) as sizemin,
+                           CAST(d.sizemax/60.0 AS REAL) as sizemax,
+                           d.constellation, d.dsotype, d.dsoclass,
+                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
+                               CASE c.catalogue
+                                   WHEN 'M' THEN 1
+                                   WHEN 'NGC' THEN 2
+                                   WHEN 'IC' THEN 3
+                                   ELSE 4
+                               END, c.designation) as designations,
+                           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+                           (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
+                    FROM dsodetail d
+                    JOIN cataloguenr c ON d.id = c.dsodetailid
+                    LEFT JOIN userimages ui ON d.id = ui.dsodetailid AND ui.is_favorite = 1
+                    WHERE d.id = ?
+                    GROUP BY d.id
+                """
+
+                cursor.execute(query, (dsodetailid,))
+                result = cursor.fetchone()
+
+                if not result:
+                    QMessageBox.warning(self, "Error", "Could not load DSO details")
+                    return
+
+                # Unpack result
+                obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
+                    constellation, dso_type, dso_class, designations, image_path, integration_time, \
+                    equipment, date_taken, notes, image_count = result
+
+                # Get primary designation for catalogue and id
+                primary_designation = designations.split(',')[0]
+                catalogue, designation = primary_designation.strip().split(' ', 1)
+
+                # Format RA/Dec for display
+                ra_str = self._format_ra(ra)
+                dec_str = self._format_dec(dec)
+
+                # Build data dictionary
+                data = {
+                    "name": item_data['name'],
+                    "ra": ra_str,
+                    "dec": dec_str,
+                    "ra_deg": ra,
+                    "dec_deg": dec,
+                    "magnitude": magnitude,
+                    "surface_brightness": surface_brightness,
+                    "size_min": size_min if size_min else 0.0,
+                    "size_max": size_max if size_max else 0.0,
+                    "constellation": constellation,
+                    "dso_type": dso_type,
+                    "dso_class": dso_class,
+                    "designations": designations,
+                    "catalogue": catalogue,
+                    "id": designation,
+                    "dsodetailid": obj_id,
+                    "image_path": image_path,
+                    "integration_time": integration_time,
+                    "equipment": equipment,
+                    "date_taken": date_taken,
+                    "notes": notes,
+                    "image_count": image_count
+                }
+
+                # Create and show detail window
+                detail_window = ObjectDetailWindow(data)
+                detail_window.show()
+                detail_window.raise_()
+                detail_window.activateWindow()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error",
+                               f"Failed to open DSO details:\n{str(e)}")
+
+    def _format_ra(self, ra_deg):
+        """Format RA in degrees to HH:MM:SS.SS format"""
+        ra_hours = ra_deg / 15.0
+        hours = int(ra_hours)
+        minutes = int((ra_hours - hours) * 60)
+        seconds = ((ra_hours - hours) * 60 - minutes) * 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
+
+    def _format_dec(self, dec_deg):
+        """Format Dec in degrees to DD:MM:SS.S format"""
+        sign = '+' if dec_deg >= 0 else '-'
+        dec_abs = abs(dec_deg)
+        degrees = int(dec_abs)
+        minutes = int((dec_abs - degrees) * 60)
+        seconds = ((dec_abs - degrees) * 60 - minutes) * 60
+        return f"{sign}{degrees:02d}:{minutes:02d}:{seconds:04.1f}"
+
+    def _show_card_context_menu(self, item_data, position):
+        """Show context menu when right-clicking on a card"""
+        context_menu = QMenu(self)
+
+        # Apply dark theme styling
+        context_menu.setStyleSheet("""
+            QMenu {
+                background-color: #404040;
+                color: #ffffff;
+                border: 1px solid #666666;
+                padding: 5px;
+            }
+            QMenu::item {
+                padding: 5px 20px;
+                border-radius: 3px;
+            }
+            QMenu::item:selected {
+                background-color: #0078d4;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: #666666;
+                margin: 5px 0;
+            }
+        """)
+
+        # Add menu actions
+        view_action = context_menu.addAction("View Full Image")
+        view_action.triggered.connect(lambda: self._on_card_double_clicked(item_data))
+
+        details_action = context_menu.addAction("View DSO Details")
+        details_action.triggered.connect(lambda: self._open_dso_details(item_data))
+
+        # Show menu at cursor position
+        context_menu.exec(position)
 
     def _on_filter_changed(self):
         """Handle filter combo box changes"""
