@@ -7164,6 +7164,12 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         collage_builder_action.triggered.connect(self._show_collage_builder)
         toolbar.addAction(collage_builder_action)
 
+        # DSO Image Gallery action
+        gallery_action = QAction("Image Gallery", self)
+        gallery_action.setToolTip("Browse all DSO images in a gallery view")
+        gallery_action.triggered.connect(self._show_dso_gallery)
+        toolbar.addAction(gallery_action)
+
         # Aladin Lite action
         aladin_lite_action = QAction("Aladin Lite", self)
         aladin_lite_action.setToolTip("Open Aladin Lite sky viewer")
@@ -7285,6 +7291,20 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         except Exception as e:
             logger.error(f"Error opening collage builder: {str(e)}", exc_info=True)
             QMessageBox.warning(self, "Error", f"Could not open Collage Builder: {str(e)}")
+
+    def _show_dso_gallery(self):
+        """Show the DSO Image Gallery window"""
+        try:
+            from DSOGallery import DSOGalleryWindow
+            if not hasattr(self, 'gallery_window') or not self.gallery_window.isVisible():
+                self.gallery_window = DSOGalleryWindow()
+            self.gallery_window.show()
+            self.gallery_window.raise_()
+            self.gallery_window.activateWindow()
+        except ImportError as e:
+            QMessageBox.warning(self, "Import Error", f"Could not load DSO Image Gallery: {e}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not open DSO Image Gallery: {e}")
 
     def _show_aladin_lite_from_toolbar(self):
         """Open Aladin Lite from toolbar with general sky view"""
