@@ -1355,13 +1355,13 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                     # Store reference to prevent garbage collection
                     self.visibility_window = DSOVisibilityApp()
 
-                    # Use coordinates instead of name for more reliable calculation
-                    # Format coordinates as a string that astropy can parse
-                    coord_string = f"{ra_deg:.6f} {dec_deg:+.6f}"
-
-                    # Pre-populate with the coordinates
+                    # Set DSO name in input field for display and title
                     if hasattr(self.visibility_window, 'dso_input'):
-                        self.visibility_window.dso_input.setText(coord_string)
+                        self.visibility_window.dso_input.setText(dso_name)
+
+                    # Use coordinates for accurate calculation
+                    if hasattr(self.visibility_window, 'set_dso_coordinates'):
+                        self.visibility_window.set_dso_coordinates(ra_deg, dec_deg)
 
                     # Show the window immediately
                     self.visibility_window.show()

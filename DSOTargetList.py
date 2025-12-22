@@ -1335,16 +1335,17 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             # Store reference to prevent garbage collection
             self.visibility_window = DSOVisibilityApp()
 
-            # Use coordinates instead of name for more reliable calculation
-            # Format coordinates as a string that astropy can parse
-            coord_string = f"{ra_deg:.6f} {dec_deg:+.6f}"
-
-            # Pre-populate with the coordinates
+            # Set DSO name in input field for display and title
             if hasattr(self.visibility_window, 'dso_input'):
-                self.visibility_window.dso_input.setText(coord_string)
-                logger.debug(f"Set coordinates in input field: {coord_string}")
+                self.visibility_window.dso_input.setText(target_name)
+                logger.debug(f"Set DSO name in input field: {target_name}")
             else:
                 logger.warning("DSO input field not found in visibility window")
+
+            # Use coordinates for accurate calculation
+            if hasattr(self.visibility_window, 'set_dso_coordinates'):
+                self.visibility_window.set_dso_coordinates(ra_deg, dec_deg)
+                logger.debug(f"Set coordinates: RA {ra_deg}° Dec {dec_deg}°")
 
             # Show the window immediately
             self.visibility_window.show()

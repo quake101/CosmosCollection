@@ -1210,6 +1210,7 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         self.dso_ra_deg = None
         self.dso_dec_deg = None
         self.current_dso_coord = None  # Store current DSO coordinates for calendar
+        self.current_dso_name = None  # Store current DSO name for window title
         self.init_ui()
 
     def init_ui(self):
@@ -1380,32 +1381,16 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
                     display_name = location_name if location_name else "User Location"
                     self.location_name_label.setText(display_name)
                     self.location_coords_label.setText(f"Lat: {lat_str}, Lon: {lon_str}")
-
-                    # Update window title with the location name and timezone
-                    if self.user_timezone:
-                        try:
-                            tz_obj = pytz.timezone(self.user_timezone)
-                            # Get current timezone abbreviation
-                            from datetime import datetime
-                            now = datetime.now(tz_obj)
-                            tz_abbrev = now.strftime('%Z')
-                            self.setWindowTitle(f"DSO Visibility Calculator - {display_name} ({tz_abbrev}) - Cosmos Collection")
-                        except Exception:
-                            self.setWindowTitle(f"DSO Visibility Calculator - {display_name} - Cosmos Collection")
-                    else:
-                        self.setWindowTitle(f"DSO Visibility Calculator - {display_name} - Cosmos Collection")
                 else:
                     # No location configured - prompt user to set location
                     self.location_name_label.setText("Location not set")
                     self.location_coords_label.setText("Click 'Set Location' to configure")
-                    self.setWindowTitle("DSO Visibility Calculator - Location Required")
                     self.user_timezone = None
                     self._show_location_required()
         except Exception as e:
             # Error accessing database - prompt user to set location
             self.location_name_label.setText("Location not set")
             self.location_coords_label.setText("Click 'Set Location' to configure")
-            self.setWindowTitle("DSO Visibility Calculator - Location Required")
             self.user_timezone = None
             self._show_location_required()
 
@@ -1417,6 +1402,10 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         # Store DSO coordinates for calendar calculations
         self.current_dso_coord = results.get('dso_coord')
 
+        # Update window title with DSO name (use stored name from input, not results)
+        if self.current_dso_name:
+            self._update_window_title_with_dso(self.current_dso_name)
+
         # Update plot
         self.plot_widget.plot_visibility(results)
 
@@ -1425,6 +1414,48 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
 
         # Start monthly visibility calculation for calendar
         self.start_monthly_visibility_calculation()
+
+    def _update_window_title_with_dso(self, dso_name):
+        """Update window title to show DSO name and common name if available"""
+        try:
+            from DatabaseManager import DatabaseManager
+
+            # Try to get common name from database
+            common_name = None
+
+            # Parse the catalog and designation from the DSO name
+            import re
+            match = re.match(r'^([A-Z]+)\s*(\d+)', dso_name.upper())
+            if match:
+                catalog = match.group(1)
+                designation = match.group(2)
+
+                # Query database for common name
+                db_manager = DatabaseManager()
+                with db_manager.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT d.commonnames
+                        FROM dsodetail d
+                        JOIN cataloguenr c ON d.id = c.dsodetailid
+                        WHERE c.catalogue = ? AND c.designation = ?
+                    """, (catalog, designation))
+
+                    result = cursor.fetchone()
+                    if result and result[0]:
+                        common_name = result[0]
+
+            # Build window title
+            if common_name:
+                title = f"DSO Visibility Calculator - {dso_name} ({common_name}) - Cosmos Collection"
+            else:
+                title = f"DSO Visibility Calculator - {dso_name} - Cosmos Collection"
+
+            self.setWindowTitle(title)
+
+        except Exception as e:
+            # Fallback to simple title if any error
+            self.setWindowTitle(f"DSO Visibility Calculator - {dso_name} - Cosmos Collection")
 
     def on_calculation_error(self, error_msg):
         """Handle calculation error"""
@@ -1528,6 +1559,9 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         date = self.date_input.date().toString("yyyy-MM-dd")
         hours = self.hours_input.value()
         min_altitude = self.min_alt_input.value()
+
+        # Store DSO name for window title
+        self.current_dso_name = dso_name
 
         # Start calculation thread with optional coordinates
         self.calc_thread = CalculationThread(dso_name, date, hours, min_altitude,
