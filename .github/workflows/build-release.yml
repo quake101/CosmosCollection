@@ -10,8 +10,17 @@ permissions:
   contents: write
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows
+          - os: ubuntu-latest
+            platform: Linux
+          - os: macos-latest
+            platform: macOS
 
     steps:
     - uses: actions/checkout@v4
@@ -26,31 +35,46 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Update version file
-      if: startsWith(github.ref, 'refs/tags/')
+    - name: Update version file (Windows)
+      if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'windows-latest'
       run: |
         $tag = "${{ github.ref }}".Replace("refs/tags/", "")
         python update_version.py $tag
+
+    - name: Update version file (Linux/macOS)
+      if: startsWith(github.ref, 'refs/tags/') && matrix.os != 'windows-latest'
+      run: |
+        tag="${{ github.ref }}"
+        tag="${tag#refs/tags/}"
+        python update_version.py "$tag"
 
     - name: Build with PyInstaller
       run: |
         pyinstaller CosmosCollection.spec
 
-    - name: Create distribution zip
+    - name: Create distribution zip (Windows)
+      if: matrix.os == 'windows-latest'
       run: |
-        Compress-Archive -Path dist/CosmosCollection/* -DestinationPath dist/CosmosCollection-Windows.zip
+        Compress-Archive -Path dist/CosmosCollection/* -DestinationPath dist/CosmosCollection-${{ matrix.platform }}.zip
+
+    - name: Create distribution zip (Linux/macOS)
+      if: matrix.os != 'windows-latest'
+      run: |
+        cd dist/CosmosCollection
+        zip -r ../CosmosCollection-${{ matrix.platform }}.zip .
+        cd ../..
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: CosmosCollection-Windows
-        path: dist/CosmosCollection-Windows.zip
+        name: CosmosCollection-${{ matrix.platform }}
+        path: dist/CosmosCollection-${{ matrix.platform }}.zip
 
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
-        files: dist/CosmosCollection-Windows.zip
+        files: dist/CosmosCollection-${{ matrix.platform }}.zip
         draft: false
         prerelease: false
         generate_release_notes: true
