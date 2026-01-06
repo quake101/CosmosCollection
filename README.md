@@ -9,23 +9,56 @@ Cosmos Collection is designed to help astrophotographers manage their image coll
 ## Features
 
 - **Image Catalog**: Organize your astrophotography images with metadata
-- **Image Viewer**: High-quality viewing experience for astronomical images
 - **Search & Filter**: Find images by object type, date, equipment, or other criteria
 - **Image Data Management**: Track technical details like exposure settings, equipment used, and capture conditions
 - **DSO Visibility Calculator**: Used to determine when DSOs are optimally visible
 - **Best DSO Tonight**: Calculates and displays the best Deep Sky Objects visible from user's location tonight
-- **DSO Target List**: DSO Target management list for planning observing sessions
-- **Telescope FOV Simulator**: Visualize future astrophotography sessions
-- **Collage Builder**: Create collages of your DSO images
+- **DSO Target List**: DSO Target management list for planning observing sessions.
+- **Telescope FOV Simulator**: Visualize future astrophotography sessions and what equipment to use.
+- **Collage Builder**: Create collages of your DSO images.
+- **Image Gallery**: View all your images in a gallery view. (With filters)
+
+## Screenshots
+  ### DSO Detail
+  ![DSO detail](screenshots/DSO-Detail.jpg)
+
+  ### DSO Visibility Calculator
+  ![DSO visibility calculator showing optimal viewing times](screenshots/DSO-Visibility-Calculator.jpg)
+
+  ### Best DSO Tonight
+  ![Best DSO Tonight](screenshots/Best-DSO-Tonight.jpg)
+
+  ### DSO Target List
+  ![DSO Target List](screenshots/DSO-Target-List.jpg)
+
+  ### Telescope FOV Simulator (Aladin-Lite)
+  ![FOV simulator preview](screenshots/Aladin-Lite-Telescope-FOV.jpg)
+
+  ### DSO Image Gallery
+  ![DSO Image Gallery](screenshots/DSO-Image-Gallery.jpg)
 
 ## Getting Started
 
-### Prerequisites
+### Download Latest Release
+
+1. Go to the [Releases](https://github.com/quake101/CosmosCollection/releases) page
+2. Download the latest version for your operating system:
+   - Windows: `CosmosCollection-Windows.zip`
+   - macOS: `CosmosCollection-macOS.zip`
+   - Linux: `CosmosCollection-Linux.zip`
+3. Extract the downloaded file
+4. Run the application executable
+
+### Building from Source
+
+If you prefer to build from source:
+
+#### Prerequisites
 
 - Python 3.x
 - Required dependencies (see requirements.txt)
 
-### Installation
+#### Installation
 
 1. Clone or download the CosmosCollection project
 2. Install dependencies:
