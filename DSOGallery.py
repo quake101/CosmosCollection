@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QGroupBox,
                                QMessageBox, QScrollArea, QComboBox, QLineEdit,
-                               QFrame, QGridLayout, QMenu)
+                               QFrame, QGridLayout, QMenu, QApplication)
 from PySide6.QtGui import QPixmap, QImage
 
 from DatabaseManager import DatabaseManager
@@ -609,6 +609,11 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.search_timer.setSingleShot(True)
         self.search_timer.timeout.connect(self._apply_filters)
 
+        # Resize debounce timer
+        self.resize_timer = QTimer()
+        self.resize_timer.setSingleShot(True)
+        self.resize_timer.timeout.connect(self._handle_resize)
+
         # Initialize UI
         self._init_ui()
 
@@ -751,10 +756,22 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
     def _calculate_grid_columns(self):
         """Calculate number of columns based on available width"""
-        card_width = 170  # Card width + spacing
-        available_width = self.scroll_area.width() - 30  # Subtract margins and scrollbar
-        columns = max(1, available_width // card_width)
-        return min(columns, 8)  # Cap at 8 columns
+        card_width = 170  # Fixed card width (from GalleryCard.setFixedWidth)
+        grid_spacing = 10  # Grid layout spacing
+        grid_margins = 20  # Grid layout margins (10 left + 10 right)
+
+        # Use viewport width for accurate calculation
+        viewport_width = self.scroll_area.viewport().width()
+        available_width = viewport_width - grid_margins
+
+        # Each card takes up card_width + spacing
+        card_width_with_spacing = card_width + grid_spacing
+
+        # Calculate how many cards fit (no arbitrary cap)
+        columns = max(1, available_width // card_width_with_spacing)
+
+        print(f"Viewport width: {viewport_width}, Available: {available_width}, Columns: {columns}")
+        return columns
 
     def _populate_grid(self):
         """Populate grid with gallery cards"""
@@ -1215,14 +1232,36 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self._initial_load_pending = False
             # Use QTimer to ensure window is fully laid out
             QTimer.singleShot(0, self._populate_grid)
+        else:
+            # Trigger a resize check to ensure grid fits current window
+            QTimer.singleShot(0, self._handle_resize)
 
-    def resizeEvent(self, event):
-        """Handle window resize - recalculate grid if needed"""
-        super().resizeEvent(event)
+    def _handle_resize(self):
+        """Handle deferred resize - recalculate grid if needed"""
+        # Only process if we have data loaded
+        if not self.filtered_items:
+            print("Resize handler: No filtered items, skipping")
+            return
+
+        # Force layout to update before calculating
+        self.scroll_area.viewport().update()
+        QApplication.processEvents()
+
         new_cols = self._calculate_grid_columns()
-        if new_cols != self.current_columns:
+        # Always update if columns changed, even if grid exists
+        if new_cols != self.current_columns and new_cols > 0:
+            print(f"Resize detected: {self.current_columns} -> {new_cols} columns")
             self.current_columns = new_cols
             self._populate_grid()
+        else:
+            print(f"Resize handler: Column count unchanged ({new_cols})")
+
+    def resizeEvent(self, event):
+        """Handle window resize - defer grid recalculation"""
+        super().resizeEvent(event)
+        print(f"Window resized to: {self.width()} x {self.height()}")
+        # Restart timer to debounce resize events
+        self.resize_timer.start(100)
 
     def closeEvent(self, event):
         """Handle window close - cleanup thread pool"""
