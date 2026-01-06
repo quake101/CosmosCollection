@@ -7179,12 +7179,12 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         toolbar.addSeparator()
 
         # SIMBAD Search action
-        simbad_action = QAction("Search SIMBAD", self)
-        simbad_action.setToolTip("Search for an object in SIMBAD and add to database")
-        simbad_action.triggered.connect(self._show_simbad_search_dialog)
-        toolbar.addAction(simbad_action)
+        #simbad_action = QAction("Search SIMBAD", self)
+        #simbad_action.setToolTip("Search for an object in SIMBAD and add to database")
+        #simbad_action.triggered.connect(self._show_simbad_search_dialog)
+        #toolbar.addAction(simbad_action)
 
-        toolbar.addSeparator()
+        #toolbar.addSeparator()
         
         # About action
         about_action = QAction("About", self)

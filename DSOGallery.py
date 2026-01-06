@@ -6,7 +6,7 @@ Displays all DSO objects with images in a responsive grid gallery format
 
 import sys
 import os
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QGroupBox,
                                QMessageBox, QScrollArea, QComboBox, QLineEdit,
@@ -58,29 +58,32 @@ class ThumbnailCache:
         self._access_order.clear()
 
 
-class ThumbnailWorker(QThread):
-    """Worker thread for generating thumbnails in background"""
-
-    # Signals
+class ThumbnailSignals(QObject):
+    """Signals for ThumbnailRunnable (QRunnable doesn't support signals directly)"""
     thumbnail_ready = Signal(object, QPixmap)  # card, pixmap
     thumbnail_error = Signal(object, str)      # card, error_message
 
-    def __init__(self, image_requests, cache=None):
+
+class ThumbnailRunnable(QRunnable):
+    """Runnable task for generating a single thumbnail in a thread pool"""
+
+    def __init__(self, card, image_path, cache, signals, cancelled_flag):
         """
-        Initialize thumbnail worker
+        Initialize thumbnail runnable
 
         Args:
-            image_requests: List of (card, image_path) tuples
+            card: GalleryCard instance to update
+            image_path: Path to image file
             cache: ThumbnailCache instance
+            signals: ThumbnailSignals instance for emitting signals
+            cancelled_flag: List with single boolean for cancellation check
         """
         super().__init__()
-        self.image_requests = image_requests
+        self.card = card
+        self.image_path = image_path
         self.cache = cache
-        self.cancelled = False
-
-    def cancel(self):
-        """Cancel the thumbnail generation"""
-        self.cancelled = True
+        self.signals = signals
+        self.cancelled_flag = cancelled_flag
 
     def _load_fits_thumbnail(self, fits_path):
         """Load a FITS file and convert to QPixmap thumbnail"""
@@ -176,82 +179,217 @@ class ThumbnailWorker(QThread):
             return None
 
     def run(self):
-        """Generate thumbnails in background"""
+        """Generate thumbnail for single image"""
+        # Check if cancelled before starting
+        if self.cancelled_flag[0]:
+            return
+
         from PySide6.QtGui import QImageReader
 
-        for card, image_path in self.image_requests:
-            if self.cancelled:
-                break
+        try:
+            # Check cache first
+            if self.cache:
+                cached_pixmap = self.cache.get(self.image_path)
+                if cached_pixmap:
+                    self.signals.thumbnail_ready.emit(self.card, cached_pixmap)
+                    return
+
+            # Check if cancelled
+            if self.cancelled_flag[0]:
+                return
+
+            if os.path.exists(self.image_path):
+                # Check file size
+                file_size = os.path.getsize(self.image_path)
+                if file_size == 0:
+                    self.signals.thumbnail_error.emit(self.card, "Empty File")
+                    return
+
+                # Get file extension
+                _, ext = os.path.splitext(self.image_path.lower())
+
+                pixmap = None
+
+                # Handle FITS files
+                if ext in ['.fits', '.fit', '.fts']:
+                    pixmap = self._load_fits_thumbnail(self.image_path)
+                    if pixmap is None:
+                        self.signals.thumbnail_error.emit(self.card, "FITS Load Error")
+                        return
+                else:
+                    # Load regular image formats
+                    QImageReader.setAllocationLimit(512)
+
+                    # Try standard QPixmap loading
+                    pixmap = QPixmap(self.image_path)
+
+                    # If failed, try QImageReader
+                    if pixmap.isNull():
+                        try:
+                            reader = QImageReader(self.image_path)
+                            if reader.canRead():
+                                # Set explicit format
+                                if ext in ['.jpg', '.jpeg']:
+                                    reader.setFormat(b"JPEG")
+                                elif ext == '.png':
+                                    reader.setFormat(b"PNG")
+                                elif ext in ['.tiff', '.tif']:
+                                    reader.setFormat(b"TIFF")
+
+                                image = reader.read()
+                                if not image.isNull():
+                                    pixmap = QPixmap.fromImage(image)
+                        except Exception:
+                            pass
+
+                # Check if cancelled before emitting
+                if self.cancelled_flag[0]:
+                    return
+
+                if pixmap and not pixmap.isNull():
+                    # Scale to 150x150 (gallery card size)
+                    scaled_pixmap = pixmap.scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+                    # Cache the thumbnail
+                    if self.cache:
+                        self.cache.put(self.image_path, scaled_pixmap)
+
+                    self.signals.thumbnail_ready.emit(self.card, scaled_pixmap)
+                else:
+                    error_msg = f"Load Error"
+                    self.signals.thumbnail_error.emit(self.card, error_msg)
+            else:
+                self.signals.thumbnail_error.emit(self.card, "File Not Found")
+
+        except Exception as e:
+            self.signals.thumbnail_error.emit(self.card, f"Error: {str(e)[:20]}")
+
+
+class DataLoaderSignals(QObject):
+    """Signals for DataLoaderRunnable"""
+    data_loaded = Signal(list)  # Emits list of loaded items
+    load_error = Signal(str)    # Emits error message
+
+
+class DataLoaderRunnable(QRunnable):
+    """Runnable task for loading gallery data in background"""
+
+    def __init__(self, signals):
+        """
+        Initialize data loader runnable
+
+        Args:
+            signals: DataLoaderSignals instance for emitting signals
+        """
+        super().__init__()
+        self.signals = signals
+
+    def _get_friendly_type_name(self, dso_type):
+        """Convert DSO type code to user-friendly name"""
+        type_mapping = {
+            "GALXY": "Galaxy",
+            "DRKNB": "Dark Nebula",
+            "OPNCL": "Open Cluster",
+            "PLNNB": "Planetary Nebula",
+            "BRTNB": "Bright Nebula",
+            "SNREM": "Supernova Remnant",
+            "GALCL": "Galaxy Cluster",
+            "GLOCL": "Globular Cluster",
+            "CL+NB": "Cluster + Nebula",
+            "GX+DN": "Galaxy + Dark Nebula",
+            "ASTER": "Asterism",
+            "2STAR": "Double Star",
+            "3STAR": "Triple Star",
+            "4STAR": "Quadruple Star",
+            "1STAR": "Single Star",
+            "QUASR": "Quasar",
+            "NONEX": "Non-existent",
+            "LMCCN": "LMC Cluster/Nebula",
+            "LMCDN": "LMC Dark Nebula",
+            "LMCGC": "LMC Globular Cluster",
+            "LMCOC": "LMC Open Cluster",
+            "SMCGC": "SMC Globular Cluster",
+            "SMCCN": "SMC Cluster/Nebula",
+            "SMCOC": "SMC Open Cluster"
+        }
+        return type_mapping.get(dso_type, dso_type)
+
+    def run(self):
+        """Load gallery data from database"""
+        import sqlite3
+        from ResourceManager import ResourceManager
+
+        try:
+            # Create new SQLite connection in this thread (DatabaseManager is a singleton)
+            db_path = ResourceManager.get_database_path()
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
 
             try:
-                # Check cache first
-                if self.cache:
-                    cached_pixmap = self.cache.get(image_path)
-                    if cached_pixmap:
-                        self.thumbnail_ready.emit(card, cached_pixmap)
-                        continue
+                cursor = conn.cursor()
 
-                if os.path.exists(image_path):
-                    # Check file size
-                    file_size = os.path.getsize(image_path)
-                    if file_size == 0:
-                        self.thumbnail_error.emit(card, "Empty File")
-                        continue
+                # Optimized query - single pass with LEFT JOIN instead of correlated subqueries
+                query = """
+                WITH PreferredImages AS (
+                    SELECT
+                        dsodetailid,
+                        image_path,
+                        equipment,
+                        is_favorite,
+                        ROW_NUMBER() OVER (PARTITION BY dsodetailid ORDER BY is_favorite DESC, id ASC) as rn
+                    FROM userimages
+                )
+                SELECT DISTINCT
+                    d.id as dsodetailid,
+                    pi.image_path,
+                    pi.equipment,
+                    pi.is_favorite,
+                    d.dsotype,
+                    d.constellation,
+                    GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', '
+                        ORDER BY
+                            CASE c.catalogue
+                                WHEN 'M' THEN 1
+                                WHEN 'NGC' THEN 2
+                                WHEN 'IC' THEN 3
+                                ELSE 4
+                            END, c.designation) as name
+                FROM dsodetail d
+                INNER JOIN cataloguenr c ON d.id = c.dsodetailid
+                LEFT JOIN PreferredImages pi ON d.id = pi.dsodetailid AND pi.rn = 1
+                WHERE pi.image_path IS NOT NULL
+                GROUP BY d.id
+                ORDER BY name
+                """
 
-                    # Get file extension
-                    _, ext = os.path.splitext(image_path.lower())
+                cursor.execute(query)
+                rows = cursor.fetchall()
 
-                    pixmap = None
+                # Convert rows to dictionaries
+                items = []
+                for row in rows:
+                    item = {
+                        'dsodetailid': row[0],
+                        'image_path': row[1],
+                        'equipment': row[2] or '',
+                        'is_favorite': row[3],
+                        'dsotype': row[4] or '',
+                        'constellation': row[5] or '',
+                        'name': row[6] or 'Unknown',
+                        'friendly_type': self._get_friendly_type_name(row[4] or '')
+                    }
+                    items.append(item)
 
-                    # Handle FITS files
-                    if ext in ['.fits', '.fit', '.fts']:
-                        pixmap = self._load_fits_thumbnail(image_path)
-                        if pixmap is None:
-                            self.thumbnail_error.emit(card, "FITS Load Error")
-                            continue
-                    else:
-                        # Load regular image formats
-                        QImageReader.setAllocationLimit(512)
+                # Emit success signal with loaded data
+                self.signals.data_loaded.emit(items)
 
-                        # Try standard QPixmap loading
-                        pixmap = QPixmap(image_path)
+            finally:
+                # Close the connection
+                conn.close()
 
-                        # If failed, try QImageReader
-                        if pixmap.isNull():
-                            try:
-                                reader = QImageReader(image_path)
-                                if reader.canRead():
-                                    # Set explicit format
-                                    if ext in ['.jpg', '.jpeg']:
-                                        reader.setFormat(b"JPEG")
-                                    elif ext == '.png':
-                                        reader.setFormat(b"PNG")
-                                    elif ext in ['.tiff', '.tif']:
-                                        reader.setFormat(b"TIFF")
-
-                                    image = reader.read()
-                                    if not image.isNull():
-                                        pixmap = QPixmap.fromImage(image)
-                            except Exception:
-                                pass
-
-                    if pixmap and not pixmap.isNull():
-                        # Scale to 150x150 (gallery card size)
-                        scaled_pixmap = pixmap.scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-                        # Cache the thumbnail
-                        if self.cache:
-                            self.cache.put(image_path, scaled_pixmap)
-
-                        self.thumbnail_ready.emit(card, scaled_pixmap)
-                    else:
-                        error_msg = f"Load Error"
-                        self.thumbnail_error.emit(card, error_msg)
-                else:
-                    self.thumbnail_error.emit(card, "File Not Found")
-
-            except Exception as e:
-                self.thumbnail_error.emit(card, f"Error: {str(e)[:20]}")
+        except Exception as e:
+            # Emit error signal
+            self.signals.load_error.emit(str(e))
 
 
 class GalleryCard(QFrame):
@@ -451,9 +589,17 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             'equipment': 'All'
         }
 
-        # Thumbnail cache and worker
+        # Thumbnail cache and thread pool
         self.thumbnail_cache = ThumbnailCache(max_size=200)
-        self.thumbnail_worker = None
+        self.thread_pool = QThreadPool.globalInstance()
+        self.thread_pool.setMaxThreadCount(4)  # Use 4 threads for parallel loading
+        self.thumbnail_signals = ThumbnailSignals()
+        self.cancelled_flag = [False]  # Mutable flag for cancellation
+
+        # Data loader signals
+        self.data_loader_signals = DataLoaderSignals()
+        self.data_loader_signals.data_loaded.connect(self._on_data_loaded)
+        self.data_loader_signals.load_error.connect(self._on_data_load_error)
 
         # Search debounce timer
         self.search_timer = QTimer()
@@ -466,9 +612,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Setup window position persistence
         self.setup_window_position()
 
-        # Load data (defer grid population until window is shown)
+        # Load data in background (defer grid population until data is loaded)
         self._initial_load_pending = True
-        self._load_gallery_items()
+        self._start_background_data_load()
 
     def _init_ui(self):
         """Create the user interface"""
@@ -545,102 +691,32 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.status_label.setStyleSheet("padding: 5px;")
         main_layout.addWidget(self.status_label)
 
-    def _load_gallery_items(self):
-        """Load DSOs with favorite images from database"""
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
+    def _start_background_data_load(self):
+        """Start loading gallery data in background thread"""
+        loader = DataLoaderRunnable(self.data_loader_signals)
+        self.thread_pool.start(loader)
 
-                # Query DSOs with images (prefer favorite, but show any image if no favorite)
-                query = """
-                SELECT DISTINCT
-                    d.id as dsodetailid,
-                    (SELECT image_path FROM userimages WHERE dsodetailid = d.id ORDER BY is_favorite DESC, id ASC LIMIT 1) as image_path,
-                    (SELECT equipment FROM userimages WHERE dsodetailid = d.id ORDER BY is_favorite DESC, id ASC LIMIT 1) as equipment,
-                    (SELECT is_favorite FROM userimages WHERE dsodetailid = d.id ORDER BY is_favorite DESC, id ASC LIMIT 1) as is_favorite,
-                    d.dsotype,
-                    d.constellation,
-                    GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', '
-                        ORDER BY
-                            CASE c.catalogue
-                                WHEN 'M' THEN 1
-                                WHEN 'NGC' THEN 2
-                                WHEN 'IC' THEN 3
-                                ELSE 4
-                            END, c.designation) as name
-                FROM dsodetail d
-                INNER JOIN cataloguenr c ON d.id = c.dsodetailid
-                WHERE EXISTS (SELECT 1 FROM userimages WHERE dsodetailid = d.id)
-                GROUP BY d.id
-                ORDER BY name
-                """
+    def _on_data_loaded(self, items):
+        """Handle data loaded from background thread"""
+        self.all_items = items
+        self.filtered_items = self.all_items.copy()
 
-                cursor.execute(query)
-                rows = cursor.fetchall()
+        # Populate filter dropdowns
+        self._populate_type_filter()
+        self._populate_equipment_filter()
 
-                # Convert rows to dictionaries
-                self.all_items = []
-                for row in rows:
-                    item = {
-                        'dsodetailid': row[0],
-                        'image_path': row[1],
-                        'equipment': row[2] or '',
-                        'is_favorite': row[3],
-                        'dsotype': row[4] or '',
-                        'constellation': row[5] or '',
-                        'name': row[6] or 'Unknown',
-                        'friendly_type': self._get_friendly_type_name(row[4] or '')
-                    }
-                    self.all_items.append(item)
+        # Update status
+        count = len(self.all_items)
+        self.status_label.setText(f"Loaded {count} DSO{'s' if count != 1 else ''} with images")
 
-                # Initially, filtered items = all items
-                self.filtered_items = self.all_items.copy()
+        # Populate grid if window is already shown
+        if not self._initial_load_pending:
+            self._populate_grid()
 
-                # Populate filter dropdowns
-                self._populate_type_filter()
-                self._populate_equipment_filter()
-
-                # Update status
-                count = len(self.all_items)
-                self.status_label.setText(f"Loaded {count} DSO{'s' if count != 1 else ''} with images")
-
-                # Populate grid (unless initial load - will be done in showEvent)
-                if not self._initial_load_pending:
-                    self._populate_grid()
-
-        except Exception as e:
-            self.status_label.setText(f"Error loading gallery: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to load DSO gallery:\n{str(e)}")
-
-    def _get_friendly_type_name(self, dso_type):
-        """Convert DSO type code to user-friendly name"""
-        type_mapping = {
-            "GALXY": "Galaxy",
-            "DRKNB": "Dark Nebula",
-            "OPNCL": "Open Cluster",
-            "PLNNB": "Planetary Nebula",
-            "BRTNB": "Bright Nebula",
-            "SNREM": "Supernova Remnant",
-            "GALCL": "Galaxy Cluster",
-            "GLOCL": "Globular Cluster",
-            "CL+NB": "Cluster + Nebula",
-            "GX+DN": "Galaxy + Dark Nebula",
-            "ASTER": "Asterism",
-            "2STAR": "Double Star",
-            "3STAR": "Triple Star",
-            "4STAR": "Quadruple Star",
-            "1STAR": "Single Star",
-            "QUASR": "Quasar",
-            "NONEX": "Non-existent",
-            "LMCCN": "LMC Cluster/Nebula",
-            "LMCDN": "LMC Dark Nebula",
-            "LMCGC": "LMC Globular Cluster",
-            "LMCOC": "LMC Open Cluster",
-            "SMCGC": "SMC Globular Cluster",
-            "SMCCN": "SMC Cluster/Nebula",
-            "SMCOC": "SMC Open Cluster"
-        }
-        return type_mapping.get(dso_type, dso_type)
+    def _on_data_load_error(self, error_message):
+        """Handle error loading data from background thread"""
+        self.status_label.setText(f"Error loading gallery: {error_message}")
+        QMessageBox.critical(self, "Error", f"Failed to load DSO gallery:\n{error_message}")
 
     def _populate_type_filter(self):
         """Populate type filter dropdown with unique types from loaded data"""
@@ -687,12 +763,20 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         # Check if there are items to display
         if not self.filtered_items:
-            # Show message when no items
-            no_items_label = QLabel("No DSO images found matching your filters")
-            no_items_label.setStyleSheet("font-size: 14px; color: #888888; padding: 50px;")
-            no_items_label.setAlignment(Qt.AlignCenter)
-            self.grid_layout.addWidget(no_items_label, 0, 0)
-            self.status_label.setText(f"Showing 0 of {len(self.all_items)} DSOs")
+            # Show different message if still loading data vs no results
+            if not self.all_items:
+                # Still loading initial data
+                loading_label = QLabel("Loading DSO images from database...")
+                loading_label.setStyleSheet("font-size: 14px; color: #cccccc; padding: 50px;")
+            else:
+                # Data loaded but no matches for current filters
+                loading_label = QLabel("No DSO images found matching your filters")
+                loading_label.setStyleSheet("font-size: 14px; color: #888888; padding: 50px;")
+            loading_label.setAlignment(Qt.AlignCenter)
+            self.grid_layout.addWidget(loading_label, 0, 0)
+
+            if self.all_items:
+                self.status_label.setText(f"Showing 0 of {len(self.all_items)} DSOs")
             return
 
         # Calculate columns based on window width
@@ -702,8 +786,24 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Store cards for thumbnail loading
         self.cards = []
 
-        # Create and add cards to grid
-        for idx, item in enumerate(self.filtered_items):
+        # Update status immediately
+        showing = len(self.filtered_items)
+        total = len(self.all_items)
+        if showing == total:
+            self.status_label.setText(f"Loading {total} DSO{'s' if total != 1 else ''}...")
+        else:
+            self.status_label.setText(f"Loading {showing} of {total} DSOs...")
+
+        # Create cards in batches to keep UI responsive
+        self._create_cards_batch(0, cols)
+
+    def _create_cards_batch(self, start_idx, cols, batch_size=50):
+        """Create a batch of gallery cards to keep UI responsive"""
+        end_idx = min(start_idx + batch_size, len(self.filtered_items))
+
+        # Create cards for this batch
+        for idx in range(start_idx, end_idx):
+            item = self.filtered_items[idx]
             row = idx // cols
             col = idx % cols
 
@@ -718,46 +818,53 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             # Store reference
             self.cards.append(card)
 
-        # Add stretch to push cards to top-left
-        self.grid_layout.setRowStretch(len(self.filtered_items) // cols + 1, 1)
-        self.grid_layout.setColumnStretch(cols, 1)
-
-        # Update status
-        showing = len(self.filtered_items)
-        total = len(self.all_items)
-        if showing == total:
-            self.status_label.setText(f"Showing all {total} DSO{'s' if total != 1 else ''}")
+        # If there are more cards to create, schedule next batch
+        if end_idx < len(self.filtered_items):
+            QTimer.singleShot(10, lambda: self._create_cards_batch(end_idx, cols, batch_size))
         else:
-            self.status_label.setText(f"Showing {showing} of {total} DSOs")
+            # All cards created - finalize grid layout
+            self.grid_layout.setRowStretch(len(self.filtered_items) // cols + 1, 1)
+            self.grid_layout.setColumnStretch(cols, 1)
 
-        # Load thumbnails in background
-        self._load_thumbnails()
+            # Update status
+            showing = len(self.filtered_items)
+            total = len(self.all_items)
+            if showing == total:
+                self.status_label.setText(f"Showing all {total} DSO{'s' if total != 1 else ''}")
+            else:
+                self.status_label.setText(f"Showing {showing} of {total} DSOs")
+
+            # Load thumbnails in background
+            self._load_thumbnails()
 
     def _load_thumbnails(self):
-        """Load thumbnails in background thread"""
-        # Cancel existing worker if running
-        if self.thumbnail_worker and self.thumbnail_worker.isRunning():
-            self.thumbnail_worker.cancel()
-            self.thumbnail_worker.wait()
-            # Disconnect old signals to prevent updates to deleted cards
-            try:
-                self.thumbnail_worker.thumbnail_ready.disconnect()
-                self.thumbnail_worker.thumbnail_error.disconnect()
-            except:
-                pass
+        """Load thumbnails in background thread pool"""
+        # Cancel any pending tasks (they will check the flag and exit early)
+        self.cancelled_flag[0] = True
+        # Create new cancellation flag for new batch of tasks
+        self.cancelled_flag = [False]
 
-        # Create list of thumbnail requests (card, image_path)
-        requests = []
+        # Connect signals (disconnect first to avoid duplicates)
+        try:
+            self.thumbnail_signals.thumbnail_ready.disconnect()
+            self.thumbnail_signals.thumbnail_error.disconnect()
+        except:
+            pass
+
+        self.thumbnail_signals.thumbnail_ready.connect(self._on_thumbnail_ready)
+        self.thumbnail_signals.thumbnail_error.connect(self._on_thumbnail_error)
+
+        # Create and submit runnable for each thumbnail
         for card in self.cards:
             image_path = card.item_data['image_path']
-            requests.append((card, image_path))
-
-        # Start thumbnail worker
-        if requests:
-            self.thumbnail_worker = ThumbnailWorker(requests, self.thumbnail_cache)
-            self.thumbnail_worker.thumbnail_ready.connect(self._on_thumbnail_ready)
-            self.thumbnail_worker.thumbnail_error.connect(self._on_thumbnail_error)
-            self.thumbnail_worker.start()
+            runnable = ThumbnailRunnable(
+                card,
+                image_path,
+                self.thumbnail_cache,
+                self.thumbnail_signals,
+                self.cancelled_flag
+            )
+            self.thread_pool.start(runnable)
 
     def _on_thumbnail_ready(self, card, pixmap):
         """Handle thumbnail loaded successfully"""
@@ -1111,11 +1218,10 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self._populate_grid()
 
     def closeEvent(self, event):
-        """Handle window close - cleanup thumbnail worker"""
-        # Cancel thumbnail worker if running
-        if self.thumbnail_worker and self.thumbnail_worker.isRunning():
-            self.thumbnail_worker.cancel()
-            self.thumbnail_worker.wait()
+        """Handle window close - cleanup thread pool"""
+        # Cancel all pending thumbnail tasks
+        self.cancelled_flag[0] = True
+        self.thread_pool.waitForDone(5000)  # Wait up to 5 seconds for tasks to finish
         super().closeEvent(event)
 
 
