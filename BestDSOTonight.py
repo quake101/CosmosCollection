@@ -593,6 +593,11 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                 border-radius: 3px;
                 color: #ffffff;
             }
+            QSpinBox:disabled, QComboBox:disabled {
+                background-color: #353535;
+                color: #888888;
+                border: 1px solid #555555;
+            }
             QTableWidget {
                 background-color: #404040;
                 border: 1px solid #666666;
@@ -666,99 +671,113 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.location_label = QLabel("Loading location...")
         location_layout.addWidget(self.location_label)
         main_layout.addWidget(self.location_group)
-        
-        # Settings
+
+        # Calculation Settings Group
         settings_group = QGroupBox("Calculation Settings")
         settings_layout = QVBoxLayout(settings_group)
-        
-        # First row of settings
+
+        # First row - Basic settings
         settings_row1 = QHBoxLayout()
-        
+
         # Minimum altitude
         settings_row1.addWidget(QLabel("Min Altitude:"))
         self.min_altitude_spin = QSpinBox()
         self.min_altitude_spin.setRange(10, 90)
         self.min_altitude_spin.setValue(30)
         self.min_altitude_spin.setSuffix("°")
+        self.min_altitude_spin.setToolTip("Minimum altitude for DSO visibility (used with all calculation modes)")
         settings_row1.addWidget(self.min_altitude_spin)
-        
+
         # Maximum magnitude
         settings_row1.addWidget(QLabel("Max Magnitude:"))
         self.max_magnitude_combo = QComboBox()
         self.max_magnitude_combo.addItems(["8.0", "10.0", "12.0", "14.0", "16.0"])
         self.max_magnitude_combo.setCurrentText("12.0")
+        self.max_magnitude_combo.setToolTip("Maximum magnitude for DSO selection (used with all calculation modes)")
         settings_row1.addWidget(self.max_magnitude_combo)
-        
+
+        # Catalog dropdown selection
+        settings_row1.addWidget(QLabel("Catalog:"))
+        self.catalog_combo = QComboBox()
+        self.load_catalog_options()
+        self.catalog_combo.addItem("All Catalogs")
+        for catalog in sorted(self.available_catalogs):
+            self.catalog_combo.addItem(catalog)
+        self.catalog_combo.setCurrentText("All Catalogs")
+        self.catalog_combo.setToolTip("Filter by catalog (ignored when using target list)")
+        settings_row1.addWidget(self.catalog_combo)
+
+        # DSO Type filter
+        settings_row1.addWidget(QLabel("Type:"))
+        self.dso_type_combo = QComboBox()
+        self.load_dso_type_options()
+        self.dso_type_combo.setToolTip("Filter by DSO type (ignored when using target list)")
+        settings_row1.addWidget(self.dso_type_combo)
+
+        settings_row1.addStretch()
+        settings_layout.addLayout(settings_row1)
+
+        # Second row - Time frame and DSO limit
+        settings_row2 = QHBoxLayout()
+
         # DSO Limit
-        settings_row1.addWidget(QLabel("DSO Limit:"))
+        settings_row2.addWidget(QLabel("DSO Limit:"))
         self.dso_limit_spin = QSpinBox()
         self.dso_limit_spin.setRange(50, 1000)
         self.dso_limit_spin.setValue(200)
         self.dso_limit_spin.setSingleStep(50)
-        settings_row1.addWidget(self.dso_limit_spin)
+        self.dso_limit_spin.setToolTip("Maximum number of DSOs to process (ignored when using target list)")
+        settings_row2.addWidget(self.dso_limit_spin)
 
         # Time Frame: Start Hour
-        settings_row1.addWidget(QLabel("Start Hour:"))
+        settings_row2.addWidget(QLabel("Start Hour:"))
         self.start_hour_spin = QSpinBox()
         self.start_hour_spin.setRange(0, 23)
         self.start_hour_spin.setValue(18)  # Default, will be updated
         self.start_hour_spin.setSuffix(":00")
-        self.start_hour_spin.setToolTip("Observation start time (24-hour format)")
-        settings_row1.addWidget(self.start_hour_spin)
+        self.start_hour_spin.setToolTip("Observation start time in 24-hour format (used with all calculation modes)")
+        settings_row2.addWidget(self.start_hour_spin)
 
         # Time Frame: Duration
-        settings_row1.addWidget(QLabel("Duration:"))
+        settings_row2.addWidget(QLabel("Duration:"))
         self.duration_hours_spin = QSpinBox()
         self.duration_hours_spin.setRange(1, 24)
         self.duration_hours_spin.setValue(12)  # Default, will be updated
         self.duration_hours_spin.setSuffix(" hrs")
-        self.duration_hours_spin.setToolTip("Observation window duration")
-        settings_row1.addWidget(self.duration_hours_spin)
+        self.duration_hours_spin.setToolTip("Observation window duration (used with all calculation modes)")
+        settings_row2.addWidget(self.duration_hours_spin)
 
-        settings_row1.addStretch()
+        settings_row2.addStretch()
+        settings_layout.addLayout(settings_row2)
+
+        # Action Group - Button and Checkbox
+        action_group = QGroupBox("Actions")
+        action_layout = QVBoxLayout(action_group)
 
         # Calculate button
         self.calculate_btn = QPushButton("Calculate Best DSOs Tonight")
         self.calculate_btn.clicked.connect(self.calculate_best_dsos)
-        settings_row1.addWidget(self.calculate_btn)
+        action_layout.addWidget(self.calculate_btn)
 
-        settings_layout.addLayout(settings_row1)
-        
-        # Second row - Catalog and DSO Type selection
-        catalog_row = QHBoxLayout()
-        catalog_row.addWidget(QLabel("Catalog:"))
-        
-        # Catalog dropdown selection
-        self.catalog_combo = QComboBox()
-        self.load_catalog_options()
-        
-        # Add "All Catalogs" option and individual catalogs
-        self.catalog_combo.addItem("All Catalogs")
-        for catalog in sorted(self.available_catalogs):
-            self.catalog_combo.addItem(catalog)
-        
-        self.catalog_combo.setCurrentText("All Catalogs")
-        catalog_row.addWidget(self.catalog_combo)
-        
-        # DSO Type filter
-        catalog_row.addWidget(QLabel("Type:"))
-        self.dso_type_combo = QComboBox()
-        self.load_dso_type_options()
-        catalog_row.addWidget(self.dso_type_combo)
-        
-        catalog_row.addStretch()
-        settings_layout.addLayout(catalog_row)
-
-        # Third row - Use Target List checkbox
-        target_list_row = QHBoxLayout()
+        # Use Target List checkbox
         self.use_target_list_checkbox = QCheckBox("Use My Target List")
-        self.use_target_list_checkbox.setToolTip("Calculate visibility only for DSOs in your target list")
-        self.use_target_list_checkbox.stateChanged.connect(self._on_target_list_checkbox_changed)
-        target_list_row.addWidget(self.use_target_list_checkbox)
-        target_list_row.addStretch()
-        settings_layout.addLayout(target_list_row)
+        self.use_target_list_checkbox.setToolTip(
+            "Calculate visibility only for DSOs in your target list.\n\n"
+            "When checked:\n"
+            "• Min Altitude and Max Magnitude settings are still used\n"
+            "• Start Hour and Duration settings are still used\n"
+            "• Catalog, Type, and DSO Limit settings are ignored"
+        )
+        self.use_target_list_checkbox.toggled.connect(self._on_target_list_checkbox_changed)
+        action_layout.addWidget(self.use_target_list_checkbox)
 
-        main_layout.addWidget(settings_group)
+        # Horizontal layout to hold both groups side by side
+        groups_layout = QHBoxLayout()
+        groups_layout.addWidget(settings_group, stretch=3)  # Settings takes more space
+        groups_layout.addWidget(action_group, stretch=1)    # Actions takes less space
+        groups_layout.setAlignment(action_group, Qt.AlignTop)  # Align Actions to top
+
+        main_layout.addLayout(groups_layout)
         
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -975,13 +994,20 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self.dso_type_combo.addItem("All Types")
     
 
-    def _on_target_list_checkbox_changed(self, state):
+    def _on_target_list_checkbox_changed(self, checked):
         """Handle target list checkbox state change"""
-        use_target_list = (state == Qt.Checked)
+        # checked is a boolean from the toggled signal
 
-        # Disable catalog and type filters when using target list
-        self.catalog_combo.setEnabled(not use_target_list)
-        self.dso_type_combo.setEnabled(not use_target_list)
+        # Disable/enable settings based on whether target list is used
+        # When using target list, catalog and type filters don't apply
+        self.catalog_combo.setEnabled(not checked)
+        self.dso_type_combo.setEnabled(not checked)
+
+        # DSO limit doesn't apply when using target list (uses all targets)
+        self.dso_limit_spin.setEnabled(not checked)
+
+        # The global stylesheet's :disabled state will automatically
+        # grey out the disabled widgets
 
     def calculate_best_dsos(self):
         """Start the calculation of best DSOs for tonight"""
