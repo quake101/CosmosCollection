@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
     QVBoxLayout, QWidget, QLabel, QDialog,
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
-    QToolBar, QMessageBox, QMenu, QScrollArea
+    QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout
 )
 
 # Local imports (always needed)
@@ -4095,7 +4095,7 @@ class ObjectDetailWindow(QDialog):
             text += "<br>"
         else:
             # Indicate fallback to built-in data
-            text += "<span style='color: #FFA500;'>SIMBAD data unavailable - using built-in emission data</span><br><br>"
+            text += ""
 
         # Always show built-in emission line data
         text += f"<b>{info['description']}</b><br><br>"
@@ -4137,7 +4137,67 @@ class ObjectDetailWindow(QDialog):
         """Set up the UI components - called after window is shown"""
         logger.debug(f"_setup_ui called for {self.data['name']}")
         try:
-            # Create main horizontal layout
+            # Create menu bar using QToolBar with proper menu buttons
+            from PySide6.QtWidgets import QToolButton
+            menubar = QToolBar()
+            menubar.setMovable(False)
+            menubar.setStyleSheet("QToolBar { border: 0px; spacing: 3px; }")
+
+            # Tools menu
+            tools_menu = QMenu("Tools", self)
+
+            # Add Visibility Calculator action (if available)
+            if VISIBILITY_AVAILABLE:
+                visibility_action = QAction("Open Visibility Calculator", self)
+                visibility_action.triggered.connect(self._open_visibility_calculator)
+                tools_menu.addAction(visibility_action)
+
+            # Add Aladin Lite action
+            aladin_action = QAction("Open in Aladin Lite", self)
+            aladin_action.triggered.connect(lambda: self._open_aladin_lite(self.data))
+            tools_menu.addAction(aladin_action)
+
+            # Create Tools button with menu
+            tools_button = QToolButton()
+            tools_button.setText("Tools")
+            tools_button.setMenu(tools_menu)
+            tools_button.setPopupMode(QToolButton.InstantPopup)
+            menubar.addWidget(tools_button)
+
+            # Target List menu
+            target_menu = QMenu("Target List", self)
+
+            # Add to Target List action (will be hidden/shown based on state)
+            self.add_target_action = QAction("Add to Target List", self)
+            self.add_target_action.triggered.connect(self._add_to_target_list)
+            target_menu.addAction(self.add_target_action)
+
+            # Remove from Target List action (initially hidden)
+            self.remove_target_action = QAction("Remove from Target List", self)
+            self.remove_target_action.triggered.connect(self._remove_from_target_list)
+            self.remove_target_action.setVisible(False)
+            target_menu.addAction(self.remove_target_action)
+
+            # Open from Target List action (initially hidden)
+            self.open_target_action = QAction("Open from Target List", self)
+            self.open_target_action.triggered.connect(self._open_from_target_list)
+            self.open_target_action.setVisible(False)
+            target_menu.addAction(self.open_target_action)
+
+            # Create Target List button with menu
+            target_button = QToolButton()
+            target_button.setText("Target List")
+            target_button.setMenu(target_menu)
+            target_button.setPopupMode(QToolButton.InstantPopup)
+            menubar.addWidget(target_button)
+
+            # Create main vertical layout to hold menubar and content
+            window_layout = QVBoxLayout()
+            window_layout.setContentsMargins(0, 0, 0, 0)
+            window_layout.setSpacing(0)
+            window_layout.addWidget(menubar)
+
+            # Create main horizontal layout for content
             main_layout = QHBoxLayout()
 
             # Left side - Image placeholder and information
@@ -4235,52 +4295,48 @@ class ObjectDetailWindow(QDialog):
             left_layout.addLayout(image_layout, stretch=2)  # Give image area more stretch
 
             # Create container for image information form
-            self.info_form_container = QWidget()
-            info_form_layout = QVBoxLayout()
+            self.info_form_container = QGroupBox("Image Information")
+            self.info_form_container.setStyleSheet(
+                "QGroupBox:title { subcontrol-position: top center; font-size: 16pt; font-weight: bold; }")
+            info_form_layout = QGridLayout()
             info_form_layout.setSpacing(5)  # Reduce spacing between elements
+            info_form_layout.setVerticalSpacing(5)
+            info_form_layout.setHorizontalSpacing(10)
 
-            # Image information: Integration Time
-            integration_layout = QHBoxLayout()
+            # Row 0: Integration Time and Date (side by side)
             integration_label = QLabel("Integration:")
             self.integration_edit = QLineEdit()
             self.integration_edit.setPlaceholderText("e.g., 2h 30m")
-            integration_layout.addWidget(integration_label)
-            integration_layout.addWidget(self.integration_edit)
-            info_form_layout.addLayout(integration_layout)
+            info_form_layout.addWidget(integration_label, 0, 0)
+            info_form_layout.addWidget(self.integration_edit, 0, 1)
 
-            # Image information: Telescope
-            telescope_layout = QHBoxLayout()
+            date_label = QLabel("Date:")
+            self.date_edit = QLineEdit()
+            self.date_edit.setPlaceholderText("e.g., 2024-03-15")
+            info_form_layout.addWidget(date_label, 0, 2)
+            info_form_layout.addWidget(self.date_edit, 0, 3)
+
+            # Row 1: Telescope (full width)
             telescope_label = QLabel("Telescope:")
             self.telescope_combo = QComboBox()
             self.telescope_combo.setEditable(True)
             self.telescope_combo.setPlaceholderText("Select telescope or enter custom equipment")
-            telescope_layout.addWidget(telescope_label)
-            telescope_layout.addWidget(self.telescope_combo)
-            info_form_layout.addLayout(telescope_layout)
+            info_form_layout.addWidget(telescope_label, 1, 0)
+            info_form_layout.addWidget(self.telescope_combo, 1, 1, 1, 3)  # Span 3 columns
 
-            # Image information: Date Taken
-            date_layout = QHBoxLayout()
-            date_label = QLabel("Date:")
-            self.date_edit = QLineEdit()
-            self.date_edit.setPlaceholderText("e.g., 2024-03-15")
-            date_layout.addWidget(date_label)
-            date_layout.addWidget(self.date_edit)
-            info_form_layout.addLayout(date_layout)
-
-            # Image information: Notes
-            notes_layout = QVBoxLayout()
+            # Row 2: Notes (label and text edit on same row)
             notes_label = QLabel("Notes:")
+            notes_label.setAlignment(Qt.AlignTop)  # Align label to top
             self.notes_edit = QTextEdit()
             self.notes_edit.setPlaceholderText("Additional notes about the image")
             self.notes_edit.setMaximumHeight(60)  # Limit notes height
-            notes_layout.addWidget(notes_label)
-            notes_layout.addWidget(self.notes_edit)
-            info_form_layout.addLayout(notes_layout)
+            info_form_layout.addWidget(notes_label, 2, 0)
+            info_form_layout.addWidget(self.notes_edit, 2, 1, 1, 3)  # Span 3 columns
 
-            # Image information: Save button
+            # Row 3: Save button
             self.save_button = QPushButton("Save Image Information")
             self.save_button.clicked.connect(self._save_image_info)
-            info_form_layout.addWidget(self.save_button)
+            info_form_layout.addWidget(self.save_button, 3, 0, 1, 4)  # Span all columns
 
             self.info_form_container.setLayout(info_form_layout)
             left_layout.addWidget(self.info_form_container, stretch=1)  # Give info area less stretch
@@ -4447,55 +4503,19 @@ class ObjectDetailWindow(QDialog):
             # Add some spacing
             right_layout.addStretch()
 
-            # Add buttons layout
-            buttons_layout = QVBoxLayout()
-
-            # Add Visibility Calculator button (if available)
-            if VISIBILITY_AVAILABLE:
-                visibility_button = QPushButton("Open Visibility Calculator")
-                visibility_button.clicked.connect(self._open_visibility_calculator)
-                buttons_layout.addWidget(visibility_button)
-
-            # Add Aladin Lite button
-            aladin_button = QPushButton("Open in Aladin Lite")
-            aladin_button.clicked.connect(lambda: self._open_aladin_lite(self.data))
-            buttons_layout.addWidget(aladin_button)
-
-            # Add to Target List button (conditional based on whether DSO is already in target list)
-            self.target_list_button = QPushButton("Add to Target List")
-            self.target_list_button.clicked.connect(self._add_to_target_list)
-            
-            # Remove from Target List button (initially hidden)
-            self.remove_target_button = QPushButton("Remove from Target List")
-            self.remove_target_button.clicked.connect(self._remove_from_target_list)
-            self.remove_target_button.setVisible(False)
-
-            # Open from Target List button (initially hidden, shown when DSO is in target list)
-            self.open_target_button = QPushButton("Open from Target List")
-            self.open_target_button.clicked.connect(self._open_from_target_list)
-            self.open_target_button.setVisible(False)
-
-            buttons_layout.addWidget(self.target_list_button)
-            buttons_layout.addWidget(self.remove_target_button)
-            buttons_layout.addWidget(self.open_target_button)
-
-            # Check if DSO is already in target list and update button visibility
+            # Check if DSO is already in target list and update menu action visibility
             self._update_target_list_buttons()
-
-            # Add close button at the bottom
-            close_button = QPushButton("Close")
-            close_button.clicked.connect(self.close)
-            buttons_layout.addWidget(close_button)
-
-            right_layout.addLayout(buttons_layout)
 
             # Add right layout to a container widget
             right_container = QWidget()
             right_container.setLayout(right_layout)
             main_layout.addWidget(right_container)
 
-            # Set the main layout
-            self.setLayout(main_layout)
+            # Add the main content layout to the window layout
+            window_layout.addLayout(main_layout)
+
+            # Set the window layout
+            self.setLayout(window_layout)
 
             # Defer image loading to improve initial window performance
             if self.data.get('image_path'):
@@ -5704,25 +5724,25 @@ class ObjectDetailWindow(QDialog):
         self.notes_edit.setText("")
 
     def _update_target_list_buttons(self):
-        """Update target list button visibility based on whether DSO is already in target list"""
+        """Update target list menu action visibility based on whether DSO is already in target list"""
         try:
             is_in_target_list = self._check_if_in_target_list()
 
             if is_in_target_list:
-                self.target_list_button.setVisible(False)
-                self.remove_target_button.setVisible(True)
-                self.open_target_button.setVisible(True)
+                self.add_target_action.setVisible(False)
+                self.remove_target_action.setVisible(True)
+                self.open_target_action.setVisible(True)
             else:
-                self.target_list_button.setVisible(True)
-                self.remove_target_button.setVisible(False)
-                self.open_target_button.setVisible(False)
+                self.add_target_action.setVisible(True)
+                self.remove_target_action.setVisible(False)
+                self.open_target_action.setVisible(False)
 
         except Exception as e:
-            logger.error(f"Error updating target list buttons: {str(e)}")
-            # Show add button as fallback
-            self.target_list_button.setVisible(True)
-            self.remove_target_button.setVisible(False)
-            self.open_target_button.setVisible(False)
+            logger.error(f"Error updating target list menu actions: {str(e)}")
+            # Show add action as fallback
+            self.add_target_action.setVisible(True)
+            self.remove_target_action.setVisible(False)
+            self.open_target_action.setVisible(False)
     
     def _check_if_in_target_list(self):
         """Check if current DSO is already in the target list"""
