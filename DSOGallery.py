@@ -592,7 +592,10 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Thumbnail cache and thread pool
         self.thumbnail_cache = ThumbnailCache(max_size=200)
         self.thread_pool = QThreadPool.globalInstance()
-        self.thread_pool.setMaxThreadCount(4)  # Use 4 threads for parallel loading
+        # Use all available cores minus 2 to keep system responsive
+        cpu_count = os.cpu_count() or 4
+        thread_count = max(2, cpu_count - 2)  # Minimum of 2 threads, max of (cores - 2)
+        self.thread_pool.setMaxThreadCount(thread_count)
         self.thumbnail_signals = ThumbnailSignals()
         self.cancelled_flag = [False]  # Mutable flag for cancellation
 
@@ -846,10 +849,14 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         # Connect signals (disconnect first to avoid duplicates)
         try:
-            self.thumbnail_signals.thumbnail_ready.disconnect()
-            self.thumbnail_signals.thumbnail_error.disconnect()
-        except:
-            pass
+            self.thumbnail_signals.thumbnail_ready.disconnect(self._on_thumbnail_ready)
+        except (TypeError, RuntimeError):
+            pass  # Not connected yet
+
+        try:
+            self.thumbnail_signals.thumbnail_error.disconnect(self._on_thumbnail_error)
+        except (TypeError, RuntimeError):
+            pass  # Not connected yet
 
         self.thumbnail_signals.thumbnail_ready.connect(self._on_thumbnail_ready)
         self.thumbnail_signals.thumbnail_error.connect(self._on_thumbnail_error)
