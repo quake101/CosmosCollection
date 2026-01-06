@@ -567,6 +567,11 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                 color: #ffffff;
                 selection-background-color: #0078d4;
                 border: 1px solid #666666;
+                padding: 2px;
+            }
+            QComboBox QAbstractItemView::item {
+                padding: 5px;
+                min-height: 20px;
             }
             QScrollArea {
                 border: none;
@@ -661,6 +666,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         filters_layout.addWidget(QLabel("Type:"))
         self.type_combo = QComboBox()
         self.type_combo.addItem("All")
+        self.type_combo.setMinimumWidth(150)
+        self.type_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.type_combo.currentTextChanged.connect(self._on_filter_changed)
         filters_layout.addWidget(self.type_combo)
 
@@ -668,6 +675,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         filters_layout.addWidget(QLabel("Equipment:"))
         self.equipment_combo = QComboBox()
         self.equipment_combo.addItem("All")
+        self.equipment_combo.setMinimumWidth(200)
+        self.equipment_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.equipment_combo.currentTextChanged.connect(self._on_filter_changed)
         filters_layout.addWidget(self.equipment_combo)
 
@@ -740,6 +749,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         for dso_type in sorted(types):
             self.type_combo.addItem(dso_type)
 
+        # Ensure dropdown view is wide enough to show full text
+        self.type_combo.view().setMinimumWidth(self.type_combo.minimumSizeHint().width())
+
     def _populate_equipment_filter(self):
         """Populate equipment filter dropdown with unique equipment from loaded data"""
         # Get unique equipment (non-empty)
@@ -753,6 +765,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.equipment_combo.addItem("All")
         for equipment in sorted(equipment_set):
             self.equipment_combo.addItem(equipment)
+
+        # Ensure dropdown view is wide enough to show full text
+        self.equipment_combo.view().setMinimumWidth(self.equipment_combo.minimumSizeHint().width())
 
     def _calculate_grid_columns(self):
         """Calculate number of columns based on available width"""
