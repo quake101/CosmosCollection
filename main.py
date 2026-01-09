@@ -22,7 +22,7 @@ if getattr(sys, 'frozen', False):
         print(f"Warning: Could not configure SSL certificates: {e}")
 
 # Core PySide6 imports (always needed)
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings, Slot
 from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
@@ -1280,6 +1280,12 @@ class DSOTableModel(QAbstractTableModel):
             logger.debug(f"Continuing to load data for pending sort ({self.load_offset}/{self.total_count})")
             from PySide6.QtCore import QTimer
             QTimer.singleShot(50, self.load_more_data)
+        # Continue loading all data in background until complete
+        elif self.load_offset < self.total_count:
+            logger.debug(f"Background loading: {self.load_offset}/{self.total_count} objects loaded, continuing...")
+            from PySide6.QtCore import QTimer
+            # Use longer delay (200ms) for background loading to not impact UI performance
+            QTimer.singleShot(200, self.load_more_data)
 
     def get_load_progress(self):
         """Get current loading progress for status display"""
@@ -4153,7 +4159,7 @@ class ObjectDetailWindow(QDialog):
 
             # Add Aladin Lite button
             aladin_button = QToolButton()
-            aladin_button.setText("Aladin Lite\FOV Simulator")
+            aladin_button.setText("Aladin Lite\\FOV Simulator")
             aladin_button.setToolTip("Open Aladin Lite interactive sky atlas with telescope field of view simulator")
             aladin_button.clicked.connect(lambda: self._open_aladin_lite(self.data))
             menubar.addWidget(aladin_button)
@@ -6211,7 +6217,17 @@ class SettingsDialog(QDialog):
         name_layout.addWidget(name_label)
         name_layout.addWidget(self.location_name_input)
         location_group_layout.addLayout(name_layout)
-        
+
+        # Add map selection button
+        map_button_layout = QHBoxLayout()
+        map_button = QPushButton("Select Location from Map")
+        map_button.setToolTip("Open an interactive map to visually select your location")
+        map_button.clicked.connect(self._open_map_picker)
+        map_button_layout.addStretch()
+        map_button_layout.addWidget(map_button)
+        map_button_layout.addStretch()
+        location_group_layout.addLayout(map_button_layout)
+
         location_layout.addWidget(location_group)
         
         # Timezone settings group
@@ -6251,8 +6267,9 @@ class SettingsDialog(QDialog):
         help_text = QLabel("""
 <b>Tips:</b>
 • Latitude: Positive values for Northern Hemisphere, negative for Southern
-• Longitude: Positive values for Eastern Hemisphere, negative for Western  
-• You can find coordinates using online tools like Google Maps
+• Longitude: Positive values for Eastern Hemisphere, negative for Western
+• Use "Select Location from Map" for easy coordinate selection
+• You can search locations by name or click directly on the map
 • Time zone affects visibility calculation displays and times
         """)
         help_text.setWordWrap(True)
@@ -6436,6 +6453,426 @@ class SettingsDialog(QDialog):
         except Exception as e:
             logger.error(f"Error saving settings: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to save settings: {str(e)}")
+
+    def _open_map_picker(self):
+        """Open map dialog to select location coordinates"""
+        try:
+            # Get current coordinates as starting point (or default to NYC)
+            current_lat = 40.7128
+            current_lon = -74.0060
+
+            try:
+                lat_text = self.latitude_input.text().strip()
+                lon_text = self.longitude_input.text().strip()
+                if lat_text and lon_text:
+                    current_lat = float(lat_text)
+                    current_lon = float(lon_text)
+            except ValueError:
+                # Use default coordinates if current values are invalid
+                pass
+
+            # Open dialog
+            dialog = MapLocationPickerDialog(current_lat, current_lon, parent=self)
+            if dialog.exec() == QDialog.Accepted:
+                result = dialog.get_selected_coordinates()
+                if result:
+                    lat, lon, location_name = result
+                    self.latitude_input.setText(f"{lat:.6f}")
+                    self.longitude_input.setText(f"{lon:.6f}")
+                    if location_name:
+                        self.location_name_input.setText(location_name)
+
+        except Exception as e:
+            logger.error(f"Error opening map picker: {str(e)}")
+            QMessageBox.warning(self, "Error",
+                f"Failed to open map picker: {str(e)}\n\n"
+                "Please enter coordinates manually.")
+
+
+# --- Map Location Picker Dialog ---
+class MapBridge(QObject):
+    """Bridge object for Qt-JavaScript communication in map picker"""
+
+    def __init__(self, dialog):
+        super().__init__()
+        self.dialog = dialog
+
+    @Slot(float, float, str)
+    def selectLocation(self, lat, lon, location_name):
+        """Called from JavaScript when user selects a location on the map"""
+        self.dialog._on_location_selected(lat, lon, location_name)
+
+
+class MapLocationPickerDialog(QDialog):
+    """Dialog for selecting location coordinates from an interactive map"""
+
+    def __init__(self, initial_lat=40.7128, initial_lon=-74.0060, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Location from Map - Cosmos Collection")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setModal(True)
+        self.resize(900, 700)
+
+        # Store initial coordinates
+        self.initial_lat = initial_lat
+        self.initial_lon = initial_lon
+
+        # Selected coordinates (None until user selects)
+        self.selected_lat = None
+        self.selected_lon = None
+        self.selected_location_name = ""
+
+        # Web view and bridge
+        self.web_view = None
+        self.bridge = None
+        self.channel = None
+        self.web_placeholder = None
+
+        self._setup_ui()
+
+        # Defer web view creation to avoid initialization issues
+        QTimer.singleShot(100, self._load_map)
+
+    def _setup_ui(self):
+        """Set up the dialog UI"""
+        layout = QVBoxLayout()
+
+        # Search section
+        search_layout = QHBoxLayout()
+        search_label = QLabel("Search:")
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Enter city name, address, or landmark...")
+        self.search_input.returnPressed.connect(self._on_search_clicked)
+        self.search_button = QPushButton("Search")
+        self.search_button.clicked.connect(self._on_search_clicked)
+
+        search_layout.addWidget(search_label)
+        search_layout.addWidget(self.search_input, 1)
+        search_layout.addWidget(self.search_button)
+        layout.addLayout(search_layout)
+
+        # Placeholder for map (will be replaced by web view)
+        self.web_placeholder = QLabel("Loading map...")
+        self.web_placeholder.setAlignment(Qt.AlignCenter)
+        self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: #888888; font-size: 14px; }")
+        self.web_placeholder.setMinimumSize(800, 500)
+        layout.addWidget(self.web_placeholder, 1)
+
+        # Coordinates display
+        self.coords_label = QLabel("Click on the map to select a location")
+        self.coords_label.setAlignment(Qt.AlignCenter)
+        self.coords_label.setStyleSheet("QLabel { font-size: 12pt; padding: 10px; }")
+        layout.addWidget(self.coords_label)
+
+        # Help text
+        help_text = QLabel("Tip: You can pan, zoom, and search for locations. Click anywhere on the map to select coordinates.")
+        help_text.setWordWrap(True)
+        help_text.setStyleSheet("QLabel { color: #888888; font-size: 9pt; padding: 5px; }")
+        help_text.setAlignment(Qt.AlignCenter)
+        layout.addWidget(help_text)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        self.select_button = QPushButton("Select Location")
+        self.select_button.clicked.connect(self.accept)
+        self.select_button.setEnabled(False)  # Disabled until location selected
+        self.select_button.setDefault(True)
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+
+        button_layout.addWidget(self.select_button)
+        button_layout.addWidget(self.cancel_button)
+        layout.addLayout(button_layout)
+
+        self.setLayout(layout)
+
+    def _create_map_html(self, lat, lon, zoom=10):
+        """Create HTML with Leaflet map and JavaScript bridge"""
+        html_template = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Location Picker</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <style>
+        body {{ margin: 0; padding: 0; }}
+        #map {{ width: 100%; height: 100vh; }}
+        .info-box {{
+            position: absolute;
+            bottom: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 5px;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            z-index: 1000;
+            max-width: 500px;
+            text-align: center;
+        }}
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div class="info-box" id="infoBox">Click on the map to select a location</div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        var qt_bridge = null;
+        var map = null;
+        var marker = null;
+        var searchTimeout = null;
+
+        // Initialize QWebChannel for Qt-JavaScript communication
+        new QWebChannel(qt.webChannelTransport, function(channel) {{
+            qt_bridge = channel.objects.qt_bridge;
+            console.log("Qt bridge initialized");
+        }});
+
+        // Initialize Leaflet map
+        try {{
+            map = L.map('map').setView([{lat}, {lon}], {zoom});
+
+            // Add OpenStreetMap tiles
+            L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+                maxZoom: 19
+            }}).addTo(map);
+
+            // Add initial marker at starting position
+            marker = L.marker([{lat}, {lon}], {{
+                draggable: true
+            }}).addTo(map);
+
+            // Handle marker drag
+            marker.on('dragend', function(e) {{
+                var latlng = e.target.getLatLng();
+                onLocationSelected(latlng.lat, latlng.lng);
+            }});
+
+            // Handle map clicks
+            map.on('click', function(e) {{
+                var lat = e.latlng.lat;
+                var lon = e.latlng.lng;
+
+                // Update or create marker
+                if (marker) {{
+                    marker.setLatLng(e.latlng);
+                }} else {{
+                    marker = L.marker(e.latlng, {{
+                        draggable: true
+                    }}).addTo(map);
+
+                    marker.on('dragend', function(e) {{
+                        var latlng = e.target.getLatLng();
+                        onLocationSelected(latlng.lat, latlng.lng);
+                    }});
+                }}
+
+                onLocationSelected(lat, lon);
+            }});
+
+            document.getElementById('infoBox').innerHTML = 'Map loaded successfully - Click to select location';
+        }} catch (e) {{
+            console.error("Failed to initialize map:", e);
+            document.getElementById('infoBox').innerHTML = 'Error loading map: ' + e.message;
+        }}
+
+        function onLocationSelected(lat, lon) {{
+            // Update info box
+            document.getElementById('infoBox').innerHTML =
+                'Selected: ' + lat.toFixed(6) + '°, ' + lon.toFixed(6) + '° - Getting location name...';
+
+            // Reverse geocode to get location name
+            reverseGeocode(lat, lon);
+        }}
+
+        function reverseGeocode(lat, lon) {{
+            fetch('https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lon, {{
+                headers: {{
+                    'User-Agent': 'CosmosCollection/1.0'
+                }}
+            }})
+            .then(response => response.json())
+            .then(data => {{
+                var locationName = data.display_name || "";
+
+                // Update info box
+                document.getElementById('infoBox').innerHTML =
+                    'Selected: ' + lat.toFixed(6) + '°, ' + lon.toFixed(6) + '°<br>' +
+                    '<small>' + locationName + '</small>';
+
+                // Send to Qt
+                if (qt_bridge) {{
+                    qt_bridge.selectLocation(lat, lon, locationName);
+                }}
+            }})
+            .catch(error => {{
+                console.error('Reverse geocoding failed:', error);
+                document.getElementById('infoBox').innerHTML =
+                    'Selected: ' + lat.toFixed(6) + '°, ' + lon.toFixed(6) + '°';
+
+                // Send to Qt anyway
+                if (qt_bridge) {{
+                    qt_bridge.selectLocation(lat, lon, "");
+                }}
+            }});
+        }}
+
+        // Search function (called from Qt)
+        function searchLocation(query) {{
+            if (!query || query.trim() === '') {{
+                return;
+            }}
+
+            document.getElementById('infoBox').innerHTML = 'Searching for: ' + query + '...';
+
+            fetch('https://nominatim.openstreetmap.org/search?format=json&q=' + encodeURIComponent(query) + '&limit=1', {{
+                headers: {{
+                    'User-Agent': 'CosmosCollection/1.0'
+                }}
+            }})
+            .then(response => response.json())
+            .then(data => {{
+                if (data && data.length > 0) {{
+                    var result = data[0];
+                    var lat = parseFloat(result.lat);
+                    var lon = parseFloat(result.lon);
+
+                    // Pan to location
+                    map.setView([lat, lon], 13);
+
+                    // Update marker
+                    if (marker) {{
+                        marker.setLatLng([lat, lon]);
+                    }} else {{
+                        marker = L.marker([lat, lon], {{
+                            draggable: true
+                        }}).addTo(map);
+
+                        marker.on('dragend', function(e) {{
+                            var latlng = e.target.getLatLng();
+                            onLocationSelected(latlng.lat, latlng.lng);
+                        }});
+                    }}
+
+                    // Select this location
+                    onLocationSelected(lat, lon);
+                }} else {{
+                    document.getElementById('infoBox').innerHTML = 'No results found for: ' + query;
+                }}
+            }})
+            .catch(error => {{
+                console.error('Search failed:', error);
+                document.getElementById('infoBox').innerHTML = 'Search failed. Please try again.';
+            }});
+        }}
+    </script>
+</body>
+</html>"""
+        return html_template
+
+    def _load_map(self):
+        """Create and load the web view with the map"""
+        try:
+            # Import QtWebEngine components
+            try:
+                from PySide6.QtWebEngineWidgets import QWebEngineView
+                from PySide6.QtWebEngineCore import QWebEngineSettings
+                from PySide6.QtWebChannel import QWebChannel
+            except ImportError as ie:
+                QMessageBox.warning(self, "Feature Unavailable",
+                    "Map picker requires QtWebEngine which is not available.\n\n"
+                    "You can still enter coordinates manually.")
+                logger.error(f"QtWebEngine not available: {ie}")
+                self.reject()
+                return
+
+            # Create web view
+            self.web_view = QWebEngineView()
+            self.web_view.setMinimumSize(800, 500)
+
+            # Configure web settings
+            settings = self.web_view.settings()
+            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
+
+            # Set up QWebChannel for Qt-JavaScript bridge
+            self.bridge = MapBridge(self)
+            self.channel = QWebChannel()
+            self.channel.registerObject("qt_bridge", self.bridge)
+            self.web_view.page().setWebChannel(self.channel)
+
+            # Generate and load HTML
+            html = self._create_map_html(self.initial_lat, self.initial_lon)
+            self.web_view.setHtml(html)
+
+            # Replace placeholder with web view
+            if self.web_placeholder:
+                layout = self.layout()
+                for i in range(layout.count()):
+                    item = layout.itemAt(i)
+                    if item and item.widget() == self.web_placeholder:
+                        layout.removeWidget(self.web_placeholder)
+                        self.web_placeholder.hide()
+                        self.web_placeholder.deleteLater()
+                        self.web_placeholder = None
+
+                        layout.insertWidget(i, self.web_view, 1)
+                        self.web_view.show()
+                        break
+
+            logger.debug("Map view created successfully")
+
+        except Exception as e:
+            logger.error(f"Failed to create map view: {e}")
+            QMessageBox.critical(self, "Error",
+                f"Failed to load map picker: {str(e)}\n\n"
+                "Please enter coordinates manually.")
+            self.reject()
+
+    def _on_location_selected(self, lat, lon, location_name=""):
+        """Called when user selects a location (from JavaScript bridge)"""
+        self.selected_lat = lat
+        self.selected_lon = lon
+        self.selected_location_name = location_name
+
+        # Update display
+        lat_str = f"{abs(lat):.6f}°{'N' if lat >= 0 else 'S'}"
+        lon_str = f"{abs(lon):.6f}°{'W' if lon < 0 else 'E'}"
+
+        if location_name:
+            # Truncate long location names
+            display_name = location_name if len(location_name) <= 60 else location_name[:57] + "..."
+            self.coords_label.setText(f"Selected: {lat_str}, {lon_str}\n{display_name}")
+        else:
+            self.coords_label.setText(f"Selected: {lat_str}, {lon_str}")
+
+        # Enable select button
+        self.select_button.setEnabled(True)
+
+        logger.debug(f"Location selected: {lat}, {lon} - {location_name}")
+
+    def _on_search_clicked(self):
+        """Handle search button click"""
+        query = self.search_input.text().strip()
+        if query and self.web_view:
+            # Execute JavaScript search function
+            self.web_view.page().runJavaScript(f"searchLocation({repr(query)})")
+
+    def get_selected_coordinates(self):
+        """Get the selected coordinates"""
+        if self.selected_lat is not None and self.selected_lon is not None:
+            return (self.selected_lat, self.selected_lon, self.selected_location_name)
+        return None
 
 
 # --- Telescope Management Dialog ---
@@ -7177,6 +7614,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         # Exit startup mode after initialization to enable full sorting
         QTimer.singleShot(1000, self._exit_startup_mode)  # Small delay to ensure everything is loaded
 
+        # Start background loading of all objects after a short delay
+        QTimer.singleShot(1500, self._start_background_loading)
+
         logger.debug("MainWindow initialization complete")
 
     def _create_toolbar(self):
@@ -7232,7 +7672,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         toolbar.addAction(gallery_action)
 
         # Aladin Lite action
-        aladin_lite_action = QAction("Aladin Lite\FOV Simulator", self)
+        aladin_lite_action = QAction("Aladin Lite\\FOV Simulator", self)
         aladin_lite_action.setToolTip("Open Aladin Lite sky viewer")
         aladin_lite_action.triggered.connect(self._show_aladin_lite_from_toolbar)
         toolbar.addAction(aladin_lite_action)
@@ -7257,6 +7697,36 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Show the settings dialog"""
         settings_dialog = SettingsDialog(self)
         settings_dialog.exec()
+
+    def _check_location_on_startup(self):
+        """Check if user has configured their location and prompt if not"""
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
+                row = cursor.fetchone()
+
+                if not row or row[0] is None or row[1] is None:
+                    # Location not configured, show dialog
+                    msg = QMessageBox(self)
+                    msg.setIcon(QMessageBox.Information)
+                    msg.setWindowTitle("Location Required")
+                    msg.setText("Welcome to Cosmos Collection!")
+                    msg.setInformativeText(
+                        "Some features require your observer location to work properly:\n\n"
+                        "• Best DSO Tonight - Find optimal objects for your location\n"
+                        "• Visibility Calculator - Calculate when objects are visible\n"
+                        "• Altitude/Azimuth calculations\n\n"
+                        "Would you like to set your location now?"
+                    )
+                    msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                    msg.setDefaultButton(QMessageBox.Yes)
+
+                    if msg.exec() == QMessageBox.Yes:
+                        self._show_settings()
+
+        except Exception as e:
+            logger.error(f"Error checking location on startup: {str(e)}")
 
     def _show_telescopes(self):
         """Show the telescopes dialog"""
@@ -7723,6 +8193,15 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Exit startup mode for the model to enable full sorting"""
         if hasattr(self.model, 'exit_startup_mode'):
             self.model.exit_startup_mode()
+
+    def _start_background_loading(self):
+        """Start background loading of all objects in chunks"""
+        if hasattr(self.model, 'load_offset') and hasattr(self.model, 'total_count'):
+            if self.model.load_offset < self.model.total_count:
+                logger.info(f"Starting background loading: {self.model.load_offset}/{self.model.total_count} objects loaded")
+                self.model.load_more_data()
+            else:
+                logger.info(f"All {self.model.total_count} objects already loaded")
 
     def _save_simbad_object_to_database(self, object_data):
         """Save SIMBAD object data to the database"""
@@ -8197,7 +8676,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         visibility_action = context_menu.addAction("Visibility Calculator")
         visibility_action.triggered.connect(lambda: self._context_open_visibility(row))
 
-        aladin_action = context_menu.addAction("Aladin Lite\FOV Simulator")
+        aladin_action = context_menu.addAction("Aladin Lite\\FOV Simulator")
         aladin_action.triggered.connect(lambda: self._context_open_aladin(row))
 
         context_menu.addSeparator()
@@ -8489,6 +8968,10 @@ if __name__ == "__main__":
 
         window = MainWindow(dso_data, catalogs, total_count)
         window.show()
+
+        # Check if location is configured after window is shown
+        QTimer.singleShot(500, window._check_location_on_startup)
+
         sys.exit(app.exec())
 
     except Exception as e:
