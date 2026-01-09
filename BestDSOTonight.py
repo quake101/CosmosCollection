@@ -1378,25 +1378,31 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                     # Import and open DSO Visibility Calculator
                     from DSOVisibilityCalculator import DSOVisibilityApp
 
-                    # Store reference to prevent garbage collection
-                    self.visibility_window = DSOVisibilityApp()
+                    # Store reference to prevent garbage collection - use list to allow multiple windows
+                    if not hasattr(self, 'visibility_windows'):
+                        self.visibility_windows = []
+
+                    visibility_window = DSOVisibilityApp()
 
                     # Set DSO name in input field for display and title
-                    if hasattr(self.visibility_window, 'dso_input'):
-                        self.visibility_window.dso_input.setText(dso_name)
+                    if hasattr(visibility_window, 'dso_input'):
+                        visibility_window.dso_input.setText(dso_name)
 
                     # Use coordinates for accurate calculation
-                    if hasattr(self.visibility_window, 'set_dso_coordinates'):
-                        self.visibility_window.set_dso_coordinates(ra_deg, dec_deg)
+                    if hasattr(visibility_window, 'set_dso_coordinates'):
+                        visibility_window.set_dso_coordinates(ra_deg, dec_deg)
 
                     # Show the window immediately
-                    self.visibility_window.show()
-                    self.visibility_window.raise_()
-                    self.visibility_window.activateWindow()
+                    visibility_window.show()
+                    visibility_window.raise_()
+                    visibility_window.activateWindow()
+
+                    # Store reference after showing to prevent garbage collection
+                    self.visibility_windows.append(visibility_window)
 
                     # Automatically trigger calculation after a short delay
-                    if hasattr(self.visibility_window, 'calculate_visibility'):
-                        QTimer.singleShot(500, self.visibility_window.calculate_visibility)
+                    if hasattr(visibility_window, 'calculate_visibility'):
+                        QTimer.singleShot(500, visibility_window.calculate_visibility)
                 else:
                     QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
         except Exception as e:

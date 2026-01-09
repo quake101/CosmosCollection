@@ -4143,43 +4143,47 @@ class ObjectDetailWindow(QDialog):
             menubar.setMovable(False)
             menubar.setStyleSheet("QToolBar { border: 0px; spacing: 3px; }")
 
-            # Tools menu
-            tools_menu = QMenu("Tools", self)
-
-            # Add Visibility Calculator action (if available)
+            # Add Visibility Calculator button (if available)
             if VISIBILITY_AVAILABLE:
-                visibility_action = QAction("Open Visibility Calculator", self)
-                visibility_action.triggered.connect(self._open_visibility_calculator)
-                tools_menu.addAction(visibility_action)
+                visibility_button = QToolButton()
+                visibility_button.setText("Visibility Calculator")
+                visibility_button.setToolTip("Open the Visibility Calculator to see when this object is visible")
+                visibility_button.clicked.connect(self._open_visibility_calculator)
+                menubar.addWidget(visibility_button)
 
-            # Add Aladin Lite action
-            aladin_action = QAction("Open in Aladin Lite", self)
-            aladin_action.triggered.connect(lambda: self._open_aladin_lite(self.data))
-            tools_menu.addAction(aladin_action)
+            # Add Aladin Lite button
+            aladin_button = QToolButton()
+            aladin_button.setText("Aladin Lite\FOV Simulator")
+            aladin_button.setToolTip("Open Aladin Lite interactive sky atlas with telescope field of view simulator")
+            aladin_button.clicked.connect(lambda: self._open_aladin_lite(self.data))
+            menubar.addWidget(aladin_button)
 
-            # Create Tools button with menu
-            tools_button = QToolButton()
-            tools_button.setText("Tools")
-            tools_button.setMenu(tools_menu)
-            tools_button.setPopupMode(QToolButton.InstantPopup)
-            menubar.addWidget(tools_button)
+            # Add Wikipedia button
+            wikipedia_button = QToolButton()
+            wikipedia_button.setText("Wikipedia")
+            wikipedia_button.setToolTip("Open the Wikipedia page for this object in your browser")
+            wikipedia_button.clicked.connect(self._open_wikipedia)
+            menubar.addWidget(wikipedia_button)
 
             # Target List menu
             target_menu = QMenu("Target List", self)
 
             # Add to Target List action (will be hidden/shown based on state)
             self.add_target_action = QAction("Add to Target List", self)
+            self.add_target_action.setToolTip("Add this object to your observing target list")
             self.add_target_action.triggered.connect(self._add_to_target_list)
             target_menu.addAction(self.add_target_action)
 
             # Remove from Target List action (initially hidden)
             self.remove_target_action = QAction("Remove from Target List", self)
+            self.remove_target_action.setToolTip("Remove this object from your target list")
             self.remove_target_action.triggered.connect(self._remove_from_target_list)
             self.remove_target_action.setVisible(False)
             target_menu.addAction(self.remove_target_action)
 
             # Open from Target List action (initially hidden)
             self.open_target_action = QAction("Open from Target List", self)
+            self.open_target_action.setToolTip("Open this DSO from your target list")
             self.open_target_action.triggered.connect(self._open_from_target_list)
             self.open_target_action.setVisible(False)
             target_menu.addAction(self.open_target_action)
@@ -4187,6 +4191,7 @@ class ObjectDetailWindow(QDialog):
             # Create Target List button with menu
             target_button = QToolButton()
             target_button.setText("Target List")
+            target_button.setToolTip("Manage your observing target list")
             target_button.setMenu(target_menu)
             target_button.setPopupMode(QToolButton.InstantPopup)
             menubar.addWidget(target_button)
@@ -5256,6 +5261,42 @@ class ObjectDetailWindow(QDialog):
             logger.error(f"Error opening Aladin Lite: {str(e)}", exc_info=True)
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Error", f"Failed to open Aladin Lite: {str(e)}")
+
+    def _open_wikipedia(self):
+        """Open Wikipedia page for the current DSO in the default browser"""
+        try:
+            import webbrowser
+            import re
+
+            # Get the DSO name
+            dso_name = self.data.get('name', '').strip()
+
+            if not dso_name:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "No Name", "Cannot open Wikipedia: DSO name not available.")
+                return
+
+            # Strip out parentheses and their contents (e.g., "IC 410 (Tadpoles Nebula)" -> "IC 410")
+            dso_name = re.sub(r'\s*\([^)]*\)', '', dso_name).strip()
+
+            # Convert M catalog names to "Messier" format (e.g., M31 or M 31 -> Messier_31)
+            if re.match(r'^M\s*\d+$', dso_name):
+                # Extract the number and format as "Messier_XX"
+                number = re.search(r'\d+', dso_name).group()
+                wiki_name = f'Messier_{number}'
+            else:
+                # For other catalogs, replace spaces with underscores
+                wiki_name = dso_name.replace(' ', '_')
+
+            wiki_url = f"https://en.wikipedia.org/wiki/{wiki_name}"
+
+            logger.debug(f"Opening Wikipedia page: {wiki_url}")
+            webbrowser.open(wiki_url)
+
+        except Exception as e:
+            logger.error(f"Error opening Wikipedia: {str(e)}", exc_info=True)
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Error", f"Failed to open Wikipedia: {str(e)}")
 
     def eventFilter(self, obj, event):
         """Handle mouse events for zooming and panning"""
@@ -7161,7 +7202,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         toolbar.addSeparator()
         
         # DSO Visibility Calculator action
-        visibility_action = QAction("DSO Visibility", self)
+        visibility_action = QAction("Visibility Calculator", self)
         visibility_action.setToolTip("Calculate DSO visibility from your location")
         visibility_action.triggered.connect(self._show_dso_visibility)
         toolbar.addAction(visibility_action)
@@ -7191,7 +7232,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         toolbar.addAction(gallery_action)
 
         # Aladin Lite action
-        aladin_lite_action = QAction("Aladin Lite", self)
+        aladin_lite_action = QAction("Aladin Lite\FOV Simulator", self)
         aladin_lite_action.setToolTip("Open Aladin Lite sky viewer")
         aladin_lite_action.triggered.connect(self._show_aladin_lite_from_toolbar)
         toolbar.addAction(aladin_lite_action)
@@ -8153,10 +8194,10 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         details_action = context_menu.addAction("View DSO Details")
         details_action.triggered.connect(lambda: self._context_view_details(row))
 
-        visibility_action = context_menu.addAction("Open DSO Visibility Calculator")
+        visibility_action = context_menu.addAction("Visibility Calculator")
         visibility_action.triggered.connect(lambda: self._context_open_visibility(row))
 
-        aladin_action = context_menu.addAction("Open in Aladin Lite")
+        aladin_action = context_menu.addAction("Aladin Lite\FOV Simulator")
         aladin_action.triggered.connect(lambda: self._context_open_aladin(row))
 
         context_menu.addSeparator()
