@@ -804,11 +804,23 @@ class DSOTableModel(QAbstractTableModel):
 
     def _format_cell_data(self, entry, col):
         """Format cell data with caching"""
+        # Check if we have a matched designation from search
+        matched_designation = entry.get("matched_designation")
+
         if col == 0:
-            if self.selected_catalog and self.selected_catalog != "All Catalogs":
+            # Show catalog from matched designation if available
+            if matched_designation:
+                parts = matched_designation.split(" ", 1)
+                return parts[0] if parts else entry["catalogue"]
+            elif self.selected_catalog and self.selected_catalog != "All Catalogs":
                 return self.selected_catalog
             return entry["catalogue"]
         elif col == 1:
+            # Show designation from matched designation if available
+            if matched_designation:
+                parts = matched_designation.split(" ", 1)
+                return parts[1] if len(parts) > 1 else matched_designation
+
             designations = entry["designations"].split(", ")
             if self.selected_catalog and self.selected_catalog != "All Catalogs":
                 for designation in designations:
@@ -953,29 +965,47 @@ class DSOTableModel(QAbstractTableModel):
 
                 # Apply search text filter
                 if search_text:
+                    matched_designation = None
+
                     # If we have a catalog filter, prioritize exact catalog+designation matches
                     if selected_catalog and selected_catalog != "All Catalogs":
                         # Check for exact match: catalog filter + search text = designation
                         designations = item["designations"].split(", ")
-                        exact_match = any(
-                            designation.lower() == f"{selected_catalog.lower()} {search_text}"
-                            for designation in designations
-                        )
+                        for designation in designations:
+                            if designation.lower() == f"{selected_catalog.lower()} {search_text}":
+                                matched_designation = designation
+                                break
 
                         # Also check if the item's ID matches the search
                         id_match = search_text in item["id"].lower()
 
-                        if exact_match or id_match:
-                            matches.append((item, 0))  # Priority 0 = exact match
+                        if matched_designation or id_match:
+                            item_copy = item.copy()
+                            if matched_designation:
+                                item_copy["matched_designation"] = matched_designation
+                            matches.append((item_copy, 0))  # Priority 0 = exact match
                             continue
 
-                    # Otherwise do regular substring matching
+                    # Otherwise do regular substring matching and find which designation matched
+                    designations = item["designations"].split(", ")
+
+                    # Check each designation for a match
+                    for designation in designations:
+                        if search_text in designation.lower():
+                            matched_designation = designation
+                            break
+
+                    # Check other fields
                     if (search_text in item["catalogue"].lower() or
                         search_text in item["id"].lower() or
                         self._format_ra(item["ra_deg"]).lower() in search_text or
                         self._format_dec(item["dec_deg"]).lower() in search_text or
-                        search_text in item["designations"].lower()):
-                        matches.append((item, 1))  # Priority 1 = substring match
+                        matched_designation):
+
+                        item_copy = item.copy()
+                        if matched_designation:
+                            item_copy["matched_designation"] = matched_designation
+                        matches.append((item_copy, 1))  # Priority 1 = substring match
                 else:
                     matches.append((item, 1))
 
@@ -1211,14 +1241,36 @@ class DSOTableModel(QAbstractTableModel):
 
             # Rebuild filtered data from all loaded data
             if search_text or show_images_only:
-                self.filtered_data = [
-                    item for item in self.dso_data
-                    if ((not show_images_only or item["image_count"] > 0) and
-                        (not search_text or
-                         search_text in item["catalogue"].lower() or
-                         search_text in item["id"].lower() or
-                         search_text in item["designations"].lower()))
-                ]
+                filtered_items = []
+                for item in self.dso_data:
+                    # Apply show_images_only filter
+                    if show_images_only and item["image_count"] == 0:
+                        continue
+
+                    # Apply search text filter
+                    if search_text:
+                        matched_designation = None
+
+                        # Check each designation for a match
+                        designations = item["designations"].split(", ")
+                        for designation in designations:
+                            if search_text in designation.lower():
+                                matched_designation = designation
+                                break
+
+                        # Check if any field matches
+                        if (search_text in item["catalogue"].lower() or
+                            search_text in item["id"].lower() or
+                            matched_designation):
+
+                            item_copy = item.copy()
+                            if matched_designation:
+                                item_copy["matched_designation"] = matched_designation
+                            filtered_items.append(item_copy)
+                    else:
+                        filtered_items.append(item)
+
+                self.filtered_data = filtered_items
                 logger.debug(f"Applied search/image filters: filtered data is now {len(self.filtered_data)} items from {len(self.dso_data)} loaded")
             else:
                 # No additional filters, so all loaded data is visible
