@@ -6667,7 +6667,7 @@ class MapLocationPickerDialog(QDialog):
     <meta charset="utf-8">
     <title>Location Picker</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qwebchannel@6.2.0/qwebchannel.min.js"></script>
     <style>
         body {{ margin: 0; padding: 0; }}
         #map {{ width: 100%; height: 100vh; }}
@@ -6882,6 +6882,7 @@ class MapLocationPickerDialog(QDialog):
             # Create web view
             self.web_view = QWebEngineView()
             self.web_view.setMinimumSize(800, 500)
+            self.web_view.setContextMenuPolicy(Qt.DefaultContextMenu)
 
             # Configure web settings
             settings = self.web_view.settings()
@@ -6889,7 +6890,15 @@ class MapLocationPickerDialog(QDialog):
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
 
-            # Set up QWebChannel for Qt-JavaScript bridge
+            # Enable developer tools for debugging
+            try:
+                settings.setAttribute(QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled, True)
+                self.web_view.page().settings().setAttribute(QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled, True)
+                logger.debug("Developer tools enabled for map picker")
+            except Exception as e:
+                logger.debug(f"Could not enable developer tools: {e}")
+
+            # Set up QWebChannel for Qt-JavaScript bridge BEFORE loading HTML
             self.bridge = MapBridge(self)
             self.channel = QWebChannel()
             self.channel.registerObject("qt_bridge", self.bridge)
@@ -6898,6 +6907,9 @@ class MapLocationPickerDialog(QDialog):
             # Generate and load HTML
             html = self._create_map_html(self.initial_lat, self.initial_lon)
             self.web_view.setHtml(html)
+
+            # Add load finished handler to check if everything loaded
+            self.web_view.loadFinished.connect(self._on_map_loaded)
 
             # Replace placeholder with web view
             if self.web_placeholder:
@@ -6923,8 +6935,51 @@ class MapLocationPickerDialog(QDialog):
                 "Please enter coordinates manually.")
             self.reject()
 
+    def _on_map_loaded(self, success):
+        """Called when the map page finishes loading"""
+        if success:
+            logger.debug("Map page loaded successfully")
+
+            # Test basic JavaScript execution
+            self.web_view.page().runJavaScript(
+                "1 + 1",
+                lambda result: logger.debug(f"JavaScript execution test (1+1): {result}")
+            )
+
+            # Check if QWebChannel is available
+            self.web_view.page().runJavaScript(
+                "typeof QWebChannel !== 'undefined'",
+                lambda result: logger.debug(f"QWebChannel available: {result}")
+            )
+
+            # Check if qt object is available
+            self.web_view.page().runJavaScript(
+                "typeof qt !== 'undefined'",
+                lambda result: logger.debug(f"qt object available: {result}")
+            )
+
+            # Check bridge status after a delay (give it time to initialize)
+            QTimer.singleShot(2000, self._check_bridge_status)
+        else:
+            logger.error("Map page failed to load")
+
+    def _check_bridge_status(self):
+        """Check if the JavaScript bridge is ready"""
+        def log_bridge_status(result):
+            logger.debug(f"Bridge ready status: {result}")
+            if not result:
+                logger.error("Bridge failed to initialize! Trying to manually trigger...")
+                # Try to manually test the bridge by calling selectLocation
+                self.web_view.page().runJavaScript(
+                    "if (qt_bridge && qt_bridge.selectLocation) { qt_bridge.selectLocation(40.7128, -74.0060, 'Test Location'); } else { console.log('Bridge not available'); }",
+                    lambda r: logger.debug(f"Manual bridge test result: {r}")
+                )
+
+        self.web_view.page().runJavaScript("bridgeReady", log_bridge_status)
+
     def _on_location_selected(self, lat, lon, location_name=""):
         """Called when user selects a location (from JavaScript bridge)"""
+        logger.debug(f"_on_location_selected called: lat={lat}, lon={lon}, name={location_name}")
         self.selected_lat = lat
         self.selected_lon = lon
         self.selected_location_name = location_name
