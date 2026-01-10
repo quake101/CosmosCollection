@@ -167,10 +167,7 @@ class VersionManager:
         """Get detailed version information for the About dialog"""
         version_info = self.get_version_info()
 
-        details = [f"Version: {version_info['local_version']}"]
-
-        if version_info['build_date']:
-            details.append(f"Build Date: {version_info['build_date']}")
+        details = [f"Local Version: {version_info['local_version']}"]
 
         if version_info['github_available']:
             if version_info['update_available']:

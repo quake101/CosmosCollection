@@ -6569,9 +6569,9 @@ class MapLocationPickerDialog(QDialog):
         self.initial_lat = initial_lat
         self.initial_lon = initial_lon
 
-        # Selected coordinates (None until user selects)
-        self.selected_lat = None
-        self.selected_lon = None
+        # Selected coordinates (initialize with initial values so user can accept without clicking)
+        self.selected_lat = initial_lat
+        self.selected_lon = initial_lon
         self.selected_location_name = ""
 
         # Web view and bridge
@@ -6581,6 +6581,11 @@ class MapLocationPickerDialog(QDialog):
         self.web_placeholder = None
 
         self._setup_ui()
+
+        # Update coordinates display with initial position
+        lat_str = f"{abs(initial_lat):.6f}°{'N' if initial_lat >= 0 else 'S'}"
+        lon_str = f"{abs(initial_lon):.6f}°{'W' if initial_lon < 0 else 'E'}"
+        self.coords_label.setText(f"Current position: {lat_str}, {lon_str}\nClick on the map to change location")
 
         # Defer web view creation to avoid initialization issues
         QTimer.singleShot(100, self._load_map)
@@ -6629,7 +6634,7 @@ class MapLocationPickerDialog(QDialog):
 
         self.select_button = QPushButton("Select Location")
         self.select_button.clicked.connect(self.accept)
-        self.select_button.setEnabled(False)  # Disabled until location selected
+        self.select_button.setEnabled(True)  # Enabled since we have initial coordinates
         self.select_button.setDefault(True)
 
         self.cancel_button = QPushButton("Cancel")
