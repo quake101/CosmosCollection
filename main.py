@@ -6523,19 +6523,30 @@ class SettingsDialog(QDialog):
                 # Use default coordinates if current values are invalid
                 pass
 
+            logger.debug(f"Opening map picker with initial coords: {current_lat}, {current_lon}")
+
             # Open dialog
             dialog = MapLocationPickerDialog(current_lat, current_lon, parent=self)
-            if dialog.exec() == QDialog.Accepted:
+            result_code = dialog.exec()
+            logger.debug(f"Map picker dialog closed with result: {result_code}")
+
+            if result_code == QDialog.Accepted:
                 result = dialog.get_selected_coordinates()
+                logger.debug(f"Got coordinates from dialog: {result}")
                 if result:
                     lat, lon, location_name = result
+                    logger.debug(f"Updating settings dialog with: lat={lat}, lon={lon}, name={location_name}")
                     self.latitude_input.setText(f"{lat:.6f}")
                     self.longitude_input.setText(f"{lon:.6f}")
                     if location_name:
                         self.location_name_input.setText(location_name)
+                else:
+                    logger.warning("Dialog accepted but no coordinates returned")
+            else:
+                logger.debug("Map picker dialog was cancelled")
 
         except Exception as e:
-            logger.error(f"Error opening map picker: {str(e)}")
+            logger.error(f"Error opening map picker: {str(e)}", exc_info=True)
             QMessageBox.warning(self, "Error",
                 f"Failed to open map picker: {str(e)}\n\n"
                 "Please enter coordinates manually.")
@@ -6552,6 +6563,7 @@ class MapBridge(QObject):
     @Slot(float, float, str)
     def selectLocation(self, lat, lon, location_name):
         """Called from JavaScript when user selects a location on the map"""
+        logger.debug(f"MapBridge.selectLocation called: lat={lat}, lon={lon}, name={location_name}")
         self.dialog._on_location_selected(lat, lon, location_name)
 
 
@@ -6686,11 +6698,13 @@ class MapLocationPickerDialog(QDialog):
         var map = null;
         var marker = null;
         var searchTimeout = null;
+        var bridgeReady = false;
 
         // Initialize QWebChannel for Qt-JavaScript communication
         new QWebChannel(qt.webChannelTransport, function(channel) {{
             qt_bridge = channel.objects.qt_bridge;
-            console.log("Qt bridge initialized");
+            bridgeReady = true;
+            console.log("Qt bridge initialized successfully");
         }});
 
         // Initialize Leaflet map
@@ -6749,6 +6763,25 @@ class MapLocationPickerDialog(QDialog):
 
             // Reverse geocode to get location name
             reverseGeocode(lat, lon);
+
+            // Also send coordinates immediately to Qt (in case reverse geocode fails)
+            sendToQt(lat, lon, "");
+        }}
+
+        function sendToQt(lat, lon, locationName) {{
+            if (bridgeReady && qt_bridge) {{
+                try {{
+                    qt_bridge.selectLocation(lat, lon, locationName);
+                    console.log("Sent to Qt: " + lat + ", " + lon);
+                }} catch(e) {{
+                    console.error("Error calling Qt bridge:", e);
+                }}
+            }} else {{
+                console.warn("Qt bridge not ready yet, retrying in 100ms...");
+                setTimeout(function() {{
+                    sendToQt(lat, lon, locationName);
+                }}, 100);
+            }}
         }}
 
         function reverseGeocode(lat, lon) {{
@@ -6766,20 +6799,14 @@ class MapLocationPickerDialog(QDialog):
                     'Selected: ' + lat.toFixed(6) + '°, ' + lon.toFixed(6) + '°<br>' +
                     '<small>' + locationName + '</small>';
 
-                // Send to Qt
-                if (qt_bridge) {{
-                    qt_bridge.selectLocation(lat, lon, locationName);
-                }}
+                // Send to Qt with location name
+                sendToQt(lat, lon, locationName);
             }})
             .catch(error => {{
                 console.error('Reverse geocoding failed:', error);
                 document.getElementById('infoBox').innerHTML =
                     'Selected: ' + lat.toFixed(6) + '°, ' + lon.toFixed(6) + '°';
-
-                // Send to Qt anyway
-                if (qt_bridge) {{
-                    qt_bridge.selectLocation(lat, lon, "");
-                }}
+                // Location will already be sent from onLocationSelected
             }});
         }}
 
@@ -6927,6 +6954,7 @@ class MapLocationPickerDialog(QDialog):
 
     def get_selected_coordinates(self):
         """Get the selected coordinates"""
+        logger.debug(f"get_selected_coordinates called: lat={self.selected_lat}, lon={self.selected_lon}, name={self.selected_location_name}")
         if self.selected_lat is not None and self.selected_lon is not None:
             return (self.selected_lat, self.selected_lon, self.selected_location_name)
         return None
