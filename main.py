@@ -6346,8 +6346,9 @@ class SettingsDialog(QDialog):
         # Standard dialog buttons
         self.save_button = QPushButton("Save")
         self.save_button.clicked.connect(self._save_settings)
-        self.save_button.setDefault(True)
-        
+        # Don't set as default to prevent accidental saves when map picker closes
+        # self.save_button.setDefault(True)
+
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.reject)
         
@@ -6488,15 +6489,32 @@ class SettingsDialog(QDialog):
                 
                 # Insert new settings
                 cursor.execute("""
-                    INSERT INTO usersettings (location_lat, location_lon, location_name, timezone) 
+                    INSERT INTO usersettings (location_lat, location_lon, location_name, timezone)
                     VALUES (?, ?, ?, ?)
                 """, (lat, lon, location_name, timezone))
                 conn.commit()
-                
-            QMessageBox.information(self, "Settings Saved", 
+
+                logger.debug(f"Settings saved to database: lat={lat}, lon={lon}, name={location_name}, timezone={timezone}")
+
+                # Read back the saved settings to verify they were saved correctly
+                cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                verify_row = cursor.fetchone()
+                if verify_row:
+                    saved_lat, saved_lon, saved_name, saved_tz = verify_row
+                    logger.debug(f"Verification - Read back from database: lat={saved_lat}, lon={saved_lon}, name={saved_name}, timezone={saved_tz}")
+
+                    # Check if saved values match what we tried to save
+                    if saved_lat == lat and saved_lon == lon:
+                        logger.debug("✓ Verification SUCCESS: Saved coordinates match!")
+                    else:
+                        logger.error(f"✗ Verification FAILED: Coordinates don't match! Expected lat={lat}, lon={lon} but got lat={saved_lat}, lon={saved_lon}")
+                else:
+                    logger.error("✗ Verification FAILED: Could not read back saved settings from database!")
+
+            QMessageBox.information(self, "Settings Saved",
                 "Your location and timezone settings have been saved successfully!\n\n"
                 "The new settings will be used for all visibility calculations.")
-            
+
             self.accept()
             
         except ValueError:
@@ -6523,33 +6541,25 @@ class SettingsDialog(QDialog):
                 # Use default coordinates if current values are invalid
                 pass
 
-            logger.debug(f"Opening map picker with initial coords: {current_lat}, {current_lon}")
-
-            # Open dialog
-            dialog = MapLocationPickerDialog(current_lat, current_lon, parent=self)
+            # Open dialog - parent=None to avoid event propagation issues between nested modal dialogs
+            dialog = MapLocationPickerDialog(current_lat, current_lon, parent=None)
             result_code = dialog.exec()
-            logger.debug(f"Map picker dialog closed with result: {result_code}")
 
             if result_code == QDialog.Accepted:
                 result = dialog.get_selected_coordinates()
-                logger.debug(f"Got coordinates from dialog: {result}")
                 if result:
                     lat, lon, location_name = result
-                    logger.debug(f"Updating settings dialog with: lat={lat}, lon={lon}, name={location_name}")
                     self.latitude_input.setText(f"{lat:.6f}")
                     self.longitude_input.setText(f"{lon:.6f}")
                     if location_name:
                         self.location_name_input.setText(location_name)
-                else:
-                    logger.warning("Dialog accepted but no coordinates returned")
-            else:
-                logger.debug("Map picker dialog was cancelled")
 
         except Exception as e:
             logger.error(f"Error opening map picker: {str(e)}", exc_info=True)
             QMessageBox.warning(self, "Error",
                 f"Failed to open map picker: {str(e)}\n\n"
                 "Please enter coordinates manually.")
+
 
 
 # --- Map Location Picker Dialog ---
@@ -6590,7 +6600,6 @@ class MapLocationPickerDialog(QDialog):
         self.web_view = None
         self.bridge = None
         self.channel = None
-        self.web_placeholder = None
 
         self._setup_ui()
 
@@ -6599,8 +6608,8 @@ class MapLocationPickerDialog(QDialog):
         lon_str = f"{abs(initial_lon):.6f}°{'W' if initial_lon < 0 else 'E'}"
         self.coords_label.setText(f"Current position: {lat_str}, {lon_str}\nClick on the map to change location")
 
-        # Defer web view creation to avoid initialization issues
-        QTimer.singleShot(100, self._load_map)
+        # Create web view immediately instead of deferring
+        self._load_map()
 
     def _setup_ui(self):
         """Set up the dialog UI"""
@@ -6620,12 +6629,12 @@ class MapLocationPickerDialog(QDialog):
         search_layout.addWidget(self.search_button)
         layout.addLayout(search_layout)
 
-        # Placeholder for map (will be replaced by web view)
-        self.web_placeholder = QLabel("Loading map...")
-        self.web_placeholder.setAlignment(Qt.AlignCenter)
-        self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: #888888; font-size: 14px; }")
-        self.web_placeholder.setMinimumSize(800, 500)
-        layout.addWidget(self.web_placeholder, 1)
+        # Placeholder for map (will be replaced by web view in _load_map)
+        self.map_container = QWidget()
+        self.map_container.setMinimumSize(800, 500)
+        self.map_layout = QVBoxLayout(self.map_container)
+        self.map_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.map_container, 1)
 
         # Coordinates display
         self.coords_label = QLabel("Click on the map to select a location")
@@ -6645,12 +6654,13 @@ class MapLocationPickerDialog(QDialog):
         button_layout.addStretch()
 
         self.select_button = QPushButton("Select Location")
-        self.select_button.clicked.connect(self.accept)
+        self.select_button.clicked.connect(self._on_select_clicked)
         self.select_button.setEnabled(True)  # Enabled since we have initial coordinates
-        self.select_button.setDefault(True)
+        # Don't set as default to prevent event propagation to parent dialog
+        # self.select_button.setDefault(True)
 
         self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.clicked.connect(self.reject)
+        self.cancel_button.clicked.connect(self._on_cancel_clicked)
 
         button_layout.addWidget(self.select_button)
         button_layout.addWidget(self.cancel_button)
@@ -6890,11 +6900,12 @@ class MapLocationPickerDialog(QDialog):
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
 
-            # Enable developer tools for debugging
+            # Enable developer tools for debugging (optional - don't fail if unavailable)
             try:
                 settings.setAttribute(QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled, True)
-                self.web_view.page().settings().setAttribute(QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled, True)
                 logger.debug("Developer tools enabled for map picker")
+            except AttributeError:
+                logger.debug("DeveloperExtrasEnabled not available in this Qt version")
             except Exception as e:
                 logger.debug(f"Could not enable developer tools: {e}")
 
@@ -6911,28 +6922,18 @@ class MapLocationPickerDialog(QDialog):
             # Add load finished handler to check if everything loaded
             self.web_view.loadFinished.connect(self._on_map_loaded)
 
-            # Replace placeholder with web view
-            if self.web_placeholder:
-                layout = self.layout()
-                for i in range(layout.count()):
-                    item = layout.itemAt(i)
-                    if item and item.widget() == self.web_placeholder:
-                        layout.removeWidget(self.web_placeholder)
-                        self.web_placeholder.hide()
-                        self.web_placeholder.deleteLater()
-                        self.web_placeholder = None
-
-                        layout.insertWidget(i, self.web_view, 1)
-                        self.web_view.show()
-                        break
+            # Add web view to map container
+            self.map_layout.addWidget(self.web_view)
 
             logger.debug("Map view created successfully")
+            logger.debug("_load_map() completed successfully - dialog should still be open")
 
         except Exception as e:
-            logger.error(f"Failed to create map view: {e}")
+            logger.error(f"Failed to create map view: {e}", exc_info=True)
             QMessageBox.critical(self, "Error",
                 f"Failed to load map picker: {str(e)}\n\n"
                 "Please enter coordinates manually.")
+            logger.debug("About to call self.reject() due to exception")
             self.reject()
 
     def _on_map_loaded(self, success):
@@ -7007,9 +7008,16 @@ class MapLocationPickerDialog(QDialog):
             # Execute JavaScript search function
             self.web_view.page().runJavaScript(f"searchLocation({repr(query)})")
 
+    def _on_select_clicked(self):
+        """Handle Select Location button click"""
+        self.accept()
+
+    def _on_cancel_clicked(self):
+        """Handle Cancel button click"""
+        self.reject()
+
     def get_selected_coordinates(self):
         """Get the selected coordinates"""
-        logger.debug(f"get_selected_coordinates called: lat={self.selected_lat}, lon={self.selected_lon}, name={self.selected_location_name}")
         if self.selected_lat is not None and self.selected_lon is not None:
             return (self.selected_lat, self.selected_lon, self.selected_location_name)
         return None
