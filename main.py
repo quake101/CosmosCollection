@@ -565,6 +565,104 @@ class VisibilityCalculationWorker(QObject):
             self.error.emit(f"Error calculating viewing season information:<br>{str(e)}")
 
 
+# --- Initial Startup Data Loader Thread ---
+class InitialDataLoadWorker(QThread):
+    """Worker thread for loading initial DSO data on startup without blocking UI"""
+    data_loaded = Signal(list, list, int)  # dso_data, catalogs, total_count
+    load_failed = Signal(str)  # error message
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    def run(self):
+        """Load initial data batch in background thread"""
+        try:
+            import sqlite3
+            from ResourceManager import ResourceManager
+
+            db_path = ResourceManager.get_database_path()
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # Get list of available catalogs
+            cursor.execute("""
+                SELECT DISTINCT catalogue
+                FROM cataloguenr
+                ORDER BY catalogue
+            """)
+            catalogs = [row[0] for row in cursor.fetchall()]
+
+            # Get total count for progress indication
+            cursor.execute("SELECT COUNT(DISTINCT d.id) FROM dsodetail d JOIN cataloguenr c ON d.id = c.dsodetailid")
+            total_count = cursor.fetchone()[0]
+            logger.debug(f"Total DSO count: {total_count}")
+
+            # Load initial batch of objects (first 2000 for faster startup)
+            cursor.execute("""
+                SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
+                       CAST(d.sizemin/60.0 AS REAL) as sizemin,
+                       CAST(d.sizemax/60.0 AS REAL) as sizemax,
+                       d.constellation, d.dsotype, d.dsoclass,
+                       GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ') as designations,
+                       ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+                       (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
+                FROM dsodetail d
+                JOIN cataloguenr c ON d.id = c.dsodetailid
+                LEFT JOIN userimages ui ON d.id = ui.dsodetailid
+                GROUP BY d.id
+                ORDER BY c.catalogue, CAST(c.designation AS INTEGER)
+                LIMIT 2000
+            """)
+
+            dso_data = []
+            for row in cursor.fetchall():
+                obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
+                    constellation, dso_type, dso_class, designations, image_path, integration_time, \
+                    equipment, date_taken, notes, image_count = row
+
+                # Get the primary designation
+                primary_designation = designations.split(',')[0]
+                catalogue, designation = primary_designation.split(' ', 1)
+
+                # Handle size values
+                size_min_arcmin = float(size_min) if size_min is not None else 0.0
+                size_max_arcmin = float(size_max) if size_max is not None else 0.0
+
+                dso_data.append({
+                    "id": designation,
+                    "ra_deg": ra,
+                    "dec_deg": dec,
+                    "catalogue": catalogue,
+                    "name": f"{catalogue} {designation}",
+                    "magnitude": magnitude,
+                    "surface_brightness": surface_brightness,
+                    "size_min": size_min_arcmin,
+                    "size_max": size_max_arcmin,
+                    "constellation": constellation,
+                    "dso_type": dso_type,
+                    "dso_class": dso_class,
+                    "designations": designations,
+                    "image_path": image_path,
+                    "integration_time": integration_time,
+                    "equipment": equipment,
+                    "date_taken": date_taken,
+                    "notes": notes,
+                    "image_count": image_count
+                })
+
+            logger.debug(f"Loaded initial batch: {len(dso_data)} of {total_count} DSOs in background thread")
+
+            conn.close()
+
+            # Emit the loaded data
+            self.data_loaded.emit(dso_data, catalogs, total_count)
+
+        except Exception as e:
+            logger.error(f"Error loading initial data in background: {e}", exc_info=True)
+            self.load_failed.emit(str(e))
+
+
 # --- Lazy Loading Worker Thread ---
 class DataLoadWorker(QThread):
     """Worker thread for loading additional DSO data in background"""
@@ -752,6 +850,84 @@ class DataLoadWorker(QThread):
                 pass
 
 
+# --- Parallel Loading Manager ---
+class ParallelDataLoadManager(QObject):
+    """Manages multiple DataLoadWorker threads for parallel data loading"""
+    all_data_loaded = Signal(list)  # Signal with all combined data
+    progress_updated = Signal(int, int)  # loaded count, total count
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.workers = []
+        self.results = {}  # Dictionary to store results by offset
+        self.expected_batches = 0
+        self.completed_batches = 0
+        self.total_records = 0
+
+    def load_batches_parallel(self, start_offset, total_to_load, batch_size, max_threads, catalog_filter=None, type_filter=None):
+        """Load multiple batches in parallel using worker threads"""
+        # Calculate how many batches we need
+        num_batches = (total_to_load + batch_size - 1) // batch_size  # Ceiling division
+        num_batches = min(num_batches, max_threads)  # Don't create more threads than needed
+
+        self.expected_batches = num_batches
+        self.completed_batches = 0
+        self.results = {}
+        self.workers = []
+        self.total_records = 0
+
+        logger.debug(f"Starting parallel load: {num_batches} batches, {max_threads} max threads, offset={start_offset}, total_to_load={total_to_load}")
+
+        # Create and start worker threads for each batch
+        for i in range(num_batches):
+            offset = start_offset + (i * batch_size)
+            # Last batch might be smaller
+            limit = min(batch_size, total_to_load - (i * batch_size))
+
+            if limit <= 0:
+                break
+
+            worker = DataLoadWorker(offset, limit, catalog_filter, type_filter)
+            worker.data_loaded.connect(lambda data, offset=offset: self._on_batch_loaded(data, offset))
+            self.workers.append(worker)
+            worker.start()
+
+    def _on_batch_loaded(self, data, offset):
+        """Handle a batch being loaded"""
+        self.results[offset] = data
+        self.completed_batches += 1
+        self.total_records += len(data)
+
+        logger.debug(f"Batch loaded: offset={offset}, records={len(data)}, completed={self.completed_batches}/{self.expected_batches}")
+
+        # Emit progress
+        self.progress_updated.emit(self.total_records, self.expected_batches)
+
+        # Check if all batches are complete
+        if self.completed_batches >= self.expected_batches:
+            self._combine_and_emit_results()
+
+    def _combine_and_emit_results(self):
+        """Combine all batch results in order and emit"""
+        # Sort by offset to maintain correct order
+        sorted_offsets = sorted(self.results.keys())
+        combined_data = []
+
+        for offset in sorted_offsets:
+            combined_data.extend(self.results[offset])
+
+        logger.debug(f"All batches loaded: {len(combined_data)} total records from {self.expected_batches} batches")
+        self.all_data_loaded.emit(combined_data)
+
+        # Clean up workers
+        for worker in self.workers:
+            if worker.isRunning():
+                worker.quit()
+                worker.wait()
+        self.workers = []
+        self.results = {}
+
+
 # --- Model for displaying DSO data in table ---
 class DSOTableModel(QAbstractTableModel):
     def __init__(self, dso_data, parent=None, db_manager=None, total_count=None):
@@ -771,6 +947,12 @@ class DSOTableModel(QAbstractTableModel):
         self.load_worker = None
         self.load_batch_size = 2000
         self.startup_mode = True  # Prevent sort-triggered loading during startup
+
+        # Parallel loading support
+        self.parallel_loader = ParallelDataLoadManager(self)
+        self.parallel_loader.all_data_loaded.connect(self._on_parallel_data_loaded)
+        self.max_threads = self._get_max_threads()
+        logger.debug(f"DSOTableModel initialized with max_threads={self.max_threads}")
 
     def rowCount(self, index=QModelIndex()):
         return len(self.filtered_data)
@@ -1198,8 +1380,19 @@ class DSOTableModel(QAbstractTableModel):
             # Reduced debug logging for non-trigger cases
             pass
 
+    def _get_max_threads(self):
+        """Get max_threads setting from QSettings"""
+        try:
+            settings = QSettings("AstroAssist", "CosmosCollection")
+            default_threads = max(1, (os.cpu_count() or 4) - 2)
+            max_threads = settings.value("max_threads", default_threads, type=int)
+            return max(1, min(max_threads, 128))  # Ensure reasonable bounds
+        except Exception as e:
+            logger.error(f"Error reading max_threads setting: {e}")
+            return max(1, (os.cpu_count() or 4) - 2)
+
     def load_more_data(self):
-        """Load the next batch of data in background"""
+        """Load the next batches of data in parallel background threads"""
         if self.loading or self.load_offset >= self.total_count:
             logger.debug(f"Load blocked: loading={self.loading}, offset={self.load_offset}, total={self.total_count}")
             return
@@ -1208,16 +1401,28 @@ class DSOTableModel(QAbstractTableModel):
         catalog_filter = self.selected_catalog if self.selected_catalog else None
         type_filter = getattr(self, '_current_selected_type', None)
 
-        logger.debug(f"Loading more data from offset {self.load_offset}, batch size {self.load_batch_size}, catalog={catalog_filter}, type={type_filter}")
+        # Calculate how much data remains to load
+        remaining = self.total_count - self.load_offset
+
+        # Load up to max_threads * batch_size in this batch (parallel loading)
+        total_to_load = min(remaining, self.max_threads * self.load_batch_size)
+
+        logger.debug(f"Starting parallel load from offset {self.load_offset}, loading {total_to_load} records using {self.max_threads} threads, catalog={catalog_filter}, type={type_filter}")
         self.loading = True
 
         # Emit signal to update UI loading state
         if hasattr(self.parent(), '_on_loading_started'):
             self.parent()._on_loading_started()
 
-        self.load_worker = DataLoadWorker(self.load_offset, self.load_batch_size, catalog_filter, type_filter)
-        self.load_worker.data_loaded.connect(self._on_data_loaded)
-        self.load_worker.start()
+        # Use parallel loader
+        self.parallel_loader.load_batches_parallel(
+            self.load_offset,
+            total_to_load,
+            self.load_batch_size,
+            self.max_threads,
+            catalog_filter,
+            type_filter
+        )
 
     def _on_data_loaded(self, new_data):
         """Handle new data batch loaded from background thread"""
@@ -1286,6 +1491,80 @@ class DSOTableModel(QAbstractTableModel):
 
             self.load_offset += len(new_data)
             logger.debug(f"Added {len(new_data)} DSOs, total now: {len(self.dso_data)}")
+
+        self.loading = False
+
+        # Emit signal to update UI loading state
+        if hasattr(self.parent(), '_on_loading_finished'):
+            self.parent()._on_loading_finished()
+
+    def _on_parallel_data_loaded(self, new_data):
+        """Handle parallel data batches loaded from background threads"""
+        if new_data:
+            # Add new data to existing data
+            self.beginInsertRows(QModelIndex(), len(self.dso_data), len(self.dso_data) + len(new_data) - 1)
+            self.dso_data.extend(new_data)
+            self.endInsertRows()
+
+            # Re-apply current filters to include new data
+            # Catalog and type filters are already applied at SQL level, so we only need to filter by:
+            # - search text
+            # - show_images_only
+            old_filtered_len = len(self.filtered_data)
+
+            search_text = getattr(self, '_current_search', '').lower() if hasattr(self, '_current_search') else ""
+            show_images_only = getattr(self, '_current_show_images_only', False)
+
+            # Notify view that data is about to change
+            self.layoutAboutToBeChanged.emit()
+
+            # Rebuild filtered data from all loaded data
+            if search_text or show_images_only:
+                filtered_items = []
+                for item in self.dso_data:
+                    # Apply show_images_only filter
+                    if show_images_only and item["image_count"] == 0:
+                        continue
+
+                    # Apply search text filter
+                    if search_text:
+                        matched_designation = None
+
+                        # Check each designation for a match
+                        designations = item["designations"].split(", ")
+                        for designation in designations:
+                            if search_text in designation.lower():
+                                matched_designation = designation
+                                break
+
+                        # Check if any field matches
+                        if (search_text in item["catalogue"].lower() or
+                            search_text in item["id"].lower() or
+                            matched_designation):
+
+                            item_copy = item.copy()
+                            if matched_designation:
+                                item_copy["matched_designation"] = matched_designation
+                            filtered_items.append(item_copy)
+                    else:
+                        filtered_items.append(item)
+
+                self.filtered_data = filtered_items
+                logger.debug(f"Applied search/image filters: filtered data is now {len(self.filtered_data)} items from {len(self.dso_data)} loaded")
+            else:
+                # No additional filters, so all loaded data is visible
+                self.filtered_data = self.dso_data.copy()
+                logger.debug(f"No additional filters: showing all {len(self.filtered_data)} loaded items")
+
+            new_filtered_len = len(self.filtered_data)
+            new_matches = new_filtered_len - old_filtered_len
+            logger.debug(f"After filtering: filtered data grew from {old_filtered_len} to {new_filtered_len} (+{new_matches} new matches from {len(new_data)} loaded)")
+
+            # Notify view that layout has changed
+            self.layoutChanged.emit()
+
+            self.load_offset += len(new_data)
+            logger.debug(f"Added {len(new_data)} DSOs from parallel loading, total now: {len(self.dso_data)}")
 
         self.loading = False
 
@@ -9262,97 +9541,49 @@ if __name__ == "__main__":
 
     # Initialize database manager and get data
     db_manager = DatabaseManager()
-    try:
-        with db_manager.get_connection() as conn:
-            cursor = conn.cursor()
 
-            # Check if the catalogs directory exists, create if needed
-            catalogs_dir = os.path.join(APP_DIR, 'catalogs')
-            if not os.path.exists(catalogs_dir):
-                os.makedirs(catalogs_dir)
+    # Global reference to hold the initial data loader
+    initial_loader = None
+    window = None
 
-            # Get major catalogs (with at least 50 objects to filter out minor catalogs)
-            cursor.execute("""
-                SELECT catalogue, COUNT(DISTINCT dsodetailid) as count
-                FROM cataloguenr
-                GROUP BY catalogue
-                HAVING count >= 50
-                ORDER BY catalogue
-            """)
-            catalogs = [row[0] for row in cursor.fetchall()]
+    def on_initial_data_loaded(dso_data, catalogs, total_count):
+        """Handle initial data loaded from background thread"""
+        global window
+        try:
+            logger.debug(f"Initial data loaded in background: {len(dso_data)} DSOs")
 
-            # Get total count for progress indication
-            cursor.execute("SELECT COUNT(DISTINCT d.id) FROM dsodetail d JOIN cataloguenr c ON d.id = c.dsodetailid")
-            total_count = cursor.fetchone()[0]
-            logger.debug(f"Total DSO count: {total_count}")
+            # Create and show the main window with loaded data
+            window = MainWindow(dso_data, catalogs, total_count)
+            window.show()
 
-            # Load initial batch of objects (first 2000 for faster startup)
-            cursor.execute("""
-                SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
-                       CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                       CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                       d.constellation, d.dsotype, d.dsoclass,
-                       GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ') as designations,
-                       ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
-                       (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-                FROM dsodetail d
-                JOIN cataloguenr c ON d.id = c.dsodetailid
-                LEFT JOIN userimages ui ON d.id = ui.dsodetailid
-                GROUP BY d.id
-                ORDER BY c.catalogue, CAST(c.designation AS INTEGER)
-                LIMIT 2000
-            """)
+            # Check if location is configured after window is shown
+            QTimer.singleShot(500, window._check_location_on_startup)
 
-            dso_data = []
-            for row in cursor.fetchall():
-                # Process each row and add to data
-                obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
-                    constellation, dso_type, dso_class, designations, image_path, integration_time, \
-                    equipment, date_taken, notes, image_count = row
-
-                # Get the primary designation
-                primary_designation = designations.split(',')[0]
-                catalogue, designation = primary_designation.split(' ', 1)
-
-                # Handle size values
-                size_min_arcmin = float(size_min) if size_min is not None else 0.0
-                size_max_arcmin = float(size_max) if size_max is not None else 0.0
-
-                dso_data.append({
-                    "id": designation,
-                    "ra_deg": ra,
-                    "dec_deg": dec,
-                    "catalogue": catalogue,
-                    "name": f"{catalogue} {designation}",
-                    "magnitude": magnitude,
-                    "surface_brightness": surface_brightness,
-                    "size_min": size_min_arcmin,
-                    "size_max": size_max_arcmin,
-                    "constellation": constellation,
-                    "dso_type": dso_type,
-                    "dso_class": dso_class,
-                    "designations": designations,
-                    "image_path": image_path,
-                    "integration_time": integration_time,
-                    "equipment": equipment,
-                    "date_taken": date_taken,
-                    "notes": notes,
-                    "image_count": image_count
-                })
-
-            logger.debug(f"Loaded initial batch: {len(dso_data)} of {total_count} DSOs")
-
-        if not dso_data:
+        except Exception as e:
+            logger.error(f"Error creating main window: {e}", exc_info=True)
             from PySide6.QtWidgets import QMessageBox
-
-            QMessageBox.critical(None, "Error", "Failed to load DSO data from database")
+            QMessageBox.critical(None, "Error", f"Failed to initialize application: {str(e)}")
             sys.exit(1)
 
-        window = MainWindow(dso_data, catalogs, total_count)
-        window.show()
+    def on_initial_load_failed(error_msg):
+        """Handle initial data load failure"""
+        from PySide6.QtWidgets import QMessageBox
+        logger.error(f"Failed to load initial data: {error_msg}")
+        QMessageBox.critical(None, "Error", f"Failed to load DSO data from database:\n{error_msg}")
+        sys.exit(1)
 
-        # Check if location is configured after window is shown
-        QTimer.singleShot(500, window._check_location_on_startup)
+    try:
+        # Check if catalogs directory exists, create if needed
+        catalogs_dir = os.path.join(APP_DIR, 'catalogs')
+        if not os.path.exists(catalogs_dir):
+            os.makedirs(catalogs_dir)
+
+        # Start background thread to load initial data
+        logger.debug("Starting background thread to load initial DSO data")
+        initial_loader = InitialDataLoadWorker()
+        initial_loader.data_loaded.connect(on_initial_data_loaded)
+        initial_loader.load_failed.connect(on_initial_load_failed)
+        initial_loader.start()
 
         sys.exit(app.exec())
 
