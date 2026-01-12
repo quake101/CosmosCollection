@@ -493,10 +493,13 @@ class DSOCalculationThread(QThread):
             
             visible_dsos = []
             total_dsos = len(dso_catalog)
-            
-            # Determine number of threads (use CPU count but limit to reasonable maximum)
+
+            # Determine number of threads from user settings
+            from PySide6.QtCore import QSettings
             import os
-            max_workers = min(os.cpu_count() or 4, 8)  # Use CPU count, max 8 threads
+            settings = QSettings("CosmosCollection", "CosmosCollection")
+            default_threads = max(1, (os.cpu_count() or 4) - 2)
+            max_workers = settings.value("max_threads", default_threads, type=int)
             
             # Split DSOs into batches for parallel processing
             batch_size = max(1, len(dso_catalog) // max_workers)
@@ -834,6 +837,19 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
     def load_location_info(self):
         """Load and display location information"""
+        # Check if observer location should be shown
+        from PySide6.QtCore import QSettings
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        show_location = settings.value("show_observer_location", True, type=bool)
+
+        # Hide the location group if setting is disabled
+        if not show_location:
+            self.location_group.setVisible(False)
+            return
+
+        # Make sure it's visible if setting is enabled
+        self.location_group.setVisible(True)
+
         try:
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:

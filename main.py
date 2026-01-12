@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
     QVBoxLayout, QWidget, QLabel, QDialog,
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
-    QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout
+    QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout, QSpinBox
 )
 
 # Local imports (always needed)
@@ -3970,17 +3970,25 @@ class ObjectDetailWindow(QDialog):
 
     def _defer_heavy_calculations(self):
         """Perform heavy calculations after window is shown"""
-        # Load user location and update visibility calculations
-        self._load_user_location()
-        lat_val = self.location_lat_edit.text().strip()
-        lon_val = self.location_lon_edit.text().strip()
-        if lat_val and lon_val:
+        # Check user preference for showing observer location
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        show_location = settings.value("show_observer_location", True, type=bool)
+
+        if not show_location:
+            # Hide location groupbox if user preference is disabled
             self.location_groupbox.setVisible(False)
-            # Defer the season calculation to avoid blocking
-            QTimer.singleShot(500, self._set_season_label_from_location)
         else:
-            self.location_groupbox.setVisible(True)
-            self.season_label.setText("Enter your location above and press Save to see viewing season/dates.")
+            # Load user location and update visibility calculations
+            self._load_user_location()
+            lat_val = self.location_lat_edit.text().strip()
+            lon_val = self.location_lon_edit.text().strip()
+            if lat_val and lon_val:
+                self.location_groupbox.setVisible(False)
+                # Defer the season calculation to avoid blocking
+                QTimer.singleShot(500, self._set_season_label_from_location)
+            else:
+                self.location_groupbox.setVisible(True)
+                self.season_label.setText("Enter your location above and press Save to see viewing season/dates.")
         
         # Load user images after window is shown and other calculations are done
         # Note: _load_user_images() will call _load_current_image_info() to populate the form
@@ -4589,8 +4597,14 @@ class ObjectDetailWindow(QDialog):
                 self.info_form_container.setVisible(False)
 
                 # Set default visibility for location groupbox - will be updated in deferred calculations
-                self.location_groupbox.setVisible(True)
-                self.season_label.setText("Loading location information...")
+                # Check user preference for showing observer location
+                settings = QSettings("CosmosCollection", "CosmosCollection")
+                show_location = settings.value("show_observer_location", True, type=bool)
+                if show_location:
+                    self.location_groupbox.setVisible(True)
+                    self.season_label.setText("Loading location information...")
+                else:
+                    self.location_groupbox.setVisible(False)
 
                 # Ensure the window is properly sized before showing
                 self.adjustSize()
@@ -4720,6 +4734,8 @@ class ObjectDetailWindow(QDialog):
                 cursor = conn.cursor()
                 cursor.execute("INSERT INTO usersettings (location_lat, location_lon) VALUES (?, ?)", (lat, lon))
                 conn.commit()
+            # Hide location groupbox after successful save (location is now configured)
+            # This respects the existing behavior of hiding the input fields once location is set
             self.location_groupbox.setVisible(False)
             self._set_season_label_from_location()
         except Exception as e:
@@ -6330,7 +6346,61 @@ class SettingsDialog(QDialog):
         
         location_layout.addStretch()
         tab_widget.addTab(location_tab, "Location && Time Zone")
-        
+
+        # Application Settings tab
+        app_settings_tab = QWidget()
+        app_settings_layout = QVBoxLayout(app_settings_tab)
+
+        # UI Preferences group
+        ui_prefs_group = QGroupBox("User Interface Preferences")
+        ui_prefs_layout = QVBoxLayout(ui_prefs_group)
+
+        # Show Observer Location checkbox
+        self.show_observer_location_checkbox = QCheckBox("Show Observer Location")
+        self.show_observer_location_checkbox.setToolTip(
+            "When enabled, displays your observer location information in various windows\n"
+            "(Best DSO Tonight, DSO Visibility Calculator, and Main Window)"
+        )
+        ui_prefs_layout.addWidget(self.show_observer_location_checkbox)
+
+        # Check for updates on startup checkbox
+        self.check_updates_checkbox = QCheckBox("Check for updates on startup")
+        self.check_updates_checkbox.setToolTip(
+            "When enabled, automatically checks for application updates when the program starts"
+        )
+        ui_prefs_layout.addWidget(self.check_updates_checkbox)
+
+        app_settings_layout.addWidget(ui_prefs_group)
+
+        # Performance Settings group
+        perf_settings_group = QGroupBox("Performance Settings")
+        perf_settings_layout = QVBoxLayout(perf_settings_group)
+
+        # Thread count setting
+        thread_layout = QHBoxLayout()
+        thread_label = QLabel("Maximum Threads:")
+        thread_label.setMinimumWidth(120)
+        self.thread_count_spinbox = QSpinBox()
+        self.thread_count_spinbox.setMinimum(1)
+        self.thread_count_spinbox.setMaximum(128)
+        import os
+        default_threads = max(1, (os.cpu_count() or 4) - 2)
+        self.thread_count_spinbox.setValue(default_threads)
+        self.thread_count_spinbox.setToolTip(
+            f"Number of threads to use for parallel operations.\n"
+            f"Default: {default_threads} (CPU cores - 2)\n"
+            f"Higher values may improve performance but increase CPU usage."
+        )
+        thread_layout.addWidget(thread_label)
+        thread_layout.addWidget(self.thread_count_spinbox)
+        thread_layout.addStretch()
+        perf_settings_layout.addLayout(thread_layout)
+
+        app_settings_layout.addWidget(perf_settings_group)
+        app_settings_layout.addStretch()
+
+        tab_widget.addTab(app_settings_tab, "Application Settings")
+
         layout.addWidget(tab_widget)
         
         # Buttons
@@ -6393,7 +6463,21 @@ class SettingsDialog(QDialog):
                 except Exception:
                     # Columns don't exist yet, that's ok
                     pass
-                    
+
+            # Load UI preferences from QSettings
+            settings = QSettings("CosmosCollection", "CosmosCollection")
+            show_observer_location = settings.value("show_observer_location", True, type=bool)
+            self.show_observer_location_checkbox.setChecked(show_observer_location)
+
+            check_updates = settings.value("check_updates_on_startup", True, type=bool)
+            self.check_updates_checkbox.setChecked(check_updates)
+
+            # Load thread count setting
+            import os
+            default_threads = max(1, (os.cpu_count() or 4) - 2)
+            thread_count = settings.value("max_threads", default_threads, type=int)
+            self.thread_count_spinbox.setValue(thread_count)
+
         except Exception as e:
             logger.error(f"Error loading settings: {str(e)}")
             
@@ -6511,9 +6595,11 @@ class SettingsDialog(QDialog):
                 else:
                     logger.error("✗ Verification FAILED: Could not read back saved settings from database!")
 
-            QMessageBox.information(self, "Settings Saved",
-                "Your location and timezone settings have been saved successfully!\n\n"
-                "The new settings will be used for all visibility calculations.")
+            # Save UI preferences to QSettings
+            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings.setValue("show_observer_location", self.show_observer_location_checkbox.isChecked())
+            settings.setValue("check_updates_on_startup", self.check_updates_checkbox.isChecked())
+            settings.setValue("max_threads", self.thread_count_spinbox.value())
 
             self.accept()
             
@@ -7765,6 +7851,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         # Start background loading of all objects after a short delay
         QTimer.singleShot(1500, self._start_background_loading)
 
+        # Check for updates on startup if enabled
+        QTimer.singleShot(2000, self._check_updates_on_startup)
+
         logger.debug("MainWindow initialization complete")
 
     def _create_toolbar(self):
@@ -8350,6 +8439,49 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 self.model.load_more_data()
             else:
                 logger.info(f"All {self.model.total_count} objects already loaded")
+
+    def _check_updates_on_startup(self):
+        """Silently check for updates on startup if enabled in settings"""
+        try:
+            # Check if the setting is enabled
+            settings = QSettings("CosmosCollection", "CosmosCollection")
+            check_updates = settings.value("check_updates_on_startup", True, type=bool)
+
+            if not check_updates:
+                logger.debug("Update check on startup is disabled")
+                return
+
+            logger.debug("Checking for updates on startup")
+
+            from version import version_manager
+            from PySide6.QtWidgets import QMessageBox
+            import webbrowser
+
+            # Get version info
+            version_info = version_manager.get_version_info()
+
+            # Only show message if update is available
+            if version_info.get('github_available') and version_info.get('update_available'):
+                logger.info(f"Update available: {version_info.get('github_version')}")
+                msg = QMessageBox()
+                msg.setWindowTitle("Update Available")
+                msg.setText(f"A new version is available!")
+                msg.setInformativeText(
+                    f"Current version: {version_info['local_version']}\n"
+                    f"Latest version: {version_info['github_version']}\n\n"
+                    f"Would you like to visit the download page?"
+                )
+                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                msg.setDefaultButton(QMessageBox.Yes)
+
+                if msg.exec() == QMessageBox.Yes and version_info.get('github_url'):
+                    webbrowser.open(version_info['github_url'])
+            else:
+                logger.debug("No updates available or unable to check")
+
+        except Exception as e:
+            # Silently fail - don't bother user on startup with error messages
+            logger.error(f"Error checking for updates on startup: {str(e)}")
 
     def _save_simbad_object_to_database(self, object_data):
         """Save SIMBAD object data to the database"""

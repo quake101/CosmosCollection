@@ -597,9 +597,12 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Thumbnail cache and thread pool
         self.thumbnail_cache = ThumbnailCache(max_size=200)
         self.thread_pool = QThreadPool.globalInstance()
-        # Use all available cores minus 2 to keep system responsive
+        # Get thread count from user settings
+        from PySide6.QtCore import QSettings
+        settings = QSettings("CosmosCollection", "CosmosCollection")
         cpu_count = os.cpu_count() or 4
-        thread_count = max(2, cpu_count - 2)  # Minimum of 2 threads, max of (cores - 2)
+        default_threads = max(1, cpu_count - 2)
+        thread_count = settings.value("max_threads", default_threads, type=int)
         self.thread_pool.setMaxThreadCount(thread_count)
         self.thumbnail_signals = ThumbnailSignals()
         self.cancelled_flag = [False]  # Mutable flag for cancellation

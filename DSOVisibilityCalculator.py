@@ -1336,6 +1336,19 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
 
     def _load_location_from_database(self):
         """Load observer location from the database"""
+        # Check if observer location should be shown
+        from PySide6.QtCore import QSettings
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        show_location = settings.value("show_observer_location", True, type=bool)
+
+        # Hide the location group if setting is disabled
+        if not show_location:
+            self.location_group.setVisible(False)
+            return
+
+        # Make sure it's visible if setting is enabled
+        self.location_group.setVisible(True)
+
         try:
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
