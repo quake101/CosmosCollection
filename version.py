@@ -7,15 +7,102 @@ Handles version information from local fallback and GitHub releases
 import requests
 import json
 import logging
+import subprocess
+import sys
+import os
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
-# Local fallback version - update this manually or via build process
-__version__ = "1.0.10"
-__build_date__ = "2025-09-22"
+# Local fallback version - updated automatically during GitHub Actions build
+_FALLBACK_VERSION = "1.0.10"
+_FALLBACK_BUILD_DATE = "2025-09-22"
+
+
+def _get_git_version() -> Optional[str]:
+    """
+    Try to get version from git tags when running from source.
+    Returns None if not in a git repository or git is not available.
+    """
+    try:
+        # Only works when running from source with .git directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Check if .git directory exists
+        if not os.path.exists(os.path.join(script_dir, '.git')):
+            return None
+
+        result = subprocess.run(
+            ['git', 'describe', '--tags', '--always', '--abbrev=0'],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            cwd=script_dir
+        )
+
+        if result.returncode == 0:
+            version = result.stdout.strip().lstrip('v')
+            if version:
+                logger.debug(f"Detected git version: {version}")
+                return version
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+        logger.debug(f"Could not get git version: {e}")
+
+    return None
+
+
+def _get_git_commit_date() -> Optional[str]:
+    """
+    Try to get the date of the latest commit when running from source.
+    Returns None if not in a git repository or git is not available.
+    """
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        if not os.path.exists(os.path.join(script_dir, '.git')):
+            return None
+
+        result = subprocess.run(
+            ['git', 'log', '-1', '--format=%ci'],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            cwd=script_dir
+        )
+
+        if result.returncode == 0:
+            # Parse date from git format (YYYY-MM-DD HH:MM:SS +0000)
+            date_str = result.stdout.strip().split()[0]
+            if date_str:
+                logger.debug(f"Detected git commit date: {date_str}")
+                return date_str
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+        logger.debug(f"Could not get git commit date: {e}")
+
+    return None
+
+
+def _is_packaged_build() -> bool:
+    """Check if running as a packaged/frozen build (e.g., PyInstaller)"""
+    return getattr(sys, 'frozen', False)
+
+
+# Determine version and build date
+# For packaged builds: use fallback (set by CI during build)
+# For source builds: try to use git, fallback to hardcoded if git unavailable
+if _is_packaged_build():
+    __version__ = _FALLBACK_VERSION
+    __build_date__ = _FALLBACK_BUILD_DATE
+    logger.debug("Using packaged build version")
+else:
+    __version__ = _get_git_version() or _FALLBACK_VERSION
+    __build_date__ = _get_git_commit_date() or _FALLBACK_BUILD_DATE
+    if __version__ != _FALLBACK_VERSION:
+        logger.debug(f"Using git-detected version: {__version__}")
+    else:
+        logger.debug("Using fallback version (git not available)")
 
 class VersionManager:
     """Manages version information for the application"""

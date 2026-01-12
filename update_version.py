@@ -18,9 +18,9 @@ def update_version(tag):
         with open('version.py', 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # Update version and build date
-        content = re.sub(r'__version__ = "[^"]*"', f'__version__ = "{clean_tag}"', content)
-        content = re.sub(r'__build_date__ = "[^"]*"', f'__build_date__ = "{datetime.now().strftime("%Y-%m-%d")}"', content)
+        # Update fallback version and build date (used for packaged builds)
+        content = re.sub(r'_FALLBACK_VERSION = "[^"]*"', f'_FALLBACK_VERSION = "{clean_tag}"', content)
+        content = re.sub(r'_FALLBACK_BUILD_DATE = "[^"]*"', f'_FALLBACK_BUILD_DATE = "{datetime.now().strftime("%Y-%m-%d")}"', content)
 
         # Write back
         with open('version.py', 'w', encoding='utf-8') as f:
