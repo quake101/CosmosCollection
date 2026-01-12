@@ -2248,20 +2248,20 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             event.accept()  # Always accept to prevent hanging
 
     def _load_telescopes(self):
-        """Load user telescopes from database"""
+        """Load active user telescopes from database"""
         try:
             with DatabaseManager().get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT id, name, aperture, focal_length, is_active 
-                    FROM usertelescopes 
-                    WHERE focal_length IS NOT NULL AND focal_length > 0
-                    ORDER BY is_active DESC, name ASC
+                    SELECT id, name, aperture, focal_length, is_active
+                    FROM usertelescopes
+                    WHERE focal_length IS NOT NULL AND focal_length > 0 AND is_active = 1
+                    ORDER BY name ASC
                 """)
-                
+
                 telescopes = cursor.fetchall()
                 self.telescopes = []
-                
+
                 for telescope_id, name, aperture, focal_length, is_active in telescopes:
                     telescope_data = {
                         'id': telescope_id,
@@ -2271,15 +2271,13 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                         'is_active': is_active
                     }
                     self.telescopes.append(telescope_data)
-                    
+
                     # Add to combo box
                     display_name = f"{name} ({focal_length}mm f/{focal_length/aperture:.1f})" if aperture else f"{name} ({focal_length}mm)"
-                    if is_active:
-                        display_name += " *"
                     self.telescope_combo.addItem(display_name, telescope_data)
-                
-                logger.debug(f"Loaded {len(telescopes)} telescopes with focal length data")
-                
+
+                logger.debug(f"Loaded {len(telescopes)} active telescopes with focal length data")
+
         except Exception as e:
             logger.error(f"Error loading telescopes: {str(e)}")
 
@@ -5637,6 +5635,12 @@ class ObjectDetailWindow(QDialog):
                 # Extract the number and format as "Messier_XX"
                 number = re.search(r'\d+', dso_name).group()
                 wiki_name = f'Messier_{number}'
+            # Convert Sh2 catalog names to "Sh_2-" format (e.g., "Sh2 129" -> "Sh_2-129")
+            elif re.match(r'^Sh2[\s\-]*(\d+)$', dso_name, re.IGNORECASE):
+                # Extract the number AFTER "Sh2" and format as "Sh_2-XX"
+                match = re.match(r'^Sh2[\s\-]*(\d+)$', dso_name, re.IGNORECASE)
+                number = match.group(1)
+                wiki_name = f'Sh_2-{number}'
             else:
                 # For other catalogs, replace spaces with underscores
                 wiki_name = dso_name.replace(' ', '_')
@@ -7538,7 +7542,8 @@ class TelescopeDialog(QDialog):
         self.delete_button.setEnabled(False)
         list_button_layout.addWidget(self.delete_button)
         
-        self.set_active_button = QPushButton("Set as Active")
+        self.set_active_button = QPushButton("Enable")
+        self.set_active_button.setToolTip("Enable/disable telescope in FOV Simulator")
         self.set_active_button.clicked.connect(self._set_active_telescope)
         self.set_active_button.setEnabled(False)
         list_button_layout.addWidget(self.set_active_button)
@@ -7652,7 +7657,7 @@ class TelescopeDialog(QDialog):
         # Bottom buttons
         bottom_layout = QHBoxLayout()
         
-        help_text = QLabel("Tip: Set one telescope as 'Active' to use it as the default for calculations.")
+        help_text = QLabel("Tip: Enable telescopes to make them available in the Aladin Lite FOV Simulator. Multiple telescopes can be enabled.")
         help_text.setStyleSheet("color: #888888; font-size: 9pt;")
         bottom_layout.addWidget(help_text)
         
@@ -7664,9 +7669,10 @@ class TelescopeDialog(QDialog):
         
         layout.addLayout(bottom_layout)
         self.setLayout(layout)
-        
+
         # Track current editing telescope
         self.current_telescope_id = None
+        self.current_telescope_is_active = False
         
     def _calculate_fratio(self):
         """Calculate and display F-ratio based on aperture and focal length"""
@@ -7695,41 +7701,51 @@ class TelescopeDialog(QDialog):
     def _load_telescopes(self):
         """Load telescopes from database into the list"""
         try:
+            # Block signals to prevent selection events during loading
+            self.telescope_list.blockSignals(True)
             self.telescope_list.clear()
-            
+
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT id, name, aperture, focal_length, mount_type, is_active 
-                    FROM usertelescopes 
+                    SELECT id, name, aperture, focal_length, mount_type, is_active
+                    FROM usertelescopes
                     ORDER BY is_active DESC, name ASC
                 """)
-                
+
                 telescopes = cursor.fetchall()
-                
+
                 for telescope_id, name, aperture, focal_length, mount_type, is_active in telescopes:
                     # Create list item text
                     fratio = focal_length / aperture if aperture and aperture > 0 else 0
-                    status = " (Active)" if is_active else ""
-                    
+                    status = " (Enabled)" if is_active else ""
+
                     item_text = f"{name}{status}"
                     if aperture:
                         item_text += f" - {aperture}mm"
                     if fratio > 0:
                         item_text += f" f/{fratio:.1f}"
-                    
+
                     # Create list item
                     from PySide6.QtWidgets import QListWidgetItem
                     item = QListWidgetItem(item_text)
                     item.setData(Qt.UserRole, telescope_id)  # Store telescope ID
-                    
-                    # Highlight active telescope
+
+                    # Highlight enabled telescope
                     if is_active:
                         item.setBackground(QColor(0, 120, 212, 50))  # Light blue background
-                        
+
                     self.telescope_list.addItem(item)
-                    
+
+            # Unblock signals before clearing selection
+            self.telescope_list.blockSignals(False)
+
+            # Clear selection and form after loading
+            self._clear_form()
+
         except Exception as e:
+            # Make sure to unblock signals even if there's an error
+            self.telescope_list.blockSignals(False)
             logger.error(f"Error loading telescopes: {str(e)}")
             QMessageBox.critical(self, "Database Error", f"Failed to load telescopes: {str(e)}")
     
@@ -7753,32 +7769,39 @@ class TelescopeDialog(QDialog):
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT name, aperture, focal_length, mount_type, notes 
-                    FROM usertelescopes 
+                    SELECT name, aperture, focal_length, mount_type, notes, is_active
+                    FROM usertelescopes
                     WHERE id = ?
                 """, (telescope_id,))
-                
+
                 row = cursor.fetchone()
                 if row:
-                    name, aperture, focal_length, mount_type, notes = row
-                    
+                    name, aperture, focal_length, mount_type, notes, is_active = row
+
                     self.name_input.setText(name or "")
                     self.aperture_input.setText(str(aperture) if aperture else "")
                     self.focal_length_input.setText(str(focal_length) if focal_length else "")
-                    
+
                     # Set mount type
                     mount_index = self.mount_combo.findText(mount_type or "")
                     if mount_index >= 0:
                         self.mount_combo.setCurrentIndex(mount_index)
-                    
+
                     self.notes_input.setPlainText(notes or "")
-                    
-                    # Set current editing ID
+
+                    # Set current editing ID and active status
                     self.current_telescope_id = telescope_id
-                    
+                    self.current_telescope_is_active = bool(is_active)
+
                     # Update save button text
                     self.save_button.setText("Update Telescope")
-                    
+
+                    # Update the enable/disable button text
+                    if self.current_telescope_is_active:
+                        self.set_active_button.setText("Disable")
+                    else:
+                        self.set_active_button.setText("Enable")
+
         except Exception as e:
             logger.error(f"Error loading telescope data: {str(e)}")
             QMessageBox.critical(self, "Database Error", f"Failed to load telescope data: {str(e)}")
@@ -7791,8 +7814,10 @@ class TelescopeDialog(QDialog):
         self.mount_combo.setCurrentIndex(0)
         self.notes_input.clear()
         self.current_telescope_id = None
+        self.current_telescope_is_active = False
         self.save_button.setText("Save Telescope")
-        
+        self.set_active_button.setText("Enable")
+
         # Clear selection
         self.telescope_list.clearSelection()
         
@@ -7872,7 +7897,7 @@ class TelescopeDialog(QDialog):
             return
             
         telescope_id = selected_items[0].data(Qt.UserRole)
-        telescope_name = selected_items[0].text().split(" (")[0]  # Remove status text
+        telescope_name = selected_items[0].text().split(" (")[0]  # Remove status/specs text
         
         # Confirm deletion
         reply = QMessageBox.question(
@@ -7901,34 +7926,62 @@ class TelescopeDialog(QDialog):
                 QMessageBox.critical(self, "Error", f"Failed to delete telescope: {str(e)}")
     
     def _set_active_telescope(self):
-        """Set selected telescope as active"""
+        """Toggle active/inactive status for selected telescope"""
         selected_items = self.telescope_list.selectedItems()
         if not selected_items:
             return
-            
+
         telescope_id = selected_items[0].data(Qt.UserRole)
-        telescope_name = selected_items[0].text().split(" (")[0]  # Remove status text
-        
+        telescope_name = selected_items[0].text().split(" (")[0]  # Remove status/specs text
+
+        # Validate telescope_id
+        if telescope_id is None:
+            QMessageBox.warning(self, "Error", "Invalid telescope selection. Please try again.")
+            return
+
         try:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                
-                # First, set all telescopes as inactive
-                cursor.execute("UPDATE usertelescopes SET is_active = 0")
-                
-                # Then set the selected telescope as active
-                cursor.execute("UPDATE usertelescopes SET is_active = 1 WHERE id = ?", (telescope_id,))
-                
+
+                # First, verify the telescope exists and get its current active status
+                cursor.execute("SELECT is_active FROM usertelescopes WHERE id = ?", (telescope_id,))
+                result = cursor.fetchone()
+                if not result:
+                    QMessageBox.warning(self, "Error", f"Telescope with ID {telescope_id} not found in database.")
+                    return
+
+                current_is_active = bool(result[0])
+
+                # Toggle the active status
+                new_status = 0 if current_is_active else 1
+                cursor.execute("UPDATE usertelescopes SET is_active = ? WHERE id = ?", (new_status, telescope_id))
+                rows_updated = cursor.rowcount
+
+                if rows_updated == 0:
+                    QMessageBox.warning(self, "Error", f"Failed to update telescope status. No rows were updated.")
+                    conn.rollback()
+                    return
+
                 conn.commit()
-            
-            QMessageBox.information(self, "Success", f"Telescope '{telescope_name}' is now set as active.")
-            
+
+                # Log the change
+                status_text = "inactive" if current_is_active else "active"
+                logger.debug(f"Set telescope ID {telescope_id} to {status_text}, rows affected: {rows_updated}")
+
+            # Show success message
+            if current_is_active:
+                success_message = f"Telescope '{telescope_name}' is now inactive and will not appear in the FOV Simulator."
+            else:
+                success_message = f"Telescope '{telescope_name}' is now active and will appear in the FOV Simulator."
+
+            QMessageBox.information(self, "Success", success_message)
+
             # Reload telescopes
             self._load_telescopes()
-            
+
         except Exception as e:
-            logger.error(f"Error setting active telescope: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to set active telescope: {str(e)}")
+            logger.error(f"Error toggling telescope active status: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to update telescope status: {str(e)}")
 
 
 # --- About Dialog ---

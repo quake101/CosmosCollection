@@ -179,20 +179,30 @@ class AddTargetDialog(QDialog):
         """Populate dialog fields with DSO data"""
         if not self.dso_data:
             return
-            
+
         self.name_edit.setText(self.dso_data.get("name", ""))
         self.type_edit.setText(self.dso_data.get("dso_type", ""))
         self.constellation_edit.setText(self.dso_data.get("constellation", ""))
-        self.ra_edit.setText(str(self.dso_data.get("ra_deg", "")))
-        self.dec_edit.setText(str(self.dso_data.get("dec_deg", "")))
-        self.magnitude_edit.setText(str(self.dso_data.get("magnitude", "")))
-        
+
+        # Handle numeric fields - only set if value is not None
+        ra_deg = self.dso_data.get("ra_deg")
+        if ra_deg is not None:
+            self.ra_edit.setText(str(ra_deg))
+
+        dec_deg = self.dso_data.get("dec_deg")
+        if dec_deg is not None:
+            self.dec_edit.setText(str(dec_deg))
+
+        magnitude = self.dso_data.get("magnitude")
+        if magnitude is not None:
+            self.magnitude_edit.setText(str(magnitude))
+
         # Format size
         size_min = self.dso_data.get("size_min", 0)
         size_max = self.dso_data.get("size_max", 0)
         if size_min > 0 or size_max > 0:
             self.size_edit.setText(f"{size_min:.1f} x {size_max:.1f}")
-            
+
         # Populate best months if available
         self.months_edit.setText(self.dso_data.get("best_months", ""))
     
@@ -203,15 +213,23 @@ class AddTargetDialog(QDialog):
             if not self.name_edit.text().strip():
                 QMessageBox.warning(self, "Validation Error", "Name is required.")
                 return
-            
+
+            # Helper function to safely convert to float
+            def safe_float(text):
+                """Convert text to float, handling empty strings and 'None'"""
+                text = text.strip()
+                if not text or text.lower() == 'none':
+                    return 0.0
+                return float(text)
+
             # Create target data
             target_data = {
                 "name": self.name_edit.text().strip(),
                 "dso_type": self.type_edit.text().strip(),
                 "constellation": self.constellation_edit.text().strip(),
-                "ra_deg": float(self.ra_edit.text()) if self.ra_edit.text() else 0.0,
-                "dec_deg": float(self.dec_edit.text()) if self.dec_edit.text() else 0.0,
-                "magnitude": float(self.magnitude_edit.text()) if self.magnitude_edit.text() else 0.0,
+                "ra_deg": safe_float(self.ra_edit.text()),
+                "dec_deg": safe_float(self.dec_edit.text()),
+                "magnitude": safe_float(self.magnitude_edit.text()),
                 "size_info": self.size_edit.text().strip(),
                 "priority": self.priority_combo.currentText(),
                 "status": self.status_combo.currentText(),
@@ -533,9 +551,20 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         dialog.name_edit.setText(target_data.get("name", ""))
         dialog.type_edit.setText(target_data.get("dso_type", ""))
         dialog.constellation_edit.setText(target_data.get("constellation", ""))
-        dialog.ra_edit.setText(str(target_data.get("ra_deg", "")))
-        dialog.dec_edit.setText(str(target_data.get("dec_deg", "")))
-        dialog.magnitude_edit.setText(str(target_data.get("magnitude", "")))
+
+        # Handle numeric fields - only set if value is not None
+        ra_deg = target_data.get("ra_deg")
+        if ra_deg is not None:
+            dialog.ra_edit.setText(str(ra_deg))
+
+        dec_deg = target_data.get("dec_deg")
+        if dec_deg is not None:
+            dialog.dec_edit.setText(str(dec_deg))
+
+        magnitude = target_data.get("magnitude")
+        if magnitude is not None:
+            dialog.magnitude_edit.setText(str(magnitude))
+
         dialog.size_edit.setText(target_data.get("size_info", ""))
         dialog.priority_combo.setCurrentText(target_data.get("priority", "Medium"))
         dialog.status_combo.setCurrentText(target_data.get("status", "Not Observed"))
@@ -1488,9 +1517,20 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             dialog.name_edit.setText(target_data.get("name", ""))
             dialog.type_edit.setText(target_data.get("dso_type", ""))
             dialog.constellation_edit.setText(target_data.get("constellation", ""))
-            dialog.ra_edit.setText(str(target_data.get("ra_deg", "")))
-            dialog.dec_edit.setText(str(target_data.get("dec_deg", "")))
-            dialog.magnitude_edit.setText(str(target_data.get("magnitude", "")))
+
+            # Handle numeric fields - only set if value is not None
+            ra_deg = target_data.get("ra_deg")
+            if ra_deg is not None:
+                dialog.ra_edit.setText(str(ra_deg))
+
+            dec_deg = target_data.get("dec_deg")
+            if dec_deg is not None:
+                dialog.dec_edit.setText(str(dec_deg))
+
+            magnitude = target_data.get("magnitude")
+            if magnitude is not None:
+                dialog.magnitude_edit.setText(str(magnitude))
+
             dialog.size_edit.setText(target_data.get("size_info", ""))
             dialog.priority_combo.setCurrentText(target_data.get("priority", "Medium"))
             dialog.status_combo.setCurrentText(target_data.get("status", "Not Observed"))
