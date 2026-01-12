@@ -6652,6 +6652,9 @@ class SettingsDialog(QDialog):
 class MapBridge(QObject):
     """Bridge object for Qt-JavaScript communication in map picker"""
 
+    searchCompleted = Signal(str)  # Signal to send search results back to JavaScript
+    geocodeCompleted = Signal(str)  # Signal to send geocode results back to JavaScript
+
     def __init__(self, dialog):
         super().__init__()
         self.dialog = dialog
@@ -6661,6 +6664,22 @@ class MapBridge(QObject):
         """Called from JavaScript when user selects a location on the map"""
         logger.debug(f"MapBridge.selectLocation called: lat={lat}, lon={lon}, name={location_name}")
         self.dialog._on_location_selected(lat, lon, location_name)
+
+    @Slot(str)
+    def searchLocationFromPython(self, query):
+        """Search for location using Python (to avoid CORS issues)"""
+        logger.debug(f"MapBridge.searchLocationFromPython called: query={query}")
+        result = self.dialog._search_location_python(query)
+        logger.debug(f"Emitting search result: {result}")
+        self.searchCompleted.emit(result)
+
+    @Slot(float, float)
+    def reverseGeocodeFromPython(self, lat, lon):
+        """Reverse geocode using Python (to avoid CORS issues)"""
+        logger.debug(f"MapBridge.reverseGeocodeFromPython called: lat={lat}, lon={lon}")
+        result = self.dialog._reverse_geocode_python(lat, lon)
+        logger.debug(f"Emitting geocode result: {result}")
+        self.geocodeCompleted.emit(result)
 
 
 class MapLocationPickerDialog(QDialog):
@@ -6795,12 +6814,26 @@ class MapLocationPickerDialog(QDialog):
         var marker = null;
         var searchTimeout = null;
         var bridgeReady = false;
+        var currentGeocodeLat = null;
+        var currentGeocodeLon = null;
 
         // Initialize QWebChannel for Qt-JavaScript communication
         new QWebChannel(qt.webChannelTransport, function(channel) {{
             qt_bridge = channel.objects.qt_bridge;
             bridgeReady = true;
             console.log("Qt bridge initialized successfully");
+
+            // Connect to search results signal
+            qt_bridge.searchCompleted.connect(function(resultJson) {{
+                console.log("Received search results:", resultJson);
+                handleSearchResults(resultJson);
+            }});
+
+            // Connect to geocode results signal
+            qt_bridge.geocodeCompleted.connect(function(resultJson) {{
+                console.log("Received geocode results:", resultJson);
+                handleGeocodeResults(resultJson);
+            }});
         }});
 
         // Initialize Leaflet map
@@ -6881,13 +6914,27 @@ class MapLocationPickerDialog(QDialog):
         }}
 
         function reverseGeocode(lat, lon) {{
-            fetch('https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lon, {{
-                headers: {{
-                    'User-Agent': 'CosmosCollection/1.0'
-                }}
-            }})
-            .then(response => response.json())
-            .then(data => {{
+            // Store current coordinates for when we receive the result
+            currentGeocodeLat = lat;
+            currentGeocodeLon = lon;
+
+            // Use Python bridge to reverse geocode (avoids CORS issues)
+            if (bridgeReady && qt_bridge && qt_bridge.reverseGeocodeFromPython) {{
+                qt_bridge.reverseGeocodeFromPython(lat, lon);
+            }} else {{
+                console.warn('Bridge not ready or reverseGeocodeFromPython not available');
+                document.getElementById('infoBox').innerHTML =
+                    'Selected: ' + lat.toFixed(6) + '°, ' + lon.toFixed(6) + '°';
+                // Send coordinates without name
+                sendToQt(lat, lon, "");
+            }}
+        }}
+
+        function handleGeocodeResults(resultJson) {{
+            try {{
+                var data = JSON.parse(resultJson);
+                var lat = currentGeocodeLat;
+                var lon = currentGeocodeLon;
                 var locationName = data.display_name || "";
 
                 // Update info box
@@ -6897,13 +6944,12 @@ class MapLocationPickerDialog(QDialog):
 
                 // Send to Qt with location name
                 sendToQt(lat, lon, locationName);
-            }})
-            .catch(error => {{
-                console.error('Reverse geocoding failed:', error);
+            }} catch(error) {{
+                console.error('Error handling geocode results:', error);
                 document.getElementById('infoBox').innerHTML =
-                    'Selected: ' + lat.toFixed(6) + '°, ' + lon.toFixed(6) + '°';
-                // Location will already be sent from onLocationSelected
-            }});
+                    'Selected: ' + currentGeocodeLat.toFixed(6) + '°, ' + currentGeocodeLon.toFixed(6) + '°';
+                sendToQt(currentGeocodeLat, currentGeocodeLon, "");
+            }}
         }}
 
         // Search function (called from Qt)
@@ -6914,13 +6960,19 @@ class MapLocationPickerDialog(QDialog):
 
             document.getElementById('infoBox').innerHTML = 'Searching for: ' + query + '...';
 
-            fetch('https://nominatim.openstreetmap.org/search?format=json&q=' + encodeURIComponent(query) + '&limit=1', {{
-                headers: {{
-                    'User-Agent': 'CosmosCollection/1.0'
-                }}
-            }})
-            .then(response => response.json())
-            .then(data => {{
+            // Use Python bridge to search (avoids CORS issues)
+            if (bridgeReady && qt_bridge && qt_bridge.searchLocationFromPython) {{
+                qt_bridge.searchLocationFromPython(query);
+            }} else {{
+                console.error('Bridge not ready or searchLocationFromPython not available');
+                document.getElementById('infoBox').innerHTML = 'Search unavailable. Please try again in a moment.';
+            }}
+        }}
+
+        function handleSearchResults(resultJson) {{
+            try {{
+                var data = JSON.parse(resultJson);
+
                 if (data && data.length > 0) {{
                     var result = data[0];
                     var lat = parseFloat(result.lat);
@@ -6946,13 +6998,12 @@ class MapLocationPickerDialog(QDialog):
                     // Select this location
                     onLocationSelected(lat, lon);
                 }} else {{
-                    document.getElementById('infoBox').innerHTML = 'No results found for: ' + query;
+                    document.getElementById('infoBox').innerHTML = 'No results found';
                 }}
-            }})
-            .catch(error => {{
-                console.error('Search failed:', error);
+            }} catch(error) {{
+                console.error('Error handling search results:', error);
                 document.getElementById('infoBox').innerHTML = 'Search failed. Please try again.';
-            }});
+            }}
         }}
     </script>
 </body>
@@ -7087,11 +7138,62 @@ class MapLocationPickerDialog(QDialog):
 
         logger.debug(f"Location selected: {lat}, {lon} - {location_name}")
 
+    def _search_location_python(self, query):
+        """Search for location using Python's urllib to avoid CORS issues"""
+        import urllib.request
+        import urllib.parse
+        import json
+
+        try:
+            # URL encode the query
+            encoded_query = urllib.parse.quote(query)
+            url = f"https://nominatim.openstreetmap.org/search?format=json&q={encoded_query}&limit=1"
+
+            # Create request with User-Agent header (required by Nominatim)
+            request = urllib.request.Request(
+                url,
+                headers={'User-Agent': 'CosmosCollection/1.0'}
+            )
+
+            # Make the request
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"Search results: {data}")
+                return json.dumps(data)  # Return as JSON string
+
+        except Exception as e:
+            logger.error(f"Error searching location: {e}")
+            return json.dumps([])  # Return empty array on error
+
+    def _reverse_geocode_python(self, lat, lon):
+        """Reverse geocode using Python's urllib to avoid CORS issues"""
+        import urllib.request
+        import json
+
+        try:
+            url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}"
+
+            # Create request with User-Agent header (required by Nominatim)
+            request = urllib.request.Request(
+                url,
+                headers={'User-Agent': 'CosmosCollection/1.0'}
+            )
+
+            # Make the request
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"Reverse geocode result: {data}")
+                return json.dumps(data)  # Return as JSON string
+
+        except Exception as e:
+            logger.error(f"Error reverse geocoding: {e}")
+            return json.dumps({})  # Return empty object on error
+
     def _on_search_clicked(self):
         """Handle search button click"""
         query = self.search_input.text().strip()
         if query and self.web_view:
-            # Execute JavaScript search function
+            # Call JavaScript function which will call back to Python for the actual search
             self.web_view.page().runJavaScript(f"searchLocation({repr(query)})")
 
     def _on_select_clicked(self):
