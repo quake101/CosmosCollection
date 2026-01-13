@@ -1321,10 +1321,10 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         details_action = context_menu.addAction("View DSO Details")
         details_action.triggered.connect(lambda: self._context_view_details(row))
 
-        visibility_action = context_menu.addAction("Open DSO Visibility Calculator")
+        visibility_action = context_menu.addAction("Visibility Calculator")
         visibility_action.triggered.connect(lambda: self._context_open_visibility(row))
 
-        aladin_action = context_menu.addAction("Open in Aladin Lite")
+        aladin_action = context_menu.addAction("Aladin Lite\\FOV Simulator")
         aladin_action.triggered.connect(lambda: self._context_open_aladin(row))
 
         context_menu.addSeparator()

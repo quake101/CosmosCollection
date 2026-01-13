@@ -8295,52 +8295,54 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
-        
+
         # Settings action
         settings_action = QAction("Settings", self)
         settings_action.setToolTip("Open application settings")
         settings_action.triggered.connect(self._show_settings)
         toolbar.addAction(settings_action)
-        
-        toolbar.addSeparator()
-        
-        # Telescopes action  
+
+        # Telescopes action
         telescopes_action = QAction("Telescopes", self)
         telescopes_action.setToolTip("Manage telescope configurations")
         telescopes_action.triggered.connect(self._show_telescopes)
         toolbar.addAction(telescopes_action)
-        
+
         toolbar.addSeparator()
-        
-        # DSO Visibility Calculator action
-        visibility_action = QAction("Visibility Calculator", self)
-        visibility_action.setToolTip("Calculate DSO visibility from your location")
-        visibility_action.triggered.connect(self._show_dso_visibility)
-        toolbar.addAction(visibility_action)
-        
+
         # Best DSO Tonight action
         best_dso_action = QAction("Best DSO Tonight", self)
         best_dso_action.setToolTip("Find the best DSOs visible tonight")
         best_dso_action.triggered.connect(self._show_best_dso_tonight)
         toolbar.addAction(best_dso_action)
-        
+
         # Target List action
         target_list_action = QAction("Target List", self)
         target_list_action.setToolTip("Manage your DSO target list")
         target_list_action.triggered.connect(self._show_target_list)
         toolbar.addAction(target_list_action)
-        
-        # Collage Builder action
-        collage_builder_action = QAction("Collage Builder", self)
-        collage_builder_action.setToolTip("Create image collages from your DSO photos")
-        collage_builder_action.triggered.connect(self._show_collage_builder)
-        toolbar.addAction(collage_builder_action)
+
+        toolbar.addSeparator()
 
         # DSO Image Gallery action
         gallery_action = QAction("Image Gallery", self)
         gallery_action.setToolTip("Browse all DSO images in a gallery view")
         gallery_action.triggered.connect(self._show_dso_gallery)
         toolbar.addAction(gallery_action)
+
+        # Collage Builder action
+        collage_builder_action = QAction("Collage Builder", self)
+        collage_builder_action.setToolTip("Create image collages from your DSO photos")
+        collage_builder_action.triggered.connect(self._show_collage_builder)
+        toolbar.addAction(collage_builder_action)
+
+        toolbar.addSeparator()
+
+        # DSO Visibility Calculator action
+        visibility_action = QAction("Visibility Calculator", self)
+        visibility_action.setToolTip("Calculate DSO visibility from your location")
+        visibility_action.triggered.connect(self._show_dso_visibility)
+        toolbar.addAction(visibility_action)
 
         # Aladin Lite action
         aladin_lite_action = QAction("Aladin Lite\\FOV Simulator", self)
@@ -8350,14 +8352,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
         toolbar.addSeparator()
 
-        # SIMBAD Search action
-        #simbad_action = QAction("Search SIMBAD", self)
-        #simbad_action.setToolTip("Search for an object in SIMBAD and add to database")
-        #simbad_action.triggered.connect(self._show_simbad_search_dialog)
-        #toolbar.addAction(simbad_action)
-
-        #toolbar.addSeparator()
-        
         # About action
         about_action = QAction("About", self)
         about_action.setToolTip("About Cosmos Collection")
