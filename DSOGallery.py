@@ -617,10 +617,13 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.search_timer.setSingleShot(True)
         self.search_timer.timeout.connect(self._apply_filters)
 
-        # Resize debounce timer
+        # Resize debounce timer (longer delay to reduce rebuilds)
         self.resize_timer = QTimer()
         self.resize_timer.setSingleShot(True)
         self.resize_timer.timeout.connect(self._handle_resize)
+
+        # Flag to track if resize is in progress
+        self.resize_in_progress = False
 
         # Initialize UI
         self._init_ui()
@@ -788,7 +791,6 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Calculate how many cards fit (no arbitrary cap)
         columns = max(1, available_width // card_width_with_spacing)
 
-        print(f"Viewport width: {viewport_width}, Available: {available_width}, Columns: {columns}")
         return columns
 
     def _populate_grid(self):
@@ -1257,32 +1259,74 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     def _handle_resize(self):
         """Handle deferred resize - recalculate grid if needed"""
         # Only process if we have data loaded
-        if not self.filtered_items:
-            print("Resize handler: No filtered items, skipping")
+        if not self.filtered_items or self.resize_in_progress:
             return
-
-        # Force layout to update before calculating
-        self.scroll_area.viewport().update()
-        QApplication.processEvents()
 
         new_cols = self._calculate_grid_columns()
         # Always update if columns changed, even if grid exists
         if new_cols != self.current_columns and new_cols > 0:
-            print(f"Resize detected: {self.current_columns} -> {new_cols} columns")
-            self.current_columns = new_cols
-            self._populate_grid()
-        else:
-            print(f"Resize handler: Column count unchanged ({new_cols})")
+            # Set flag to prevent multiple simultaneous resizes
+            self.resize_in_progress = True
+
+            # Show visual feedback - change cursor and status
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            old_status = self.status_label.text()
+            self.status_label.setText("Reorganizing gallery layout...")
+            self.status_label.setStyleSheet("padding: 5px; color: #ffcc00;")
+
+            # Schedule grid rebuild after UI update
+            QTimer.singleShot(10, lambda: self._rebuild_grid_for_resize(new_cols, old_status))
+
+    def _rebuild_grid_for_resize(self, new_cols, old_status):
+        """Rebuild grid with new column count and restore status"""
+        self.current_columns = new_cols
+        self._populate_grid()
+
+        # Restore original status after a brief delay
+        QTimer.singleShot(100, lambda: self._restore_status_after_resize(old_status))
+
+    def _restore_status_after_resize(self, old_status):
+        """Restore status label and cursor after resize completes"""
+        self.status_label.setText(old_status)
+        self.status_label.setStyleSheet("padding: 5px;")
+        self.resize_in_progress = False
+        # Restore normal cursor
+        QApplication.restoreOverrideCursor()
 
     def resizeEvent(self, event):
         """Handle window resize - defer grid recalculation"""
         super().resizeEvent(event)
-        print(f"Window resized to: {self.width()} x {self.height()}")
-        # Restart timer to debounce resize events
-        self.resize_timer.start(100)
+
+        # Show real-time column count during resize
+        if self.filtered_items and not self.resize_in_progress:
+            current_cols = self._calculate_grid_columns()
+
+            # Calculate pixels needed for next column
+            card_width = 170
+            grid_spacing = 10
+            grid_margins = 20
+            viewport_width = self.scroll_area.viewport().width()
+
+            # Width needed for next column
+            card_width_with_spacing = card_width + grid_spacing
+            next_col_viewport_width = (current_cols + 1) * card_width_with_spacing + grid_margins
+            pixels_needed = next_col_viewport_width - viewport_width
+
+            if pixels_needed > 0:
+                self.status_label.setText(f"Columns: {current_cols} | +{pixels_needed}px wider for next column")
+            else:
+                self.status_label.setText(f"Columns: {current_cols}")
+            self.status_label.setStyleSheet("padding: 5px; color: #88ccff;")
+
+        # Restart timer to debounce resize events (300ms delay reduces rebuild frequency)
+        self.resize_timer.start(300)
 
     def closeEvent(self, event):
-        """Handle window close - cleanup thread pool"""
+        """Handle window close - cleanup thread pool and cursor"""
+        # Restore cursor if it was changed during resize
+        if self.resize_in_progress:
+            QApplication.restoreOverrideCursor()
+
         # Cancel all pending thumbnail tasks
         self.cancelled_flag[0] = True
         self.thread_pool.waitForDone(5000)  # Wait up to 5 seconds for tasks to finish
