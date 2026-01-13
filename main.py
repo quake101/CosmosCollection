@@ -6688,14 +6688,14 @@ class SettingsDialog(QDialog):
         
         # Buttons
         button_layout = QHBoxLayout()
-        
+
         # Test location button
         self.test_button = QPushButton("Test Location")
         self.test_button.clicked.connect(self._test_location)
         button_layout.addWidget(self.test_button)
-        
+
         button_layout.addStretch()
-        
+
         # Standard dialog buttons
         self.save_button = QPushButton("Save")
         self.save_button.clicked.connect(self._save_settings)
@@ -9585,6 +9585,14 @@ if __name__ == "__main__":
     icon_path = os.path.join(APP_DIR, 'images', 'CosmosCollection.png')
     app_icon = QIcon(icon_path)
     app.setWindowIcon(app_icon)
+
+    # Set global stylesheet for consistent button sizing across all platforms
+    # This ensures buttons have proper height on macOS where text can be cut off
+    app.setStyleSheet("""
+        QPushButton {
+            min-height: 32px;
+        }
+    """)
 
     # Initialize database manager and get data
     db_manager = DatabaseManager()
