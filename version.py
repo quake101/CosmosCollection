@@ -26,20 +26,25 @@ def _get_git_version() -> Optional[str]:
     Try to get version from git tags when running from source.
     Returns None if not in a git repository or git is not available.
     """
+    # Get script directory (needed for both main and fallback methods)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Check if .git directory exists
+    if not os.path.exists(os.path.join(script_dir, '.git')):
+        return None
+
+    # Windows-specific flag to avoid console window popup
+    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+
     try:
-        # Only works when running from source with .git directory
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-
-        # Check if .git directory exists
-        if not os.path.exists(os.path.join(script_dir, '.git')):
-            return None
-
+        # Try faster command first: get most recent tag
         result = subprocess.run(
-            ['git', 'describe', '--tags', '--always', '--abbrev=0'],
+            ['git', 'describe', '--tags', '--abbrev=0'],
             capture_output=True,
             text=True,
-            timeout=2,
-            cwd=script_dir
+            timeout=5,  # Increased timeout for Windows
+            cwd=script_dir,
+            creationflags=creation_flags
         )
 
         if result.returncode == 0:
@@ -47,7 +52,25 @@ def _get_git_version() -> Optional[str]:
             if version:
                 logger.debug(f"Detected git version: {version}")
                 return version
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+    except subprocess.TimeoutExpired:
+        logger.debug("Git describe timed out, trying alternative method")
+        # Fallback: try getting tag from current commit or most recent tag
+        try:
+            result = subprocess.run(
+                ['git', 'tag', '--points-at', 'HEAD'],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                cwd=script_dir,
+                creationflags=creation_flags
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                version = result.stdout.strip().split('\n')[0].lstrip('v')
+                logger.debug(f"Detected git version from tag: {version}")
+                return version
+        except Exception:
+            pass
+    except (FileNotFoundError, Exception) as e:
         logger.debug(f"Could not get git version: {e}")
 
     return None
@@ -58,18 +81,22 @@ def _get_git_commit_date() -> Optional[str]:
     Try to get the date of the latest commit when running from source.
     Returns None if not in a git repository or git is not available.
     """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if not os.path.exists(os.path.join(script_dir, '.git')):
+        return None
+
+    # Windows-specific flag to avoid console window popup
+    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+
     try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-
-        if not os.path.exists(os.path.join(script_dir, '.git')):
-            return None
-
         result = subprocess.run(
             ['git', 'log', '-1', '--format=%ci'],
             capture_output=True,
             text=True,
-            timeout=2,
-            cwd=script_dir
+            timeout=5,  # Increased timeout for Windows consistency
+            cwd=script_dir,
+            creationflags=creation_flags
         )
 
         if result.returncode == 0:
