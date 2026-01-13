@@ -634,10 +634,29 @@ class VisibilityCalendar(QCalendarWidget):
         # Connect to date change
         self.currentPageChanged.connect(self.on_month_changed)
 
+        # Enable mouse tracking for tooltips
+        self.setMouseTracking(True)
+
+        # Create custom tooltip widget
+        from PySide6.QtWidgets import QLabel
+        from PySide6.QtCore import Qt as QtCore
+        self.tooltip_label = QLabel(self)
+        self.tooltip_label.setWindowFlags(QtCore.ToolTip | QtCore.FramelessWindowHint | QtCore.WindowStaysOnTopHint)
+        self.tooltip_label.setStyleSheet("""
+            QLabel {
+                background-color: #404040;
+                color: white;
+                border: 1px solid #666666;
+                border-radius: 3px;
+                padding: 4px 8px;
+                font-size: 10pt;
+            }
+        """)
+        self.tooltip_label.hide()
+
     def set_visibility_hours(self, visibility_hours):
         """Set visibility hours for days in the current month"""
         self.visibility_hours = visibility_hours
-        self._update_tooltips()
         # Force a complete repaint of the calendar
         self.updateCells()
         self.update()
@@ -645,25 +664,10 @@ class VisibilityCalendar(QCalendarWidget):
     def clear_visibility_hours(self):
         """Clear all visibility hour data"""
         self.visibility_hours = {}
-        self._update_tooltips()
+        self.tooltip_label.hide()
         # Force a complete repaint of the calendar
         self.updateCells()
         self.update()
-
-    def _update_tooltips(self):
-        """Update tooltips for all days with visibility data"""
-        date = QDate(self.yearShown(), self.monthShown(), 1)
-        for day in range(1, date.daysInMonth() + 1):
-            cell_date = QDate(self.yearShown(), self.monthShown(), day)
-            if day in self.visibility_hours:
-                hours = self.visibility_hours[day]
-                # Set tooltip with exact hours
-                format = QTextCharFormat()
-                format.setToolTip(f"{hours:.1f} hours visible")
-                self.setDateTextFormat(cell_date, format)
-            else:
-                # Clear tooltip
-                self.setDateTextFormat(cell_date, QTextCharFormat())
 
     def get_color_for_hours(self, hours):
         """Get background and foreground colors for given visibility hours"""
@@ -716,12 +720,55 @@ class VisibilityCalendar(QCalendarWidget):
         # Default painting for dates outside current month (grayed out)
         super().paintCell(painter, rect, date)
 
+    def mouseMoveEvent(self, event):
+        """Handle mouse move to show custom tooltips"""
+        super().mouseMoveEvent(event)
+
+        # Get the date at the mouse position
+        from PySide6.QtCore import QPoint
+        date = self.dateAt(event.pos())
+
+        if date.isValid() and date.month() == self.monthShown() and date.year() == self.yearShown():
+            day = date.day()
+            if day in self.visibility_hours:
+                hours = self.visibility_hours[day]
+                # Show tooltip with hours
+                self.tooltip_label.setText(f"{hours:.1f} hours visible")
+                self.tooltip_label.adjustSize()
+
+                # Position tooltip near cursor, ensuring it stays on screen
+                tooltip_pos = self.mapToGlobal(event.pos())
+                tooltip_pos.setX(tooltip_pos.x() + 15)  # Offset from cursor
+                tooltip_pos.setY(tooltip_pos.y() + 15)
+
+                self.tooltip_label.move(tooltip_pos)
+                self.tooltip_label.show()
+                self.tooltip_label.raise_()  # Ensure it's on top
+                return
+
+        # No tooltip to show, hide it
+        self.tooltip_label.hide()
+
+    def leaveEvent(self, event):
+        """Hide tooltip when mouse leaves the calendar"""
+        super().leaveEvent(event)
+        self.tooltip_label.hide()
+
     def on_month_changed(self, year, month):
         """Called when the displayed month changes"""
         # Clear visibility data when month changes (will need to recalculate)
         self.clear_visibility_hours()
         # Notify parent to recalculate for this month
         self.monthChanged.emit(year, month)
+
+    def __del__(self):
+        """Destructor - clean up the tooltip widget"""
+        try:
+            if hasattr(self, 'tooltip_label'):
+                self.tooltip_label.hide()
+                self.tooltip_label.deleteLater()
+        except:
+            pass  # Ignore errors during cleanup
 
 
 class CalculationThread(QThread):
@@ -791,6 +838,7 @@ class VisibilityPlot(FigureCanvas):
         self.annotation = None
         self.cursor_lines = []
         self.last_idx = None  # Cache last index for performance
+        self.last_tooltip_text = None  # Cache last tooltip content
 
         # Initialize current time line storage
         self.current_time_lines = []
@@ -800,8 +848,29 @@ class VisibilityPlot(FigureCanvas):
         self.update_timer.timeout.connect(self.update_current_time_line)
         self.update_timer.setInterval(30000)  # 30 seconds in milliseconds
 
+        # Create custom floating tooltip widget (Qt-based, not matplotlib)
+        from PySide6.QtWidgets import QLabel
+        from PySide6.QtCore import Qt as QtCore
+        self.qt_tooltip = QLabel(parent if parent else self)
+        self.qt_tooltip.setWindowFlags(QtCore.ToolTip | QtCore.FramelessWindowHint | QtCore.WindowStaysOnTopHint)
+        self.qt_tooltip.setAttribute(QtCore.WA_TranslucentBackground, False)  # Reduce flicker
+        self.qt_tooltip.setStyleSheet("""
+            QLabel {
+                background-color: #404040;
+                color: white;
+                border: 1px solid #666666;
+                border-radius: 3px;
+                padding: 6px 10px;
+                font-size: 9pt;
+                font-family: monospace;
+            }
+        """)
+        self.qt_tooltip.hide()
+
         # Connect mouse motion event
         self.mpl_connect('motion_notify_event', self.on_mouse_move)
+        # Connect mouse leave event
+        self.mpl_connect('axes_leave_event', self.on_mouse_leave)
 
     def plot_visibility(self, results):
         """Create visibility plot with altitude and azimuth"""
@@ -924,6 +993,7 @@ class VisibilityPlot(FigureCanvas):
         # Reset cursor lines and cached index
         self.cursor_lines = []
         self.last_idx = None
+        self.last_tooltip_text = None
 
         # Clear old current time lines
         for line in self.current_time_lines:
@@ -1026,10 +1096,17 @@ class VisibilityPlot(FigureCanvas):
                 pass  # Already removed or invalid
             self.annotation = None
 
+        # Hide Qt tooltip and reset cache
+        if hasattr(self, 'qt_tooltip'):
+            self.qt_tooltip.hide()
+        self.last_tooltip_text = None
+
     def on_mouse_move(self, event):
         """Handle mouse movement for hover tooltips with vertical cursor line"""
         if not self.hover_data or event.inaxes is None or event.xdata is None:
             self.clear_cursor_elements()
+            self.last_idx = None
+            self.last_tooltip_text = None
             self.draw_idle()
             return
 
@@ -1043,8 +1120,13 @@ class VisibilityPlot(FigureCanvas):
             return
         self.last_idx = idx
 
-        # Clear previous elements
-        self.clear_cursor_elements()
+        # Clear previous cursor lines only (keep tooltip visible)
+        for line in self.cursor_lines:
+            try:
+                line.remove()
+            except (ValueError, NotImplementedError):
+                pass
+        self.cursor_lines = []
 
         # Get the x-position from our data (for precise alignment)
         hours_from_start = self.hover_data['hours_from_start']
@@ -1078,32 +1160,68 @@ class VisibilityPlot(FigureCanvas):
             f"Optimal: {'Yes' if optimal else 'No'}"
         )
 
-        # Smart positioning: place box on left when near right edge, on right when near left edge
-        # Get the axis x-limits to determine position
-        x_min, x_max = event.inaxes.get_xlim()
-        x_range = x_max - x_min
+        # Only update tooltip if content changed (reduces flicker)
+        if hover_text != self.last_tooltip_text:
+            self.last_tooltip_text = hover_text
 
-        # If we're in the right 25% of the plot, put the box on the left
-        if x_pos > (x_min + 0.75 * x_range):
-            x_offset = -120  # Place box to the left
-        else:
-            x_offset = 10  # Place box to the right (default)
+            # Batch updates to reduce flicker
+            self.qt_tooltip.setUpdatesEnabled(False)
 
-        # Create new annotation on the current axis
-        self.annotation = event.inaxes.annotate(
-            hover_text,
-            xy=(x_pos, event.ydata),
-            xytext=(x_offset, 10),
-            textcoords='offset points',
-            bbox=dict(boxstyle='round,pad=0.5', fc='#404040', alpha=0.9, edgecolor='#666666'),
-            fontsize=9,
-            color='white',
-            fontfamily='monospace',
-            zorder=1000
-        )
+            # Use Qt tooltip instead of matplotlib annotation (ensures it appears on top of calendar)
+            self.qt_tooltip.setText(hover_text)
+            self.qt_tooltip.adjustSize()
 
-        # Use draw_idle for better performance
+            # Get mouse position in global screen coordinates
+            from PySide6.QtCore import QPoint
+            cursor_pos = self.mapToGlobal(QPoint(int(event.x), int(self.height() - event.y)))
+
+            # Smart positioning: offset tooltip to avoid covering data and calendar
+            # Get the axis limits to determine position
+            x_min, x_max = event.inaxes.get_xlim()
+            y_min, y_max = event.inaxes.get_ylim()
+            x_range = x_max - x_min
+            y_range = y_max - y_min
+
+            # Horizontal positioning: left when near right edge, right otherwise
+            if x_pos > (x_min + 0.75 * x_range):
+                x_offset = -self.qt_tooltip.width() - 15  # Place to the left of cursor
+            else:
+                x_offset = 15  # Place to the right of cursor
+
+            # Vertical positioning: below when near top (to avoid calendar), above otherwise
+            if event.ydata > (y_min + 0.6 * y_range):
+                y_offset = 15  # Place below cursor
+            else:
+                y_offset = -self.qt_tooltip.height() - 15  # Place above cursor
+
+            # Position and show the Qt tooltip
+            tooltip_pos = cursor_pos + QPoint(x_offset, y_offset)
+            self.qt_tooltip.move(tooltip_pos)
+
+            # Only call show and raise if not already visible
+            if not self.qt_tooltip.isVisible():
+                self.qt_tooltip.show()
+                self.qt_tooltip.raise_()
+
+            # Re-enable updates after all changes are made
+            self.qt_tooltip.setUpdatesEnabled(True)
+
+        # Use draw_idle for better performance (for cursor lines)
         self.draw_idle()
+
+    def on_mouse_leave(self, event):
+        """Handle mouse leaving the plot area"""
+        self.clear_cursor_elements()
+        self.draw_idle()
+
+    def __del__(self):
+        """Destructor - clean up the tooltip widget"""
+        try:
+            if hasattr(self, 'qt_tooltip'):
+                self.qt_tooltip.hide()
+                self.qt_tooltip.deleteLater()
+        except:
+            pass  # Ignore errors during cleanup
 
 
 class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
@@ -1652,3 +1770,27 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         """
         self.dso_ra_deg = ra_deg
         self.dso_dec_deg = dec_deg
+
+    def closeEvent(self, event):
+        """Handle window close event - clean up tooltips and threads"""
+        # Hide and clean up the plot widget's tooltip
+        if hasattr(self, 'plot_widget') and hasattr(self.plot_widget, 'qt_tooltip'):
+            self.plot_widget.qt_tooltip.hide()
+            self.plot_widget.qt_tooltip.deleteLater()
+
+        # Hide and clean up the calendar widget's tooltip
+        if hasattr(self, 'calendar') and hasattr(self.calendar, 'tooltip_label'):
+            self.calendar.tooltip_label.hide()
+            self.calendar.tooltip_label.deleteLater()
+
+        # Stop any running calculation threads
+        if self.calc_thread and self.calc_thread.isRunning():
+            self.calc_thread.quit()
+            self.calc_thread.wait()
+
+        if self.monthly_calc_thread and self.monthly_calc_thread.isRunning():
+            self.monthly_calc_thread.quit()
+            self.monthly_calc_thread.wait()
+
+        # Call parent closeEvent
+        super().closeEvent(event)
