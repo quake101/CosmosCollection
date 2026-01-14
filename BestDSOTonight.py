@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMutex
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
-                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QMenu, QCheckBox)
+                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QMenu, QCheckBox, QApplication)
 
 from astropy import units as u
 from astropy.time import Time
@@ -645,9 +645,30 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.load_location_info()
 
         # Set time frame defaults based on twilight calculation
-        start_hour, duration = self.calculate_twilight_times()
-        self.start_hour_spin.setValue(start_hour)
-        self.duration_hours_spin.setValue(duration)
+        # Use QTimer to defer this until after UI is shown
+        QTimer.singleShot(0, self._complete_initialization)
+
+    def _complete_initialization(self):
+        """Complete initialization after UI is shown - calculates twilight times"""
+        # Update status to show what's happening
+        # This may trigger IERS data download on first run
+        self.status_label.setText("Loading astronomical ephemeris data...")
+        self.status_label.setStyleSheet("color: #88ccff;")
+        QApplication.processEvents()  # Force UI update
+
+        try:
+            # Calculate twilight times (may trigger IERS data download)
+            start_hour, duration = self.calculate_twilight_times()
+            self.start_hour_spin.setValue(start_hour)
+            self.duration_hours_spin.setValue(duration)
+        except Exception as e:
+            # If calculation fails, use defaults but don't crash
+            self.start_hour_spin.setValue(18)
+            self.duration_hours_spin.setValue(12)
+
+        # Update status to ready
+        self.status_label.setText("Ready to calculate best DSOs for tonight")
+        self.status_label.setStyleSheet("")  # Reset to default color
 
         # Auto-select target list and calculate if requested
         if self.auto_use_target_list:
@@ -832,7 +853,8 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         main_layout.addWidget(results_group)
         
         # Status label
-        self.status_label = QLabel("Ready to calculate best DSOs for tonight")
+        self.status_label = QLabel("Initializing astronomical calculations...")
+        self.status_label.setStyleSheet("color: #88ccff;")
         main_layout.addWidget(self.status_label)
 
     def load_location_info(self):
@@ -1057,11 +1079,13 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         # Create status text
         if use_target_list:
-            self.status_label.setText(f"Calculating visibility for DSOs in your target list...")
+            self.status_label.setText(f"Calculating visibility for DSOs in your target list... (may download ephemeris data on first run)")
         else:
             catalog_text = "all catalogs" if not selected_catalogs else f"{selected_catalog} catalog"
             type_text = "all types" if not selected_dso_types else f"{selected_dso_type} objects"
-            self.status_label.setText(f"Calculating visibility for {type_text} from {catalog_text}...")
+            self.status_label.setText(f"Calculating visibility for {type_text} from {catalog_text}... (may download ephemeris data on first run)")
+
+        self.status_label.setStyleSheet("color: #88ccff;")
 
         # Get time frame settings from UI
         start_hour = self.start_hour_spin.value()
@@ -1079,13 +1103,15 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.progress_bar.setVisible(False)
         self.calculate_btn.setEnabled(True)
         self.calculate_btn.setText("Calculate Best DSOs Tonight")
-        
+
         if not visible_dsos:
             self.status_label.setText("No DSOs meet the visibility criteria for tonight")
+            self.status_label.setStyleSheet("")  # Reset to default color
             self.results_table.setRowCount(0)
             return
-        
+
         self.status_label.setText(f"Found {len(visible_dsos)} visible DSOs for tonight")
+        self.status_label.setStyleSheet("")  # Reset to default color
         
         # Disable sorting temporarily while populating
         self.results_table.setSortingEnabled(False)
@@ -1272,6 +1298,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.calculate_btn.setEnabled(True)
         self.calculate_btn.setText("Calculate Best DSOs Tonight")
         self.status_label.setText(f"Error: {error_msg}")
+        self.status_label.setStyleSheet("color: #ff8888;")  # Red for errors
         QMessageBox.warning(self, "Calculation Error", error_msg)
 
     def _show_context_menu(self, position):
