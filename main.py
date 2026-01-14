@@ -7989,10 +7989,10 @@ class AboutDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("About Cosmos Collection")
-        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.MSWindowsFixedSizeDialogHint)
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
 
-        # Set a fixed size that accommodates the new version content
-        self.setFixedSize(420, 380)
+        # Set minimum size to accommodate content on all platforms
+        self.setMinimumSize(450, 420)
 
         # Create main layout with proper margins and spacing
         About_layout = QVBoxLayout(self)
