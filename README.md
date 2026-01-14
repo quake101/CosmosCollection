@@ -49,6 +49,28 @@ Cosmos Collection is designed to help astrophotographers manage their image coll
 3. Extract the downloaded file
 4. Run the application executable
 
+#### Linux System Requirements
+
+Before running Cosmos Collection on Linux, you need to install the required Qt system libraries:
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get update
+sudo apt-get install libxcb-cursor0
+```
+
+**Fedora/RHEL:**
+```bash
+sudo dnf install xcb-util-cursor
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S xcb-util-cursor
+```
+
+This is a one-time system setup required for Qt 6.5+ applications.
+
 ### Building from Source
 
 If you prefer to build from source:
@@ -57,6 +79,7 @@ If you prefer to build from source:
 
 - Python 3.x
 - Required dependencies (see requirements.txt)
+- **Linux only**: System Qt libraries (see Linux System Requirements above)
 
 #### Installation
 
