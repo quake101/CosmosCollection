@@ -582,6 +582,10 @@ class AddImageDialog(QDialog):
                 completer.setFilterMode(Qt.MatchContains)
                 self.dso_combo.setCompleter(completer)
 
+                # Clear selection so placeholder text is shown
+                self.dso_combo.setCurrentIndex(-1)
+                self.dso_combo.lineEdit().clear()
+
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to load DSO list: {str(e)}")
 
