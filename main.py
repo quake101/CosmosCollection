@@ -5205,8 +5205,8 @@ class ObjectDetailWindow(QDialog):
                         cursor.execute("""
                             INSERT INTO userimages (
                                 dsodetailid, image_path, integration_time,
-                                equipment, date_taken, notes
-                            ) VALUES (?, ?, ?, ?, ?, ?)
+                                equipment, date_taken, notes, created_date
+                            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
                         """, (
                             dsodetailid, file_name,
                             '',  # Blank integration time
@@ -9590,7 +9590,7 @@ if __name__ == "__main__":
     # This ensures buttons have proper height on macOS where text can be cut off
     app.setStyleSheet("""
         QPushButton {
-            min-height: 32px;
+            min-height: 28px;
         }
     """)
 

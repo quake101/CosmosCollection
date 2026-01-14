@@ -10,7 +10,9 @@ from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QGroupBox,
                                QMessageBox, QScrollArea, QComboBox, QLineEdit,
-                               QFrame, QGridLayout, QMenu, QApplication)
+                               QFrame, QGridLayout, QMenu, QApplication,
+                               QDialog, QFileDialog, QFormLayout, QDialogButtonBox,
+                               QCompleter)
 from PySide6.QtGui import QPixmap, QImage
 
 from DatabaseManager import DatabaseManager
@@ -323,6 +325,17 @@ class DataLoaderRunnable(QRunnable):
             # Create new SQLite connection in this thread (DatabaseManager is a singleton)
             db_path = ResourceManager.get_database_path()
             conn = sqlite3.connect(str(db_path))
+
+            # Ensure created_date column exists (migration for older databases)
+            # Do this before setting row_factory
+            # Note: ALTER TABLE cannot use CURRENT_TIMESTAMP as default, so we use NULL
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(userimages)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if 'created_date' not in columns:
+                cursor.execute("ALTER TABLE userimages ADD COLUMN created_date TEXT")
+                conn.commit()
+
             conn.row_factory = sqlite3.Row
 
             try:
@@ -336,6 +349,7 @@ class DataLoaderRunnable(QRunnable):
                         image_path,
                         equipment,
                         is_favorite,
+                        created_date,
                         ROW_NUMBER() OVER (PARTITION BY dsodetailid ORDER BY is_favorite DESC, id ASC) as rn
                     FROM userimages
                 )
@@ -353,7 +367,8 @@ class DataLoaderRunnable(QRunnable):
                                 WHEN 'NGC' THEN 2
                                 WHEN 'IC' THEN 3
                                 ELSE 4
-                            END, c.designation) as name
+                            END, c.designation) as name,
+                    pi.created_date
                 FROM dsodetail d
                 INNER JOIN cataloguenr c ON d.id = c.dsodetailid
                 LEFT JOIN PreferredImages pi ON d.id = pi.dsodetailid AND pi.rn = 1
@@ -376,7 +391,8 @@ class DataLoaderRunnable(QRunnable):
                         'dsotype': row[4] or '',
                         'constellation': row[5] or '',
                         'name': row[6] or 'Unknown',
-                        'friendly_type': self._get_friendly_type_name(row[4] or '')
+                        'friendly_type': self._get_friendly_type_name(row[4] or ''),
+                        'created_date': row[7] or ''
                     }
                     items.append(item)
 
@@ -390,6 +406,228 @@ class DataLoaderRunnable(QRunnable):
         except Exception as e:
             # Emit error signal
             self.signals.load_error.emit(str(e))
+
+
+class AddImageDialog(QDialog):
+    """Dialog for adding a new image to a DSO"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Image to DSO")
+        self.setMinimumWidth(500)
+        self.selected_file = None
+        self.dso_data = []  # List of (dsodetailid, name) tuples
+
+        self._init_ui()
+        self._load_dso_list()
+        self._apply_dark_theme()
+
+    def _init_ui(self):
+        """Create the dialog UI"""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+
+        # Instructions
+        instructions = QLabel("Select an image file and choose which DSO to attach it to.")
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+
+        # Form layout for inputs
+        form_layout = QFormLayout()
+        form_layout.setSpacing(10)
+
+        # Image file selection
+        file_layout = QHBoxLayout()
+        self.file_path_edit = QLineEdit()
+        self.file_path_edit.setPlaceholderText("No file selected...")
+        self.file_path_edit.setReadOnly(True)
+        file_layout.addWidget(self.file_path_edit)
+
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._browse_file)
+        file_layout.addWidget(browse_btn)
+        form_layout.addRow("Image File:", file_layout)
+
+        # DSO selection with search
+        self.dso_combo = QComboBox()
+        self.dso_combo.setEditable(True)
+        self.dso_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.dso_combo.lineEdit().setPlaceholderText("Search for DSO...")
+        self.dso_combo.setMinimumWidth(300)
+        form_layout.addRow("Attach to DSO:", self.dso_combo)
+
+        # Optional metadata fields
+        self.equipment_edit = QLineEdit()
+        self.equipment_edit.setPlaceholderText("e.g., 8\" SCT, ASI294MC Pro")
+        form_layout.addRow("Equipment:", self.equipment_edit)
+
+        self.integration_edit = QLineEdit()
+        self.integration_edit.setPlaceholderText("e.g., 2h 30m")
+        form_layout.addRow("Integration Time:", self.integration_edit)
+
+        self.date_edit = QLineEdit()
+        self.date_edit.setPlaceholderText("e.g., 2024-01-15")
+        form_layout.addRow("Date Taken:", self.date_edit)
+
+        self.notes_edit = QLineEdit()
+        self.notes_edit.setPlaceholderText("Optional notes about this image")
+        form_layout.addRow("Notes:", self.notes_edit)
+
+        layout.addLayout(form_layout)
+
+        # Dialog buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._validate_and_accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _apply_dark_theme(self):
+        """Apply dark theme styling"""
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+            QLineEdit, QComboBox {
+                background-color: #404040;
+                color: #ffffff;
+                border: 1px solid #666666;
+                padding: 5px;
+                border-radius: 3px;
+                min-height: 20px;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid #0078d4;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox::down-arrow {
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #ffffff;
+                margin-right: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #404040;
+                color: #ffffff;
+                selection-background-color: #0078d4;
+                border: 1px solid #666666;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 3px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton:pressed {
+                background-color: #005a9e;
+            }
+        """)
+
+    def _load_dso_list(self):
+        """Load all DSOs from database for the combo box"""
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                query = """
+                    SELECT d.id as dsodetailid,
+                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', '
+                               ORDER BY CASE c.catalogue
+                                   WHEN 'M' THEN 1
+                                   WHEN 'NGC' THEN 2
+                                   WHEN 'IC' THEN 3
+                                   ELSE 4
+                               END, c.designation) as name,
+                           d.constellation,
+                           d.dsotype
+                    FROM dsodetail d
+                    JOIN cataloguenr c ON d.id = c.dsodetailid
+                    GROUP BY d.id
+                    ORDER BY
+                        CASE
+                            WHEN name LIKE 'M %' THEN 1
+                            WHEN name LIKE 'NGC %' THEN 2
+                            WHEN name LIKE 'IC %' THEN 3
+                            ELSE 4
+                        END,
+                        name
+                """
+                cursor.execute(query)
+                rows = cursor.fetchall()
+
+                # Clear and populate combo box
+                self.dso_combo.clear()
+                self.dso_data = []
+
+                for row in rows:
+                    dsodetailid, name, constellation, dsotype = row
+                    display_text = f"{name} ({constellation})"
+                    self.dso_combo.addItem(display_text, dsodetailid)
+                    self.dso_data.append((dsodetailid, name))
+
+                # Setup completer for search functionality
+                completer = QCompleter([self.dso_combo.itemText(i) for i in range(self.dso_combo.count())])
+                completer.setCaseSensitivity(Qt.CaseInsensitive)
+                completer.setFilterMode(Qt.MatchContains)
+                self.dso_combo.setCompleter(completer)
+
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to load DSO list: {str(e)}")
+
+    def _browse_file(self):
+        """Open file dialog to select an image"""
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Image File",
+            os.path.expanduser("~"),
+            "Image Files (*.png *.jpg *.jpeg *.tif *.tiff *.fits *.fit *.fts);;"
+            "PNG Files (*.png);;"
+            "JPEG Files (*.jpg *.jpeg);;"
+            "TIFF Files (*.tif *.tiff);;"
+            "FITS Files (*.fits *.fit *.fts);;"
+            "All Files (*.*)"
+        )
+        if file_name:
+            self.selected_file = file_name
+            self.file_path_edit.setText(file_name)
+
+    def _validate_and_accept(self):
+        """Validate inputs before accepting"""
+        if not self.selected_file:
+            QMessageBox.warning(self, "Missing Image", "Please select an image file.")
+            return
+
+        if not os.path.exists(self.selected_file):
+            QMessageBox.warning(self, "File Not Found", "The selected image file does not exist.")
+            return
+
+        if self.dso_combo.currentIndex() < 0:
+            QMessageBox.warning(self, "No DSO Selected", "Please select a DSO to attach the image to.")
+            return
+
+        self.accept()
+
+    def get_image_data(self):
+        """Return the entered image data"""
+        return {
+            'dsodetailid': self.dso_combo.currentData(),
+            'image_path': self.selected_file,
+            'equipment': self.equipment_edit.text().strip(),
+            'integration_time': self.integration_edit.text().strip(),
+            'date_taken': self.date_edit.text().strip(),
+            'notes': self.notes_edit.text().strip()
+        }
 
 
 class GalleryCard(QFrame):
@@ -592,7 +830,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             'search': '',
             'catalog': 'All',
             'type': 'All',
-            'equipment': 'All'
+            'equipment': 'All',
+            'sort': 'Name (A-Z)'
         }
 
         # Thumbnail cache and thread pool
@@ -625,6 +864,13 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         # Flag to track if resize is in progress
         self.resize_in_progress = False
+
+        # Lazy loading tracking
+        self.thumbnail_loaded_indices = set()  # Track which card indices have been queued
+        self.scroll_debounce_timer = QTimer()
+        self.scroll_debounce_timer.setSingleShot(True)
+        self.scroll_debounce_timer.timeout.connect(self._on_scroll_debounced)
+        self.visible_buffer_rows = 2  # Load this many extra rows above/below visible area
 
         # Initialize UI
         self._init_ui()
@@ -687,10 +933,23 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.equipment_combo.currentTextChanged.connect(self._on_filter_changed)
         filters_layout.addWidget(self.equipment_combo)
 
+        # Sort dropdown
+        filters_layout.addWidget(QLabel("Sort:"))
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(["Name (A-Z)", "Name (Z-A)", "Date Added (Newest)", "Date Added (Oldest)", "Type", "Constellation"])
+        self.sort_combo.setMinimumWidth(130)
+        self.sort_combo.currentTextChanged.connect(self._on_sort_changed)
+        filters_layout.addWidget(self.sort_combo)
+
         # Clear filters button
         clear_btn = QPushButton("Clear Filters")
         clear_btn.clicked.connect(self._clear_filters)
         filters_layout.addWidget(clear_btn)
+
+        # Add Image button
+        add_image_btn = QPushButton("Add Image")
+        add_image_btn.clicked.connect(self._show_add_image_dialog)
+        filters_layout.addWidget(add_image_btn)
 
         filters_layout.addStretch()
         main_layout.addWidget(filters_group)
@@ -709,6 +968,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         self.scroll_area.setWidget(self.grid_container)
         main_layout.addWidget(self.scroll_area)
+
+        # Connect scroll bar to lazy loading
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
         # Status label
         self.status_label = QLabel("Loading...")
@@ -884,11 +1146,14 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self._load_thumbnails()
 
     def _load_thumbnails(self):
-        """Load thumbnails in background thread pool"""
+        """Load thumbnails for visible cards only (lazy loading)"""
         # Cancel any pending tasks (they will check the flag and exit early)
         self.cancelled_flag[0] = True
         # Create new cancellation flag for new batch of tasks
         self.cancelled_flag = [False]
+
+        # Reset tracking for new grid
+        self.thumbnail_loaded_indices.clear()
 
         # Connect signals (disconnect first to avoid duplicates)
         try:
@@ -904,17 +1169,76 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.thumbnail_signals.thumbnail_ready.connect(self._on_thumbnail_ready)
         self.thumbnail_signals.thumbnail_error.connect(self._on_thumbnail_error)
 
-        # Create and submit runnable for each thumbnail
-        for card in self.cards:
-            image_path = card.item_data['image_path']
-            runnable = ThumbnailRunnable(
-                card,
-                image_path,
-                self.thumbnail_cache,
-                self.thumbnail_signals,
-                self.cancelled_flag
-            )
-            self.thread_pool.start(runnable)
+        # Load only visible thumbnails initially
+        self._load_visible_thumbnails()
+
+        # Schedule a second check after layout settles (handles edge cases)
+        QTimer.singleShot(100, self._load_visible_thumbnails)
+
+    def _get_visible_card_indices(self):
+        """Calculate which card indices are currently visible in the viewport"""
+        if not hasattr(self, 'cards') or not self.cards or self.current_columns == 0:
+            return set()
+
+        # Get scroll area viewport geometry
+        viewport = self.scroll_area.viewport()
+        viewport_height = viewport.height()
+        scroll_pos = self.scroll_area.verticalScrollBar().value()
+
+        # Estimate card height (thumbnail 150 + name label ~20 + type label ~16 + margins ~20)
+        card_height = 210  # Approximate height of each card including spacing
+
+        # Calculate visible row range
+        first_visible_row = max(0, scroll_pos // card_height - self.visible_buffer_rows)
+        last_visible_row = (scroll_pos + viewport_height) // card_height + self.visible_buffer_rows
+
+        # Convert rows to card indices
+        visible_indices = set()
+        total_cards = len(self.cards)
+
+        for row in range(first_visible_row, last_visible_row + 1):
+            for col in range(self.current_columns):
+                idx = row * self.current_columns + col
+                if 0 <= idx < total_cards:
+                    visible_indices.add(idx)
+
+        return visible_indices
+
+    def _load_visible_thumbnails(self):
+        """Load thumbnails for currently visible cards that haven't been loaded yet"""
+        visible_indices = self._get_visible_card_indices()
+
+        # Find indices that need loading (visible but not yet queued)
+        indices_to_load = visible_indices - self.thumbnail_loaded_indices
+
+        if not indices_to_load:
+            return
+
+        # Mark these indices as queued
+        self.thumbnail_loaded_indices.update(indices_to_load)
+
+        # Queue thumbnail loading for new visible cards
+        for idx in indices_to_load:
+            if idx < len(self.cards):
+                card = self.cards[idx]
+                image_path = card.item_data['image_path']
+                runnable = ThumbnailRunnable(
+                    card,
+                    image_path,
+                    self.thumbnail_cache,
+                    self.thumbnail_signals,
+                    self.cancelled_flag
+                )
+                self.thread_pool.start(runnable)
+
+    def _on_scroll(self, value):
+        """Handle scroll events - debounce and trigger lazy loading"""
+        # Use debounce to avoid excessive loading during fast scrolling
+        self.scroll_debounce_timer.start(50)  # 50ms debounce
+
+    def _on_scroll_debounced(self):
+        """Handle debounced scroll - load newly visible thumbnails"""
+        self._load_visible_thumbnails()
 
     def _on_thumbnail_ready(self, card, pixmap):
         """Handle thumbnail loaded successfully"""
@@ -1208,12 +1532,37 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.current_filters['catalog'] = self.catalog_combo.currentText()
         self.current_filters['type'] = self.type_combo.currentText()
         self.current_filters['equipment'] = self.equipment_combo.currentText()
+        self.current_filters['sort'] = self.sort_combo.currentText()
 
         # Filter items
         self.filtered_items = [item for item in self.all_items if self._matches_filters(item)]
 
+        # Apply sorting
+        self._sort_items()
+
         # Refresh grid
         self._populate_grid()
+
+    def _on_sort_changed(self):
+        """Handle sort dropdown change"""
+        self._apply_filters()
+
+    def _sort_items(self):
+        """Sort filtered items based on current sort selection"""
+        sort_option = self.current_filters['sort']
+
+        if sort_option == "Name (A-Z)":
+            self.filtered_items.sort(key=lambda x: x['name'].lower())
+        elif sort_option == "Name (Z-A)":
+            self.filtered_items.sort(key=lambda x: x['name'].lower(), reverse=True)
+        elif sort_option == "Date Added (Newest)":
+            self.filtered_items.sort(key=lambda x: x.get('created_date', '') or '', reverse=True)
+        elif sort_option == "Date Added (Oldest)":
+            self.filtered_items.sort(key=lambda x: x.get('created_date', '') or '')
+        elif sort_option == "Type":
+            self.filtered_items.sort(key=lambda x: (x['friendly_type'].lower(), x['name'].lower()))
+        elif sort_option == "Constellation":
+            self.filtered_items.sort(key=lambda x: (x['constellation'].lower(), x['name'].lower()))
 
     def _matches_filters(self, item):
         """Check if item matches all current filters"""
@@ -1250,6 +1599,64 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.type_combo.setCurrentText("All")
         self.equipment_combo.setCurrentText("All")
         self._apply_filters()
+
+    def _show_add_image_dialog(self):
+        """Show dialog to add a new image to a DSO"""
+        dialog = AddImageDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            image_data = dialog.get_image_data()
+            self._add_image_to_database(image_data)
+
+    def _add_image_to_database(self, image_data):
+        """Add an image to the database and refresh the gallery"""
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO userimages (
+                        dsodetailid, image_path, integration_time,
+                        equipment, date_taken, notes, created_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                """, (
+                    image_data['dsodetailid'],
+                    image_data['image_path'],
+                    image_data['integration_time'],
+                    image_data['equipment'],
+                    image_data['date_taken'],
+                    image_data['notes']
+                ))
+                conn.commit()
+
+            # Show success message
+            QMessageBox.information(self, "Image Added",
+                                   f"Image successfully added to database.")
+
+            # Refresh the gallery data
+            self._refresh_gallery()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error",
+                               f"Failed to add image to database:\n{str(e)}")
+
+    def _refresh_gallery(self):
+        """Reload gallery data from database"""
+        # Clear current data
+        self.all_items = []
+        self.filtered_items = []
+        self.data_loaded = False
+        self.thumbnail_loaded_indices.clear()
+
+        # Cancel pending thumbnail tasks
+        self.cancelled_flag[0] = True
+
+        # Clear thumbnail cache for this item (in case image changed)
+        self.thumbnail_cache.clear()
+
+        # Update status
+        self.status_label.setText("Refreshing gallery...")
+
+        # Reload data from database
+        self._start_background_data_load()
 
     def showEvent(self, event):
         """Handle window show - populate grid on first show"""

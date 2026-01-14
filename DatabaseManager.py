@@ -78,7 +78,16 @@ class DatabaseManager:
                 except sqlite3.OperationalError:
                     # Column already exists, ignore
                     pass
-                
+
+                # Add created_date column if it doesn't exist (for existing databases)
+                # Note: ALTER TABLE cannot use CURRENT_TIMESTAMP as default, so we use NULL
+                try:
+                    cursor.execute("ALTER TABLE userimages ADD COLUMN created_date TEXT")
+                    logger.debug("Added created_date column to userimages table")
+                except sqlite3.OperationalError:
+                    # Column already exists, ignore
+                    pass
+
                 # Create usertargetlist table for user's observing target list
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS usertargetlist (
