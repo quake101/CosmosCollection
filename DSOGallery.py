@@ -586,6 +586,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.db_manager = DatabaseManager()
         self.all_items = []
         self.filtered_items = []
+        self.data_loaded = False  # Track whether initial data load is complete
         self.current_columns = 1
         self.current_filters = {
             'search': '',
@@ -723,6 +724,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         """Handle data loaded from background thread"""
         self.all_items = items
         self.filtered_items = self.all_items.copy()
+        self.data_loaded = True  # Mark data as loaded
 
         # Populate filter dropdowns
         self._populate_type_filter()
@@ -804,10 +806,14 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Check if there are items to display
         if not self.filtered_items:
             # Show different message if still loading data vs no results
-            if not self.all_items:
+            if not self.data_loaded:
                 # Still loading initial data
                 loading_label = QLabel("Loading DSO images from database...")
                 loading_label.setStyleSheet("font-size: 14px; color: #cccccc; padding: 50px;")
+            elif len(self.all_items) == 0:
+                # Data loaded but database has no images
+                loading_label = QLabel("No DSO images in your database.\n\nAdd images to DSO objects to see them here.")
+                loading_label.setStyleSheet("font-size: 14px; color: #888888; padding: 50px;")
             else:
                 # Data loaded but no matches for current filters
                 loading_label = QLabel("No DSO images found matching your filters")
