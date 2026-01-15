@@ -368,7 +368,9 @@ class DataLoaderRunnable(QRunnable):
                                 WHEN 'IC' THEN 3
                                 ELSE 4
                             END, c.designation) as name,
-                    pi.created_date
+                    pi.created_date,
+                    d.ra,
+                    d.dec
                 FROM dsodetail d
                 INNER JOIN cataloguenr c ON d.id = c.dsodetailid
                 LEFT JOIN PreferredImages pi ON d.id = pi.dsodetailid AND pi.rn = 1
@@ -392,7 +394,9 @@ class DataLoaderRunnable(QRunnable):
                         'constellation': row[5] or '',
                         'name': row[6] or 'Unknown',
                         'friendly_type': self._get_friendly_type_name(row[4] or ''),
-                        'created_date': row[7] or ''
+                        'created_date': row[7] or '',
+                        'ra_deg': row[8],
+                        'dec_deg': row[9]
                     }
                     items.append(item)
 
@@ -1063,6 +1067,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
     def _populate_grid(self):
         """Populate grid with gallery cards"""
+        # Disable updates during grid rebuild to prevent excessive repainting
+        self.grid_container.setUpdatesEnabled(False)
+
         # Clear existing cards
         while self.grid_layout.count():
             item = self.grid_layout.takeAt(0)
@@ -1089,6 +1096,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
             if self.all_items:
                 self.status_label.setText(f"Showing 0 of {len(self.all_items)} DSOs")
+
+            # Re-enable updates
+            self.grid_container.setUpdatesEnabled(True)
             return
 
         # Calculate columns based on window width
@@ -1098,9 +1108,16 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Store cards for thumbnail loading
         self.cards = []
 
-        # Update status immediately
+        # Show wait cursor during loading if many items
         showing = len(self.filtered_items)
         total = len(self.all_items)
+        if showing > 50:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self._loading_cursor_active = True
+        else:
+            self._loading_cursor_active = False
+
+        # Update status immediately
         if showing == total:
             self.status_label.setText(f"Loading {total} DSO{'s' if total != 1 else ''}...")
         else:
@@ -1109,7 +1126,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Create cards in batches to keep UI responsive
         self._create_cards_batch(0, cols)
 
-    def _create_cards_batch(self, start_idx, cols, batch_size=50):
+    def _create_cards_batch(self, start_idx, cols, batch_size=15):
         """Create a batch of gallery cards to keep UI responsive"""
         end_idx = min(start_idx + batch_size, len(self.filtered_items))
 
@@ -1130,13 +1147,26 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             # Store reference
             self.cards.append(card)
 
+        # Update progress in status bar
+        total = len(self.filtered_items)
+        self.status_label.setText(f"Loading gallery... {end_idx}/{total}")
+
         # If there are more cards to create, schedule next batch
+        # Use QTimer.singleShot(0, ...) to allow UI events to process between batches
         if end_idx < len(self.filtered_items):
-            QTimer.singleShot(10, lambda: self._create_cards_batch(end_idx, cols, batch_size))
+            QTimer.singleShot(0, lambda: self._create_cards_batch(end_idx, cols, batch_size))
         else:
             # All cards created - finalize grid layout
             self.grid_layout.setRowStretch(len(self.filtered_items) // cols + 1, 1)
             self.grid_layout.setColumnStretch(cols, 1)
+
+            # Re-enable updates now that grid is built
+            self.grid_container.setUpdatesEnabled(True)
+
+            # Restore cursor if we set it
+            if hasattr(self, '_loading_cursor_active') and self._loading_cursor_active:
+                QApplication.restoreOverrideCursor()
+                self._loading_cursor_active = False
 
             # Update status
             showing = len(self.filtered_items)
@@ -1150,7 +1180,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self._load_thumbnails()
 
     def _load_thumbnails(self):
-        """Load thumbnails for visible cards only (lazy loading)"""
+        """Load all thumbnails, prioritizing visible cards first"""
         # Cancel any pending tasks (they will check the flag and exit early)
         self.cancelled_flag[0] = True
         # Create new cancellation flag for new batch of tasks
@@ -1173,11 +1203,11 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.thumbnail_signals.thumbnail_ready.connect(self._on_thumbnail_ready)
         self.thumbnail_signals.thumbnail_error.connect(self._on_thumbnail_error)
 
-        # Load only visible thumbnails initially
+        # Load visible thumbnails first (priority)
         self._load_visible_thumbnails()
 
-        # Schedule a second check after layout settles (handles edge cases)
-        QTimer.singleShot(100, self._load_visible_thumbnails)
+        # Schedule loading of remaining thumbnails after visible ones are queued
+        QTimer.singleShot(200, self._load_remaining_thumbnails)
 
     def _get_visible_card_indices(self):
         """Calculate which card indices are currently visible in the viewport"""
@@ -1235,10 +1265,44 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                 )
                 self.thread_pool.start(runnable)
 
+    def _load_remaining_thumbnails(self, batch_start=0, batch_size=20):
+        """Load remaining thumbnails that weren't in the initial visible set"""
+        if not hasattr(self, 'cards') or not self.cards:
+            return
+
+        # Check if cancelled (grid was rebuilt)
+        if self.cancelled_flag[0]:
+            return
+
+        total_cards = len(self.cards)
+        batch_end = min(batch_start + batch_size, total_cards)
+        loaded_count = 0
+
+        # Queue thumbnails for this batch (skip already queued ones)
+        for idx in range(batch_start, batch_end):
+            if idx not in self.thumbnail_loaded_indices:
+                self.thumbnail_loaded_indices.add(idx)
+                card = self.cards[idx]
+                image_path = card.item_data['image_path']
+                runnable = ThumbnailRunnable(
+                    card,
+                    image_path,
+                    self.thumbnail_cache,
+                    self.thumbnail_signals,
+                    self.cancelled_flag
+                )
+                self.thread_pool.start(runnable)
+                loaded_count += 1
+
+        # Schedule next batch if there are more cards
+        if batch_end < total_cards:
+            # Small delay between batches to keep UI responsive
+            QTimer.singleShot(50, lambda: self._load_remaining_thumbnails(batch_end, batch_size))
+
     def _on_scroll(self, value):
         """Handle scroll events - debounce and trigger lazy loading"""
         # Use debounce to avoid excessive loading during fast scrolling
-        self.scroll_debounce_timer.start(50)  # 50ms debounce
+        self.scroll_debounce_timer.start(100)  # 100ms debounce for smoother scrolling
 
     def _on_scroll_debounced(self):
         """Handle debounced scroll - load newly visible thumbnails"""
@@ -1371,8 +1435,13 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                                        f"The file may be corrupted or in an unsupported format.")
                     return
 
-            # Create and show image viewer window (pixmap, title, file_path, parent)
-            self.image_viewer = ImageViewerWindow(pixmap, item_data['name'], image_path, self)
+            # Create and show image viewer window (pixmap, title, file_path, parent, dso_ra, dso_dec)
+            ra_deg = item_data.get('ra_deg')
+            dec_deg = item_data.get('dec_deg')
+            self.image_viewer = ImageViewerWindow(
+                pixmap, item_data['name'], image_path, self,
+                dso_ra=ra_deg, dso_dec=dec_deg
+            )
             self.image_viewer.show()
             self.image_viewer.raise_()
             self.image_viewer.activateWindow()
@@ -1742,6 +1811,10 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         """Handle window close - cleanup thread pool and cursor"""
         # Restore cursor if it was changed during resize
         if self.resize_in_progress:
+            QApplication.restoreOverrideCursor()
+
+        # Restore cursor if it was changed during loading
+        if hasattr(self, '_loading_cursor_active') and self._loading_cursor_active:
             QApplication.restoreOverrideCursor()
 
         # Cancel all pending thumbnail tasks

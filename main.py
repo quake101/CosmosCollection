@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
     QVBoxLayout, QWidget, QLabel, QDialog,
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
-    QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout, QSpinBox
+    QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout, QSpinBox, QFileDialog
 )
 
 # Local imports (always needed)
@@ -3274,7 +3274,8 @@ class ImageViewerWindow(QDialog):
     """Window to display an image in full size with enhanced controls"""
     zoom_changed = Signal(float)  # Signal for zoom level changes
 
-    def __init__(self, pixmap: QPixmap, title: str, file_path: str = None, parent=None):
+    def __init__(self, pixmap: QPixmap, title: str, file_path: str = None, parent=None,
+                 dso_ra: float = None, dso_dec: float = None):
         super().__init__(parent)
         self.setWindowTitle(f"{title} - Image Viewer - Cosmos Collection")
         self.setWindowFlags(
@@ -3292,6 +3293,10 @@ class ImageViewerWindow(QDialog):
         self.image_position = [0, 0]
         self.last_mouse_pos = None
         self.is_panning = False
+
+        # Store DSO coordinates for plate solving hints
+        self.dso_ra = dso_ra  # RA in degrees
+        self.dso_dec = dso_dec  # Dec in degrees
 
         # Create main layout
         main_layout = QVBoxLayout()
@@ -3344,6 +3349,21 @@ class ImageViewerWindow(QDialog):
             self.info_toggle_button.setChecked(False)
             self.info_toggle_button.clicked.connect(self._toggle_file_info)
             toolbar.addWidget(self.info_toggle_button)
+
+            # Add annotations button
+            self.annotations_button = QPushButton("Show Annotations")
+            self.annotations_button.setFixedSize(120, 30)
+            self.annotations_button.clicked.connect(self._show_annotations_dialog)
+            toolbar.addWidget(self.annotations_button)
+
+        # Initialize annotation system
+        self.annotation_renderer = None
+        self._annotation_status_text = None  # For status bar display
+        # Load annotation enabled state from settings
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        self.annotations_enabled = settings.value("annotation_enabled", False, type=bool)
+        self.plate_solve_result = None
+        self.plate_solve_worker = None
 
         main_layout.addLayout(toolbar)
 
@@ -3483,6 +3503,10 @@ class ImageViewerWindow(QDialog):
             self.initial_zoom_factor = self.zoom_factor
             self.initial_fit_done = True
 
+            # Auto-load annotations if enabled and cached WCS exists
+            if self.annotations_enabled and self.file_path:
+                self._auto_load_annotations()
+
     def eventFilter(self, obj, event):
         """Handle mouse events for zooming and panning"""
         if obj == self.image_label:
@@ -3550,6 +3574,12 @@ class ImageViewerWindow(QDialog):
 
         # Draw the image
         painter.drawPixmap(x, y, scaled_pixmap)
+
+        # Draw annotations if enabled
+        if self.annotations_enabled and self.annotation_renderer:
+            logger.debug(f"Drawing annotations: zoom={self.zoom_factor}, pos=({x}, {y})")
+            self.annotation_renderer.render(painter, self.zoom_factor, x, y)
+
         painter.end()
 
         # Update the display
@@ -3626,11 +3656,18 @@ class ImageViewerWindow(QDialog):
         self.image_position = [0, 0]
         self._update_zoom()
 
-    def _update_status(self):
+    def _update_status(self, annotation_status=None):
         """Update the status bar with current zoom level and image size"""
         zoom_percent = int(self.zoom_factor * 100)
-        image_size = f"{self.original_pixmap.width()}—{self.original_pixmap.height()}"
-        self.status_bar.setText(f"Zoom: {zoom_percent}% | Image Size: {image_size} pixels")
+        image_size = f"{self.original_pixmap.width()}x{self.original_pixmap.height()}"
+        base_status = f"Zoom: {zoom_percent}% | Image Size: {image_size} pixels"
+
+        if annotation_status:
+            self.status_bar.setText(f"{base_status} | {annotation_status}")
+        elif hasattr(self, '_annotation_status_text') and self._annotation_status_text:
+            self.status_bar.setText(f"{base_status} | {self._annotation_status_text}")
+        else:
+            self.status_bar.setText(base_status)
 
     def _open_file_location(self):
         """Open the file location in the system's file explorer"""
@@ -3997,8 +4034,412 @@ class ImageViewerWindow(QDialog):
             # Any other error reading FITS
             return None
 
+    def _show_annotations_dialog(self):
+        """Show the annotations dialog for plate solving and annotation settings"""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QCheckBox, QProgressBar
+        from pathlib import Path
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Image Annotations")
+        dialog.setMinimumWidth(400)
+
+        layout = QVBoxLayout(dialog)
+
+        # Check if WCS file exists for this image
+        wcs_exists = False
+        if self.file_path:
+            wcs_file = Path(self.file_path).with_suffix('.wcs')
+            wcs_exists = wcs_file.exists()
+
+        # Auto-load cached WCS if available and not already loaded
+        if wcs_exists and not (self.plate_solve_result and self.plate_solve_result.success):
+            self._load_cached_wcs()
+
+        # Status label
+        self.annotation_status = QLabel("Ready to plate solve")
+        self.annotation_status.setStyleSheet("color: #cccccc; padding: 5px;")
+        layout.addWidget(self.annotation_status)
+
+        # Progress bar
+        self.annotation_progress = QProgressBar()
+        self.annotation_progress.setRange(0, 0)  # Indeterminate
+        self.annotation_progress.setVisible(False)
+        layout.addWidget(self.annotation_progress)
+
+        # Plate solve button - show "Re-Plate Solve" if WCS exists or already solved
+        solve_layout = QHBoxLayout()
+        if self.plate_solve_result and self.plate_solve_result.success:
+            self.solve_button = QPushButton("Re-Plate Solve Image")
+            self.annotation_status.setText(
+                f"Solved: RA {self.plate_solve_result.ra_center:.4f}, "
+                f"Dec {self.plate_solve_result.dec_center:.4f}, "
+                f"Scale {self.plate_solve_result.pixel_scale:.2f}\"/px"
+            )
+        elif wcs_exists:
+            self.solve_button = QPushButton("Re-Plate Solve Image")
+            self.annotation_status.setText("Cached plate solve available - click to load")
+        else:
+            self.solve_button = QPushButton("Plate Solve Image")
+
+        self.solve_button.clicked.connect(lambda: self._start_plate_solve(dialog))
+        solve_layout.addWidget(self.solve_button)
+
+        solve_layout.addStretch()
+        layout.addLayout(solve_layout)
+
+        # Load saved annotation settings
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+
+        # Annotation toggles (only enabled after plate solve)
+        toggles_group = QGroupBox("Annotation Layers")
+        toggles_layout = QVBoxLayout(toggles_group)
+
+        self.show_dsos_check = QCheckBox("Show DSO Labels")
+        self.show_dsos_check.setChecked(settings.value("annotation_show_dsos", True, type=bool))
+        self.show_dsos_check.stateChanged.connect(self._update_annotation_settings)
+        toggles_layout.addWidget(self.show_dsos_check)
+
+        self.show_stars_check = QCheckBox("Show Star Labels")
+        self.show_stars_check.setChecked(settings.value("annotation_show_stars", True, type=bool))
+        self.show_stars_check.stateChanged.connect(self._update_annotation_settings)
+        toggles_layout.addWidget(self.show_stars_check)
+
+        self.show_constellations_check = QCheckBox("Show Constellation Lines")
+        self.show_constellations_check.setChecked(settings.value("annotation_show_constellations", True, type=bool))
+        self.show_constellations_check.stateChanged.connect(self._update_annotation_settings)
+        toggles_layout.addWidget(self.show_constellations_check)
+
+        self.show_grid_check = QCheckBox("Show Coordinate Grid")
+        self.show_grid_check.setChecked(settings.value("annotation_show_grid", True, type=bool))
+        self.show_grid_check.stateChanged.connect(self._update_annotation_settings)
+        toggles_layout.addWidget(self.show_grid_check)
+
+        # Enable/disable based on solve state
+        has_solution = bool(self.plate_solve_result and self.plate_solve_result.success)
+        toggles_group.setEnabled(has_solution)
+        logger.debug(f"Annotations dialog: has_solution={has_solution}, annotations_enabled={self.annotations_enabled}, "
+                     f"annotation_renderer={self.annotation_renderer is not None}")
+
+        layout.addWidget(toggles_group)
+
+        # Enable/disable annotations toggle
+        self.enable_annotations_check = QCheckBox("Enable Annotations Overlay")
+        logger.info(f"Creating enable_annotations_check: will setChecked({self.annotations_enabled}), setEnabled({has_solution})")
+        self.enable_annotations_check.setChecked(self.annotations_enabled)
+        self.enable_annotations_check.setEnabled(has_solution)
+        self.enable_annotations_check.stateChanged.connect(self._toggle_annotations)
+        logger.info(f"enable_annotations_check created: isChecked={self.enable_annotations_check.isChecked()}, isEnabled={self.enable_annotations_check.isEnabled()}")
+        layout.addWidget(self.enable_annotations_check)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        button_layout.addWidget(close_btn)
+
+        layout.addLayout(button_layout)
+
+        # Apply dark theme
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #555555;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+            }
+            QCheckBox {
+                color: #ffffff;
+                padding: 5px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton:disabled {
+                background-color: #555555;
+                color: #888888;
+            }
+            QProgressBar {
+                border: 1px solid #555555;
+                border-radius: 3px;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #0078d4;
+            }
+        """)
+
+        dialog.exec()
+
+    def _start_plate_solve(self, dialog):
+        """Start the plate solving process"""
+        if not self.file_path:
+            QMessageBox.warning(self, "Error", "No image file path available")
+            return
+
+        try:
+            from PlateSolver import PlateSolverWorker
+        except ImportError as e:
+            QMessageBox.critical(self, "Error", f"Plate solver not available: {e}")
+            return
+
+        # Update UI
+        self.solve_button.setEnabled(False)
+        self.annotation_progress.setVisible(True)
+        self.annotation_status.setText("Starting plate solve...")
+
+        # Build hints from DSO coordinates if available
+        hints = {}
+        if self.dso_ra is not None and self.dso_dec is not None:
+            hints['ra'] = self.dso_ra
+            hints['dec'] = self.dso_dec
+            hints['radius'] = 15  # Search within 15 degrees of the DSO
+            self.annotation_status.setText(f"Plate solving near RA={self.dso_ra:.2f}, Dec={self.dso_dec:.2f}...")
+
+        # Create worker
+        self.plate_solve_worker = PlateSolverWorker(self.file_path, hints if hints else None)
+        self.plate_solve_worker.progress.connect(
+            lambda msg: self.annotation_status.setText(msg)
+        )
+        self.plate_solve_worker.finished.connect(
+            lambda result: self._on_plate_solve_finished(result, dialog)
+        )
+        self.plate_solve_worker.start()
+
+    def _on_plate_solve_finished(self, result, dialog):
+        """Handle plate solve completion"""
+        self.annotation_progress.setVisible(False)
+        self.solve_button.setEnabled(True)
+
+        self.plate_solve_result = result
+
+        if result.success:
+            self.annotation_status.setText(
+                f"Solved with {result.solver_used}: RA {result.ra_center:.4f}, "
+                f"Dec {result.dec_center:.4f}, Scale {result.pixel_scale:.2f}\"/px"
+            )
+            self.solve_button.setText("Re-Solve Image")
+
+            # Enable annotation controls
+            if hasattr(self, 'enable_annotations_check'):
+                self.enable_annotations_check.setEnabled(True)
+            if hasattr(self, 'show_dsos_check'):
+                self.show_dsos_check.parent().setEnabled(True)
+
+            # Initialize annotation renderer
+            self._init_annotation_renderer()
+
+            QMessageBox.information(self, "Plate Solve Complete",
+                f"Image successfully plate solved!\n\n"
+                f"Solver: {result.solver_used}\n"
+                f"Center: RA {result.ra_center:.4f}, Dec {result.dec_center:.4f}\n"
+                f"Pixel Scale: {result.pixel_scale:.2f} arcsec/pixel"
+            )
+        else:
+            self.annotation_status.setText(f"Solve failed: {result.error_message}")
+            QMessageBox.warning(self, "Plate Solve Failed",
+                f"Could not plate solve the image.\n\n{result.error_message}")
+
+    def _auto_load_annotations(self):
+        """Auto-load annotations if cached WCS exists and annotations are enabled"""
+        if not self.file_path:
+            return
+
+        # Check if WCS file exists
+        from pathlib import Path
+        wcs_file = Path(self.file_path).with_suffix('.wcs')
+        if not wcs_file.exists():
+            logger.debug(f"No cached WCS file for auto-load: {wcs_file}")
+            return
+
+        # Load cached WCS if not already loaded
+        if not (self.plate_solve_result and self.plate_solve_result.success):
+            logger.info("Auto-loading cached WCS for annotations")
+            self._annotation_status_text = "Loading plate solve data..."
+            self._update_status()
+            self._load_cached_wcs()
+
+    def _load_cached_wcs(self):
+        """Load cached WCS file if available"""
+        if not self.file_path:
+            return
+
+        try:
+            from PlateSolver import PlateSolver, PlateSolveResult
+            from pathlib import Path
+
+            wcs_file = Path(self.file_path).with_suffix('.wcs')
+            if not wcs_file.exists():
+                return
+
+            logger.info(f"Loading cached WCS from {wcs_file}")
+
+            # Use PlateSolver to parse the WCS file
+            solver = PlateSolver()
+            wcs_header = solver._parse_wcs_file(wcs_file)
+
+            if wcs_header and wcs_header.get('CRVAL1') is not None:
+                # Create a PlateSolveResult from cached data
+                result = PlateSolveResult()
+                result.success = True
+                result.solver_used = 'ASTAP (cached)'
+                result.wcs_header = wcs_header
+                result.ra_center = wcs_header.get('CRVAL1')
+                result.dec_center = wcs_header.get('CRVAL2')
+
+                # Calculate pixel scale
+                if 'CD1_1' in wcs_header:
+                    result.pixel_scale = abs(wcs_header['CD1_1']) * 3600
+                elif 'CDELT1' in wcs_header:
+                    result.pixel_scale = abs(wcs_header['CDELT1']) * 3600
+
+                self.plate_solve_result = result
+                logger.info(f"Loaded cached WCS: RA={result.ra_center}, Dec={result.dec_center}, scale={result.pixel_scale}")
+
+                # Initialize annotation renderer
+                self._init_annotation_renderer()
+
+        except Exception as e:
+            logger.warning(f"Failed to load cached WCS: {e}")
+
+    def _init_annotation_renderer(self):
+        """Initialize the annotation renderer with WCS data"""
+        if not self.plate_solve_result or not self.plate_solve_result.success:
+            logger.warning("Cannot init annotation renderer - no successful plate solve result")
+            return
+
+        try:
+            from AnnotationOverlay import AnnotationRenderer, CatalogQueryWorker
+
+            self.annotation_renderer = AnnotationRenderer()
+            self.annotation_renderer.set_wcs(
+                self.plate_solve_result.wcs_header,
+                self.original_pixmap.width(),
+                self.original_pixmap.height()
+            )
+
+            # Apply saved layer settings to the renderer
+            settings = QSettings("CosmosCollection", "CosmosCollection")
+            self.annotation_renderer.show_dsos = settings.value("annotation_show_dsos", True, type=bool)
+            self.annotation_renderer.show_stars = settings.value("annotation_show_stars", True, type=bool)
+            self.annotation_renderer.show_constellation_lines = settings.value("annotation_show_constellations", True, type=bool)
+            self.annotation_renderer.show_grid = settings.value("annotation_show_grid", True, type=bool)
+
+            logger.info(f"Annotation renderer initialized with WCS. Image size: {self.original_pixmap.width()}x{self.original_pixmap.height()}")
+
+            # Update status to show catalog query is starting
+            self._annotation_status_text = "Querying star/DSO catalogs..."
+            self._update_status()
+
+            # Query catalogs for objects
+            self.catalog_worker = CatalogQueryWorker(
+                self.annotation_renderer.wcs,
+                magnitude_limit=8.0
+            )
+            self.catalog_worker.progress.connect(self._on_catalog_query_progress)
+            self.catalog_worker.finished.connect(self._on_catalog_query_finished)
+            self.catalog_worker.start()
+
+        except Exception as e:
+            logger.exception("Failed to initialize annotation renderer")
+            QMessageBox.warning(self, "Error", f"Failed to initialize annotations: {e}")
+
+    def _on_catalog_query_progress(self, message):
+        """Handle catalog query progress updates"""
+        self._annotation_status_text = message
+        self._update_status()
+
+    def _on_catalog_query_finished(self, stars, dsos):
+        """Handle catalog query completion"""
+        logger.info(f"Catalog query finished: {len(stars)} stars, {len(dsos)} DSOs")
+
+        # Update status with results
+        if self.annotations_enabled:
+            self._annotation_status_text = f"Annotations: {len(stars)} stars, {len(dsos)} DSOs"
+        else:
+            self._annotation_status_text = f"Annotations ready: {len(stars)} stars, {len(dsos)} DSOs (disabled)"
+        self._update_status()
+
+        if self.annotation_renderer:
+            self.annotation_renderer.set_objects(stars, dsos)
+            if self.annotations_enabled:
+                self._update_zoom()
+
+    def _update_annotation_settings(self):
+        """Update annotation visibility settings"""
+        if self.annotation_renderer:
+            self.annotation_renderer.show_dsos = self.show_dsos_check.isChecked()
+            self.annotation_renderer.show_stars = self.show_stars_check.isChecked()
+            self.annotation_renderer.show_constellation_lines = self.show_constellations_check.isChecked()
+            self.annotation_renderer.show_grid = self.show_grid_check.isChecked()
+
+            if self.annotations_enabled:
+                self._update_zoom()
+
+        # Save settings
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue("annotation_show_dsos", self.show_dsos_check.isChecked())
+        settings.setValue("annotation_show_stars", self.show_stars_check.isChecked())
+        settings.setValue("annotation_show_constellations", self.show_constellations_check.isChecked())
+        settings.setValue("annotation_show_grid", self.show_grid_check.isChecked())
+
+    def _toggle_annotations(self, state):
+        """Toggle annotations overlay on/off"""
+        # state can be Qt.CheckState enum or int - just check if it's truthy/checked
+        if hasattr(state, 'value'):
+            # It's an enum, get its integer value
+            state_int = state.value
+        else:
+            state_int = int(state)
+
+        self.annotations_enabled = (state_int == 2)  # 2 = Qt.CheckState.Checked
+        logger.info(f"Annotations toggled: state={state} (int={state_int}), enabled={self.annotations_enabled}, "
+                    f"renderer exists={self.annotation_renderer is not None}")
+
+        # Update status bar
+        if self.annotation_renderer:
+            stars = len(self.annotation_renderer.stars)
+            dsos = len(self.annotation_renderer.dsos)
+            if self.annotations_enabled:
+                self._annotation_status_text = f"Annotations: {stars} stars, {dsos} DSOs"
+            else:
+                self._annotation_status_text = None
+        self._update_status()
+
+        # Save setting
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue("annotation_enabled", self.annotations_enabled)
+
+        self._update_zoom()
+
     def closeEvent(self, event):
         """Save window position when closing"""
+        # Cancel any running plate solve
+        if self.plate_solve_worker and self.plate_solve_worker.isRunning():
+            self.plate_solve_worker.cancel()
+            self.plate_solve_worker.wait(1000)
+
         WindowPositionManager.save_window_position(self, "ImageViewer")
         event.accept()
 
@@ -5750,10 +6191,16 @@ class ObjectDetailWindow(QDialog):
         """Open the current image in a new window"""
         if self.original_pixmap is not None:
             try:
-                viewer = ImageViewerWindow(self.original_pixmap, self.data["name"], self.current_image_path, self)
+                # Pass DSO coordinates for plate solving hints
+                ra_deg = self.data.get("ra_deg")
+                dec_deg = self.data.get("dec_deg")
+                viewer = ImageViewerWindow(
+                    self.original_pixmap, self.data["name"], self.current_image_path, self,
+                    dso_ra=ra_deg, dso_dec=dec_deg
+                )
                 viewer.setModal(False)  # Make window non-modal
                 viewer.show()
-                logger.debug(f"Opened image viewer for {self.data['name']}")
+                logger.debug(f"Opened image viewer for {self.data['name']} (RA={ra_deg}, Dec={dec_deg})")
             except Exception as e:
                 logger.error(f"Error opening image viewer: {str(e)}", exc_info=True)
                 from PySide6.QtWidgets import QMessageBox
@@ -6626,9 +7073,13 @@ class SettingsDialog(QDialog):
         help_text.setWordWrap(True)
         help_text.setStyleSheet("QLabel { color: #888888; font-size: 9pt; }")
         location_layout.addWidget(help_text)
-        
+
+        # Test location button
+        self.test_button = QPushButton("Test Location")
+        self.test_button.clicked.connect(self._test_location)
+        location_layout.addWidget(self.test_button)
+
         location_layout.addStretch()
-        tab_widget.addTab(location_tab, "Location && Time Zone")
 
         # Application Settings tab
         app_settings_tab = QWidget()
@@ -6680,20 +7131,78 @@ class SettingsDialog(QDialog):
         perf_settings_layout.addLayout(thread_layout)
 
         app_settings_layout.addWidget(perf_settings_group)
+
+        # Plate Solving Settings group
+        plate_solve_group = QGroupBox("Plate Solving Settings")
+        plate_solve_layout = QVBoxLayout(plate_solve_group)
+
+        # ASTAP path setting
+        astap_layout = QHBoxLayout()
+        astap_label = QLabel("ASTAP Path:")
+        astap_label.setMinimumWidth(120)
+        self.astap_path_input = QLineEdit()
+        self.astap_path_input.setPlaceholderText("Path to astap_cli executable (auto-detected if empty)")
+        astap_browse_btn = QPushButton("Browse...")
+        astap_browse_btn.setFixedWidth(80)
+        astap_browse_btn.clicked.connect(self._browse_astap_path)
+        astap_layout.addWidget(astap_label)
+        astap_layout.addWidget(self.astap_path_input)
+        astap_layout.addWidget(astap_browse_btn)
+        plate_solve_layout.addLayout(astap_layout)
+
+        # ASTAP help text
+        astap_help = QLabel(
+            "ASTAP is a free, fast local plate solver. Download from: "
+            "<a href='https://www.hnsky.org/astap.htm' style='color: #0078d7;'>hnsky.org/astap.htm</a><br>"
+            "Point to <b>astap_cli.exe</b> (command-line version), not astap.exe (GUI). "
+            "Leave empty to auto-detect."
+        )
+        astap_help.setOpenExternalLinks(True)
+        astap_help.setWordWrap(True)
+        astap_help.setStyleSheet("QLabel { color: #888888; font-size: 9pt; margin-left: 120px; }")
+        plate_solve_layout.addWidget(astap_help)
+
+        # Astrometry.net API key setting
+        api_key_layout = QHBoxLayout()
+        api_key_label = QLabel("Astrometry.net API Key:")
+        api_key_label.setMinimumWidth(120)
+        self.astrometry_api_key_input = QLineEdit()
+        self.astrometry_api_key_input.setPlaceholderText("Required for online plate solving")
+        self.astrometry_api_key_input.setEchoMode(QLineEdit.Password)
+        show_key_btn = QPushButton("Show")
+        show_key_btn.setFixedWidth(50)
+        show_key_btn.setCheckable(True)
+        show_key_btn.clicked.connect(lambda checked: self.astrometry_api_key_input.setEchoMode(
+            QLineEdit.Normal if checked else QLineEdit.Password
+        ))
+        api_key_layout.addWidget(api_key_label)
+        api_key_layout.addWidget(self.astrometry_api_key_input)
+        api_key_layout.addWidget(show_key_btn)
+        plate_solve_layout.addLayout(api_key_layout)
+
+        # API key help text
+        api_key_help = QLabel(
+            "Get a free API key: Register at "
+            "<a href='https://nova.astrometry.net/' style='color: #0078d7;'>nova.astrometry.net</a>, "
+            "then find your key in My Account > API.<br>"
+            "An API key is required for online plate solving (used when ASTAP fails or is unavailable)."
+        )
+        api_key_help.setOpenExternalLinks(True)
+        api_key_help.setWordWrap(True)
+        api_key_help.setStyleSheet("QLabel { color: #888888; font-size: 9pt; margin-left: 120px; }")
+        plate_solve_layout.addWidget(api_key_help)
+
+        app_settings_layout.addWidget(plate_solve_group)
         app_settings_layout.addStretch()
 
+        # Add tabs
         tab_widget.addTab(app_settings_tab, "Application Settings")
+        tab_widget.addTab(location_tab, "Location && Time Zone")
 
         layout.addWidget(tab_widget)
-        
+
         # Buttons
         button_layout = QHBoxLayout()
-
-        # Test location button
-        self.test_button = QPushButton("Test Location")
-        self.test_button.clicked.connect(self._test_location)
-        button_layout.addWidget(self.test_button)
-
         button_layout.addStretch()
 
         # Standard dialog buttons
@@ -6760,6 +7269,13 @@ class SettingsDialog(QDialog):
             default_threads = max(1, (os.cpu_count() or 4) - 2)
             thread_count = settings.value("max_threads", default_threads, type=int)
             self.thread_count_spinbox.setValue(thread_count)
+
+            # Load plate solving settings
+            astap_path = settings.value("astap_path", "", type=str)
+            self.astap_path_input.setText(astap_path)
+
+            astrometry_api_key = settings.value("astrometry_api_key", "", type=str)
+            self.astrometry_api_key_input.setText(astrometry_api_key)
 
         except Exception as e:
             logger.error(f"Error loading settings: {str(e)}")
@@ -6884,6 +7400,10 @@ class SettingsDialog(QDialog):
             settings.setValue("check_updates_on_startup", self.check_updates_checkbox.isChecked())
             settings.setValue("max_threads", self.thread_count_spinbox.value())
 
+            # Save plate solving settings
+            settings.setValue("astap_path", self.astap_path_input.text().strip())
+            settings.setValue("astrometry_api_key", self.astrometry_api_key_input.text().strip())
+
             self.accept()
             
         except ValueError:
@@ -6929,6 +7449,31 @@ class SettingsDialog(QDialog):
                 f"Failed to open map picker: {str(e)}\n\n"
                 "Please enter coordinates manually.")
 
+    def _browse_astap_path(self):
+        """Browse for ASTAP executable"""
+        import sys
+        import os
+        if sys.platform == 'win32':
+            filter_str = "ASTAP CLI (astap_cli.exe);;Executable Files (*.exe);;All Files (*.*)"
+            # Start in ASTAP folder if it exists
+            if os.path.isdir("C:/Program Files/astap"):
+                start_dir = "C:/Program Files/astap"
+            elif os.path.isdir("C:/Program Files (x86)/astap"):
+                start_dir = "C:/Program Files (x86)/astap"
+            else:
+                start_dir = "C:/Program Files"
+        else:
+            filter_str = "All Files (*)"
+            start_dir = "/usr/bin"
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select ASTAP CLI Executable (astap_cli.exe)",
+            start_dir,
+            filter_str
+        )
+        if file_path:
+            self.astap_path_input.setText(file_path)
 
 
 # --- Map Location Picker Dialog ---
