@@ -667,6 +667,9 @@ try:
             def error(self, msg, exc_info=None): print(f"ERROR: {msg}")
         logger = SimpleLogger()
 
+    # Import Theme for colors
+    from Theme import COLORS
+
 except ImportError as e:
     print(f"Warning: Could not import required Qt modules: {e}")
 
@@ -1053,7 +1056,7 @@ class DraggableCell(QWidget):
         if event.mimeData().hasText():
             event.acceptProposedAction()
             # Visual feedback - highlight the drop target
-            self.setStyleSheet(self.styleSheet() + "border: 3px solid #2196F3;")
+            self.setStyleSheet(self.styleSheet() + f"border: 3px solid {COLORS['accent']};")
 
     def dragLeaveEvent(self, event):
         """Remove visual feedback when drag leaves"""
@@ -1370,7 +1373,7 @@ class ImageSelectionDialog(QDialog):
 
         ok_btn = QPushButton("Add Selected")
         ok_btn.clicked.connect(self._accept_selection)
-        ok_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
+        ok_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: white; }}")
         button_layout.addWidget(ok_btn)
 
         cancel_btn = QPushButton("Cancel")
@@ -1581,11 +1584,11 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         # Merge cells checkbox
         self.merge_cells_checkbox = QCheckBox("Merge cells for shared images")
         self.merge_cells_checkbox.setToolTip("When checked, DSO objects that share the same image will be merged into larger cells")
-        self.merge_cells_checkbox.setStyleSheet("QCheckBox { color: #ffffff; }")
+        self.merge_cells_checkbox.setStyleSheet(f"QCheckBox {{ color: {COLORS['text']}; }}")
         toolbar.addWidget(self.merge_cells_checkbox)
 
         generate_collage_btn = QPushButton("Generate Collage")
-        generate_collage_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; }")
+        generate_collage_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['accent']}; color: white; font-weight: bold; }}")
         generate_collage_btn.clicked.connect(self._generate_collage)
         generate_collage_btn.setToolTip("Create and save the collage image file")
         toolbar.addWidget(generate_collage_btn)
@@ -1690,7 +1693,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
 
         # Save Project button
         save_project_btn = QPushButton("Save Project")
-        save_project_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
+        save_project_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: white; font-weight: bold; }}")
         save_project_btn.clicked.connect(self._save_current_collage)
         save_project_btn.setToolTip("Save collage project to database")
         left_layout.addWidget(save_project_btn)
@@ -1720,13 +1723,13 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         add_images_btn = QPushButton("Add Images...")
         add_images_btn.clicked.connect(self._add_images_from_database)
         add_images_btn.setToolTip("Add images from database to this collage")
-        add_images_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
+        add_images_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: white; }}")
         img_buttons.addWidget(add_images_btn)
 
         remove_selected_btn = QPushButton("Remove Selected")
         remove_selected_btn.clicked.connect(self._remove_selected_images)
         remove_selected_btn.setToolTip("Remove selected images from collage")
-        remove_selected_btn.setStyleSheet("QPushButton { background-color: #f44336; color: white; }")
+        remove_selected_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['error']}; color: white; }}")
         img_buttons.addWidget(remove_selected_btn)
 
         clear_all_btn = QPushButton("Clear All")
@@ -1772,7 +1775,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
 
         if not collage_images:
             no_images_label = QLabel("No images in collage")
-            no_images_label.setStyleSheet("color: #888; font-style: italic; padding: 10px; font-size: 14px;")
+            no_images_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-style: italic; padding: 10px; font-size: 14px;")
             no_images_label.setAlignment(Qt.AlignCenter)
             self.images_layout.addWidget(no_images_label, 0, 0, 1, grid_width)
         else:
@@ -1799,7 +1802,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                         # Position and checkbox in one line
                         top_layout = QHBoxLayout()
                         pos_label = QLabel(f"[{row},{col}]")
-                        pos_label.setStyleSheet("font-size: 10px; color: #888; font-weight: bold;")
+                        pos_label.setStyleSheet(f"font-size: 10px; color: {COLORS['text_disabled']}; font-weight: bold;")
                         checkbox = QCheckBox()
                         checkbox.setProperty("collage_index", cell_index)
                         top_layout.addWidget(pos_label)
@@ -1812,7 +1815,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                         image_label.setAlignment(Qt.AlignCenter)
                         image_label.setMinimumSize(100, 80)
                         image_label.setMaximumSize(120, 100)
-                        image_label.setStyleSheet("border: 1px solid #666; background-color: #444; color: #888; font-size: 10px;")
+                        image_label.setStyleSheet(f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']}; color: {COLORS['text_disabled']}; font-size: 10px;")
                         image_label.setText("Loading...")
 
                         # Store reference to the label for later thumbnail updates
@@ -1827,7 +1830,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                         # DSO name - centered below the image
                         dso_label = QLabel(dso_name)
                         dso_label.setAlignment(Qt.AlignCenter)
-                        dso_label.setStyleSheet("font-size: 11px; color: #FFFFFF; font-weight: bold;")
+                        dso_label.setStyleSheet(f"font-size: 11px; color: {COLORS['text']}; font-weight: bold;")
                         dso_label.setWordWrap(True)
                         dso_label.setToolTip(f"DSO: {dso_name}\nFile: {filename}\nPath: {image_path}")
                         cell_layout.addWidget(dso_label)
@@ -1837,37 +1840,37 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
 
                         # Set image data and styling for occupied cells
                         cell_widget.set_image_data(image_data)
-                        cell_widget.setStyleSheet("""
-                            DraggableCell {
-                                border: 3px solid #4CAF50;
+                        cell_widget.setStyleSheet(f"""
+                            DraggableCell {{
+                                border: 3px solid {COLORS['success']};
                                 border-radius: 8px;
-                                background-color: #2e4a2e;
+                                background-color: {COLORS['background_light']};
                                 margin: 2px;
-                            }
+                            }}
                         """)
                     else:
                         # Empty cell - simpler layout with dark theme colors
                         pos_label = QLabel(f"[{row},{col}]")
                         pos_label.setAlignment(Qt.AlignCenter)
-                        pos_label.setStyleSheet("font-size: 11px; color: #888; font-weight: bold;")
+                        pos_label.setStyleSheet(f"font-size: 11px; color: {COLORS['text_disabled']}; font-weight: bold;")
                         cell_layout.addWidget(pos_label)
 
                         empty_label = QLabel("Empty")
                         empty_label.setAlignment(Qt.AlignCenter)
-                        empty_label.setStyleSheet("font-size: 14px; color: #666; font-style: italic;")
+                        empty_label.setStyleSheet(f"font-size: 14px; color: {COLORS['border_light']}; font-style: italic;")
                         cell_layout.addWidget(empty_label)
 
                         cell_layout.addStretch()  # Push content to top
 
                         # Set no image data and styling for empty cells
                         cell_widget.set_image_data(None)
-                        cell_widget.setStyleSheet("""
-                            DraggableCell {
-                                border: 3px dashed #555;
+                        cell_widget.setStyleSheet(f"""
+                            DraggableCell {{
+                                border: 3px dashed {COLORS['border']};
                                 border-radius: 8px;
-                                background-color: #3a3a3a;
+                                background-color: {COLORS['background_light']};
                                 margin: 2px;
-                            }
+                            }}
                         """)
 
                     # Add cell to grid
@@ -1909,7 +1912,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
             label = self.thumbnail_labels[cell_key]
             label.setPixmap(pixmap)
             label.setText("")  # Clear the "Loading..." text
-            label.setStyleSheet("border: 1px solid #666; background-color: #444;")
+            label.setStyleSheet(f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']};")
 
     def _on_thumbnail_error(self, row, col, error_message):
         """Handle thumbnail loading errors"""
@@ -1917,7 +1920,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         if cell_key in self.thumbnail_labels:
             label = self.thumbnail_labels[cell_key]
             label.setText(error_message.replace(" ", "\n"))  # Add line break for better fit
-            label.setStyleSheet("border: 1px solid #666; background-color: #444; color: #999; font-size: 10px;")
+            label.setStyleSheet(f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']}; color: {COLORS['text_secondary']}; font-size: 10px;")
 
     def _swap_images(self, source_index, target_index):
         """Swap images between two grid positions"""
@@ -2764,7 +2767,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         """Add debug button to show all collages (temporary)"""
         debug_btn = QPushButton("Debug: Show All Collages")
         debug_btn.clicked.connect(self._debug_show_all_collages)
-        debug_btn.setStyleSheet("QPushButton { background-color: #FF9800; color: white; }")
+        debug_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['warning']}; color: white; }}")
 
         # Find the toolbar layout and add the button
         if hasattr(self, 'layout'):

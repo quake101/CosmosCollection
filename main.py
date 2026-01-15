@@ -36,6 +36,7 @@ from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager, WindowPositionMixin
 from ResourceManager import ResourceManager
 from CollageBuilder import CollageBuilder, CollageBuilderWindow
+from Theme import apply_theme, COLORS
 
 # Import astroquery at module level so PyInstaller detects it
 try:
@@ -2038,7 +2039,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         # Create a placeholder widget for the web view
         self.web_placeholder = QLabel("Loading Aladin Lite...")
         self.web_placeholder.setAlignment(Qt.AlignCenter)
-        self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: white; font-size: 14px; }")
+        self.web_placeholder.setStyleSheet(f"QLabel {{ background-color: {COLORS['background']}; color: white; font-size: 14px; }}")
         self.web_placeholder.setMinimumSize(400, 300)
 
         layout.addWidget(self.web_placeholder)
@@ -2172,7 +2173,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             # Update placeholder to show error and offer browser fallback
             if self.web_placeholder:
                 self.web_placeholder.setText(f"Failed to load Aladin Lite\nError: {str(e)}\n\nClick below to open in browser instead.")
-                self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: #ff6b6b; font-size: 12px; }")
+                self.web_placeholder.setStyleSheet(f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: 12px; }}")
 
                 # Add a button to open in browser as fallback
                 self._add_browser_fallback_button()
@@ -2191,7 +2192,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
                 # Create a fallback button
                 self.fallback_button = QPushButton("Open Aladin Lite in Browser")
-                self.fallback_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; margin: 10px; padding: 8px; }")
+                self.fallback_button.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: white; font-weight: bold; margin: 10px; padding: 8px; }}")
                 self.fallback_button.clicked.connect(self._open_in_browser)
 
                 # Insert before the bottom controls (last item should be the bottom layout)
@@ -2574,7 +2575,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             # Show error in placeholder
             if self.web_placeholder:
                 self.web_placeholder.setText(f"Error loading Aladin Lite\n{str(e)}\n\nClick below to open in browser instead.")
-                self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: #ff6b6b; font-size: 12px; }")
+                self.web_placeholder.setStyleSheet(f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: 12px; }}")
             self._add_browser_fallback_button()
         
         # Add telescope FOV overlay using JavaScript injection if enabled
@@ -3143,7 +3144,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             logger.error("Failed to load Aladin Lite")
             if self.web_placeholder:
                 self.web_placeholder.setText("Failed to load Aladin Lite\nCheck your internet connection\n\nClick below to open in browser instead.")
-                self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: #ff6b6b; font-size: 12px; }")
+                self.web_placeholder.setStyleSheet(f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: 12px; }}")
             self._add_browser_fallback_button()
         else:
             logger.debug("Aladin Lite loaded successfully")
@@ -3205,7 +3206,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         logger.warning("Aladin Lite loading timed out after 30 seconds")
         if self.web_placeholder:
             self.web_placeholder.setText("Loading timed out\nAladin Lite may be slow to respond\n\nClick below to open in browser instead.")
-            self.web_placeholder.setStyleSheet("QLabel { background-color: #2b2b2b; color: #ffaa00; font-size: 12px; }")
+            self.web_placeholder.setStyleSheet(f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['warning']}; font-size: 12px; }}")
         self._add_browser_fallback_button()
 
     def _ensure_web_view_visible(self):
@@ -3307,54 +3308,59 @@ class ImageViewerWindow(QDialog):
         # Add zoom controls
         zoom_out_button = QPushButton("-")
         zoom_out_button.setFixedSize(30, 30)
+        zoom_out_button.setToolTip("Zoom out")
         zoom_out_button.clicked.connect(self._zoom_out)
         toolbar.addWidget(zoom_out_button)
 
         zoom_in_button = QPushButton("+")
         zoom_in_button.setFixedSize(30, 30)
+        zoom_in_button.setToolTip("Zoom in")
         zoom_in_button.clicked.connect(self._zoom_in)
         toolbar.addWidget(zoom_in_button)
 
         reset_button = QPushButton("Reset")
-        reset_button.setFixedSize(60, 30)
+        reset_button.setFixedHeight(30)
+        reset_button.setToolTip("Reset zoom to 100%")
         reset_button.clicked.connect(self._reset_zoom)
         toolbar.addWidget(reset_button)
 
-        # Add fit to window button
-        fit_button = QPushButton("Fit to Window")
-        fit_button.setFixedSize(100, 30)
-        fit_button.clicked.connect(self._fit_to_window)
-        toolbar.addWidget(fit_button)
-
-        # Add open file location button if file path is available
+        # Add file-specific buttons if file path is available
         if self.file_path:
             open_location_button = QPushButton("Open File Location")
-            open_location_button.setFixedSize(120, 30)
+            open_location_button.setFixedHeight(30)
+            open_location_button.setToolTip("Open the folder containing this image")
             open_location_button.clicked.connect(self._open_file_location)
             toolbar.addWidget(open_location_button)
 
-            # Add set as background button
             set_bg_button = QPushButton("Set as Background")
-            set_bg_button.setFixedSize(130, 30)
+            set_bg_button.setFixedHeight(30)
+            set_bg_button.setToolTip("Set this image as your desktop background")
             set_bg_button.clicked.connect(self._set_as_background)
             toolbar.addWidget(set_bg_button)
 
+            self.annotations_button = QPushButton("Show Annotations")
+            self.annotations_button.setFixedHeight(30)
+            self.annotations_button.setToolTip("Configure and display star/DSO annotations")
+            self.annotations_button.clicked.connect(self._show_annotations_dialog)
+            toolbar.addWidget(self.annotations_button)
+
+            self.save_annotated_button = QPushButton("Save with Annotations")
+            self.save_annotated_button.setFixedHeight(30)
+            self.save_annotated_button.setToolTip("Save image with annotations overlaid")
+            self.save_annotated_button.clicked.connect(self._save_with_annotations)
+            toolbar.addWidget(self.save_annotated_button)
+
         toolbar.addStretch()
 
-        # Add file info toggle button (if file path is available)
+        # Add file info toggle button on the right side
         if self.file_path:
             self.info_toggle_button = QPushButton("Show File Info")
-            self.info_toggle_button.setFixedSize(100, 30)
+            self.info_toggle_button.setFixedHeight(30)
+            self.info_toggle_button.setToolTip("Show/hide EXIF and file information")
             self.info_toggle_button.setCheckable(True)
             self.info_toggle_button.setChecked(False)
             self.info_toggle_button.clicked.connect(self._toggle_file_info)
             toolbar.addWidget(self.info_toggle_button)
-
-            # Add annotations button
-            self.annotations_button = QPushButton("Show Annotations")
-            self.annotations_button.setFixedSize(120, 30)
-            self.annotations_button.clicked.connect(self._show_annotations_dialog)
-            toolbar.addWidget(self.annotations_button)
 
         # Initialize annotation system
         self.annotation_renderer = None
@@ -3392,24 +3398,24 @@ class ImageViewerWindow(QDialog):
         self.file_info_panel.setFixedWidth(350)
 
         # Dark mode styling for the groupbox
-        self.file_info_panel.setStyleSheet("""
-            QGroupBox {
+        self.file_info_panel.setStyleSheet(f"""
+            QGroupBox {{
                 font-weight: bold;
                 font-size: 12pt;
                 color: #e0e0e0;
-                background-color: #2b2b2b;
-                border: 2px solid #555555;
+                background-color: {COLORS['background']};
+                border: 2px solid {COLORS['border']};
                 border-radius: 8px;
                 margin: 5px;
                 padding-top: 15px;
-            }
-            QGroupBox::title {
+            }}
+            QGroupBox::title {{
                 subcontrol-origin: margin;
                 left: 10px;
                 padding: 0 8px 0 8px;
-                color: #ffffff;
-                background-color: #2b2b2b;
-            }
+                color: {COLORS['text']};
+                background-color: {COLORS['background']};
+            }}
         """)
 
         # Create file info layout
@@ -3423,25 +3429,25 @@ class ImageViewerWindow(QDialog):
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         # Dark mode styling for scroll area
-        scroll_area.setStyleSheet("""
-            QScrollArea {
-                background-color: #1e1e1e;
-                border: 1px solid #444444;
+        scroll_area.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: {COLORS['background']};
+                border: 1px solid {COLORS['border']};
                 border-radius: 4px;
-            }
-            QScrollBar:vertical {
-                background-color: #2b2b2b;
+            }}
+            QScrollBar:vertical {{
+                background-color: {COLORS['background']};
                 width: 12px;
                 border-radius: 6px;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #555555;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {COLORS['border']};
                 border-radius: 6px;
                 min-height: 20px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background-color: #666666;
-            }
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background-color: {COLORS['border_light']};
+            }}
         """)
 
         self.file_info_content = QLabel()
@@ -3759,6 +3765,64 @@ class ImageViewerWindow(QDialog):
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Error", f"Failed to set desktop background: {str(e)}")
 
+    def _save_with_annotations(self):
+        """Save the current image with annotations overlaid"""
+        if not self.file_path or not self.original_pixmap:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Warning", "No image available to save")
+            return
+
+        if not self.annotation_renderer:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "No Annotations",
+                              "No annotations available. Please plate solve the image first\n"
+                              "and enable annotations using 'Show Annotations'.")
+            return
+
+        try:
+            from pathlib import Path
+
+            # Create a copy of the original pixmap to draw on
+            annotated_pixmap = self.original_pixmap.copy()
+
+            # Create a painter to draw annotations
+            painter = QPainter(annotated_pixmap)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+
+            # Render annotations at 100% zoom (1.0) with no offset
+            self.annotation_renderer.render(painter, 1.0, 0, 0)
+            painter.end()
+
+            # Generate default filename
+            original_path = Path(self.file_path)
+            default_name = f"{original_path.stem}_annotated{original_path.suffix}"
+            default_path = str(original_path.parent / default_name)
+
+            # Open save dialog
+            save_path, selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Save Annotated Image",
+                default_path,
+                "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;All Files (*.*)"
+            )
+
+            if save_path:
+                # Determine format from extension
+                save_ext = Path(save_path).suffix.lower()
+                if save_ext in ['.jpg', '.jpeg']:
+                    quality = 95
+                    annotated_pixmap.save(save_path, "JPEG", quality)
+                else:
+                    annotated_pixmap.save(save_path, "PNG")
+
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "Success",
+                                      f"Annotated image saved successfully!\n{save_path}")
+
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Error", f"Failed to save annotated image: {str(e)}")
+
     def _toggle_file_info(self):
         """Toggle the visibility of the file information panel"""
         if hasattr(self, 'file_info_panel'):
@@ -4057,7 +4121,7 @@ class ImageViewerWindow(QDialog):
 
         # Status label
         self.annotation_status = QLabel("Ready to plate solve")
-        self.annotation_status.setStyleSheet("color: #cccccc; padding: 5px;")
+        self.annotation_status.setStyleSheet(f"color: {COLORS['text_secondary']}; padding: 5px;")
         layout.addWidget(self.annotation_status)
 
         # Progress bar
@@ -4141,54 +4205,6 @@ class ImageViewerWindow(QDialog):
 
         layout.addLayout(button_layout)
 
-        # Apply dark theme
-        dialog.setStyleSheet("""
-            QDialog {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QGroupBox {
-                font-weight: bold;
-                border: 1px solid #555555;
-                border-radius: 5px;
-                margin-top: 10px;
-                padding-top: 10px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-            }
-            QCheckBox {
-                color: #ffffff;
-                padding: 5px;
-            }
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-            }
-            QPushButton {
-                background-color: #0078d4;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 3px;
-            }
-            QPushButton:hover {
-                background-color: #106ebe;
-            }
-            QPushButton:disabled {
-                background-color: #555555;
-                color: #888888;
-            }
-            QProgressBar {
-                border: 1px solid #555555;
-                border-radius: 3px;
-                text-align: center;
-            }
-            QProgressBar::chunk {
-                background-color: #0078d4;
-            }
-        """)
 
         dialog.exec()
 
@@ -4743,7 +4759,7 @@ class ObjectDetailWindow(QDialog):
             dso_type = self.data.get('dso_type', '')
             if dso_type not in ['BRTNB', 'CL+NB', 'PLNNB', 'SNREM']:
                 self.emission_label.setText("Not applicable (not an emission nebula)")
-                self.emission_label.setStyleSheet("color: gray;")
+                self.emission_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
                 return
 
             # Get object coordinates and name
@@ -4753,7 +4769,7 @@ class ObjectDetailWindow(QDialog):
 
             # Show querying status
             self.emission_label.setText("Querying SIMBAD...")
-            self.emission_label.setStyleSheet("color: gray;")
+            self.emission_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
 
             # Stop any existing SIMBAD query thread
             if self.simbad_query_thread and self.simbad_query_thread.isRunning():
@@ -4771,7 +4787,7 @@ class ObjectDetailWindow(QDialog):
         except Exception as e:
             logger.error(f"Error initiating SIMBAD query: {str(e)}", exc_info=True)
             self.emission_label.setText(f"Error querying SIMBAD (check internet connection)")
-            self.emission_label.setStyleSheet("color: #ff6b6b;")
+            self.emission_label.setStyleSheet(f"color: {COLORS['error']};")
 
     def _on_simbad_query_complete(self, result, object_name, ra_deg, dec_deg):
         """Handle SIMBAD query completion"""
@@ -4786,18 +4802,18 @@ class ObjectDetailWindow(QDialog):
                 self.emission_label.setStyleSheet("color: white;")
             else:
                 self.emission_label.setText("No specific emission line data available")
-                self.emission_label.setStyleSheet("color: gray;")
+                self.emission_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
 
         except Exception as e:
             logger.error(f"Error processing SIMBAD result: {str(e)}", exc_info=True)
             self.emission_label.setText("Error processing SIMBAD data")
-            self.emission_label.setStyleSheet("color: #ff6b6b;")
+            self.emission_label.setStyleSheet(f"color: {COLORS['error']};")
 
     def _on_simbad_query_failed(self, object_name, error_message):
         """Handle SIMBAD query failure"""
         logger.warning(f"SIMBAD query failed for {object_name}: {error_message}")
         self.emission_label.setText(f"SIMBAD query failed (check internet connection)")
-        self.emission_label.setStyleSheet("color: #ff6b6b;")
+        self.emission_label.setStyleSheet(f"color: {COLORS['error']};")
 
     def _parse_emission_info(self, dso_type, simbad_result):
         """Parse emission line information based on DSO type and SIMBAD data"""
@@ -5018,7 +5034,7 @@ class ObjectDetailWindow(QDialog):
 
             # Add image navigation controls
             nav_separator = QLabel("|")
-            nav_separator.setStyleSheet("font-size: 14pt; color: #666666; padding: 0 5px;")
+            nav_separator.setStyleSheet(f"font-size: 14pt; color: {COLORS['border_light']}; padding: 0 5px;")
             zoom_layout.addWidget(nav_separator)
 
             self.prev_image_button = QPushButton("⬅️")
@@ -5028,7 +5044,7 @@ class ObjectDetailWindow(QDialog):
             zoom_layout.addWidget(self.prev_image_button)
 
             self.image_counter_label = QLabel("1/1")
-            self.image_counter_label.setStyleSheet("font-size: 10pt; color: #666666; padding: 0 5px;")
+            self.image_counter_label.setStyleSheet(f"font-size: 10pt; color: {COLORS['border_light']}; padding: 0 5px;")
             self.image_counter_label.setMinimumWidth(40)
             self.image_counter_label.setAlignment(Qt.AlignCenter)
             zoom_layout.addWidget(self.image_counter_label)
@@ -5041,14 +5057,14 @@ class ObjectDetailWindow(QDialog):
 
             # Add image button
             add_separator = QLabel("|")
-            add_separator.setStyleSheet("font-size: 14pt; color: #666666; padding: 0 5px;")
+            add_separator.setStyleSheet(f"font-size: 14pt; color: {COLORS['border_light']}; padding: 0 5px;")
             zoom_layout.addWidget(add_separator)
 
             self.add_image_button = QPushButton("+")
             self.add_image_button.setFixedSize(30, 30)
             self.add_image_button.clicked.connect(self._add_user_image)
             self.add_image_button.setToolTip("Add new image")
-            self.add_image_button.setStyleSheet("QPushButton { color: #4CAF50; font-size: 16pt; font-weight: bold; }")
+            self.add_image_button.setStyleSheet(f"QPushButton {{ color: {COLORS['success']}; font-size: 16pt; font-weight: bold; }}")
             zoom_layout.addWidget(self.add_image_button)
 
             # Delete image button
@@ -5056,7 +5072,7 @@ class ObjectDetailWindow(QDialog):
             self.delete_image_button.setFixedSize(30, 30)
             self.delete_image_button.clicked.connect(self._delete_current_image)
             self.delete_image_button.setToolTip("Delete current image")
-            self.delete_image_button.setStyleSheet("QPushButton { color: #ff6b6b; font-size: 12pt; }")
+            self.delete_image_button.setStyleSheet(f"QPushButton {{ color: {COLORS['error']}; font-size: 12pt; }}")
             zoom_layout.addWidget(self.delete_image_button)
 
             # Favorite image button
@@ -5073,7 +5089,7 @@ class ObjectDetailWindow(QDialog):
             # Image label
             self.image_label = QLabel("Loading...")
             self.image_label.setAlignment(Qt.AlignCenter)
-            self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+            self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
             self.image_label.setMinimumSize(600, 400)  # Increased minimum size
             self.image_label.installEventFilter(self)  # Install event filter for mouse events
             self.image_label.setMouseTracking(True)  # Enable mouse tracking
@@ -5229,7 +5245,7 @@ class ObjectDetailWindow(QDialog):
             self.emission_label = QLabel("Loading emission data from SIMBAD...")
             self.emission_label.setAlignment(Qt.AlignLeft)
             self.emission_label.setWordWrap(True)
-            self.emission_label.setStyleSheet("color: gray; font-style: italic;")
+            self.emission_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-style: italic;")
             emission_layout.addWidget(self.emission_label)
 
             # Add SIMBAD link using coordinates
@@ -5675,7 +5691,7 @@ class ObjectDetailWindow(QDialog):
                                 if img['id'] == new_image_id:
                                     # Show loading state
                                     self.image_label.setText("Loading image...")
-                                    self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+                                    self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
 
                                     self.current_image_index = i
                                     self._load_user_image(img['image_path'])
@@ -6257,7 +6273,7 @@ class ObjectDetailWindow(QDialog):
                     if self.user_images:
                         # Update text to show loading state
                         self.image_label.setText("Loading image...")
-                        self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+                        self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
 
                         self.current_image_index = 0
                         current_image = self.user_images[self.current_image_index]
@@ -6267,18 +6283,18 @@ class ObjectDetailWindow(QDialog):
                     else:
                         # No images available - update to show no image message
                         self.image_label.setText("No image attached to this DSO.")
-                        self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+                        self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
                         self.info_form_container.setVisible(False)
                 else:
                     logger.error(f"Could not find dsodetailid for {self.data['name']}")
                     self.image_label.setText("No image attached to this DSO.")
-                    self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+                    self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
                     self.info_form_container.setVisible(False)
 
         except Exception as e:
             logger.error(f"Error loading user images: {str(e)}", exc_info=True)
             self.image_label.setText("Error loading images.")
-            self.image_label.setStyleSheet("font-size: 14pt; color: #ff6b6b;")
+            self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['error']};")
             self.info_form_container.setVisible(False)
 
     def _update_image_navigation(self):
@@ -6309,7 +6325,7 @@ class ObjectDetailWindow(QDialog):
         if self.user_images and self.current_image_index > 0:
             # Show loading state
             self.image_label.setText("Loading image...")
-            self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+            self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
 
             self.current_image_index -= 1
             current_image = self.user_images[self.current_image_index]
@@ -6323,7 +6339,7 @@ class ObjectDetailWindow(QDialog):
         if self.user_images and self.current_image_index < len(self.user_images) - 1:
             # Show loading state
             self.image_label.setText("Loading image...")
-            self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+            self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
 
             self.current_image_index += 1
             current_image = self.user_images[self.current_image_index]
@@ -6345,11 +6361,11 @@ class ObjectDetailWindow(QDialog):
             is_favorite = current_image.get('is_favorite', 0)
             if is_favorite:
                 self.favorite_button.setText("⭐")
-                self.favorite_button.setStyleSheet("QPushButton { color: #FFD700; font-size: 12pt; }")
+                self.favorite_button.setStyleSheet(f"QPushButton {{ color: {COLORS['favorite']}; font-size: 12pt; }}")
                 self.favorite_button.setToolTip("Unmark as favorite")
             else:
                 self.favorite_button.setText("☆")
-                self.favorite_button.setStyleSheet("QPushButton { color: #888888; font-size: 12pt; }")
+                self.favorite_button.setStyleSheet(f"QPushButton {{ color: {COLORS['text_disabled']}; font-size: 12pt; }}")
                 self.favorite_button.setToolTip("Mark as favorite")
 
     def _toggle_favorite(self):
@@ -6473,7 +6489,7 @@ class ObjectDetailWindow(QDialog):
                     self.relocate_button.setVisible(False)
                     # Show loading state
                     self.image_label.setText("Loading image...")
-                    self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+                    self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
                     self._load_user_image(new_image_path)
                     
                     QMessageBox.information(self, "Success", f"Image location updated successfully!\n\nNew path: {new_image_path}")
@@ -6548,7 +6564,7 @@ class ObjectDetailWindow(QDialog):
                     # No more images - reset to default state
                     self.current_image_index = 0
                     self.image_label.setText("No Image Loaded")
-                    self.image_label.setStyleSheet("font-size: 14pt; color: gray;")
+                    self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
                     self._clear_image_info()
                 
                 # Update navigation
@@ -7071,7 +7087,7 @@ class SettingsDialog(QDialog):
 • Time zone affects visibility calculation displays and times
         """)
         help_text.setWordWrap(True)
-        help_text.setStyleSheet("QLabel { color: #888888; font-size: 9pt; }")
+        help_text.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; }}")
         location_layout.addWidget(help_text)
 
         # Test location button
@@ -7159,7 +7175,7 @@ class SettingsDialog(QDialog):
         )
         astap_help.setOpenExternalLinks(True)
         astap_help.setWordWrap(True)
-        astap_help.setStyleSheet("QLabel { color: #888888; font-size: 9pt; margin-left: 120px; }")
+        astap_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
         plate_solve_layout.addWidget(astap_help)
 
         # Astrometry.net API key setting
@@ -7189,7 +7205,7 @@ class SettingsDialog(QDialog):
         )
         api_key_help.setOpenExternalLinks(True)
         api_key_help.setWordWrap(True)
-        api_key_help.setStyleSheet("QLabel { color: #888888; font-size: 9pt; margin-left: 120px; }")
+        api_key_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
         plate_solve_layout.addWidget(api_key_help)
 
         app_settings_layout.addWidget(plate_solve_group)
@@ -7578,7 +7594,7 @@ class MapLocationPickerDialog(QDialog):
         # Help text
         help_text = QLabel("Tip: You can pan, zoom, and search for locations. Click anywhere on the map to select coordinates.")
         help_text.setWordWrap(True)
-        help_text.setStyleSheet("QLabel { color: #888888; font-size: 9pt; padding: 5px; }")
+        help_text.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; padding: 5px; }}")
         help_text.setAlignment(Qt.AlignCenter)
         layout.addWidget(help_text)
 
@@ -8142,7 +8158,7 @@ class TelescopeDialog(QDialog):
         fratio_label = QLabel("F-ratio:")
         fratio_label.setMinimumWidth(100)
         self.fratio_display = QLabel("N/A")
-        self.fratio_display.setStyleSheet("color: #888888;")
+        self.fratio_display.setStyleSheet(f"color: {COLORS['text_disabled']};")
         fratio_layout.addWidget(fratio_label)
         fratio_layout.addWidget(self.fratio_display)
         form_group_layout.addLayout(fratio_layout)
@@ -8203,7 +8219,7 @@ class TelescopeDialog(QDialog):
         bottom_layout = QHBoxLayout()
         
         help_text = QLabel("Tip: Enable telescopes to make them available in the Aladin Lite FOV Simulator. Multiple telescopes can be enabled.")
-        help_text.setStyleSheet("color: #888888; font-size: 9pt;")
+        help_text.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
         bottom_layout.addWidget(help_text)
         
         bottom_layout.addStretch()
@@ -8235,13 +8251,13 @@ class TelescopeDialog(QDialog):
                     self.fratio_display.setStyleSheet("color: #ffffff; font-weight: bold;")
                 else:
                     self.fratio_display.setText("N/A")
-                    self.fratio_display.setStyleSheet("color: #888888;")
+                    self.fratio_display.setStyleSheet(f"color: {COLORS['text_disabled']};")
             else:
                 self.fratio_display.setText("N/A")
-                self.fratio_display.setStyleSheet("color: #888888;")
+                self.fratio_display.setStyleSheet(f"color: {COLORS['text_disabled']};")
         except ValueError:
             self.fratio_display.setText("N/A")
-            self.fratio_display.setStyleSheet("color: #888888;")
+            self.fratio_display.setStyleSheet(f"color: {COLORS['text_disabled']};")
     
     def _load_telescopes(self):
         """Load telescopes from database into the list"""
@@ -8578,7 +8594,7 @@ class AboutDialog(QDialog):
         desc_label = QLabel("A personal astrophotography catalog and session planning tools for organizing and exploring your celestial images.")
         desc_label.setAlignment(Qt.AlignCenter)
         desc_label.setWordWrap(True)
-        desc_label.setStyleSheet("font-size: 11pt; color: #cccccc; margin: 10px 0px;")
+        desc_label.setStyleSheet(f"font-size: 11pt; color: {COLORS['text_secondary']}; margin: 10px 0px;")
         About_layout.addWidget(desc_label)
 
         # GitHub link
@@ -9894,34 +9910,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         # Create context menu
         context_menu = QMenu(self)
 
-        # Apply dark theme styling to the context menu
-        context_menu.setStyleSheet("""
-            QMenu {
-                background-color: #404040;
-                color: #ffffff;
-                border: 1px solid #666666;
-                padding: 2px;
-            }
-            QMenu::item {
-                background-color: transparent;
-                padding: 8px 16px;
-                border: none;
-            }
-            QMenu::item:selected {
-                background-color: #0078d4;
-                color: #ffffff;
-            }
-            QMenu::item:hover {
-                background-color: #0078d4;
-                color: #ffffff;
-            }
-            QMenu::separator {
-                height: 1px;
-                background-color: #666666;
-                margin: 2px 8px;
-            }
-        """)
-
         # Add menu actions
         details_action = context_menu.addAction("View DSO Details")
         details_action.triggered.connect(lambda: self._context_view_details(row))
@@ -10131,13 +10119,8 @@ if __name__ == "__main__":
     app_icon = QIcon(icon_path)
     app.setWindowIcon(app_icon)
 
-    # Set global stylesheet for consistent button sizing across all platforms
-    # This ensures buttons have proper height on macOS where text can be cut off
-    app.setStyleSheet("""
-        QPushButton {
-            min-height: 28px;
-        }
-    """)
+    # Apply global dark theme
+    apply_theme(app)
 
     # Initialize database manager and get data
     db_manager = DatabaseManager()

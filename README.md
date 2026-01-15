@@ -37,6 +37,9 @@ Cosmos Collection is designed to help astrophotographers manage their image coll
   ### DSO Image Gallery
   ![DSO Image Gallery](screenshots/DSO-Image-Gallery.jpg)
 
+  ### Image Viewer
+  ![Image Viewer](screenshots/Image-Viewer.jpg)
+
 ## Getting Started
 
 ### Download Latest Release

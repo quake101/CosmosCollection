@@ -17,6 +17,7 @@ from PySide6.QtGui import QPixmap, QImage
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
+from Theme import COLORS
 import numpy as np
 
 
@@ -424,7 +425,6 @@ class AddImageDialog(QDialog):
 
         self._init_ui()
         self._load_dso_list()
-        self._apply_dark_theme()
 
     def _init_ui(self):
         """Create the dialog UI"""
@@ -484,59 +484,6 @@ class AddImageDialog(QDialog):
         button_box.accepted.connect(self._validate_and_accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
-
-    def _apply_dark_theme(self):
-        """Apply dark theme styling"""
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QLabel {
-                color: #ffffff;
-            }
-            QLineEdit, QComboBox {
-                background-color: #404040;
-                color: #ffffff;
-                border: 1px solid #666666;
-                padding: 5px;
-                border-radius: 3px;
-                min-height: 20px;
-            }
-            QLineEdit:focus, QComboBox:focus {
-                border: 1px solid #0078d4;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 20px;
-            }
-            QComboBox::down-arrow {
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 6px solid #ffffff;
-                margin-right: 5px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #404040;
-                color: #ffffff;
-                selection-background-color: #0078d4;
-                border: 1px solid #666666;
-            }
-            QPushButton {
-                background-color: #0078d4;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 3px;
-                min-width: 80px;
-            }
-            QPushButton:hover {
-                background-color: #106ebe;
-            }
-            QPushButton:pressed {
-                background-color: #005a9e;
-            }
-        """)
 
     def _load_dso_list(self):
         """Load all DSOs from database for the combo box"""
@@ -670,12 +617,12 @@ class GalleryCard(QFrame):
         self.thumbnail_label = QLabel()
         self.thumbnail_label.setFixedSize(150, 150)
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
-        self.thumbnail_label.setStyleSheet("""
-            QLabel {
-                background-color: #353535;
-                border: 1px solid #555555;
+        self.thumbnail_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {COLORS['background_light']};
+                border: 1px solid {COLORS['border']};
                 border-radius: 3px;
-            }
+            }}
         """)
 
         # Placeholder text
@@ -691,22 +638,22 @@ class GalleryCard(QFrame):
 
         # DSO type label
         type_label = QLabel(self.item_data.get('friendly_type', 'Unknown'))
-        type_label.setStyleSheet("font-size: 10px; color: #cccccc;")
+        type_label.setStyleSheet(f"font-size: 10px; color: {COLORS['text_secondary']};")
         type_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(type_label)
 
         # Card styling
         self.setFixedWidth(170)
-        self.setStyleSheet("""
-            GalleryCard {
-                background-color: #404040;
-                border: 1px solid #555555;
+        self.setStyleSheet(f"""
+            GalleryCard {{
+                background-color: {COLORS['background_lighter']};
+                border: 1px solid {COLORS['border']};
                 border-radius: 5px;
-            }
-            GalleryCard:hover {
-                border: 2px solid #0078d4;
-                background-color: #4a4a4a;
-            }
+            }}
+            GalleryCard:hover {{
+                border: 2px solid {COLORS['accent']};
+                background-color: {COLORS['background_hover']};
+            }}
         """)
         self.setCursor(Qt.PointingHandCursor)
 
@@ -721,13 +668,13 @@ class GalleryCard(QFrame):
     def set_error(self, error_message):
         """Display error on card"""
         self.thumbnail_label.setText(f"Error:\n{error_message[:30]}")
-        self.thumbnail_label.setStyleSheet("""
-            QLabel {
-                background-color: #4a2020;
-                border: 1px solid #aa4444;
+        self.thumbnail_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {COLORS['error_bg']};
+                border: 1px solid {COLORS['error']};
                 border-radius: 3px;
-                color: #ff8888;
-            }
+                color: {COLORS['error']};
+            }}
         """)
 
     def mouseDoubleClickEvent(self, event):
@@ -752,81 +699,6 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         super().__init__()
         self.setWindowTitle("DSO Image Gallery - Cosmos Collection")
         self.resize(1200, 800)
-
-        # Apply dark theme
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QGroupBox {
-                background-color: #353535;
-                border: 1px solid #555555;
-                border-radius: 5px;
-                margin-top: 10px;
-                padding: 10px;
-                font-weight: bold;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-            }
-            QPushButton {
-                background-color: #0078d4;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 3px;
-                min-width: 80px;
-            }
-            QPushButton:hover {
-                background-color: #106ebe;
-            }
-            QPushButton:pressed {
-                background-color: #005a9e;
-            }
-            QLineEdit, QComboBox {
-                background-color: #404040;
-                color: #ffffff;
-                border: 1px solid #666666;
-                padding: 5px;
-                border-radius: 3px;
-                min-height: 20px;
-            }
-            QLineEdit:focus, QComboBox:focus {
-                border: 1px solid #0078d4;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 20px;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 6px solid #ffffff;
-                margin-right: 5px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #404040;
-                color: #ffffff;
-                selection-background-color: #0078d4;
-                border: 1px solid #666666;
-                padding: 2px;
-            }
-            QComboBox QAbstractItemView::item {
-                padding: 5px;
-                min-height: 20px;
-            }
-            QScrollArea {
-                border: none;
-                background-color: #2b2b2b;
-            }
-            QLabel {
-                color: #ffffff;
-            }
-        """)
 
         # Initialize data structures
         self.db_manager = DatabaseManager()
@@ -1561,28 +1433,6 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     def _show_card_context_menu(self, item_data, position):
         """Show context menu when right-clicking on a card"""
         context_menu = QMenu(self)
-
-        # Apply dark theme styling
-        context_menu.setStyleSheet("""
-            QMenu {
-                background-color: #404040;
-                color: #ffffff;
-                border: 1px solid #666666;
-                padding: 5px;
-            }
-            QMenu::item {
-                padding: 5px 20px;
-                border-radius: 3px;
-            }
-            QMenu::item:selected {
-                background-color: #0078d4;
-            }
-            QMenu::separator {
-                height: 1px;
-                background-color: #666666;
-                margin: 5px 0;
-            }
-        """)
 
         # Add menu actions
         view_action = context_menu.addAction("View Full Image")

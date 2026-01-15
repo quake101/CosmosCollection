@@ -25,6 +25,7 @@ warnings.filterwarnings('ignore')
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
+from Theme import COLORS
 
 class NumericTableWidgetItem(QTableWidgetItem):
     """Custom QTableWidgetItem that sorts by numeric value stored in UserRole"""
@@ -546,98 +547,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.resize(930, 920)
         self.auto_use_target_list = use_target_list
         self.setup_window_position()
-        
-        # Set dark theme
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QWidget {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QGroupBox {
-                font-weight: bold;
-                border: 2px solid #555555;
-                border-radius: 5px;
-                margin-top: 10px;
-                padding-top: 10px;
-                background-color: #353535;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
-                color: #ffffff;
-            }
-            QPushButton {
-                background-color: #0078d4;
-                border: none;
-                color: white;
-                padding: 8px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #106ebe;
-            }
-            QPushButton:pressed {
-                background-color: #005a9e;
-            }
-            QPushButton:disabled {
-                background-color: #555555;
-                color: #888888;
-            }
-            QSpinBox, QComboBox {
-                background-color: #404040;
-                border: 1px solid #666666;
-                padding: 5px;
-                border-radius: 3px;
-                color: #ffffff;
-            }
-            QSpinBox:disabled, QComboBox:disabled {
-                background-color: #353535;
-                color: #888888;
-                border: 1px solid #555555;
-            }
-            QTableWidget {
-                background-color: #404040;
-                border: 1px solid #666666;
-                color: #ffffff;
-                gridline-color: #666666;
-                selection-background-color: #0078d4;
-            }
-            QTableWidget::item {
-                padding: 8px;
-                border-bottom: 1px solid #555555;
-            }
-            QTableWidget::item:selected {
-                background-color: #0078d4;
-            }
-            QHeaderView::section {
-                background-color: #555555;
-                color: #ffffff;
-                padding: 8px;
-                border: none;
-                font-weight: bold;
-            }
-            QLabel {
-                color: #ffffff;
-            }
-            QProgressBar {
-                background-color: #404040;
-                border: 1px solid #666666;
-                border-radius: 3px;
-                text-align: center;
-                color: #ffffff;
-            }
-            QProgressBar::chunk {
-                background-color: #0078d4;
-                border-radius: 3px;
-            }
-        """)
-        
+
         self.calc_thread = None
         self.available_catalogs = []
         self.visible_dsos_data = []  # Store DSO data for detail window
@@ -653,7 +563,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         # Update status to show what's happening
         # This may trigger IERS data download on first run
         self.status_label.setText("Loading astronomical ephemeris data...")
-        self.status_label.setStyleSheet("color: #88ccff;")
+        self.status_label.setStyleSheet(f"color: {COLORS['info']};")
         QApplication.processEvents()  # Force UI update
 
         try:
@@ -854,7 +764,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         
         # Status label
         self.status_label = QLabel("Initializing astronomical calculations...")
-        self.status_label.setStyleSheet("color: #88ccff;")
+        self.status_label.setStyleSheet(f"color: {COLORS['info']};")
         main_layout.addWidget(self.status_label)
 
     def load_location_info(self):
@@ -1085,7 +995,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             type_text = "all types" if not selected_dso_types else f"{selected_dso_type} objects"
             self.status_label.setText(f"Calculating visibility for {type_text} from {catalog_text}... (may download ephemeris data on first run)")
 
-        self.status_label.setStyleSheet("color: #88ccff;")
+        self.status_label.setStyleSheet(f"color: {COLORS['info']};")
 
         # Get time frame settings from UI
         start_hour = self.start_hour_spin.value()
@@ -1298,7 +1208,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.calculate_btn.setEnabled(True)
         self.calculate_btn.setText("Calculate Best DSOs Tonight")
         self.status_label.setText(f"Error: {error_msg}")
-        self.status_label.setStyleSheet("color: #ff8888;")  # Red for errors
+        self.status_label.setStyleSheet(f"color: {COLORS['error']};")  # Red for errors
         QMessageBox.warning(self, "Calculation Error", error_msg)
 
     def _show_context_menu(self, position):
@@ -1315,34 +1225,6 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         # Create context menu
         context_menu = QMenu(self)
-
-        # Apply dark theme styling to the context menu
-        context_menu.setStyleSheet("""
-            QMenu {
-                background-color: #404040;
-                color: #ffffff;
-                border: 1px solid #666666;
-                padding: 2px;
-            }
-            QMenu::item {
-                background-color: transparent;
-                padding: 8px 16px;
-                border: none;
-            }
-            QMenu::item:selected {
-                background-color: #0078d4;
-                color: #ffffff;
-            }
-            QMenu::item:hover {
-                background-color: #0078d4;
-                color: #ffffff;
-            }
-            QMenu::separator {
-                height: 1px;
-                background-color: #666666;
-                margin: 2px 8px;
-            }
-        """)
 
         # Add menu actions
         details_action = context_menu.addAction("View DSO Details")

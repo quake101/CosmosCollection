@@ -37,6 +37,8 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+from Theme import COLORS
+
 # Get the application directory
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -642,15 +644,15 @@ class VisibilityCalendar(QCalendarWidget):
         from PySide6.QtCore import Qt as QtCore
         self.tooltip_label = QLabel(self)
         self.tooltip_label.setWindowFlags(QtCore.ToolTip | QtCore.FramelessWindowHint | QtCore.WindowStaysOnTopHint)
-        self.tooltip_label.setStyleSheet("""
-            QLabel {
-                background-color: #404040;
-                color: white;
-                border: 1px solid #666666;
+        self.tooltip_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {COLORS['background_lighter']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border_light']};
                 border-radius: 3px;
                 padding: 4px 8px;
                 font-size: 10pt;
-            }
+            }}
         """)
         self.tooltip_label.hide()
 
@@ -831,7 +833,7 @@ class VisibilityPlot(FigureCanvas):
         super().__init__(self.figure)
         self.setParent(parent)
         # Set dark background for the canvas
-        self.setStyleSheet("background-color: #2e2e2e;")
+        self.setStyleSheet(f"background-color: {COLORS['background']};")
 
         # Initialize hover data storage
         self.hover_data = None
@@ -854,16 +856,16 @@ class VisibilityPlot(FigureCanvas):
         self.qt_tooltip = QLabel(parent if parent else self)
         self.qt_tooltip.setWindowFlags(QtCore.ToolTip | QtCore.FramelessWindowHint | QtCore.WindowStaysOnTopHint)
         self.qt_tooltip.setAttribute(QtCore.WA_TranslucentBackground, False)  # Reduce flicker
-        self.qt_tooltip.setStyleSheet("""
-            QLabel {
-                background-color: #404040;
-                color: white;
-                border: 1px solid #666666;
+        self.qt_tooltip.setStyleSheet(f"""
+            QLabel {{
+                background-color: {COLORS['background_lighter']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border_light']};
                 border-radius: 3px;
                 padding: 6px 10px;
                 font-size: 9pt;
                 font-family: monospace;
-            }
+            }}
         """)
         self.qt_tooltip.hide()
 
@@ -1234,94 +1236,6 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         self.resize(1400, 900)
         self.setup_window_position()
 
-        # Set dark theme for the application
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QWidget {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QGroupBox {
-                font-weight: bold;
-                border: 2px solid #555555;
-                border-radius: 5px;
-                margin-top: 10px;
-                padding-top: 10px;
-                background-color: #353535;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
-                color: #ffffff;
-            }
-            QPushButton {
-                background-color: #0078d4;
-                border: none;
-                color: white;
-                padding: 8px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #106ebe;
-            }
-            QPushButton:pressed {
-                background-color: #005a9e;
-            }
-            QPushButton:disabled {
-                background-color: #555555;
-                color: #888888;
-            }
-            QLineEdit, QSpinBox, QDateEdit {
-                background-color: #404040;
-                border: 1px solid #666666;
-                padding: 5px;
-                border-radius: 3px;
-                color: #ffffff;
-            }
-            QLineEdit:focus, QSpinBox:focus, QDateEdit:focus {
-                border: 2px solid #0078d4;
-            }
-            QTextEdit {
-                background-color: #404040;
-                border: 1px solid #666666;
-                color: #ffffff;
-                border-radius: 3px;
-            }
-            QLabel {
-                color: #ffffff;
-            }
-            QCalendarWidget {
-                background-color: #353535;
-            }
-            QCalendarWidget QToolButton {
-                background-color: #505050;
-                color: #ffffff;
-                border: none;
-                border-radius: 3px;
-                padding: 5px;
-            }
-            QCalendarWidget QToolButton:hover {
-                background-color: #606060;
-            }
-            QCalendarWidget QMenu {
-                background-color: #404040;
-                color: #ffffff;
-            }
-            QCalendarWidget QSpinBox {
-                background-color: #505050;
-                color: #ffffff;
-                border: 1px solid #666666;
-            }
-            QCalendarWidget QAbstractItemView {
-                selection-background-color: #ffff00;
-            }
-        """)
-
         self.calc_thread = None
         self.monthly_calc_thread = None
         # Store optional coordinates for direct calculation (bypassing name resolution)
@@ -1439,7 +1353,7 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
 
         # Calendar status label
         self.calendar_status_label = QLabel("Select a DSO and calculate to see monthly visibility")
-        self.calendar_status_label.setStyleSheet("color: #aaaaaa; font-style: italic;")
+        self.calendar_status_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-style: italic;")
         calendar_layout.addWidget(self.calendar_status_label)
 
         right_layout.addWidget(calendar_group)
