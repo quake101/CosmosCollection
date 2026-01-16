@@ -557,7 +557,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to open Best DSO Tonight window: {str(e)}")
 
     def _view_target_details(self):
-        """Open ObjectDetailWindow for the selected target"""
+        """Open DSODetailWindow for the selected target"""
         current_row = self.targets_table.currentRow()
         if current_row < 0:
             QMessageBox.warning(self, "No Selection", "Please select a target to view details.")
@@ -572,23 +572,23 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             target_data = name_item.data(Qt.UserRole)
             target_name = target_data.get("name", "")
             
-            # Import ObjectDetailWindow from main.py
-            from main import ObjectDetailWindow
+            # Import DSODetailWindow from main.py
+            from main import DSODetailWindow
             
             # Try to find the complete DSO data in the main database
             detail_data = self._get_full_dso_data(target_name, target_data)
             
             if detail_data:
-                # Create and show the ObjectDetailWindow with full data
-                detail_window = ObjectDetailWindow(detail_data, self)
+                # Create and show the DSODetailWindow with full data
+                detail_window = DSODetailWindow(detail_data, self)
                 detail_window.show()
             else:
                 QMessageBox.warning(self, "Object Not Found", 
                                   f"Could not find complete information for {target_name} in the main DSO database.")
             
         except ImportError as e:
-            QMessageBox.critical(self, "Error", "Could not import ObjectDetailWindow. Please ensure Main.py is available.")
-            logger.error(f"Failed to import ObjectDetailWindow: {str(e)}")
+            QMessageBox.critical(self, "Error", "Could not import DSODetailWindow. Please ensure Main.py is available.")
+            logger.error(f"Failed to import DSODetailWindow: {str(e)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open target details: {str(e)}")
             logger.error(f"Error opening target details: {str(e)}")
@@ -691,7 +691,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         return None
     
     def _process_dso_query_result(self, result, target_data):
-        """Process database query result into ObjectDetailWindow format"""
+        """Process database query result into DSODetailWindow format"""
         try:
             obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
                 constellation, dso_type, dso_class, designations, image_path, integration_time, \
@@ -971,14 +971,14 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             # Create coordinate object once since we have RA/Dec
             dso_coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
             
-            # Sample dates throughout the year (same approach as ObjectDetailWindow)
+            # Sample dates throughout the year (same approach as DSODetailWindow)
             current_year = datetime.now().year
             min_altitude = 30  # Use 30° minimum altitude
             
             sample_dates = []
             visibility_results = []
             
-            for day_offset in range(0, 365, 15):  # Every 15 days like ObjectDetailWindow
+            for day_offset in range(0, 365, 15):  # Every 15 days like DSODetailWindow
                 try:
                     test_date = datetime(current_year, 1, 1) + timedelta(days=day_offset)
                     date_str = test_date.strftime('%Y-%m-%d')
@@ -1331,7 +1331,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
 
 
     def add_target_from_dso(self, dso_data):
-        """Add a target from DSO data (called from ObjectDetailWindow)"""
+        """Add a target from DSO data (called from DSODetailWindow)"""
         # If designations are available, use the preferred catalog name
         if "designations" in dso_data and dso_data["designations"]:
             preferred_name = self._get_preferred_catalog_name(dso_data["designations"])

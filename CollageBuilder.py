@@ -693,7 +693,7 @@ class ThumbnailWorker(QThread):
         self.cancelled = True
 
     def _load_fits_thumbnail(self, fits_path, colormap='gray'):
-        """Load a FITS file and convert to QPixmap thumbnail with RGB color mapping - same as ObjectDetailWindow"""
+        """Load a FITS file and convert to QPixmap thumbnail with RGB color mapping - same as DSODetailWindow"""
         try:
             # Import required libraries
             from astropy.io import fits
@@ -883,17 +883,17 @@ class ThumbnailWorker(QThread):
                     # Try different loading methods based on file type
                     pixmap = None
 
-                    # For FITS files, use the same method as ObjectDetailWindow
+                    # For FITS files, use the same method as DSODetailWindow
                     if ext in ['.fits', '.fit', '.fts']:
                         pixmap = self._load_fits_thumbnail(image_path)
                         if pixmap is None:
                             self.thumbnail_error.emit(row, col, "FITS Load\nError")
                             continue
                     else:
-                        # Load regular image formats with better error handling - same approach as ObjectDetailWindow
+                        # Load regular image formats with better error handling - same approach as DSODetailWindow
                         from PySide6.QtGui import QImageReader
 
-                        # Increase maximum allocation limit for large images (in MB) - same as ObjectDetailWindow
+                        # Increase maximum allocation limit for large images (in MB) - same as DSODetailWindow
                         QImageReader.setAllocationLimit(512)
 
                         # First try standard QPixmap loading

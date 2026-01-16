@@ -1328,7 +1328,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     def _open_dso_details(self, item_data):
         """Open DSO detail window for the selected object"""
         try:
-            from main import ObjectDetailWindow
+            from main import DSODetailWindow
 
             dsodetailid = item_data['dsodetailid']
 
@@ -1404,7 +1404,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                 }
 
                 # Create and show detail window
-                detail_window = ObjectDetailWindow(data)
+                detail_window = DSODetailWindow(data)
                 detail_window.show()
                 detail_window.raise_()
                 detail_window.activateWindow()

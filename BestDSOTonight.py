@@ -1104,7 +1104,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
     def show_object_detail(self, dso_data):
         """Show detailed information for the selected DSO"""
         try:
-            # Import ObjectDetailWindow from Main module
+            # Import DSODetailWindow from Main module
             import sys
             import os
             
@@ -1113,7 +1113,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             if current_dir not in sys.path:
                 sys.path.insert(0, current_dir)
             
-            from main import ObjectDetailWindow
+            from main import DSODetailWindow
             
             # Get DSO coordinates from astropy result
             coordinates = dso_data.get("coordinates")
@@ -1137,7 +1137,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             logger.debug(f"BestDSO opening detail for: {dso_data['dso_info']['name']}")
             logger.debug(f"Designations from dso_info: {dso_data['dso_info']['designations']}")
 
-            # Create the data dictionary expected by ObjectDetailWindow
+            # Create the data dictionary expected by DSODetailWindow
             detail_data = {
                 "name": dso_data["dso_info"]["name"],
                 "type": dso_data["dso_info"]["type"],
@@ -1163,11 +1163,11 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             }
             
             # Create and show the detail window
-            detail_window = ObjectDetailWindow(detail_data, self)
+            detail_window = DSODetailWindow(detail_data, self)
             detail_window.show()
             
         except ImportError as e:
-            QMessageBox.warning(self, "Import Error", f"Could not load ObjectDetailWindow: {e}")
+            QMessageBox.warning(self, "Import Error", f"Could not load DSODetailWindow: {e}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not open object details: {e}")
 
