@@ -104,11 +104,30 @@ Launch Cosmos Collection and start building your personal astrophotography catal
 
 Cosmos Collection supports command line operations for scripting and automation.
 
+### Using the CLI
+
+**Compiled Release:** Use the `CosmosCollection-CLI` executable included in the release:
+```bash
+# Windows
+CosmosCollection-CLI.exe --list-dsos
+
+# Linux/macOS
+./CosmosCollection-CLI --list-dsos
+```
+
+**From Source:** Use Python directly:
+```bash
+python main.py --list-dsos
+```
+
 ### Add an Image
 
 ```bash
-# Basic usage
+# Basic usage (from source)
 python main.py --add-image --dso "M31" --image "/path/to/image.jpg"
+
+# Basic usage (compiled release)
+CosmosCollection-CLI --add-image --dso "M31" --image "/path/to/image.jpg"
 
 # With full metadata
 python main.py --add-image --dso "NGC 7000" --image "/path/to/image.tif" \
@@ -133,21 +152,33 @@ python main.py --add-image --dso "NGC 7000" --image "/path/to/image.tif" \
 ### Search for DSOs
 
 ```bash
+# From source
 python main.py --search-dso "M31"
-python main.py --search-dso "Orion"
-python main.py --search-dso "NGC 70"
+
+# Compiled release
+CosmosCollection-CLI --search-dso "M31"
+CosmosCollection-CLI --search-dso "Orion"
+CosmosCollection-CLI --search-dso "NGC 70"
 ```
 
 ### List All DSOs
 
 ```bash
+# From source
 python main.py --list-dsos
+
+# Compiled release
+CosmosCollection-CLI --list-dsos
 ```
 
 ### Help
 
 ```bash
+# From source
 python main.py --help
+
+# Compiled release
+CosmosCollection-CLI --help
 ```
 
 ## Contributing
