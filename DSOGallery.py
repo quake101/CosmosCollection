@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QMessageBox, QScrollArea, QComboBox, QLineEdit,
                                QFrame, QGridLayout, QMenu, QApplication,
                                QDialog, QFileDialog, QFormLayout, QDialogButtonBox,
-                               QCompleter, QSlider)
+                               QCompleter, QSlider, QProgressDialog)
 from PySide6.QtCore import QSettings
 from PySide6.QtGui import QPixmap, QImage
 
@@ -743,6 +743,12 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.thumbnail_signals = ThumbnailSignals()
         self.cancelled_flag = [False]  # Mutable flag for cancellation
 
+        # Thumbnail loading progress tracking
+        self.thumbnail_progress_dialog = None
+        self.thumbnails_to_load = 0
+        self.thumbnails_loaded = 0
+        self.is_loading_thumbnails = False
+
         # Data loader signals
         self.data_loader_signals = DataLoaderSignals()
         self.data_loader_signals.data_loaded.connect(self._on_data_loaded)
@@ -968,6 +974,12 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
     def _populate_grid(self):
         """Populate grid with gallery cards"""
+        # Close any existing progress dialog
+        if self.thumbnail_progress_dialog:
+            self.thumbnail_progress_dialog.close()
+            self.thumbnail_progress_dialog = None
+        self.is_loading_thumbnails = False
+
         # Disable updates during grid rebuild to prevent excessive repainting
         self.grid_container.setUpdatesEnabled(False)
 
@@ -1017,6 +1029,40 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self._loading_cursor_active = True
         else:
             self._loading_cursor_active = False
+
+        # Set up progress tracking for thumbnail loading
+        self.thumbnails_to_load = showing
+        self.thumbnails_loaded = 0
+        self.is_loading_thumbnails = True
+
+        # Create and show progress dialog for loading thumbnails
+        if showing > 0:
+            self.thumbnail_progress_dialog = QProgressDialog(
+                f"Loading thumbnails... (0/{showing})",
+                None,  # No cancel button
+                0,
+                showing,
+                self
+            )
+            self.thumbnail_progress_dialog.setWindowTitle("Loading Gallery")
+            self.thumbnail_progress_dialog.setWindowModality(Qt.WindowModal)
+            self.thumbnail_progress_dialog.setMinimumDuration(500)  # Only show if takes > 500ms
+            self.thumbnail_progress_dialog.setMinimumWidth(400)
+            self.thumbnail_progress_dialog.setMinimumHeight(120)
+            self.thumbnail_progress_dialog.setStyleSheet("""
+                QProgressDialog {
+                    font-size: 12pt;
+                }
+                QProgressBar {
+                    min-height: 25px;
+                    font-size: 11pt;
+                }
+                QLabel {
+                    font-size: 12pt;
+                }
+            """)
+            self.thumbnail_progress_dialog.setValue(0)
+            QApplication.processEvents()  # Ensure dialog can be displayed
 
         # Update status immediately
         if showing == total:
@@ -1221,6 +1267,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             # Card was deleted, ignore
             pass
 
+        # Update resize progress if active
+        self._update_thumbnail_progress()
+
     def _on_thumbnail_error(self, card, error_message):
         """Handle thumbnail load error"""
         try:
@@ -1230,6 +1279,41 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         except RuntimeError:
             # Card was deleted, ignore
             pass
+
+        # Update resize progress if active
+        self._update_thumbnail_progress()
+
+    def _update_thumbnail_progress(self):
+        """Update the thumbnail loading progress dialog"""
+        if not self.is_loading_thumbnails:
+            return
+
+        self.thumbnails_loaded += 1
+
+        # Update dialog if it exists and is visible
+        if self.thumbnail_progress_dialog is not None:
+            try:
+                self.thumbnail_progress_dialog.setValue(self.thumbnails_loaded)
+                self.thumbnail_progress_dialog.setLabelText(
+                    f"Loading thumbnails... ({self.thumbnails_loaded}/{self.thumbnails_to_load})"
+                )
+            except (RuntimeError, AttributeError):
+                # Dialog was deleted or not fully initialized
+                pass
+
+        # Check if all thumbnails are complete
+        if self.thumbnails_loaded >= self.thumbnails_to_load:
+            self._finish_thumbnail_loading()
+
+    def _finish_thumbnail_loading(self):
+        """Close the thumbnail progress dialog and clean up"""
+        self.is_loading_thumbnails = False
+        self.thumbnails_to_load = 0
+        self.thumbnails_loaded = 0
+
+        if self.thumbnail_progress_dialog:
+            self.thumbnail_progress_dialog.close()
+            self.thumbnail_progress_dialog = None
 
     def _on_card_double_clicked(self, item_data):
         """Handle card double-click - open image viewer"""
@@ -1496,7 +1580,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             # Cancel pending thumbnail tasks
             self.cancelled_flag[0] = True
 
-            # Repopulate grid with new size
+            # Repopulate grid with new size (progress dialog shown by _populate_grid)
             self._populate_grid()
 
     def _apply_filters(self):
