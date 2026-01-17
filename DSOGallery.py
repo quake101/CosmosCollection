@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QMessageBox, QScrollArea, QComboBox, QLineEdit,
                                QFrame, QGridLayout, QMenu, QApplication,
                                QDialog, QFileDialog, QFormLayout, QDialogButtonBox,
-                               QCompleter)
+                               QCompleter, QSlider)
+from PySide6.QtCore import QSettings
 from PySide6.QtGui import QPixmap, QImage
 
 from DatabaseManager import DatabaseManager
@@ -70,7 +71,7 @@ class ThumbnailSignals(QObject):
 class ThumbnailRunnable(QRunnable):
     """Runnable task for generating a single thumbnail in a thread pool"""
 
-    def __init__(self, card, image_path, cache, signals, cancelled_flag):
+    def __init__(self, card, image_path, cache, signals, cancelled_flag, thumbnail_size=150):
         """
         Initialize thumbnail runnable
 
@@ -80,6 +81,7 @@ class ThumbnailRunnable(QRunnable):
             cache: ThumbnailCache instance
             signals: ThumbnailSignals instance for emitting signals
             cancelled_flag: List with single boolean for cancellation check
+            thumbnail_size: Size of thumbnail (width and height in pixels)
         """
         super().__init__()
         self.card = card
@@ -87,6 +89,7 @@ class ThumbnailRunnable(QRunnable):
         self.cache = cache
         self.signals = signals
         self.cancelled_flag = cancelled_flag
+        self.thumbnail_size = thumbnail_size
 
     def _load_fits_thumbnail(self, fits_path):
         """Load a FITS file and convert to QPixmap thumbnail"""
@@ -250,8 +253,8 @@ class ThumbnailRunnable(QRunnable):
                     return
 
                 if pixmap and not pixmap.isNull():
-                    # Scale to 150x150 (gallery card size)
-                    scaled_pixmap = pixmap.scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    # Scale to thumbnail size (gallery card size)
+                    scaled_pixmap = pixmap.scaled(self.thumbnail_size, self.thumbnail_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
                     # Cache the thumbnail
                     if self.cache:
@@ -591,7 +594,7 @@ class GalleryCard(QFrame):
     double_clicked = Signal(dict)  # Emits item_data when double-clicked
     context_menu_requested = Signal(dict, object)  # Emits item_data and position
 
-    def __init__(self, item_data, parent=None):
+    def __init__(self, item_data, parent=None, thumbnail_size=150):
         """
         Initialize gallery card
 
@@ -602,9 +605,11 @@ class GalleryCard(QFrame):
                 - dsotype: DSO type code
                 - image_path: Path to favorite image
                 - equipment: Equipment used
+            thumbnail_size (int): Size of thumbnail in pixels (default 150)
         """
         super().__init__(parent)
         self.item_data = item_data
+        self.thumbnail_size = thumbnail_size
         self._init_ui()
 
     def _init_ui(self):
@@ -613,9 +618,9 @@ class GalleryCard(QFrame):
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
 
-        # Thumbnail label (150x150)
+        # Thumbnail label (dynamic size)
         self.thumbnail_label = QLabel()
-        self.thumbnail_label.setFixedSize(150, 150)
+        self.thumbnail_label.setFixedSize(self.thumbnail_size, self.thumbnail_size)
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
         self.thumbnail_label.setStyleSheet(f"""
             QLabel {{
@@ -642,8 +647,9 @@ class GalleryCard(QFrame):
         type_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(type_label)
 
-        # Card styling
-        self.setFixedWidth(170)
+        # Card styling - card width is thumbnail size + padding (20px for margins and borders)
+        card_width = self.thumbnail_size + 20
+        self.setFixedWidth(card_width)
         self.setStyleSheet(f"""
             GalleryCard {{
                 background-color: {COLORS['background_lighter']};
@@ -660,8 +666,8 @@ class GalleryCard(QFrame):
     def set_thumbnail(self, pixmap):
         """Update thumbnail with actual image"""
         if pixmap and not pixmap.isNull():
-            # Scale to fit 150x150 while maintaining aspect ratio
-            scaled = pixmap.scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            # Scale to fit thumbnail size while maintaining aspect ratio
+            scaled = pixmap.scaled(self.thumbnail_size, self.thumbnail_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.thumbnail_label.setPixmap(scaled)
             self.thumbnail_label.setText("")  # Clear placeholder text
 
@@ -714,12 +720,22 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             'sort': 'Name (A-Z)'
         }
 
+        # Thumbnail size options: Small (100), Medium (150), Large (200), Extra Large (250)
+        self.thumbnail_size_options = {
+            'Small': 100,
+            'Medium': 150,
+            'Large': 300,
+            'Extra Large': 500
+        }
+        # Load thumbnail size from settings (default to Medium)
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        saved_size_name = settings.value("gallery_thumbnail_size", "Medium")
+        self.thumbnail_size = self.thumbnail_size_options.get(saved_size_name, 150)
+
         # Thumbnail cache and thread pool
         self.thumbnail_cache = ThumbnailCache(max_size=200)
         self.thread_pool = QThreadPool.globalInstance()
         # Get thread count from user settings
-        from PySide6.QtCore import QSettings
-        settings = QSettings("CosmosCollection", "CosmosCollection")
         cpu_count = os.cpu_count() or 4
         default_threads = max(1, cpu_count - 2)
         thread_count = settings.value("max_threads", default_threads, type=int)
@@ -821,6 +837,18 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.sort_combo.currentTextChanged.connect(self._on_sort_changed)
         filters_layout.addWidget(self.sort_combo)
 
+        # Thumbnail size selector
+        filters_layout.addWidget(QLabel("Thumbnail Size:"))
+        self.size_combo = QComboBox()
+        for size_name in self.thumbnail_size_options.keys():
+            self.size_combo.addItem(size_name)
+        # Set current selection based on loaded setting
+        current_size_name = [k for k, v in self.thumbnail_size_options.items() if v == self.thumbnail_size]
+        if current_size_name:
+            self.size_combo.setCurrentText(current_size_name[0])
+        self.size_combo.currentTextChanged.connect(self._on_thumbnail_size_changed)
+        filters_layout.addWidget(self.size_combo)
+
         # Clear filters button
         clear_btn = QPushButton("Clear Filters")
         clear_btn.clicked.connect(self._clear_filters)
@@ -921,7 +949,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
     def _calculate_grid_columns(self):
         """Calculate number of columns based on available width"""
-        card_width = 170  # Fixed card width (from GalleryCard.setFixedWidth)
+        # Card width is thumbnail_size + 20px padding (from GalleryCard._init_ui)
+        card_width = self.thumbnail_size + 20
         grid_spacing = 10  # Grid layout spacing
         grid_margins = 20  # Grid layout margins (10 left + 10 right)
 
@@ -1008,8 +1037,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             row = idx // cols
             col = idx % cols
 
-            # Create card
-            card = GalleryCard(item)
+            # Create card with current thumbnail size
+            card = GalleryCard(item, thumbnail_size=self.thumbnail_size)
             card.double_clicked.connect(self._on_card_double_clicked)
             card.context_menu_requested.connect(self._show_card_context_menu)
 
@@ -1091,8 +1120,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         viewport_height = viewport.height()
         scroll_pos = self.scroll_area.verticalScrollBar().value()
 
-        # Estimate card height (thumbnail 150 + name label ~20 + type label ~16 + margins ~20)
-        card_height = 210  # Approximate height of each card including spacing
+        # Estimate card height (thumbnail + name label ~20 + type label ~16 + margins ~30 + spacing)
+        card_height = self.thumbnail_size + 70  # Approximate height of each card including spacing
 
         # Calculate visible row range
         first_visible_row = max(0, scroll_pos // card_height - self.visible_buffer_rows)
@@ -1133,7 +1162,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                     image_path,
                     self.thumbnail_cache,
                     self.thumbnail_signals,
-                    self.cancelled_flag
+                    self.cancelled_flag,
+                    self.thumbnail_size
                 )
                 self.thread_pool.start(runnable)
 
@@ -1161,7 +1191,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                     image_path,
                     self.thumbnail_cache,
                     self.thumbnail_signals,
-                    self.cancelled_flag
+                    self.cancelled_flag,
+                    self.thumbnail_size
                 )
                 self.thread_pool.start(runnable)
                 loaded_count += 1
@@ -1448,6 +1479,26 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         """Handle filter combo box changes"""
         self._apply_filters()
 
+    def _on_thumbnail_size_changed(self, size_name):
+        """Handle thumbnail size selector change"""
+        new_size = self.thumbnail_size_options.get(size_name, 150)
+        if new_size != self.thumbnail_size:
+            self.thumbnail_size = new_size
+
+            # Save setting
+            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings.setValue("gallery_thumbnail_size", size_name)
+
+            # Clear thumbnail cache since cached images are at the old size
+            self.thumbnail_cache.clear()
+            self.thumbnail_loaded_indices.clear()
+
+            # Cancel pending thumbnail tasks
+            self.cancelled_flag[0] = True
+
+            # Repopulate grid with new size
+            self._populate_grid()
+
     def _apply_filters(self):
         """Apply all filters and refresh grid"""
         # Update current filter state
@@ -1638,7 +1689,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             current_cols = self._calculate_grid_columns()
 
             # Calculate pixels needed for next column
-            card_width = 170
+            card_width = self.thumbnail_size + 20  # Card width is thumbnail_size + padding
             grid_spacing = 10
             grid_margins = 20
             viewport_width = self.scroll_area.viewport().width()
