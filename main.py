@@ -4557,24 +4557,33 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 # --- Command Line Interface ---
 def parse_cli_arguments():
     """Parse command line arguments for CLI operations"""
+    # Determine the program name for help text
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable
+        prog_name = os.path.basename(sys.executable)
+    else:
+        # Running from source
+        prog_name = "python main.py"
+
     parser = argparse.ArgumentParser(
+        prog=prog_name,
         description='Cosmos Collection - Deep Sky Object Image Management',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 Examples:
   # Add an image to a DSO
-  python main.py --add-image --dso "M31" --image "/path/to/image.jpg"
+  {prog_name} --add-image --dso "M31" --image "/path/to/image.jpg"
 
   # Add an image with metadata
-  python main.py --add-image --dso "NGC 7000" --image "/path/to/image.tif" \\
+  {prog_name} --add-image --dso "NGC 7000" --image "/path/to/image.tif" \\
       --equipment "Telescope: AT72ED, Camera: ASI2600" \\
       --integration "3600" --date "2024-01-15" --notes "First light!"
 
   # List all DSOs in the database
-  python main.py --list-dsos
+  {prog_name} --list-dsos
 
   # Search for a DSO
-  python main.py --search-dso "M31"
+  {prog_name} --search-dso "M31"
 """
     )
 
