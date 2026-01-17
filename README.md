@@ -100,9 +100,59 @@ If you prefer to build from source:
 
 Launch Cosmos Collection and start building your personal astrophotography catalog by importing your images and adding relevant metadata for each capture.
 
+## Command Line Interface
+
+Cosmos Collection supports command line operations for scripting and automation.
+
+### Add an Image
+
+```bash
+# Basic usage
+python main.py --add-image --dso "M31" --image "/path/to/image.jpg"
+
+# With full metadata
+python main.py --add-image --dso "NGC 7000" --image "/path/to/image.tif" \
+    --equipment "Telescope: AT72ED, Camera: ASI2600" \
+    --integration "3600" \
+    --date "2024-01-15" \
+    --notes "First light!" \
+    --set-favorite
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--dso NAME` | DSO name (required) - e.g., M31, NGC 7000, IC 1396 |
+| `--image PATH` | Path to the image file (required) |
+| `--equipment TEXT` | Equipment used (optional) |
+| `--integration SECONDS` | Integration time in seconds (optional) |
+| `--date YYYY-MM-DD` | Date the image was taken (optional) |
+| `--notes TEXT` | Notes about the image (optional) |
+| `--set-favorite` | Set this image as the favorite for the DSO |
+
+### Search for DSOs
+
+```bash
+python main.py --search-dso "M31"
+python main.py --search-dso "Orion"
+python main.py --search-dso "NGC 70"
+```
+
+### List All DSOs
+
+```bash
+python main.py --list-dsos
+```
+
+### Help
+
+```bash
+python main.py --help
+```
+
 ## Contributing
 
-This is a personal project for astrophotography organization. Feel free to fork and adapt for your own use.
+This is a personal project for astrophotography organization and session planning tool. This should be viewed as a "rolling release" style project. Feel free to fork and adapt for your own use.
 
 ## License
 
