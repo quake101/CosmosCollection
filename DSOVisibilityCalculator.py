@@ -874,6 +874,44 @@ class VisibilityPlot(FigureCanvas):
         # Connect mouse leave event
         self.mpl_connect('axes_leave_event', self.on_mouse_leave)
 
+    def _add_darkness_shading(self, ax, hours_from_start, sun_altitudes):
+        """Add background shading to show darkness levels based on sun altitude.
+
+        Colors represent:
+        - Daylight (sun > 0°): No shading (default background)
+        - Civil twilight (0° to -6°): Light shade
+        - Nautical twilight (-6° to -12°): Medium shade
+        - Astronomical twilight (-12° to -18°): Dark shade
+        - Night (< -18°): Darkest shade
+        """
+        # Define darkness thresholds and colors (from lightest to darkest)
+        # Format: (sun_max, sun_min, color, alpha)
+        darkness_levels = [
+            (0, -6, '#2a3a4a', 0.6),      # Civil twilight - light blue-gray
+            (-6, -12, '#1a2535', 0.7),    # Nautical twilight - medium blue
+            (-12, -18, '#101520', 0.8),   # Astronomical twilight - dark blue
+            (-18, -90, '#080a10', 0.9),   # Night - very dark blue/black
+        ]
+
+        # For each darkness level, find and shade the regions
+        for sun_max, sun_min, color, alpha in darkness_levels:
+            # Find indices where sun is in this range
+            in_range = (sun_altitudes <= sun_max) & (sun_altitudes > sun_min)
+
+            if not np.any(in_range):
+                continue
+
+            # Find contiguous regions
+            diff = np.diff(np.concatenate(([False], in_range, [False])).astype(int))
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0]
+
+            # Shade each contiguous region
+            for start_idx, end_idx in zip(starts, ends):
+                x_start = hours_from_start[start_idx]
+                x_end = hours_from_start[min(end_idx, len(hours_from_start) - 1)]
+                ax.axvspan(x_start, x_end, facecolor=color, alpha=alpha, zorder=0)
+
     def plot_visibility(self, results):
         """Create visibility plot with altitude and azimuth"""
         self.figure.clear()
@@ -906,8 +944,15 @@ class VisibilityPlot(FigureCanvas):
         start_local = local_times[0]
         hours_from_start = [(lt - start_local).total_seconds() / 3600 for lt in local_times]
 
+        # Get sun altitudes as numpy array for shading calculations
+        sun_altitudes = sun_altaz.alt.deg
+
         # Create three subplots: altitude, azimuth, and sun
         ax1 = self.figure.add_subplot(3, 1, 1, facecolor='#2e2e2e')
+
+        # Add darkness shading first (so it appears behind the data)
+        self._add_darkness_shading(ax1, hours_from_start, sun_altitudes)
+
         ax1.plot(hours_from_start, dso_altaz.alt.deg, '#00aaff', linewidth=2, label=f'{dso_name} Altitude')
         ax1.axhline(y=30, color='#00ff88', linestyle='--', alpha=0.8, label='Min Altitude (30°)')
         ax1.axhline(y=0, color='#888888', linestyle='-', alpha=0.6, label='Horizon')
@@ -939,6 +984,10 @@ class VisibilityPlot(FigureCanvas):
 
         # DSO azimuth subplot
         ax2 = self.figure.add_subplot(3, 1, 2, facecolor='#2e2e2e')
+
+        # Add darkness shading
+        self._add_darkness_shading(ax2, hours_from_start, sun_altitudes)
+
         ax2.plot(hours_from_start, dso_altaz.az.deg, '#ff8800', linewidth=2, label=f'{dso_name} Azimuth')
 
         # Add cardinal direction lines
@@ -965,6 +1014,10 @@ class VisibilityPlot(FigureCanvas):
 
         # Sun altitude subplot
         ax3 = self.figure.add_subplot(3, 1, 3, facecolor='#2e2e2e')
+
+        # Add darkness shading
+        self._add_darkness_shading(ax3, hours_from_start, sun_altitudes)
+
         ax3.plot(hours_from_start, sun_altaz.alt.deg, '#ffaa00', linewidth=2, label='Sun Altitude')
         ax3.axhline(y=0, color='#888888', linestyle='-', alpha=0.6, label='Horizon')
         ax3.axhline(y=-12, color='#4488ff', linestyle='--', alpha=0.8, label='Astronomical Twilight')
