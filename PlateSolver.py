@@ -43,7 +43,7 @@ class PlateSolveResult:
 class PlateSolverWorker(QThread):
     """Background worker for plate solving"""
 
-    finished = Signal(object)  # Emits PlateSolveResult
+    solve_finished = Signal(object)  # Emits PlateSolveResult
     progress = Signal(str)  # Progress messages
 
     def __init__(self, image_path: str, hints: Dict[str, Any] = None):
@@ -58,6 +58,7 @@ class PlateSolverWorker(QThread):
     def run(self):
         """Run plate solving in background"""
         solver = PlateSolver()
+        astap_error = None
 
         # Try ASTAP first
         self.progress.emit("Checking for ASTAP solver...")
@@ -65,22 +66,30 @@ class PlateSolverWorker(QThread):
             self.progress.emit("Solving with ASTAP...")
             result = solver.solve_with_astap(self.image_path, self.hints)
             if result.success:
-                self.finished.emit(result)
+                self.solve_finished.emit(result)
                 return
-            self.progress.emit(f"ASTAP failed: {result.error_message}")
+            astap_error = result.error_message
+            self.progress.emit(f"ASTAP failed: {astap_error}")
         else:
+            astap_error = "ASTAP not installed or not found"
             self.progress.emit("ASTAP not found, trying online solver...")
 
         if self._cancelled:
             result = PlateSolveResult()
             result.error_message = "Cancelled"
-            self.finished.emit(result)
+            self.solve_finished.emit(result)
             return
 
         # Fall back to astrometry.net
         self.progress.emit("Solving with Astrometry.net (this may take a few minutes)...")
         result = solver.solve_with_astrometry_net(self.image_path, self.hints)
-        self.finished.emit(result)
+
+        # If astrometry.net also failed, include both error messages
+        if not result.success and astap_error:
+            astrometry_error = result.error_message
+            result.error_message = f"ASTAP: {astap_error}\n\nAstrometry.net: {astrometry_error}"
+
+        self.solve_finished.emit(result)
 
 
 class PlateSolver:

@@ -930,7 +930,6 @@ class ImageViewerWindow(QDialog):
 
         layout.addLayout(button_layout)
 
-
         dialog.exec()
 
     def _start_plate_solve(self, dialog):
@@ -963,7 +962,7 @@ class ImageViewerWindow(QDialog):
         self.plate_solve_worker.progress.connect(
             lambda msg: self.annotation_status.setText(msg)
         )
-        self.plate_solve_worker.finished.connect(
+        self.plate_solve_worker.solve_finished.connect(
             lambda result: self._on_plate_solve_finished(result, dialog)
         )
         self.plate_solve_worker.start()
@@ -972,7 +971,6 @@ class ImageViewerWindow(QDialog):
         """Handle plate solve completion"""
         self.annotation_progress.setVisible(False)
         self.solve_button.setEnabled(True)
-
         self.plate_solve_result = result
 
         if result.success:
@@ -998,9 +996,10 @@ class ImageViewerWindow(QDialog):
                 f"Pixel Scale: {result.pixel_scale:.2f} arcsec/pixel"
             )
         else:
-            self.annotation_status.setText(f"Solve failed: {result.error_message}")
+            self.annotation_status.setText(f"Solve failed!")
             QMessageBox.warning(self, "Plate Solve Failed",
-                f"Could not plate solve the image.\n\n{result.error_message}")
+                f"Could not plate solve the image.\n\n{result.error_message}" or "Unknown error",
+            )
 
     def _auto_load_annotations(self):
         """Auto-load annotations if cached WCS exists and annotations are enabled"""
