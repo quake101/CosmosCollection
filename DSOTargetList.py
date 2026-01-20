@@ -579,8 +579,25 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             dialog.telescope_combo.setCurrentIndex(0)  # "Any"
 
         if dialog.exec() == QDialog.Accepted:
+            # Store the target ID to re-select after reload
+            edited_target_id = target_data["id"]
+
             # Reload targets to reflect the changes (dialog already handles the database update)
             self._load_targets()
+
+            # Re-select the edited target
+            self._select_target_by_id(edited_target_id)
+
+    def _select_target_by_id(self, target_id):
+        """Find and select a target row by its ID"""
+        for row in range(self.targets_table.rowCount()):
+            name_item = self.targets_table.item(row, 0)
+            if name_item:
+                row_data = name_item.data(Qt.UserRole)
+                if row_data and row_data.get("id") == target_id:
+                    self.targets_table.selectRow(row)
+                    self.targets_table.scrollToItem(name_item)
+                    return
 
     def _remove_selected_target(self):
         """Remove the selected target from the list"""
@@ -1553,7 +1570,14 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
                 dialog.telescope_combo.setCurrentIndex(0)  # "Any"
 
             if dialog.exec() == QDialog.Accepted:
+                # Store the target ID to re-select after reload
+                edited_target_id = target_data["id"]
+
+                # Reload targets to reflect the changes
                 self._load_targets()
+
+                # Re-select the edited target
+                self._select_target_by_id(edited_target_id)
         except Exception as e:
             logger.error(f"Error opening edit target dialog: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to open target details: {str(e)}")

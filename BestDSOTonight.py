@@ -296,15 +296,17 @@ class DSOCalculationThread(QThread):
 
             cursor = conn.cursor()
 
-            # Query target list entries - we'll match coordinates separately
+            # Query target list entries with telescope information
             query = """
-                SELECT name, dso_type, constellation, magnitude, ra_deg, dec_deg, size_info
-                FROM usertargetlist
-                WHERE ra_deg IS NOT NULL
-                    AND dec_deg IS NOT NULL
-                    AND magnitude IS NOT NULL
-                    AND magnitude <= ?
-                ORDER BY magnitude ASC
+                SELECT t.name, t.dso_type, t.constellation, t.magnitude, t.ra_deg, t.dec_deg,
+                       t.size_info, t.telescope_id, tel.name as telescope_name
+                FROM usertargetlist t
+                LEFT JOIN usertelescopes tel ON t.telescope_id = tel.id
+                WHERE t.ra_deg IS NOT NULL
+                    AND t.dec_deg IS NOT NULL
+                    AND t.magnitude IS NOT NULL
+                    AND t.magnitude <= ?
+                ORDER BY t.magnitude ASC
             """
 
             cursor.execute(query, [self.max_magnitude])
@@ -312,7 +314,7 @@ class DSOCalculationThread(QThread):
             rows = cursor.fetchall()
             dsos = []
             for row in rows:
-                name, dso_type, constellation, magnitude, ra_deg, dec_deg, size_info = row
+                name, dso_type, constellation, magnitude, ra_deg, dec_deg, size_info, telescope_id, telescope_name = row
                 if name and magnitude is not None and ra_deg is not None and dec_deg is not None:
                     # Query designations from main database by matching coordinates
                     cursor.execute("""
@@ -346,7 +348,8 @@ class DSOCalculationThread(QThread):
                         "dso_class": "Unknown",
                         "ra_deg": float(ra_deg),
                         "dec_deg": float(dec_deg),
-                        "designations": designations
+                        "designations": designations,
+                        "telescope_name": telescope_name or "Any"
                     })
 
             conn.close()
@@ -968,6 +971,9 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         dso_limit = self.dso_limit_spin.value()
         use_target_list = self.use_target_list_checkbox.isChecked()
 
+        # Store whether we're using target list for display_results
+        self._using_target_list = use_target_list
+
         # Get selected catalog (ignored if using target list)
         selected_catalog = self.catalog_combo.currentText()
         selected_catalogs = [] if selected_catalog == "All Catalogs" else [selected_catalog]
@@ -1025,7 +1031,24 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         
         # Disable sorting temporarily while populating
         self.results_table.setSortingEnabled(False)
-        
+
+        # Configure columns based on whether we're using target list
+        if getattr(self, '_using_target_list', False):
+            self.results_table.setColumnCount(9)
+            self.results_table.setHorizontalHeaderLabels([
+                "DSO", "Type", "Constellation", "Magnitude",
+                "Max Alt.", "Best Time", "Direction", "Visible Hours", "Telescope"
+            ])
+            # Configure the new Telescope column
+            header = self.results_table.horizontalHeader()
+            header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        else:
+            self.results_table.setColumnCount(8)
+            self.results_table.setHorizontalHeaderLabels([
+                "DSO", "Type", "Constellation", "Magnitude",
+                "Max Alt.", "Best Time", "Direction", "Visible Hours"
+            ])
+
         # Populate table
         self.results_table.setRowCount(len(visible_dsos))
         
@@ -1080,6 +1103,13 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             hours_item.setData(Qt.UserRole, dso_data['visible_hours'])  # Store numeric value for sorting
             hours_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 7, hours_item)
+
+            # Telescope column (only when using target list)
+            if getattr(self, '_using_target_list', False):
+                telescope_name = dso_info.get("telescope_name", "Any")
+                telescope_item = QTableWidgetItem(telescope_name)
+                telescope_item.setTextAlignment(Qt.AlignCenter)
+                self.results_table.setItem(row, 8, telescope_item)
 
         # Re-enable sorting
         self.results_table.setSortingEnabled(True)
