@@ -71,6 +71,14 @@ class ThumbnailSignals(QObject):
 class ThumbnailRunnable(QRunnable):
     """Runnable task for generating a single thumbnail in a thread pool"""
 
+    # Map thumbnail sizes to size names for disk cache filenames
+    SIZE_NAMES = {
+        100: 'Small',
+        150: 'Medium',
+        300: 'Large',
+        500: 'ExtraLarge'
+    }
+
     def __init__(self, card, image_path, cache, signals, cancelled_flag, thumbnail_size=150):
         """
         Initialize thumbnail runnable
@@ -90,6 +98,43 @@ class ThumbnailRunnable(QRunnable):
         self.signals = signals
         self.cancelled_flag = cancelled_flag
         self.thumbnail_size = thumbnail_size
+
+    def _get_disk_cache_path(self):
+        """Get the path for the disk-cached thumbnail file"""
+        directory = os.path.dirname(self.image_path)
+        basename = os.path.basename(self.image_path)
+        name_without_ext = os.path.splitext(basename)[0]
+        size_name = self.SIZE_NAMES.get(self.thumbnail_size, f'{self.thumbnail_size}px')
+        cache_filename = f"{name_without_ext}_{size_name}_Thumbnail.jpg"
+        return os.path.join(directory, cache_filename)
+
+    def _is_disk_cache_valid(self, cache_path):
+        """Check if disk cache file exists and is newer than the original image"""
+        if not os.path.exists(cache_path):
+            return False
+        try:
+            cache_mtime = os.path.getmtime(cache_path)
+            original_mtime = os.path.getmtime(self.image_path)
+            return cache_mtime >= original_mtime
+        except OSError:
+            return False
+
+    def _load_from_disk_cache(self, cache_path):
+        """Load thumbnail from disk cache"""
+        try:
+            pixmap = QPixmap(cache_path)
+            if not pixmap.isNull():
+                return pixmap
+        except Exception:
+            pass
+        return None
+
+    def _save_to_disk_cache(self, pixmap, cache_path):
+        """Save thumbnail to disk cache as JPEG at 85% quality"""
+        try:
+            pixmap.save(cache_path, "JPEG", 85)
+        except Exception:
+            pass  # Silently fail if we can't save cache
 
     def _load_fits_thumbnail(self, fits_path):
         """Load a FITS file and convert to QPixmap thumbnail"""
@@ -193,11 +238,30 @@ class ThumbnailRunnable(QRunnable):
         from PySide6.QtGui import QImageReader
 
         try:
-            # Check cache first
+            # Check memory cache first
             if self.cache:
                 cached_pixmap = self.cache.get(self.image_path)
                 if cached_pixmap:
                     self.signals.thumbnail_ready.emit(self.card, cached_pixmap)
+                    return
+
+            # Check if cancelled
+            if self.cancelled_flag[0]:
+                return
+
+            # Check if disk caching is enabled
+            settings = QSettings("CosmosCollection", "CosmosCollection")
+            disk_cache_enabled = settings.value("cache_thumbnails_to_disk", True, type=bool)
+            disk_cache_path = self._get_disk_cache_path() if disk_cache_enabled else None
+
+            # Try loading from disk cache if enabled and valid
+            if disk_cache_enabled and self._is_disk_cache_valid(disk_cache_path):
+                disk_pixmap = self._load_from_disk_cache(disk_cache_path)
+                if disk_pixmap and not disk_pixmap.isNull():
+                    # Store in memory cache too
+                    if self.cache:
+                        self.cache.put(self.image_path, disk_pixmap)
+                    self.signals.thumbnail_ready.emit(self.card, disk_pixmap)
                     return
 
             # Check if cancelled
@@ -256,9 +320,13 @@ class ThumbnailRunnable(QRunnable):
                     # Scale to thumbnail size (gallery card size)
                     scaled_pixmap = pixmap.scaled(self.thumbnail_size, self.thumbnail_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
-                    # Cache the thumbnail
+                    # Cache the thumbnail in memory
                     if self.cache:
                         self.cache.put(self.image_path, scaled_pixmap)
+
+                    # Save to disk cache if enabled
+                    if disk_cache_enabled and disk_cache_path:
+                        self._save_to_disk_cache(scaled_pixmap, disk_cache_path)
 
                     self.signals.thumbnail_ready.emit(self.card, scaled_pixmap)
                 else:

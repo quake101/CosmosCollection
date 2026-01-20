@@ -1627,6 +1627,23 @@ class SettingsDialog(QDialog):
         thread_layout.addStretch()
         perf_settings_layout.addLayout(thread_layout)
 
+        # Thumbnail disk cache setting
+        self.cache_thumbnails_checkbox = QCheckBox("Cache thumbnails to disk")
+        self.cache_thumbnails_checkbox.setToolTip(
+            "When enabled, generated thumbnails are saved alongside original images.\n"
+            "Speeds up gallery loading on subsequent launches."
+        )
+        perf_settings_layout.addWidget(self.cache_thumbnails_checkbox)
+
+        # Thumbnail cache help text
+        cache_help = QLabel(
+            "Thumbnails will be saved as <i>{filename}_{size}_Thumbnail.jpg</i> in the same folder as the original image.<br>"
+            "This speeds up gallery loading on subsequent launches. Cache files can be safely deleted."
+        )
+        cache_help.setWordWrap(True)
+        cache_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 20px; }}")
+        perf_settings_layout.addWidget(cache_help)
+
         app_settings_layout.addWidget(perf_settings_group)
 
         # Plate Solving Settings group
@@ -1820,6 +1837,10 @@ class SettingsDialog(QDialog):
             thread_count = settings.value("max_threads", default_threads, type=int)
             self.thread_count_spinbox.setValue(thread_count)
 
+            # Load thumbnail cache setting
+            cache_thumbnails = settings.value("cache_thumbnails_to_disk", True, type=bool)
+            self.cache_thumbnails_checkbox.setChecked(cache_thumbnails)
+
             # Load plate solving settings
             astap_path = settings.value("astap_path", "", type=str)
             self.astap_path_input.setText(astap_path)
@@ -1949,6 +1970,7 @@ class SettingsDialog(QDialog):
             settings.setValue("show_observer_location", self.show_observer_location_checkbox.isChecked())
             settings.setValue("check_updates_on_startup", self.check_updates_checkbox.isChecked())
             settings.setValue("max_threads", self.thread_count_spinbox.value())
+            settings.setValue("cache_thumbnails_to_disk", self.cache_thumbnails_checkbox.isChecked())
 
             # Save plate solving settings
             settings.setValue("astap_path", self.astap_path_input.text().strip())
