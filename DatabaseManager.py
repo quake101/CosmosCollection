@@ -105,9 +105,16 @@ class DatabaseManager:
                         notes TEXT,
                         date_added TEXT,
                         date_observed TEXT,
-                        created_date TEXT DEFAULT CURRENT_TIMESTAMP
+                        created_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                        telescope_id INTEGER REFERENCES usertelescopes(id) ON DELETE SET NULL
                     )
                 """)
+
+                # Add telescope_id column if it doesn't exist (for existing databases)
+                try:
+                    cursor.execute("ALTER TABLE usertargetlist ADD COLUMN telescope_id INTEGER REFERENCES usertelescopes(id) ON DELETE SET NULL")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
                 
                 # Create usercollages table for user's collage projects
                 cursor.execute("""

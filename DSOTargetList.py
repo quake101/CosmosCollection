@@ -125,7 +125,7 @@ class AddTargetDialog(QDialog):
         self.priority_combo.addItems(["Low", "Medium", "High", "Urgent"])
         self.priority_combo.setCurrentText("Medium")
         priority_layout.addWidget(self.priority_combo)
-        
+
         # Status
         priority_layout.addWidget(QLabel("Status:"))
         self.status_combo = QComboBox()
@@ -133,6 +133,15 @@ class AddTargetDialog(QDialog):
         self.status_combo.setCurrentText("Not Observed")
         priority_layout.addWidget(self.status_combo)
         target_layout.addLayout(priority_layout)
+
+        # Telescope
+        telescope_layout = QHBoxLayout()
+        telescope_layout.addWidget(QLabel("Telescope:"))
+        self.telescope_combo = QComboBox()
+        self._populate_telescope_combo()
+        telescope_layout.addWidget(self.telescope_combo)
+        telescope_layout.addStretch()
+        target_layout.addLayout(telescope_layout)
         
         # Best months for observing
         months_layout = QHBoxLayout()
@@ -176,6 +185,36 @@ class AddTargetDialog(QDialog):
         self.target_id = target_id
         self.save_btn.setText("Save Changes")
     
+    def _populate_telescope_combo(self):
+        """Populate telescope dropdown with active telescopes"""
+        self.telescope_combo.clear()
+        self.telescope_combo.addItem("Any", None)  # First item for unassigned
+
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, name, aperture, focal_length
+                    FROM usertelescopes
+                    WHERE is_active = 1
+                    ORDER BY name
+                """)
+                telescopes = cursor.fetchall()
+
+                for telescope in telescopes:
+                    tel_id, name, aperture, focal_length = telescope
+                    # Calculate f/ratio if we have both values
+                    if aperture and focal_length and aperture > 0:
+                        f_ratio = focal_length / aperture
+                        display_text = f"{name} ({int(aperture)}mm f/{f_ratio:.1f})"
+                    elif aperture:
+                        display_text = f"{name} ({int(aperture)}mm)"
+                    else:
+                        display_text = name
+                    self.telescope_combo.addItem(display_text, tel_id)
+        except Exception as e:
+            logger.error(f"Error loading telescopes: {str(e)}")
+
     def _populate_from_dso_data(self):
         """Populate dialog fields with DSO data"""
         if not self.dso_data:
@@ -236,40 +275,43 @@ class AddTargetDialog(QDialog):
                 "status": self.status_combo.currentText(),
                 "best_months": self.months_edit.text().strip(),
                 "notes": self.notes_edit.toPlainText().strip(),
-                "date_added": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "date_added": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "telescope_id": self.telescope_combo.currentData()
             }
-            
+
             # Save to database - either INSERT new or UPDATE existing
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                
+
                 if self.is_edit_mode and self.target_id:
                     # Update existing record
                     cursor.execute("""
-                        UPDATE usertargetlist SET 
-                            name = ?, dso_type = ?, constellation = ?, ra_deg = ?, dec_deg = ?, 
-                            magnitude = ?, size_info = ?, priority = ?, status = ?, 
-                            best_months = ?, notes = ?
+                        UPDATE usertargetlist SET
+                            name = ?, dso_type = ?, constellation = ?, ra_deg = ?, dec_deg = ?,
+                            magnitude = ?, size_info = ?, priority = ?, status = ?,
+                            best_months = ?, notes = ?, telescope_id = ?
                         WHERE id = ?
                     """, (
                         target_data["name"], target_data["dso_type"], target_data["constellation"],
                         target_data["ra_deg"], target_data["dec_deg"], target_data["magnitude"],
                         target_data["size_info"], target_data["priority"], target_data["status"],
-                        target_data["best_months"], target_data["notes"], self.target_id
+                        target_data["best_months"], target_data["notes"], target_data["telescope_id"],
+                        self.target_id
                     ))
                     success_message = f"{target_data['name']} has been updated in your target list."
                 else:
                     # Insert new record
                     cursor.execute("""
                         INSERT INTO usertargetlist (
-                            name, dso_type, constellation, ra_deg, dec_deg, magnitude, 
-                            size_info, priority, status, best_months, notes, date_added
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            name, dso_type, constellation, ra_deg, dec_deg, magnitude,
+                            size_info, priority, status, best_months, notes, date_added, telescope_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         target_data["name"], target_data["dso_type"], target_data["constellation"],
                         target_data["ra_deg"], target_data["dec_deg"], target_data["magnitude"],
                         target_data["size_info"], target_data["priority"], target_data["status"],
-                        target_data["best_months"], target_data["notes"], target_data["date_added"]
+                        target_data["best_months"], target_data["notes"], target_data["date_added"],
+                        target_data["telescope_id"]
                     ))
                     success_message = f"{target_data['name']} has been added to your target list."
                 
@@ -329,7 +371,31 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
                 logger.debug("DSO target list table initialized successfully")
         except Exception as e:
             logger.error(f"Error initializing target list database: {str(e)}")
-    
+
+    def _populate_telescope_filter(self):
+        """Populate telescope filter dropdown with all telescopes (including inactive)"""
+        self.telescope_filter.clear()
+        self.telescope_filter.addItem("All", "all")
+        self.telescope_filter.addItem("Unassigned", "unassigned")
+
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                # Include all telescopes (even inactive) since targets may reference them
+                cursor.execute("""
+                    SELECT id, name, is_active
+                    FROM usertelescopes
+                    ORDER BY name
+                """)
+                telescopes = cursor.fetchall()
+
+                for telescope in telescopes:
+                    tel_id, name, is_active = telescope
+                    display_text = name if is_active else f"{name} (inactive)"
+                    self.telescope_filter.addItem(display_text, tel_id)
+        except Exception as e:
+            logger.error(f"Error loading telescopes for filter: {str(e)}")
+
     def _init_ui(self):
         """Initialize the user interface"""
         central_widget = QWidget()
@@ -391,7 +457,13 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         self.priority_filter.addItems(["All", "Low", "Medium", "High", "Urgent"])
         self.priority_filter.currentTextChanged.connect(self._filter_targets)
         control_layout.addWidget(self.priority_filter)
-        
+
+        control_layout.addWidget(QLabel("Telescope:"))
+        self.telescope_filter = QComboBox()
+        self._populate_telescope_filter()
+        self.telescope_filter.currentIndexChanged.connect(self._filter_targets)
+        control_layout.addWidget(self.telescope_filter)
+
         # Refresh button
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self._load_targets)
@@ -405,10 +477,10 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         targets_layout = QVBoxLayout()
         
         self.targets_table = QTableWidget()
-        self.targets_table.setColumnCount(10)
+        self.targets_table.setColumnCount(11)
         self.targets_table.setHorizontalHeaderLabels([
             "Name", "Type", "Constellation", "Magnitude", "Size",
-            "Priority", "Status", "Direction", "Best Months", "Date Added"
+            "Priority", "Status", "Telescope", "Direction", "Best Months", "Date Added"
         ])
 
         # Enable sorting and disable editing
@@ -417,7 +489,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         # Set column widths - Allow manual resizing
         header = self.targets_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Name column autosizes to content
-        for col in range(1, 10):
+        for col in range(1, 11):
             header.setSectionResizeMode(col, QHeaderView.Interactive)  # Other columns allow manual resizing
 
         # Set initial default widths for manually resizable columns
@@ -427,9 +499,10 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         self.targets_table.setColumnWidth(4, 80)   # Size
         self.targets_table.setColumnWidth(5, 90)   # Priority
         self.targets_table.setColumnWidth(6, 100)  # Status
-        self.targets_table.setColumnWidth(7, 70)   # Direction
-        self.targets_table.setColumnWidth(8, 150)  # Best Months
-        self.targets_table.setColumnWidth(9, 100)  # Date Added
+        self.targets_table.setColumnWidth(7, 120)  # Telescope
+        self.targets_table.setColumnWidth(8, 70)   # Direction
+        self.targets_table.setColumnWidth(9, 150)  # Best Months
+        self.targets_table.setColumnWidth(10, 100) # Date Added
         
         self.targets_table.setAlternatingRowColors(True)
         self.targets_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -495,7 +568,16 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         dialog.status_combo.setCurrentText(target_data.get("status", "Not Observed"))
         dialog.months_edit.setText(target_data.get("best_months", ""))
         dialog.notes_edit.setPlainText(target_data.get("notes", ""))
-        
+
+        # Set telescope selection
+        telescope_id = target_data.get("telescope_id")
+        if telescope_id is not None:
+            index = dialog.telescope_combo.findData(telescope_id)
+            if index >= 0:
+                dialog.telescope_combo.setCurrentIndex(index)
+        else:
+            dialog.telescope_combo.setCurrentIndex(0)  # "Any"
+
         if dialog.exec() == QDialog.Accepted:
             # Reload targets to reflect the changes (dialog already handles the database update)
             self._load_targets()
@@ -760,10 +842,11 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         """Apply filters to the targets table"""
         status_filter = self.status_filter.currentText()
         priority_filter = self.priority_filter.currentText()
-        
+        telescope_filter_data = self.telescope_filter.currentData()  # Can be "all", "unassigned", or telescope_id
+
         for row in range(self.targets_table.rowCount()):
             show_row = True
-            
+
             if status_filter != "All":
                 status_item = self.targets_table.item(row, 6)  # Status column
                 if not status_item or status_item.text() != status_filter:
@@ -773,7 +856,20 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
                 priority_item = self.targets_table.item(row, 5)  # Priority column
                 if not priority_item or priority_item.text() != priority_filter:
                     show_row = False
-            
+
+            if telescope_filter_data != "all" and show_row:
+                telescope_item = self.targets_table.item(row, 7)  # Telescope column
+                if telescope_item:
+                    telescope_id = telescope_item.data(Qt.UserRole)
+                    if telescope_filter_data == "unassigned":
+                        # Show only targets with no telescope assigned
+                        if telescope_id is not None:
+                            show_row = False
+                    else:
+                        # Filter by specific telescope ID
+                        if telescope_id != telescope_filter_data:
+                            show_row = False
+
             self.targets_table.setRowHidden(row, not show_row)
     
     def _load_targets(self):
@@ -782,15 +878,17 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT id, name, dso_type, constellation, ra_deg, dec_deg, magnitude,
-                           size_info, priority, status, best_months, notes, date_added
-                    FROM usertargetlist
-                    ORDER BY priority DESC, date_added DESC
+                    SELECT t.id, t.name, t.dso_type, t.constellation, t.ra_deg, t.dec_deg, t.magnitude,
+                           t.size_info, t.priority, t.status, t.best_months, t.notes, t.date_added,
+                           t.telescope_id, tel.name as telescope_name
+                    FROM usertargetlist t
+                    LEFT JOIN usertelescopes tel ON t.telescope_id = tel.id
+                    ORDER BY t.priority DESC, t.date_added DESC
                 """)
-                
+
                 rows = cursor.fetchall()
                 self.targets_data = []
-                
+
                 for row in rows:
                     target_data = {
                         "id": row[0],
@@ -805,7 +903,9 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
                         "status": row[9],
                         "best_months": row[10],
                         "notes": row[11],
-                        "date_added": row[12]
+                        "date_added": row[12],
+                        "telescope_id": row[13],
+                        "telescope_name": row[14]
                     }
                     self.targets_data.append(target_data)
             
@@ -863,6 +963,15 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             status_item.setTextAlignment(Qt.AlignCenter)
             self.targets_table.setItem(row, 6, status_item)
 
+            # Telescope - display name or "Any" for unassigned
+            telescope_name = target.get("telescope_name", "")
+            telescope_id = target.get("telescope_id")
+            telescope_display = telescope_name if telescope_name else "Any"
+            telescope_item = QTableWidgetItem(telescope_display)
+            telescope_item.setData(Qt.UserRole, telescope_id)  # Store telescope_id for filtering
+            telescope_item.setTextAlignment(Qt.AlignCenter)
+            self.targets_table.setItem(row, 7, telescope_item)
+
             # Direction - calculate current direction
             ra_deg = target.get("ra_deg", 0)
             dec_deg = target.get("dec_deg", 0)
@@ -872,10 +981,10 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
                 direction = "No coordinates"
             direction_item = QTableWidgetItem(direction)
             direction_item.setTextAlignment(Qt.AlignCenter)
-            self.targets_table.setItem(row, 7, direction_item)
+            self.targets_table.setItem(row, 8, direction_item)
 
             # Best Months
-            self.targets_table.setItem(row, 8, QTableWidgetItem(target.get("best_months", "")))
+            self.targets_table.setItem(row, 9, QTableWidgetItem(target.get("best_months", "")))
 
             # Date Added - use date object for sorting
             date_added = target.get("date_added", "")
@@ -895,7 +1004,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             date_item = QTableWidgetItem(formatted_date)
             date_item.setData(Qt.UserRole, date_timestamp)  # Store timestamp for sorting
             date_item.setTextAlignment(Qt.AlignCenter)
-            self.targets_table.setItem(row, 9, date_item)
+            self.targets_table.setItem(row, 10, date_item)
 
         # Re-enable sorting
         self.targets_table.setSortingEnabled(True)
@@ -1433,6 +1542,15 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             dialog.status_combo.setCurrentText(target_data.get("status", "Not Observed"))
             dialog.months_edit.setText(target_data.get("best_months", ""))
             dialog.notes_edit.setPlainText(target_data.get("notes", ""))
+
+            # Set telescope selection
+            telescope_id = target_data.get("telescope_id")
+            if telescope_id is not None:
+                index = dialog.telescope_combo.findData(telescope_id)
+                if index >= 0:
+                    dialog.telescope_combo.setCurrentIndex(index)
+            else:
+                dialog.telescope_combo.setCurrentIndex(0)  # "Any"
 
             if dialog.exec() == QDialog.Accepted:
                 self._load_targets()
