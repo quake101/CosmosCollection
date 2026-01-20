@@ -1692,9 +1692,62 @@ class SettingsDialog(QDialog):
         app_settings_layout.addWidget(plate_solve_group)
         app_settings_layout.addStretch()
 
+        # Backup/Restore tab
+        backup_restore_tab = QWidget()
+        backup_restore_layout = QVBoxLayout(backup_restore_tab)
+
+        # Backup group
+        backup_group = QGroupBox("Backup")
+        backup_group_layout = QVBoxLayout(backup_group)
+
+        backup_description = QLabel(
+            "Create a backup of all your user data including:\n"
+            "• User image metadata\n"
+            "• Target list\n"
+            "• Telescope equipment profiles\n"
+            "• Collage projects\n"
+            "• Application settings (location, timezone)"
+        )
+        backup_description.setWordWrap(True)
+        backup_group_layout.addWidget(backup_description)
+
+        backup_btn_layout = QHBoxLayout()
+        self.backup_button = QPushButton("Backup Now...")
+        self.backup_button.setToolTip("Save all user data to a backup file")
+        self.backup_button.clicked.connect(self._perform_backup)
+        backup_btn_layout.addWidget(self.backup_button)
+        backup_btn_layout.addStretch()
+        backup_group_layout.addLayout(backup_btn_layout)
+
+        backup_restore_layout.addWidget(backup_group)
+
+        # Restore group
+        restore_group = QGroupBox("Restore")
+        restore_group_layout = QVBoxLayout(restore_group)
+
+        restore_description = QLabel(
+            "Restore your user data from a previously created backup file.\n\n"
+            "<b>Warning:</b> Restoring will replace your current data with the backup data. "
+            "It is recommended to create a backup of your current data first."
+        )
+        restore_description.setWordWrap(True)
+        restore_group_layout.addWidget(restore_description)
+
+        restore_btn_layout = QHBoxLayout()
+        self.restore_button = QPushButton("Restore from Backup...")
+        self.restore_button.setToolTip("Restore user data from a backup file")
+        self.restore_button.clicked.connect(self._perform_restore)
+        restore_btn_layout.addWidget(self.restore_button)
+        restore_btn_layout.addStretch()
+        restore_group_layout.addLayout(restore_btn_layout)
+
+        backup_restore_layout.addWidget(restore_group)
+        backup_restore_layout.addStretch()
+
         # Add tabs
         tab_widget.addTab(app_settings_tab, "Application Settings")
         tab_widget.addTab(location_tab, "Location && Time Zone")
+        tab_widget.addTab(backup_restore_tab, "Backup && Restore")
 
         layout.addWidget(tab_widget)
 
@@ -1971,6 +2024,254 @@ class SettingsDialog(QDialog):
         )
         if file_path:
             self.astap_path_input.setText(file_path)
+
+    def _perform_backup(self):
+        """Perform a backup of all user data to a JSON file"""
+        import json
+        from datetime import datetime
+
+        # Get save file path from user
+        default_filename = f"CosmosCollection_Backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Backup File",
+            default_filename,
+            "JSON Files (*.json);;All Files (*.*)"
+        )
+
+        if not file_path:
+            return  # User cancelled
+
+        try:
+            # Collect all user data from database
+            backup_data = {
+                'backup_version': 1,
+                'backup_date': datetime.now().isoformat(),
+                'tables': {}
+            }
+
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Backup usersettings
+                cursor.execute("SELECT * FROM usersettings")
+                columns = [description[0] for description in cursor.description]
+                rows = cursor.fetchall()
+                backup_data['tables']['usersettings'] = {
+                    'columns': columns,
+                    'rows': [list(row) for row in rows]
+                }
+
+                # Backup usertelescopes
+                cursor.execute("SELECT * FROM usertelescopes")
+                columns = [description[0] for description in cursor.description]
+                rows = cursor.fetchall()
+                backup_data['tables']['usertelescopes'] = {
+                    'columns': columns,
+                    'rows': [list(row) for row in rows]
+                }
+
+                # Backup userimages
+                cursor.execute("SELECT * FROM userimages")
+                columns = [description[0] for description in cursor.description]
+                rows = cursor.fetchall()
+                backup_data['tables']['userimages'] = {
+                    'columns': columns,
+                    'rows': [list(row) for row in rows]
+                }
+
+                # Backup usertargetlist
+                cursor.execute("SELECT * FROM usertargetlist")
+                columns = [description[0] for description in cursor.description]
+                rows = cursor.fetchall()
+                backup_data['tables']['usertargetlist'] = {
+                    'columns': columns,
+                    'rows': [list(row) for row in rows]
+                }
+
+                # Backup usercollages
+                try:
+                    cursor.execute("SELECT * FROM usercollages")
+                    columns = [description[0] for description in cursor.description]
+                    rows = cursor.fetchall()
+                    backup_data['tables']['usercollages'] = {
+                        'columns': columns,
+                        'rows': [list(row) for row in rows]
+                    }
+                except Exception:
+                    pass  # Table might not exist
+
+                # Backup usercollageimages
+                try:
+                    cursor.execute("SELECT * FROM usercollageimages")
+                    columns = [description[0] for description in cursor.description]
+                    rows = cursor.fetchall()
+                    backup_data['tables']['usercollageimages'] = {
+                        'columns': columns,
+                        'rows': [list(row) for row in rows]
+                    }
+                except Exception:
+                    pass  # Table might not exist
+
+            # Backup QSettings (only JSON-serializable values)
+            settings = QSettings("CosmosCollection", "CosmosCollection")
+            qsettings_data = {}
+            for key in settings.allKeys():
+                value = settings.value(key)
+                # Only include basic JSON-serializable types
+                if isinstance(value, (str, int, float, bool, type(None))):
+                    qsettings_data[key] = value
+            backup_data['qsettings'] = qsettings_data
+
+            # Write the JSON file
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(backup_data, f, indent=2)
+
+            QMessageBox.information(
+                self,
+                "Backup Complete",
+                f"Backup created successfully!\n\nLocation: {file_path}"
+            )
+            logger.info(f"Backup completed successfully to {file_path}")
+
+        except Exception as e:
+            logger.error(f"Error creating backup: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Backup Error", f"Failed to create backup: {str(e)}")
+
+    def _perform_restore(self):
+        """Restore user data from a backup JSON file"""
+        import json
+
+        # Confirm with user
+        confirm = QMessageBox.warning(
+            self,
+            "Confirm Restore",
+            "Restoring from a backup will replace your current data.\n\n"
+            "It is strongly recommended to create a backup of your current data first.\n\n"
+            "Do you want to continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if confirm != QMessageBox.Yes:
+            return
+
+        # Get backup file from user
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Backup File to Restore",
+            "",
+            "JSON Files (*.json);;All Files (*.*)"
+        )
+
+        if not file_path:
+            return  # User cancelled
+
+        try:
+            # Read the JSON file
+            with open(file_path, 'r', encoding='utf-8') as f:
+                backup_data = json.load(f)
+
+            # Validate backup file
+            if 'backup_version' not in backup_data or 'tables' not in backup_data:
+                QMessageBox.critical(self, "Invalid Backup", "This file does not appear to be a valid Cosmos Collection backup.")
+                return
+
+            # Verify backup version
+            if backup_data.get('backup_version', 0) > 1:
+                QMessageBox.warning(
+                    self,
+                    "Newer Backup Version",
+                    "This backup was created with a newer version of Cosmos Collection.\n"
+                    "Some data may not be restored correctly."
+                )
+
+            # Restore database tables
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Restore usersettings (clear and insert)
+                if 'usersettings' in backup_data['tables']:
+                    cursor.execute("DELETE FROM usersettings")
+                    table_data = backup_data['tables']['usersettings']
+                    columns = table_data['columns']
+                    for row in table_data['rows']:
+                        placeholders = ', '.join(['?' for _ in columns])
+                        cursor.execute(f"INSERT INTO usersettings ({', '.join(columns)}) VALUES ({placeholders})", row)
+
+                # Restore usertelescopes
+                if 'usertelescopes' in backup_data['tables']:
+                    cursor.execute("DELETE FROM usertelescopes")
+                    table_data = backup_data['tables']['usertelescopes']
+                    columns = table_data['columns']
+                    for row in table_data['rows']:
+                        placeholders = ', '.join(['?' for _ in columns])
+                        cursor.execute(f"INSERT INTO usertelescopes ({', '.join(columns)}) VALUES ({placeholders})", row)
+
+                # Restore userimages
+                if 'userimages' in backup_data['tables']:
+                    cursor.execute("DELETE FROM userimages")
+                    table_data = backup_data['tables']['userimages']
+                    columns = table_data['columns']
+                    for row in table_data['rows']:
+                        placeholders = ', '.join(['?' for _ in columns])
+                        cursor.execute(f"INSERT INTO userimages ({', '.join(columns)}) VALUES ({placeholders})", row)
+
+                # Restore usertargetlist
+                if 'usertargetlist' in backup_data['tables']:
+                    cursor.execute("DELETE FROM usertargetlist")
+                    table_data = backup_data['tables']['usertargetlist']
+                    columns = table_data['columns']
+                    for row in table_data['rows']:
+                        placeholders = ', '.join(['?' for _ in columns])
+                        cursor.execute(f"INSERT INTO usertargetlist ({', '.join(columns)}) VALUES ({placeholders})", row)
+
+                # Restore usercollages
+                if 'usercollages' in backup_data['tables']:
+                    try:
+                        cursor.execute("DELETE FROM usercollages")
+                        table_data = backup_data['tables']['usercollages']
+                        columns = table_data['columns']
+                        for row in table_data['rows']:
+                            placeholders = ', '.join(['?' for _ in columns])
+                            cursor.execute(f"INSERT INTO usercollages ({', '.join(columns)}) VALUES ({placeholders})", row)
+                    except Exception:
+                        pass  # Table might not exist
+
+                # Restore usercollageimages
+                if 'usercollageimages' in backup_data['tables']:
+                    try:
+                        cursor.execute("DELETE FROM usercollageimages")
+                        table_data = backup_data['tables']['usercollageimages']
+                        columns = table_data['columns']
+                        for row in table_data['rows']:
+                            placeholders = ', '.join(['?' for _ in columns])
+                            cursor.execute(f"INSERT INTO usercollageimages ({', '.join(columns)}) VALUES ({placeholders})", row)
+                    except Exception:
+                        pass  # Table might not exist
+
+                conn.commit()
+
+            # Restore QSettings if present
+            if 'qsettings' in backup_data:
+                settings = QSettings("CosmosCollection", "CosmosCollection")
+                for key, value in backup_data['qsettings'].items():
+                    settings.setValue(key, value)
+
+            # Reload the settings dialog with restored data
+            self._load_current_settings()
+
+            QMessageBox.information(
+                self,
+                "Restore Complete",
+                f"Backup restored successfully from:\n{file_path}\n\n"
+                "Please restart the application for all changes to take effect."
+            )
+            logger.info(f"Backup restored successfully from {file_path}")
+
+        except Exception as e:
+            logger.error(f"Error restoring backup: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Restore Error", f"Failed to restore backup: {str(e)}")
 
 
 # --- Map Location Picker Dialog ---
