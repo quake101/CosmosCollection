@@ -980,7 +980,8 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
     def _open_clear_outside(self):
         """Open Clear Outside forecast in browser"""
         if self.lat is not None and self.lon is not None:
-            url = f"https://clearoutside.com/?lat={self.lat}&lon={self.lon}"
+            #url = f"https://clearoutside.com/?lat={self.lat}&lon={self.lon}"
+            url = f"https://clearoutside.com/forecast/{self.lat}/{self.lon}"
             webbrowser.open(url)
 
     def _open_astrospheric(self):
