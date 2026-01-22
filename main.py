@@ -1603,6 +1603,48 @@ class SettingsDialog(QDialog):
 
         app_settings_layout.addWidget(ui_prefs_group)
 
+        # Weather Units group
+        weather_units_group = QGroupBox("Weather Units")
+        weather_units_layout = QVBoxLayout(weather_units_group)
+
+        # Temperature unit setting
+        temp_unit_layout = QHBoxLayout()
+        temp_unit_label = QLabel("Temperature:")
+        temp_unit_label.setMinimumWidth(120)
+        self.temp_unit_combo = QComboBox()
+        self.temp_unit_combo.addItems(["Celsius", "Fahrenheit"])
+        self.temp_unit_combo.setToolTip("Temperature display unit for weather forecast")
+        temp_unit_layout.addWidget(temp_unit_label)
+        temp_unit_layout.addWidget(self.temp_unit_combo)
+        temp_unit_layout.addStretch()
+        weather_units_layout.addLayout(temp_unit_layout)
+
+        # Wind speed unit setting
+        wind_unit_layout = QHBoxLayout()
+        wind_unit_label = QLabel("Wind Speed:")
+        wind_unit_label.setMinimumWidth(120)
+        self.wind_unit_combo = QComboBox()
+        self.wind_unit_combo.addItems(["km/h", "mph", "m/s"])
+        self.wind_unit_combo.setToolTip("Wind speed display unit for weather forecast")
+        wind_unit_layout.addWidget(wind_unit_label)
+        wind_unit_layout.addWidget(self.wind_unit_combo)
+        wind_unit_layout.addStretch()
+        weather_units_layout.addLayout(wind_unit_layout)
+
+        # Precipitation/visibility unit setting
+        precip_unit_layout = QHBoxLayout()
+        precip_unit_label = QLabel("Precipitation/Visibility:")
+        precip_unit_label.setMinimumWidth(120)
+        self.precip_unit_combo = QComboBox()
+        self.precip_unit_combo.addItems(["Metric (mm, km)", "Imperial (in, mi)"])
+        self.precip_unit_combo.setToolTip("Units for precipitation and visibility in weather forecast")
+        precip_unit_layout.addWidget(precip_unit_label)
+        precip_unit_layout.addWidget(self.precip_unit_combo)
+        precip_unit_layout.addStretch()
+        weather_units_layout.addLayout(precip_unit_layout)
+
+        app_settings_layout.addWidget(weather_units_group)
+
         # Performance Settings group
         perf_settings_group = QGroupBox("Performance Settings")
         perf_settings_layout = QVBoxLayout(perf_settings_group)
@@ -1841,6 +1883,22 @@ class SettingsDialog(QDialog):
             cache_thumbnails = settings.value("cache_thumbnails_to_disk", True, type=bool)
             self.cache_thumbnails_checkbox.setChecked(cache_thumbnails)
 
+            # Load weather unit settings
+            temp_unit = settings.value("temperature_unit", "Celsius", type=str)
+            index = self.temp_unit_combo.findText(temp_unit)
+            if index >= 0:
+                self.temp_unit_combo.setCurrentIndex(index)
+
+            wind_unit = settings.value("wind_speed_unit", "km/h", type=str)
+            index = self.wind_unit_combo.findText(wind_unit)
+            if index >= 0:
+                self.wind_unit_combo.setCurrentIndex(index)
+
+            precip_unit = settings.value("precip_visibility_unit", "Metric (mm, km)", type=str)
+            index = self.precip_unit_combo.findText(precip_unit)
+            if index >= 0:
+                self.precip_unit_combo.setCurrentIndex(index)
+
             # Load plate solving settings
             astap_path = settings.value("astap_path", "", type=str)
             self.astap_path_input.setText(astap_path)
@@ -1971,6 +2029,11 @@ class SettingsDialog(QDialog):
             settings.setValue("check_updates_on_startup", self.check_updates_checkbox.isChecked())
             settings.setValue("max_threads", self.thread_count_spinbox.value())
             settings.setValue("cache_thumbnails_to_disk", self.cache_thumbnails_checkbox.isChecked())
+
+            # Save weather unit settings
+            settings.setValue("temperature_unit", self.temp_unit_combo.currentText())
+            settings.setValue("wind_speed_unit", self.wind_unit_combo.currentText())
+            settings.setValue("precip_visibility_unit", self.precip_unit_combo.currentText())
 
             # Save plate solving settings
             settings.setValue("astap_path", self.astap_path_input.text().strip())
@@ -3498,7 +3561,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.setWindowFlags(Qt.Window)
         self.setup_window_position()
         self.db_manager = DatabaseManager()
-        self._cached_dso_data = None
+        self._showed_dso_data = None
         self._cached_catalogs = None
 
         # Store original data for lazy loading
@@ -3687,6 +3750,12 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         target_list_action.triggered.connect(self._show_target_list)
         toolbar.addAction(target_list_action)
 
+        # Weather Forecast action
+        weather_action = QAction("Weather", self)
+        weather_action.setToolTip("View 7-day weather forecast for astrophotography")
+        weather_action.triggered.connect(self._show_weather_forecast)
+        toolbar.addAction(weather_action)
+
         toolbar.addSeparator()
 
         # DSO Image Gallery action
@@ -3781,7 +3850,21 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             QMessageBox.warning(self, "Import Error", f"Could not load DSO Visibility Calculator: {e}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not open DSO Visibility Calculator: {e}")
-            
+
+    def _show_weather_forecast(self):
+        """Show the Weather Forecast window"""
+        try:
+            from WeatherForecast import WeatherForecastWindow
+            if not hasattr(self, 'weather_forecast_window') or not self.weather_forecast_window.isVisible():
+                self.weather_forecast_window = WeatherForecastWindow()
+            self.weather_forecast_window.show()
+            self.weather_forecast_window.raise_()
+            self.weather_forecast_window.activateWindow()
+        except ImportError as e:
+            QMessageBox.warning(self, "Import Error", f"Could not load Weather Forecast: {e}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not open Weather Forecast: {e}")
+
     def _show_best_dso_tonight(self):
         """Show the Best DSO Tonight window"""
         try:

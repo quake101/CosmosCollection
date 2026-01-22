@@ -17,6 +17,7 @@ Cosmos Collection is designed to help astrophotographers manage their image coll
 - **Telescope FOV Simulator**: Visualize future astrophotography sessions and what equipment to use.
 - **Collage Builder**: Create collages of your DSO images.
 - **Image Gallery**: View all your images in a gallery view. (With filters)
+- **Weather Forecast**: 7 day weather forecast with astro related scoring. Also has detail weather forecast per day. 
 
 ## Screenshots
   ### DSO Detail
@@ -39,6 +40,12 @@ Cosmos Collection is designed to help astrophotographers manage their image coll
 
   ### Image Viewer
   ![Image Viewer](screenshots/Image-Viewer.jpg)
+
+  ### Weather Overview
+  ![Weather Overview](screenshots/Weather-Overview.jpg)
+
+  ### Weather Details
+  ![Weather Details](screenshots/Weather-Details.jpg)
 
 ## Getting Started
 

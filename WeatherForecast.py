@@ -1,0 +1,1214 @@
+#!/usr/bin/env python3
+"""
+Weather Forecast Window for Cosmos Collection
+Displays astrophotography-relevant weather data from Open-Meteo API
+"""
+
+import sys
+import logging
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+
+import matplotlib
+matplotlib.use('Qt5Agg')
+
+# Suppress matplotlib font_manager debug messages
+logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import matplotlib.pyplot as plt
+
+# Set dark theme for matplotlib
+plt.style.use('dark_background')
+
+import requests
+from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer
+from PySide6.QtWidgets import (
+    QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
+    QLabel, QGroupBox, QMessageBox, QProgressBar, QScrollArea,
+    QFrame, QGridLayout, QDialog, QTableWidget, QTableWidgetItem,
+    QHeaderView, QApplication, QSplitter, QCheckBox, QComboBox
+)
+from PySide6.QtGui import QColor
+
+from DatabaseManager import DatabaseManager
+from WindowPositionManager import WindowPositionMixin
+from Theme import COLORS
+
+# Set up logging
+logger = logging.getLogger(__name__)
+
+# Cache for weather data (persists across window instances)
+CACHE_MAX_AGE_MINUTES = 15
+
+
+class WeatherCache:
+    """Simple cache for weather data to reduce API calls"""
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(WeatherCache, cls).__new__(cls)
+            cls._instance._data = None
+            cls._instance._timestamp = None
+            cls._instance._location = None
+        return cls._instance
+
+    def get(self, lat: float, lon: float) -> Optional[List]:
+        """Get cached data if valid and for the same location"""
+        if self._data is None or self._timestamp is None:
+            return None
+
+        # Check if location matches (within small tolerance for float comparison)
+        if self._location is None:
+            return None
+        cached_lat, cached_lon = self._location
+        if abs(cached_lat - lat) > 0.01 or abs(cached_lon - lon) > 0.01:
+            logger.debug("Weather cache miss: location changed")
+            return None
+
+        # Check if cache is still valid
+        age = datetime.now() - self._timestamp
+        if age > timedelta(minutes=CACHE_MAX_AGE_MINUTES):
+            logger.debug(f"Weather cache miss: data is {age.seconds // 60} minutes old")
+            return None
+
+        logger.debug(f"Weather cache hit: data is {age.seconds // 60} minutes old")
+        return self._data
+
+    def set(self, lat: float, lon: float, data: List):
+        """Store data in cache"""
+        self._data = data
+        self._timestamp = datetime.now()
+        self._location = (lat, lon)
+        logger.debug("Weather data cached")
+
+    def get_age_str(self) -> Optional[str]:
+        """Get a human-readable string of cache age"""
+        if self._timestamp is None:
+            return None
+        age = datetime.now() - self._timestamp
+        minutes = age.seconds // 60
+        if minutes < 1:
+            return "just now"
+        elif minutes == 1:
+            return "1 minute ago"
+        else:
+            return f"{minutes} minutes ago"
+
+    def clear(self):
+        """Clear the cache"""
+        self._data = None
+        self._timestamp = None
+        self._location = None
+
+
+@dataclass
+class HourlyWeatherData:
+    """Dataclass for hourly weather data"""
+    time: datetime
+    cloud_cover: float  # Total cloud cover %
+    cloud_cover_low: float
+    cloud_cover_mid: float
+    cloud_cover_high: float
+    temperature: float  # Celsius
+    dew_point: float  # Celsius
+    humidity: float  # %
+    wind_speed: float  # km/h
+    precipitation_probability: float  # %
+    visibility: Optional[float] = None  # meters
+
+
+@dataclass
+class DailyWeatherSummary:
+    """Dataclass for daily aggregated weather data"""
+    date: datetime
+    hourly_data: List[HourlyWeatherData]
+    avg_cloud_cover: float
+    min_cloud_cover: float
+    max_cloud_cover: float
+    avg_temperature: float
+    min_temperature: float
+    max_temperature: float
+    avg_humidity: float
+    avg_wind_speed: float
+    max_wind_speed: float
+    avg_precipitation_prob: float
+    astro_score: int  # 0-100
+    seeing_estimate: str  # Excellent/Good/Moderate/Poor
+
+
+class WeatherWorker(QThread):
+    """QThread worker for fetching weather data from Open-Meteo API"""
+    weather_loaded = Signal(list)  # List of DailyWeatherSummary
+    error_occurred = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, lat: float, lon: float):
+        super().__init__()
+        self.lat = lat
+        self.lon = lon
+
+    def run(self):
+        """Fetch weather data from Open-Meteo API"""
+        try:
+            self.progress.emit("Connecting to Open-Meteo API...")
+
+            # Build API URL
+            url = (
+                f"https://api.open-meteo.com/v1/forecast?"
+                f"latitude={self.lat}&longitude={self.lon}&"
+                f"hourly=cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,"
+                f"temperature_2m,dew_point_2m,relative_humidity_2m,"
+                f"wind_speed_10m,precipitation_probability,visibility&"
+                f"forecast_days=7&timezone=auto"
+            )
+
+            # Handle SSL for PyInstaller frozen builds
+            verify = not getattr(sys, 'frozen', False)
+
+            self.progress.emit("Downloading weather forecast data...")
+            response = requests.get(url, timeout=30, verify=verify)
+            response.raise_for_status()
+
+            data = response.json()
+
+            self.progress.emit("Processing weather data...")
+            daily_summaries = self._process_weather_data(data)
+
+            self.weather_loaded.emit(daily_summaries)
+
+        except requests.exceptions.RequestException as e:
+            self.error_occurred.emit(f"Network error: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error fetching weather data: {str(e)}", exc_info=True)
+            self.error_occurred.emit(f"Error: {str(e)}")
+
+    def _process_weather_data(self, data: Dict[str, Any]) -> List[DailyWeatherSummary]:
+        """Process raw API data into daily summaries"""
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+
+        if not times:
+            return []
+
+        # Parse hourly data
+        hourly_records: List[HourlyWeatherData] = []
+        for i, time_str in enumerate(times):
+            try:
+                dt = datetime.fromisoformat(time_str)
+                hourly_records.append(HourlyWeatherData(
+                    time=dt,
+                    cloud_cover=hourly.get("cloud_cover", [0] * len(times))[i] or 0,
+                    cloud_cover_low=hourly.get("cloud_cover_low", [0] * len(times))[i] or 0,
+                    cloud_cover_mid=hourly.get("cloud_cover_mid", [0] * len(times))[i] or 0,
+                    cloud_cover_high=hourly.get("cloud_cover_high", [0] * len(times))[i] or 0,
+                    temperature=hourly.get("temperature_2m", [0] * len(times))[i] or 0,
+                    dew_point=hourly.get("dew_point_2m", [0] * len(times))[i] or 0,
+                    humidity=hourly.get("relative_humidity_2m", [0] * len(times))[i] or 0,
+                    wind_speed=hourly.get("wind_speed_10m", [0] * len(times))[i] or 0,
+                    precipitation_probability=hourly.get("precipitation_probability", [0] * len(times))[i] or 0,
+                    visibility=hourly.get("visibility", [None] * len(times))[i]
+                ))
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Error parsing hourly data at index {i}: {e}")
+                continue
+
+        # Group by date
+        daily_data: Dict[datetime.date, List[HourlyWeatherData]] = {}
+        for record in hourly_records:
+            date = record.time.date()
+            if date not in daily_data:
+                daily_data[date] = []
+            daily_data[date].append(record)
+
+        # Create daily summaries
+        daily_summaries: List[DailyWeatherSummary] = []
+        for date, hours in sorted(daily_data.items()):
+            if not hours:
+                continue
+
+            # Calculate aggregates
+            cloud_covers = [h.cloud_cover for h in hours]
+            temps = [h.temperature for h in hours]
+            humidities = [h.humidity for h in hours]
+            winds = [h.wind_speed for h in hours]
+            precip_probs = [h.precipitation_probability for h in hours]
+
+            avg_cloud = sum(cloud_covers) / len(cloud_covers)
+            avg_humidity = sum(humidities) / len(humidities)
+            avg_wind = sum(winds) / len(winds)
+            avg_precip = sum(precip_probs) / len(precip_probs)
+
+            # Calculate astro score
+            astro_score = calculate_astro_score(avg_cloud, avg_humidity, avg_wind, avg_precip)
+
+            # Estimate seeing based on nighttime hours (6pm-6am)
+            night_hours = [h for h in hours if h.time.hour >= 18 or h.time.hour < 6]
+            if night_hours:
+                night_humidity = sum(h.humidity for h in night_hours) / len(night_hours)
+                night_wind = sum(h.wind_speed for h in night_hours) / len(night_hours)
+                night_temp_dew_spread = sum(h.temperature - h.dew_point for h in night_hours) / len(night_hours)
+            else:
+                night_humidity = avg_humidity
+                night_wind = avg_wind
+                night_temp_dew_spread = sum(h.temperature - h.dew_point for h in hours) / len(hours)
+
+            seeing = estimate_seeing(night_humidity, night_wind, night_temp_dew_spread)
+
+            summary = DailyWeatherSummary(
+                date=datetime.combine(date, datetime.min.time()),
+                hourly_data=hours,
+                avg_cloud_cover=avg_cloud,
+                min_cloud_cover=min(cloud_covers),
+                max_cloud_cover=max(cloud_covers),
+                avg_temperature=sum(temps) / len(temps),
+                min_temperature=min(temps),
+                max_temperature=max(temps),
+                avg_humidity=avg_humidity,
+                avg_wind_speed=avg_wind,
+                max_wind_speed=max(winds),
+                avg_precipitation_prob=avg_precip,
+                astro_score=astro_score,
+                seeing_estimate=seeing
+            )
+            daily_summaries.append(summary)
+
+        return daily_summaries
+
+
+def calculate_astro_score(cloud_cover: float, humidity: float, wind_speed: float, precip_prob: float) -> int:
+    """
+    Calculate an astrophotography suitability score (0-100).
+
+    Cloud cover is the dominant factor - high cloud cover caps the maximum possible score
+    since you cannot do astrophotography through clouds regardless of other conditions.
+
+    Score caps based on cloud cover:
+    - >80% clouds: max score 30 (Poor)
+    - >60% clouds: max score 50 (Moderate)
+    - >40% clouds: max score 70 (Good)
+
+    Base scoring weights:
+    - Cloud cover (50%): lower is better
+    - Humidity (20%): ideal 30-50%
+    - Wind speed (15%): under 15 km/h is good
+    - Precipitation (15%): 0% is ideal
+    """
+    # Cloud cover score (0-100, lower clouds = higher score)
+    cloud_score = max(0, 100 - cloud_cover)
+
+    # Humidity score (0-100, ideal around 40%)
+    if humidity < 30:
+        humidity_score = 70 + humidity  # Slightly penalize very dry
+    elif humidity <= 50:
+        humidity_score = 100  # Ideal range
+    elif humidity <= 70:
+        humidity_score = 100 - (humidity - 50) * 2  # 50-100 as humidity goes from 50-70
+    else:
+        humidity_score = max(0, 60 - (humidity - 70))  # Penalize high humidity
+
+    # Wind score (0-100, under 15 km/h is good)
+    if wind_speed <= 10:
+        wind_score = 100
+    elif wind_speed <= 15:
+        wind_score = 100 - (wind_speed - 10) * 4  # 80-100 range
+    elif wind_speed <= 25:
+        wind_score = 80 - (wind_speed - 15) * 4  # 40-80 range
+    else:
+        wind_score = max(0, 40 - (wind_speed - 25) * 2)
+
+    # Precipitation score (0-100, 0% is ideal)
+    precip_score = max(0, 100 - precip_prob * 2)
+
+    # Weighted average
+    total_score = (
+        cloud_score * 0.50 +
+        humidity_score * 0.20 +
+        wind_score * 0.15 +
+        precip_score * 0.15
+    )
+
+    # Apply cloud cover caps - high clouds should hard-limit the score
+    # since astrophotography is impossible through heavy cloud cover
+    if cloud_cover > 80:
+        total_score = min(total_score, 30)  # Cap at Poor
+    elif cloud_cover > 60:
+        total_score = min(total_score, 50)  # Cap at low Moderate
+    elif cloud_cover > 40:
+        total_score = min(total_score, 70)  # Cap at Good
+
+    return int(min(100, max(0, total_score)))
+
+
+def estimate_seeing(humidity: float, wind_speed: float, temp_dew_spread: float) -> str:
+    """
+    Estimate seeing quality based on atmospheric conditions.
+
+    Args:
+        humidity: Relative humidity %
+        wind_speed: Wind speed in km/h
+        temp_dew_spread: Temperature minus dew point (larger = less moisture)
+
+    Returns:
+        Seeing quality string: Excellent/Good/Moderate/Poor
+    """
+    score = 100
+
+    # Humidity factor (lower is better for seeing)
+    if humidity > 80:
+        score -= 30
+    elif humidity > 65:
+        score -= 15
+    elif humidity > 50:
+        score -= 5
+
+    # Wind factor (calm is better)
+    if wind_speed > 25:
+        score -= 35
+    elif wind_speed > 15:
+        score -= 20
+    elif wind_speed > 10:
+        score -= 10
+
+    # Dew risk factor (larger spread = better)
+    if temp_dew_spread < 2:
+        score -= 25  # High dew risk
+    elif temp_dew_spread < 5:
+        score -= 10
+    elif temp_dew_spread > 10:
+        score += 5  # Very safe from dew
+
+    if score >= 80:
+        return "Excellent"
+    elif score >= 60:
+        return "Good"
+    elif score >= 40:
+        return "Moderate"
+    else:
+        return "Poor"
+
+
+def get_rating_color(score: int) -> str:
+    """Get color based on astro score"""
+    if score >= 80:
+        return COLORS['success']  # Green
+    elif score >= 60:
+        return COLORS['info']  # Blue
+    elif score >= 40:
+        return COLORS['warning']  # Yellow
+    else:
+        return COLORS['error']  # Red
+
+
+def get_rating_label(score: int) -> str:
+    """Get label based on astro score"""
+    if score >= 80:
+        return "Excellent"
+    elif score >= 60:
+        return "Good"
+    elif score >= 40:
+        return "Moderate"
+    else:
+        return "Poor"
+
+
+class DayWeatherCard(QFrame):
+    """Clickable card widget for displaying daily weather summary"""
+    clicked = Signal(object)  # Emits DailyWeatherSummary
+
+    def __init__(self, summary: DailyWeatherSummary, parent=None):
+        super().__init__(parent)
+        self.summary = summary
+        self.setFrameShape(QFrame.Box)
+        self.setFrameShadow(QFrame.Raised)
+        self.setLineWidth(1)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumWidth(100)
+        self.setMaximumWidth(130)
+
+        # Set background and border
+        rating_color = get_rating_color(summary.astro_score)
+        self.setStyleSheet(f"""
+            DayWeatherCard {{
+                background-color: {COLORS['background_light']};
+                border: 2px solid {rating_color};
+                border-radius: 8px;
+                padding: 5px;
+            }}
+            DayWeatherCard:hover {{
+                background-color: {COLORS['background_hover']};
+                border: 2px solid {rating_color};
+            }}
+        """)
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        """Set up the card UI"""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(4)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        # Day name
+        day_name = self.summary.date.strftime("%a")
+        day_label = QLabel(day_name)
+        day_label.setAlignment(Qt.AlignCenter)
+        day_label.setStyleSheet("font-weight: bold; font-size: 12pt;")
+        layout.addWidget(day_label)
+
+        # Date
+        date_str = self.summary.date.strftime("%m/%d")
+        date_label = QLabel(date_str)
+        date_label.setAlignment(Qt.AlignCenter)
+        date_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10pt;")
+        layout.addWidget(date_label)
+
+        layout.addSpacing(5)
+
+        # Cloud cover
+        cloud_label = QLabel(f"{self.summary.avg_cloud_cover:.0f}%")
+        cloud_label.setAlignment(Qt.AlignCenter)
+        cloud_label.setStyleSheet("font-size: 16pt; font-weight: bold;")
+        layout.addWidget(cloud_label)
+
+        cloud_text = QLabel("clouds")
+        cloud_text.setAlignment(Qt.AlignCenter)
+        cloud_text.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt;")
+        layout.addWidget(cloud_text)
+
+        layout.addSpacing(5)
+
+        # Rating
+        rating_color = get_rating_color(self.summary.astro_score)
+        rating_label = get_rating_label(self.summary.astro_score)
+        rating_text = QLabel(rating_label)
+        rating_text.setAlignment(Qt.AlignCenter)
+        rating_text.setStyleSheet(f"color: {rating_color}; font-weight: bold; font-size: 10pt;")
+        layout.addWidget(rating_text)
+
+        # Score
+        score_label = QLabel(f"({self.summary.astro_score})")
+        score_label.setAlignment(Qt.AlignCenter)
+        score_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt;")
+        layout.addWidget(score_label)
+
+        layout.addStretch()
+
+    def mouseDoubleClickEvent(self, event):
+        """Handle double-click to show details"""
+        self.clicked.emit(self.summary)
+        super().mouseDoubleClickEvent(event)
+
+
+class HourlyAstroChart(FigureCanvas):
+    """Matplotlib chart showing hourly astro scores for a day"""
+    hour_hovered = Signal(int)  # Emits the row index when hovering over a bar
+
+    def __init__(self, hourly_data: List[HourlyWeatherData], parent=None):
+        self.figure = Figure(figsize=(10, 3), facecolor='#2b2b2b')
+        super().__init__(self.figure)
+        self.setParent(parent)
+
+        self.hourly_data = hourly_data
+        self.bars = None
+        self.ax = None
+        self._last_hovered_index = -1
+        self._create_chart()
+
+        # Connect mouse motion event
+        self.mpl_connect('motion_notify_event', self._on_mouse_move)
+
+    def _create_chart(self):
+        """Create the hourly astro score chart"""
+        self.figure.clear()
+        self.ax = self.figure.add_subplot(111)
+
+        # Calculate hourly astro scores
+        self.hours = []
+        scores = []
+        colors = []
+
+        for hour_data in self.hourly_data:
+            self.hours.append(hour_data.time.hour)
+            score = calculate_astro_score(
+                hour_data.cloud_cover,
+                hour_data.humidity,
+                hour_data.wind_speed,
+                hour_data.precipitation_probability
+            )
+            scores.append(score)
+            colors.append(get_rating_color(score))
+
+        # Create bar chart
+        self.bars = self.ax.bar(self.hours, scores, color=colors, edgecolor='none', width=0.8)
+
+        # Add horizontal lines for rating thresholds
+        self.ax.axhline(y=80, color=COLORS['success'], linestyle='--', alpha=0.5, linewidth=1)
+        self.ax.axhline(y=60, color=COLORS['info'], linestyle='--', alpha=0.5, linewidth=1)
+        self.ax.axhline(y=40, color=COLORS['warning'], linestyle='--', alpha=0.5, linewidth=1)
+
+        # Highlight nighttime hours (6pm - 6am) with background shading
+        self.ax.axvspan(-0.5, 5.5, alpha=0.15, color='#4444ff', label='Night')
+        self.ax.axvspan(17.5, 23.5, alpha=0.15, color='#4444ff')
+
+        # Style the chart
+        self.ax.set_xlim(-0.5, 23.5)
+        self.ax.set_ylim(0, 100)
+        self.ax.set_xlabel('Hour of Day', color=COLORS['text'], fontsize=9)
+        self.ax.set_ylabel('Astro Score', color=COLORS['text'], fontsize=9)
+        self.ax.set_title('Hourly Astrophotography Conditions', color=COLORS['text'], fontsize=10, fontweight='bold')
+
+        # Set x-axis ticks
+        self.ax.set_xticks(range(0, 24, 2))
+        self.ax.set_xticklabels([f'{h:02d}:00' for h in range(0, 24, 2)], fontsize=8)
+
+        # Style axes
+        self.ax.set_facecolor('#2b2b2b')
+        self.ax.tick_params(colors=COLORS['text_secondary'], labelsize=8)
+        self.ax.spines['bottom'].set_color(COLORS['border'])
+        self.ax.spines['top'].set_color(COLORS['border'])
+        self.ax.spines['left'].set_color(COLORS['border'])
+        self.ax.spines['right'].set_color(COLORS['border'])
+
+        # Add grid
+        self.ax.yaxis.grid(True, linestyle=':', alpha=0.3, color=COLORS['border'])
+
+        # Add legend for rating levels
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor=COLORS['success'], label='Excellent (80+)'),
+            Patch(facecolor=COLORS['info'], label='Good (60-79)'),
+            Patch(facecolor=COLORS['warning'], label='Moderate (40-59)'),
+            Patch(facecolor=COLORS['error'], label='Poor (<40)'),
+        ]
+        self.ax.legend(handles=legend_elements, loc='upper right', fontsize=7,
+                  facecolor='#353535', edgecolor=COLORS['border'], labelcolor=COLORS['text'])
+
+        self.figure.tight_layout()
+        self.draw()
+
+    def _on_mouse_move(self, event):
+        """Handle mouse movement to detect bar hover"""
+        if event.inaxes != self.ax or self.bars is None:
+            if self._last_hovered_index != -1:
+                self._last_hovered_index = -1
+                self.hour_hovered.emit(-1)
+            return
+
+        # Find which bar the mouse is over
+        for i, bar in enumerate(self.bars):
+            if bar.contains(event)[0]:
+                if self._last_hovered_index != i:
+                    self._last_hovered_index = i
+                    self.hour_hovered.emit(i)
+                return
+
+        # Mouse not over any bar
+        if self._last_hovered_index != -1:
+            self._last_hovered_index = -1
+            self.hour_hovered.emit(-1)
+
+
+class DayDetailDialog(QDialog):
+    """Dialog showing detailed hourly weather data for a day"""
+
+    def __init__(self, summary: DailyWeatherSummary, parent=None):
+        super().__init__(parent)
+        self.summary = summary
+        self.setWindowTitle(f"Weather Details - {summary.date.strftime('%A, %B %d, %Y')} - Cosmos Collection")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setModal(False)
+        self.resize(900, 750)
+
+        # Get unit preferences
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        self.temp_unit = settings.value("temperature_unit", "Celsius", type=str)
+        self.wind_unit = settings.value("wind_speed_unit", "km/h", type=str)
+        self.precip_unit = settings.value("precip_visibility_unit", "Metric (mm, km)", type=str)
+
+        self._setup_ui()
+
+    def _convert_temp(self, celsius: float) -> float:
+        """Convert temperature based on user preference"""
+        if self.temp_unit == "Fahrenheit":
+            return celsius * 9 / 5 + 32
+        return celsius
+
+    def _temp_suffix(self) -> str:
+        """Get temperature unit suffix"""
+        return "F" if self.temp_unit == "Fahrenheit" else "C"
+
+    def _convert_wind(self, kmh: float) -> float:
+        """Convert wind speed from km/h based on user preference"""
+        if self.wind_unit == "mph":
+            return kmh * 0.621371
+        elif self.wind_unit == "m/s":
+            return kmh / 3.6
+        return kmh
+
+    def _wind_suffix(self) -> str:
+        """Get wind speed unit suffix"""
+        return self.wind_unit
+
+    def _setup_ui(self):
+        """Set up the dialog UI"""
+        layout = QVBoxLayout(self)
+
+        # Summary header
+        header_group = QGroupBox("Daily Summary")
+        header_layout = QGridLayout(header_group)
+
+        # Rating
+        rating_color = get_rating_color(self.summary.astro_score)
+        rating_label = QLabel(f"Astro Rating: {get_rating_label(self.summary.astro_score)} ({self.summary.astro_score})")
+        rating_label.setStyleSheet(f"color: {rating_color}; font-weight: bold; font-size: 12pt;")
+        header_layout.addWidget(rating_label, 0, 0)
+
+        # Seeing estimate
+        seeing_label = QLabel(f"Seeing Estimate: {self.summary.seeing_estimate}")
+        header_layout.addWidget(seeing_label, 0, 1)
+
+        # Cloud cover
+        cloud_label = QLabel(f"Cloud Cover: {self.summary.min_cloud_cover:.0f}% - {self.summary.max_cloud_cover:.0f}% (avg: {self.summary.avg_cloud_cover:.0f}%)")
+        header_layout.addWidget(cloud_label, 1, 0)
+
+        # Temperature
+        min_temp = self._convert_temp(self.summary.min_temperature)
+        max_temp = self._convert_temp(self.summary.max_temperature)
+        temp_label = QLabel(f"Temperature: {min_temp:.1f} - {max_temp:.1f}{self._temp_suffix()}")
+        header_layout.addWidget(temp_label, 1, 1)
+
+        # Wind
+        avg_wind = self._convert_wind(self.summary.avg_wind_speed)
+        max_wind = self._convert_wind(self.summary.max_wind_speed)
+        wind_label = QLabel(f"Wind: avg {avg_wind:.1f} {self._wind_suffix()}, max {max_wind:.1f} {self._wind_suffix()}")
+        header_layout.addWidget(wind_label, 2, 0)
+
+        # Humidity
+        humidity_label = QLabel(f"Humidity: {self.summary.avg_humidity:.0f}%")
+        header_layout.addWidget(humidity_label, 2, 1)
+
+        layout.addWidget(header_group)
+
+        # Hourly astro score chart
+        chart_group = QGroupBox("Hourly Astro Score")
+        chart_layout = QVBoxLayout(chart_group)
+        self.chart = HourlyAstroChart(self.summary.hourly_data, self)
+        self.chart.setMinimumHeight(200)
+        self.chart.setMaximumHeight(250)
+        self.chart.hour_hovered.connect(self._on_chart_hover)
+        chart_layout.addWidget(self.chart)
+        layout.addWidget(chart_group)
+
+        # Hourly data table
+        table_group = QGroupBox("Hourly Forecast (Nighttime hours highlighted)")
+        table_layout = QVBoxLayout(table_group)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(10)
+        self.table.setHorizontalHeaderLabels([
+            "Time", "Cloud %", "Low", "Mid", "High",
+            f"Temp ({self._temp_suffix()})", f"Dew ({self._temp_suffix()})", "Humidity %",
+            f"Wind ({self._wind_suffix()})", "Precip %"
+        ])
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+
+        # Configure header
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        for i in range(1, 10):
+            header.setSectionResizeMode(i, QHeaderView.Stretch)
+
+        # Populate table
+        self.table.setRowCount(len(self.summary.hourly_data))
+        for row, hour_data in enumerate(self.summary.hourly_data):
+            # Check if nighttime (6pm - 6am)
+            is_night = hour_data.time.hour >= 18 or hour_data.time.hour < 6
+
+            # Time
+            time_item = QTableWidgetItem(hour_data.time.strftime("%H:%M"))
+            time_item.setTextAlignment(Qt.AlignCenter)
+            if is_night:
+                time_item.setBackground(QColor(COLORS['background_lighter']))
+            self.table.setItem(row, 0, time_item)
+
+            # Cloud cover columns
+            for col, value in enumerate([
+                hour_data.cloud_cover,
+                hour_data.cloud_cover_low,
+                hour_data.cloud_cover_mid,
+                hour_data.cloud_cover_high
+            ], start=1):
+                item = QTableWidgetItem(f"{value:.0f}")
+                item.setTextAlignment(Qt.AlignCenter)
+                if is_night:
+                    item.setBackground(QColor(COLORS['background_lighter']))
+                # Color code cloud cover
+                if value <= 20:
+                    item.setForeground(QColor(COLORS['success']))
+                elif value <= 50:
+                    item.setForeground(QColor(COLORS['info']))
+                elif value <= 70:
+                    item.setForeground(QColor(COLORS['warning']))
+                else:
+                    item.setForeground(QColor(COLORS['error']))
+                self.table.setItem(row, col, item)
+
+            # Temperature
+            temp_item = QTableWidgetItem(f"{self._convert_temp(hour_data.temperature):.1f}")
+            temp_item.setTextAlignment(Qt.AlignCenter)
+            if is_night:
+                temp_item.setBackground(QColor(COLORS['background_lighter']))
+            self.table.setItem(row, 5, temp_item)
+
+            # Dew point
+            dew_item = QTableWidgetItem(f"{self._convert_temp(hour_data.dew_point):.1f}")
+            dew_item.setTextAlignment(Qt.AlignCenter)
+            if is_night:
+                dew_item.setBackground(QColor(COLORS['background_lighter']))
+            # Warn if close to dew point
+            temp_dew_spread = hour_data.temperature - hour_data.dew_point
+            if temp_dew_spread < 2:
+                dew_item.setForeground(QColor(COLORS['error']))
+            elif temp_dew_spread < 5:
+                dew_item.setForeground(QColor(COLORS['warning']))
+            self.table.setItem(row, 6, dew_item)
+
+            # Humidity
+            humid_item = QTableWidgetItem(f"{hour_data.humidity:.0f}")
+            humid_item.setTextAlignment(Qt.AlignCenter)
+            if is_night:
+                humid_item.setBackground(QColor(COLORS['background_lighter']))
+            if hour_data.humidity > 80:
+                humid_item.setForeground(QColor(COLORS['error']))
+            elif hour_data.humidity > 65:
+                humid_item.setForeground(QColor(COLORS['warning']))
+            self.table.setItem(row, 7, humid_item)
+
+            # Wind speed (convert for display, but use original km/h for color thresholds)
+            wind_converted = self._convert_wind(hour_data.wind_speed)
+            wind_item = QTableWidgetItem(f"{wind_converted:.1f}")
+            wind_item.setTextAlignment(Qt.AlignCenter)
+            if is_night:
+                wind_item.setBackground(QColor(COLORS['background_lighter']))
+            if hour_data.wind_speed > 25:  # Thresholds in km/h
+                wind_item.setForeground(QColor(COLORS['error']))
+            elif hour_data.wind_speed > 15:
+                wind_item.setForeground(QColor(COLORS['warning']))
+            self.table.setItem(row, 8, wind_item)
+
+            # Precipitation probability
+            precip_item = QTableWidgetItem(f"{hour_data.precipitation_probability:.0f}")
+            precip_item.setTextAlignment(Qt.AlignCenter)
+            if is_night:
+                precip_item.setBackground(QColor(COLORS['background_lighter']))
+            if hour_data.precipitation_probability > 50:
+                precip_item.setForeground(QColor(COLORS['error']))
+            elif hour_data.precipitation_probability > 20:
+                precip_item.setForeground(QColor(COLORS['warning']))
+            self.table.setItem(row, 9, precip_item)
+
+        table_layout.addWidget(self.table)
+        layout.addWidget(table_group)
+
+        # Close button
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        button_layout.addWidget(close_btn)
+        layout.addLayout(button_layout)
+
+    def _on_chart_hover(self, row_index: int):
+        """Handle hover events from the chart to select table row"""
+        if row_index >= 0 and row_index < self.table.rowCount():
+            self.table.selectRow(row_index)
+            self.table.scrollTo(self.table.model().index(row_index, 0))
+        else:
+            self.table.clearSelection()
+
+
+class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
+    """Main window for weather forecast display"""
+    WINDOW_POSITION_KEY = "WeatherForecast"
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Weather Forecast - Cosmos Collection")
+        self.resize(900, 500)
+        self.setup_window_position()
+
+        self.worker = None
+        self.daily_summaries: List[DailyWeatherSummary] = []
+        self.day_cards: List[DayWeatherCard] = []
+
+        # Get temperature unit preference
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        self.temp_unit = settings.value("temperature_unit", "Celsius", type=str)
+
+        # Auto-refresh timer
+        self.auto_refresh_timer = QTimer(self)
+        self.auto_refresh_timer.timeout.connect(self._on_auto_refresh_triggered)
+        self.next_refresh_time: Optional[datetime] = None
+
+        self._setup_ui()
+        self._setup_menu_bar()
+        self._restore_auto_refresh_settings()
+        self._load_location()
+
+    def _setup_ui(self):
+        """Set up the main window UI"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        main_layout = QVBoxLayout(central_widget)
+
+        # Header with location and refresh button
+        header_layout = QHBoxLayout()
+        self.location_label = QLabel("Location: Loading...")
+        self.location_label.setStyleSheet("font-size: 11pt;")
+        header_layout.addWidget(self.location_label)
+        header_layout.addStretch()
+
+        self.refresh_btn = QPushButton("Refresh Forecast")
+        self.refresh_btn.setToolTip("Fetch fresh weather data (bypasses cache)")
+        self.refresh_btn.clicked.connect(lambda: self._refresh_forecast(force=True))
+        header_layout.addWidget(self.refresh_btn)
+
+        # Auto-refresh controls
+        self.auto_refresh_checkbox = QCheckBox("Auto-refresh")
+        self.auto_refresh_checkbox.setToolTip("Automatically refresh weather data at the selected interval")
+        self.auto_refresh_checkbox.setChecked(False)
+        self.auto_refresh_checkbox.stateChanged.connect(self._on_auto_refresh_changed)
+        header_layout.addWidget(self.auto_refresh_checkbox)
+
+        self.refresh_interval_combo = QComboBox()
+        self.refresh_interval_combo.setToolTip("Select auto-refresh interval")
+        self.refresh_interval_combo.addItem("15 min", 15)
+        self.refresh_interval_combo.addItem("30 min", 30)
+        self.refresh_interval_combo.addItem("1 hour", 60)
+        self.refresh_interval_combo.addItem("2 hours", 120)
+        self.refresh_interval_combo.addItem("4 hours", 240)
+        self.refresh_interval_combo.setCurrentIndex(2)  # Default to 1 hour
+        self.refresh_interval_combo.currentIndexChanged.connect(self._on_refresh_interval_changed)
+        self.refresh_interval_combo.setEnabled(False)  # Disabled until auto-refresh is enabled
+        header_layout.addWidget(self.refresh_interval_combo)
+
+        main_layout.addLayout(header_layout)
+
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setMaximum(0)  # Indeterminate
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
+
+        # Weekly overview group
+        overview_group = QGroupBox("Weekly Overview")
+        overview_layout = QVBoxLayout(overview_group)
+
+        # Scroll area for day cards
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setMinimumHeight(220)  # Minimum to show cards properly
+
+        self.cards_widget = QWidget()
+        self.cards_layout = QHBoxLayout(self.cards_widget)
+        self.cards_layout.setSpacing(10)
+        self.cards_layout.setContentsMargins(5, 5, 5, 5)
+        self.cards_layout.addStretch()
+
+        scroll_area.setWidget(self.cards_widget)
+        overview_layout.addWidget(scroll_area)
+
+        # Help text
+        help_text = QLabel("Double-click a day card for detailed hourly forecast")
+        help_text.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        help_text.setAlignment(Qt.AlignCenter)
+        overview_layout.addWidget(help_text)
+
+        main_layout.addWidget(overview_group, 1)  # Give stretch factor to expand
+
+        # Legend
+        legend_group = QGroupBox("Rating Legend")
+        legend_layout = QHBoxLayout(legend_group)
+        legend_layout.addStretch()
+
+        for label, color in [
+            ("Excellent (80-100)", COLORS['success']),
+            ("Good (60-79)", COLORS['info']),
+            ("Moderate (40-59)", COLORS['warning']),
+            ("Poor (0-39)", COLORS['error'])
+        ]:
+            legend_item = QLabel(f"  {label}  ")
+            legend_item.setStyleSheet(f"color: {color}; font-weight: bold;")
+            legend_layout.addWidget(legend_item)
+
+        legend_layout.addStretch()
+        main_layout.addWidget(legend_group)
+
+        # Status bar
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        main_layout.addWidget(self.status_label)
+
+    def _setup_menu_bar(self):
+        """Set up the menu bar with external weather links"""
+        menu_bar = self.menuBar()
+
+        # Add actions directly to menu bar (no dropdown needed)
+        clear_outside_action = menu_bar.addAction("Clear Outside")
+        clear_outside_action.setToolTip("Open Clear Outside astronomy forecast in browser")
+        clear_outside_action.triggered.connect(self._open_clear_outside)
+
+        astrospheric_action = menu_bar.addAction("Astrospheric")
+        astrospheric_action.setToolTip("Open Astrospheric astronomy forecast in browser")
+        astrospheric_action.triggered.connect(self._open_astrospheric)
+
+        noaa_action = menu_bar.addAction("NOAA")
+        noaa_action.setToolTip("Open NOAA 7-day weather forecast in browser")
+        noaa_action.triggered.connect(self._open_noaa)
+
+    def _open_clear_outside(self):
+        """Open Clear Outside forecast in browser"""
+        if self.lat is not None and self.lon is not None:
+            url = f"https://clearoutside.com/?lat={self.lat}&lon={self.lon}"
+            webbrowser.open(url)
+
+    def _open_astrospheric(self):
+        """Open Astrospheric forecast in browser"""
+        if self.lat is not None and self.lon is not None:
+            url = f"https://www.astrospheric.com/?Latitude={self.lat}&Longitude={self.lon}"
+            webbrowser.open(url)
+
+    def _open_noaa(self):
+        """Open NOAA 7-day forecast in browser"""
+        if self.lat is not None and self.lon is not None:
+            url = f"https://forecast.weather.gov/MapClick.php?lat={self.lat}&lon={self.lon}"
+            webbrowser.open(url)
+
+    def _load_location(self):
+        """Load location from database"""
+        # Check if observer location should be shown
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        show_location = settings.value("show_observer_location", True, type=bool)
+
+        # Hide the location label if setting is disabled
+        self.location_label.setVisible(show_location)
+
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT location_lat, location_lon, location_name, timezone "
+                    "FROM usersettings ORDER BY id DESC LIMIT 1"
+                )
+                row = cursor.fetchone()
+
+                if row:
+                    self.lat, self.lon, location_name, timezone = row
+                    if self.lat is not None and self.lon is not None:
+                        lat_str = f"{abs(self.lat):.2f}{'N' if self.lat >= 0 else 'S'}"
+                        lon_str = f"{abs(self.lon):.2f}{'W' if self.lon < 0 else 'E'}"
+                        display_name = location_name if location_name else "User Location"
+                        self.location_label.setText(f"Location: {display_name} ({lat_str}, {lon_str})")
+
+                        # Auto-fetch weather
+                        self._refresh_forecast()
+                        return
+
+            # No location configured
+            self.lat = None
+            self.lon = None
+            self.location_label.setText("Location: Not configured")
+            self.status_label.setText("Please configure your location in Settings to view weather forecast.")
+            self.status_label.setStyleSheet(f"color: {COLORS['warning']};")
+            self.refresh_btn.setEnabled(False)
+
+        except Exception as e:
+            logger.error(f"Error loading location: {str(e)}")
+            self.status_label.setText(f"Error loading location: {str(e)}")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _refresh_forecast(self, force: bool = False):
+        """Fetch weather forecast data, using cache if available"""
+        if self.lat is None or self.lon is None:
+            QMessageBox.warning(self, "No Location",
+                "Please configure your observer location in Settings before viewing weather forecast.")
+            return
+
+        if self.worker and self.worker.isRunning():
+            return
+
+        # Check cache first (unless force refresh)
+        if not force:
+            cache = WeatherCache()
+            cached_data = cache.get(self.lat, self.lon)
+            if cached_data is not None:
+                self._on_weather_loaded(cached_data, from_cache=True)
+                return
+
+        # Show progress
+        self.progress_bar.setVisible(True)
+        self.refresh_btn.setEnabled(False)
+        self.status_label.setText("Fetching weather data...")
+        self.status_label.setStyleSheet("")
+
+        # Start worker thread
+        self.worker = WeatherWorker(self.lat, self.lon)
+        self.worker.weather_loaded.connect(self._on_weather_loaded)
+        self.worker.error_occurred.connect(self._on_error)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.start()
+
+    def _on_progress(self, message: str):
+        """Handle progress updates"""
+        self.status_label.setText(message)
+
+    def _on_weather_loaded(self, summaries: List[DailyWeatherSummary], from_cache: bool = False):
+        """Handle successful weather data load"""
+        self.progress_bar.setVisible(False)
+        self.refresh_btn.setEnabled(True)
+        self.daily_summaries = summaries
+
+        # Store in cache if this is fresh data
+        if not from_cache and self.lat is not None and self.lon is not None:
+            cache = WeatherCache()
+            cache.set(self.lat, self.lon, summaries)
+
+        # Clear existing cards
+        for card in self.day_cards:
+            card.deleteLater()
+        self.day_cards.clear()
+
+        # Remove stretch
+        while self.cards_layout.count():
+            item = self.cards_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Create new cards
+        for summary in summaries:
+            card = DayWeatherCard(summary)
+            card.clicked.connect(self._show_day_detail)
+            self.cards_layout.addWidget(card)
+            self.day_cards.append(card)
+
+        self.cards_layout.addStretch()
+
+        # Update status
+        if from_cache:
+            cache = WeatherCache()
+            age_str = cache.get_age_str()
+            status_text = f"Using cached data (fetched {age_str})"
+        else:
+            now = datetime.now()
+            status_text = f"Last updated: {now.strftime('%Y-%m-%d %I:%M %p')}"
+
+        # Append next refresh time if auto-refresh is enabled
+        if self.next_refresh_time is not None:
+            status_text += f" | Next refresh: {self.next_refresh_time.strftime('%I:%M %p')}"
+
+        self.status_label.setText(status_text)
+        self.status_label.setStyleSheet("")
+
+    def _on_error(self, error_message: str):
+        """Handle errors from worker"""
+        self.progress_bar.setVisible(False)
+        self.refresh_btn.setEnabled(True)
+        self.status_label.setText(f"Error: {error_message}")
+        self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+        QMessageBox.warning(self, "Weather Fetch Error", error_message)
+
+    def _show_day_detail(self, summary: DailyWeatherSummary):
+        """Show detailed dialog for a day"""
+        dialog = DayDetailDialog(summary, self)
+        dialog.show()
+
+    def _on_auto_refresh_changed(self, state: int):
+        """Handle auto-refresh checkbox state change"""
+        enabled = state == Qt.Checked.value
+        self.refresh_interval_combo.setEnabled(enabled)
+
+        # Save setting
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue("weather_auto_refresh_enabled", enabled)
+
+        if enabled:
+            # Start the timer with the selected interval
+            self._start_auto_refresh_timer()
+        else:
+            self.auto_refresh_timer.stop()
+            self.next_refresh_time = None
+            self._update_status_with_next_refresh()
+
+    def _on_refresh_interval_changed(self, index: int):
+        """Handle refresh interval combo box change"""
+        # Save setting
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue("weather_auto_refresh_interval", index)
+
+        if self.auto_refresh_checkbox.isChecked():
+            # Restart timer with new interval
+            self._start_auto_refresh_timer()
+
+    def _restore_auto_refresh_settings(self):
+        """Restore auto-refresh settings from saved state"""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+
+        # Restore interval first (before enabling auto-refresh)
+        interval_index = settings.value("weather_auto_refresh_interval", 2, type=int)  # Default to 1 hour
+        if 0 <= interval_index < self.refresh_interval_combo.count():
+            self.refresh_interval_combo.setCurrentIndex(interval_index)
+
+        # Restore auto-refresh enabled state
+        auto_refresh_enabled = settings.value("weather_auto_refresh_enabled", False, type=bool)
+        self.auto_refresh_checkbox.setChecked(auto_refresh_enabled)
+
+    def _start_auto_refresh_timer(self):
+        """Start the auto-refresh timer and update next refresh time"""
+        interval_minutes = self.refresh_interval_combo.currentData()
+        self.next_refresh_time = datetime.now() + timedelta(minutes=interval_minutes)
+        self.auto_refresh_timer.start(interval_minutes * 60 * 1000)
+        self._update_status_with_next_refresh()
+
+    def _on_auto_refresh_triggered(self):
+        """Handle auto-refresh timer timeout"""
+        self._refresh_forecast(force=True)
+        # Schedule next refresh
+        if self.auto_refresh_checkbox.isChecked():
+            interval_minutes = self.refresh_interval_combo.currentData()
+            self.next_refresh_time = datetime.now() + timedelta(minutes=interval_minutes)
+
+    def _update_status_with_next_refresh(self):
+        """Update the status label to include next refresh time"""
+        current_text = self.status_label.text()
+        # Remove any existing next refresh info
+        if " | Next refresh:" in current_text:
+            current_text = current_text.split(" | Next refresh:")[0]
+
+        if self.next_refresh_time is not None:
+            current_text += f" | Next refresh: {self.next_refresh_time.strftime('%I:%M %p')}"
+
+        self.status_label.setText(current_text)
+
+
+def main():
+    """Main entry point for standalone testing"""
+    app = QApplication(sys.argv)
+    window = WeatherForecastWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
