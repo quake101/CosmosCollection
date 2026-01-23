@@ -234,8 +234,10 @@ class WeatherWorker(QThread):
         sun_alt_map = dict(zip(all_times, sun_altitudes))
 
         # Create daily summaries
+        sorted_dates = sorted(daily_data.keys())
         daily_summaries: List[DailyWeatherSummary] = []
-        for date, hours in sorted(daily_data.items()):
+        for date_idx, date in enumerate(sorted_dates):
+            hours = daily_data[date]
             if not hours:
                 continue
 
@@ -251,25 +253,31 @@ class WeatherWorker(QThread):
             avg_wind = sum(winds) / len(winds)
             avg_precip = sum(precip_probs) / len(precip_probs)
 
-            # Filter to astronomically dark hours (sun altitude < -12 degrees)
-            dark_hours = [h for h in hours if sun_alt_map.get(h.time, 0) < -12]
+            # Build "tonight" hours: evening dark hours of this day + morning dark hours of next day
+            evening_dark = [h for h in hours if h.time.hour >= 12 and sun_alt_map.get(h.time, 0) < -12]
+            morning_dark = []
+            if date_idx + 1 < len(sorted_dates):
+                next_date = sorted_dates[date_idx + 1]
+                next_hours = daily_data[next_date]
+                morning_dark = [h for h in next_hours if h.time.hour < 12 and sun_alt_map.get(h.time, 0) < -12]
+            tonight_hours = evening_dark + morning_dark
 
-            # Calculate astro score from dark hours only
-            if dark_hours:
-                dark_cloud = sum(h.cloud_cover for h in dark_hours) / len(dark_hours)
-                dark_humidity = sum(h.humidity for h in dark_hours) / len(dark_hours)
-                dark_wind = sum(h.wind_speed for h in dark_hours) / len(dark_hours)
-                dark_precip = sum(h.precipitation_probability for h in dark_hours) / len(dark_hours)
-                astro_score = calculate_astro_score(dark_cloud, dark_humidity, dark_wind, dark_precip)
+            # Calculate astro score as the average of individual hourly scores
+            if tonight_hours:
+                hourly_scores = [
+                    calculate_astro_score(h.cloud_cover, h.humidity, h.wind_speed, h.precipitation_probability)
+                    for h in tonight_hours
+                ]
+                astro_score = int(sum(hourly_scores) / len(hourly_scores))
             else:
                 # No dark hours (e.g., polar summer) - score is 0
                 astro_score = 0
 
-            # Estimate seeing based on dark hours
-            if dark_hours:
-                night_humidity = sum(h.humidity for h in dark_hours) / len(dark_hours)
-                night_wind = sum(h.wind_speed for h in dark_hours) / len(dark_hours)
-                night_temp_dew_spread = sum(h.temperature - h.dew_point for h in dark_hours) / len(dark_hours)
+            # Estimate seeing based on tonight's hours
+            if tonight_hours:
+                night_humidity = sum(h.humidity for h in tonight_hours) / len(tonight_hours)
+                night_wind = sum(h.wind_speed for h in tonight_hours) / len(tonight_hours)
+                night_temp_dew_spread = sum(h.temperature - h.dew_point for h in tonight_hours) / len(tonight_hours)
             else:
                 night_humidity = avg_humidity
                 night_wind = avg_wind
@@ -774,8 +782,14 @@ class DayDetailDialog(QDialog):
             if self.next_day_summary is not None
             else "Not available - no forecast data for the next day"
         )
-        self.midnight_view_checkbox.toggled.connect(self._update_view)
+        self.midnight_view_checkbox.toggled.connect(self._on_midnight_view_toggled)
         layout.addWidget(self.midnight_view_checkbox)
+
+        # Restore saved state (after connecting signal so view updates)
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        saved_midnight_view = settings.value("weather_center_on_midnight", False, type=bool)
+        if saved_midnight_view and self.next_day_summary is not None:
+            self.midnight_view_checkbox.setChecked(True)
 
         # Hourly astro score chart
         chart_group = QGroupBox("Hourly Astro Score")
@@ -823,6 +837,12 @@ class DayDetailDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         button_layout.addWidget(close_btn)
         layout.addLayout(button_layout)
+
+    def _on_midnight_view_toggled(self, checked: bool):
+        """Save midnight view preference and update the view"""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue("weather_center_on_midnight", checked)
+        self._update_view()
 
     def _on_chart_hover(self, row_index: int):
         """Handle hover events from the chart to select table row"""
