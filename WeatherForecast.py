@@ -25,6 +25,9 @@ import matplotlib.pyplot as plt
 plt.style.use('dark_background')
 
 import requests
+from astropy import units as u
+from astropy.time import Time
+from astropy.coordinates import EarthLocation, AltAz, get_sun
 from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
@@ -225,13 +228,18 @@ class WeatherWorker(QThread):
                 daily_data[date] = []
             daily_data[date].append(record)
 
+        # Calculate sun altitudes for all hourly records (vectorized for efficiency)
+        all_times = [record.time for record in hourly_records]
+        sun_altitudes = calculate_sun_altitudes(self.lat, self.lon, all_times)
+        sun_alt_map = dict(zip(all_times, sun_altitudes))
+
         # Create daily summaries
         daily_summaries: List[DailyWeatherSummary] = []
         for date, hours in sorted(daily_data.items()):
             if not hours:
                 continue
 
-            # Calculate aggregates
+            # Calculate aggregates for all hours (used for display)
             cloud_covers = [h.cloud_cover for h in hours]
             temps = [h.temperature for h in hours]
             humidities = [h.humidity for h in hours]
@@ -243,15 +251,25 @@ class WeatherWorker(QThread):
             avg_wind = sum(winds) / len(winds)
             avg_precip = sum(precip_probs) / len(precip_probs)
 
-            # Calculate astro score
-            astro_score = calculate_astro_score(avg_cloud, avg_humidity, avg_wind, avg_precip)
+            # Filter to astronomically dark hours (sun altitude < -12 degrees)
+            dark_hours = [h for h in hours if sun_alt_map.get(h.time, 0) < -12]
 
-            # Estimate seeing based on nighttime hours (6pm-6am)
-            night_hours = [h for h in hours if h.time.hour >= 18 or h.time.hour < 6]
-            if night_hours:
-                night_humidity = sum(h.humidity for h in night_hours) / len(night_hours)
-                night_wind = sum(h.wind_speed for h in night_hours) / len(night_hours)
-                night_temp_dew_spread = sum(h.temperature - h.dew_point for h in night_hours) / len(night_hours)
+            # Calculate astro score from dark hours only
+            if dark_hours:
+                dark_cloud = sum(h.cloud_cover for h in dark_hours) / len(dark_hours)
+                dark_humidity = sum(h.humidity for h in dark_hours) / len(dark_hours)
+                dark_wind = sum(h.wind_speed for h in dark_hours) / len(dark_hours)
+                dark_precip = sum(h.precipitation_probability for h in dark_hours) / len(dark_hours)
+                astro_score = calculate_astro_score(dark_cloud, dark_humidity, dark_wind, dark_precip)
+            else:
+                # No dark hours (e.g., polar summer) - score is 0
+                astro_score = 0
+
+            # Estimate seeing based on dark hours
+            if dark_hours:
+                night_humidity = sum(h.humidity for h in dark_hours) / len(dark_hours)
+                night_wind = sum(h.wind_speed for h in dark_hours) / len(dark_hours)
+                night_temp_dew_spread = sum(h.temperature - h.dew_point for h in dark_hours) / len(dark_hours)
             else:
                 night_humidity = avg_humidity
                 night_wind = avg_wind
@@ -416,6 +434,29 @@ def get_rating_label(score: int) -> str:
         return "Poor"
 
 
+def calculate_sun_altitudes(lat: float, lon: float, times: List[datetime]) -> List[float]:
+    """
+    Calculate sun altitude for each time point.
+
+    Args:
+        lat: Observer latitude in degrees
+        lon: Observer longitude in degrees
+        times: List of datetime objects for each hour
+
+    Returns:
+        List of sun altitudes in degrees for each time point
+    """
+    if not times:
+        return []
+
+    location = EarthLocation(lat=lat * u.deg, lon=lon * u.deg)
+    astropy_times = Time([t.isoformat() for t in times])
+    altaz_frame = AltAz(obstime=astropy_times, location=location)
+    sun_altaz = get_sun(astropy_times).transform_to(altaz_frame)
+
+    return sun_altaz.alt.deg.tolist()
+
+
 class DayWeatherCard(QFrame):
     """Clickable card widget for displaying daily weather summary"""
     clicked = Signal(object)  # Emits DailyWeatherSummary
@@ -522,18 +563,37 @@ class HourlyAstroChart(FigureCanvas):
         # Connect mouse motion event
         self.mpl_connect('motion_notify_event', self._on_mouse_move)
 
+    def refresh(self, hourly_data: List[HourlyWeatherData]):
+        """Refresh the chart with new hourly data"""
+        self.hourly_data = hourly_data
+        self._last_hovered_index = -1
+        self._create_chart()
+
     def _create_chart(self):
         """Create the hourly astro score chart"""
         self.figure.clear()
         self.ax = self.figure.add_subplot(111)
 
+        # Detect if this is a midnight-centered view (hours not sequential 0-23)
+        # by checking if hours wrap around midnight
+        is_midnight_view = False
+        if len(self.hourly_data) > 1:
+            first_hour = self.hourly_data[0].time.hour
+            last_hour = self.hourly_data[-1].time.hour
+            # Midnight view: starts at 18+ and ends at 5 or less
+            if first_hour >= 18 and last_hour <= 5:
+                is_midnight_view = True
+
         # Calculate hourly astro scores
-        self.hours = []
+        x_positions = []
+        hour_labels = []
         scores = []
         colors = []
 
-        for hour_data in self.hourly_data:
-            self.hours.append(hour_data.time.hour)
+        for idx, hour_data in enumerate(self.hourly_data):
+            # Use sequential index for x position (works for both views)
+            x_positions.append(idx)
+            hour_labels.append(f"{hour_data.time.hour:02d}:00")
             score = calculate_astro_score(
                 hour_data.cloud_cover,
                 hour_data.humidity,
@@ -543,28 +603,39 @@ class HourlyAstroChart(FigureCanvas):
             scores.append(score)
             colors.append(get_rating_color(score))
 
-        # Create bar chart
-        self.bars = self.ax.bar(self.hours, scores, color=colors, edgecolor='none', width=0.8)
+        # Create bar chart using sequential indices
+        self.bars = self.ax.bar(x_positions, scores, color=colors, edgecolor='none', width=0.8)
 
         # Add horizontal lines for rating thresholds
         self.ax.axhline(y=80, color=COLORS['success'], linestyle='--', alpha=0.5, linewidth=1)
         self.ax.axhline(y=60, color=COLORS['info'], linestyle='--', alpha=0.5, linewidth=1)
         self.ax.axhline(y=40, color=COLORS['warning'], linestyle='--', alpha=0.5, linewidth=1)
 
-        # Highlight nighttime hours (6pm - 6am) with background shading
-        self.ax.axvspan(-0.5, 5.5, alpha=0.15, color='#4444ff', label='Night')
-        self.ax.axvspan(17.5, 23.5, alpha=0.15, color='#4444ff')
+        num_hours = len(self.hourly_data)
+
+        if is_midnight_view:
+            # For midnight view, shade the entire chart area (all hours are nighttime)
+            self.ax.axvspan(-0.5, num_hours - 0.5, alpha=0.15, color='#4444ff', label='Night')
+            self.ax.set_xlabel('Time (Evening → Morning)', color=COLORS['text'], fontsize=9)
+            self.ax.set_title('Tonight\'s Astrophotography Conditions', color=COLORS['text'], fontsize=10, fontweight='bold')
+        else:
+            # Highlight nighttime hours (6pm - 6am) with background shading
+            self.ax.axvspan(-0.5, 5.5, alpha=0.15, color='#4444ff', label='Night')
+            self.ax.axvspan(17.5, 23.5, alpha=0.15, color='#4444ff')
+            self.ax.set_xlabel('Hour of Day', color=COLORS['text'], fontsize=9)
+            self.ax.set_title('Hourly Astrophotography Conditions', color=COLORS['text'], fontsize=10, fontweight='bold')
 
         # Style the chart
-        self.ax.set_xlim(-0.5, 23.5)
+        self.ax.set_xlim(-0.5, num_hours - 0.5)
         self.ax.set_ylim(0, 100)
-        self.ax.set_xlabel('Hour of Day', color=COLORS['text'], fontsize=9)
         self.ax.set_ylabel('Astro Score', color=COLORS['text'], fontsize=9)
-        self.ax.set_title('Hourly Astrophotography Conditions', color=COLORS['text'], fontsize=10, fontweight='bold')
 
-        # Set x-axis ticks
-        self.ax.set_xticks(range(0, 24, 2))
-        self.ax.set_xticklabels([f'{h:02d}:00' for h in range(0, 24, 2)], fontsize=8)
+        # Set x-axis ticks - show every other label to avoid crowding
+        tick_step = 2 if num_hours > 12 else 1
+        tick_positions = list(range(0, num_hours, tick_step))
+        tick_labels = [hour_labels[i] for i in tick_positions]
+        self.ax.set_xticks(tick_positions)
+        self.ax.set_xticklabels(tick_labels, fontsize=8)
 
         # Style axes
         self.ax.set_facecolor('#2b2b2b')
@@ -616,9 +687,10 @@ class HourlyAstroChart(FigureCanvas):
 class DayDetailDialog(QDialog):
     """Dialog showing detailed hourly weather data for a day"""
 
-    def __init__(self, summary: DailyWeatherSummary, parent=None):
+    def __init__(self, summary: DailyWeatherSummary, next_day_summary: Optional[DailyWeatherSummary] = None, parent=None):
         super().__init__(parent)
         self.summary = summary
+        self.next_day_summary = next_day_summary
         self.setWindowTitle(f"Weather Details - {summary.date.strftime('%A, %B %d, %Y')} - Cosmos Collection")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setModal(False)
@@ -694,6 +766,17 @@ class DayDetailDialog(QDialog):
 
         layout.addWidget(header_group)
 
+        # View mode toggle
+        self.midnight_view_checkbox = QCheckBox("Center on Midnight (show tonight's hours: 18:00-05:00)")
+        self.midnight_view_checkbox.setEnabled(self.next_day_summary is not None)
+        self.midnight_view_checkbox.setToolTip(
+            "Show evening hours (18:00-23:00) of this day plus morning hours (00:00-05:00) of the next day"
+            if self.next_day_summary is not None
+            else "Not available - no forecast data for the next day"
+        )
+        self.midnight_view_checkbox.toggled.connect(self._update_view)
+        layout.addWidget(self.midnight_view_checkbox)
+
         # Hourly astro score chart
         chart_group = QGroupBox("Hourly Astro Score")
         chart_layout = QVBoxLayout(chart_group)
@@ -721,13 +804,54 @@ class DayDetailDialog(QDialog):
 
         # Configure header
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        # Use Fixed mode for Time column to prevent flickering during row selection
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.resizeSection(0, 60)  # Fixed width for time column
         for i in range(1, 10):
             header.setSectionResizeMode(i, QHeaderView.Stretch)
 
-        # Populate table
-        self.table.setRowCount(len(self.summary.hourly_data))
-        for row, hour_data in enumerate(self.summary.hourly_data):
+        # Populate table with initial data
+        self._populate_table(self.summary.hourly_data)
+
+        table_layout.addWidget(self.table)
+        layout.addWidget(table_group)
+
+        # Close button
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        button_layout.addWidget(close_btn)
+        layout.addLayout(button_layout)
+
+    def _on_chart_hover(self, row_index: int):
+        """Handle hover events from the chart to select table row"""
+        if row_index >= 0 and row_index < self.table.rowCount():
+            self.table.selectRow(row_index)
+            self.table.scrollTo(self.table.model().index(row_index, 0))
+        else:
+            self.table.clearSelection()
+
+    def _get_display_hours(self) -> List[HourlyWeatherData]:
+        """Get the hourly data to display based on current view mode"""
+        if self.midnight_view_checkbox.isChecked() and self.next_day_summary:
+            # Evening of current day (18:00-23:00) + morning of next day (00:00-05:00)
+            evening_hours = [h for h in self.summary.hourly_data if h.time.hour >= 18]
+            morning_hours = [h for h in self.next_day_summary.hourly_data if h.time.hour <= 5]
+            return evening_hours + morning_hours
+        else:
+            return self.summary.hourly_data
+
+    def _update_view(self):
+        """Refresh chart and table when view mode changes"""
+        display_hours = self._get_display_hours()
+        self.chart.refresh(display_hours)
+        self._populate_table(display_hours)
+
+    def _populate_table(self, hourly_data: List[HourlyWeatherData]):
+        """Populate the table with hourly weather data"""
+        self.table.setRowCount(len(hourly_data))
+        for row, hour_data in enumerate(hourly_data):
             # Check if nighttime (6pm - 6am)
             is_night = hour_data.time.hour >= 18 or hour_data.time.hour < 6
 
@@ -814,25 +938,6 @@ class DayDetailDialog(QDialog):
                 precip_item.setForeground(QColor(COLORS['warning']))
             self.table.setItem(row, 9, precip_item)
 
-        table_layout.addWidget(self.table)
-        layout.addWidget(table_group)
-
-        # Close button
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
-        button_layout.addWidget(close_btn)
-        layout.addLayout(button_layout)
-
-    def _on_chart_hover(self, row_index: int):
-        """Handle hover events from the chart to select table row"""
-        if row_index >= 0 and row_index < self.table.rowCount():
-            self.table.selectRow(row_index)
-            self.table.scrollTo(self.table.model().index(row_index, 0))
-        else:
-            self.table.clearSelection()
-
 
 class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
     """Main window for weather forecast display"""
@@ -841,7 +946,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Weather Forecast - Cosmos Collection")
-        self.resize(900, 500)
+        self.resize(815, 500)
         self.setup_window_position()
 
         self.worker = None
@@ -1132,7 +1237,16 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
 
     def _show_day_detail(self, summary: DailyWeatherSummary):
         """Show detailed dialog for a day"""
-        dialog = DayDetailDialog(summary, self)
+        # Find next day's summary if available
+        next_day_summary = None
+        try:
+            current_index = self.daily_summaries.index(summary)
+            if current_index + 1 < len(self.daily_summaries):
+                next_day_summary = self.daily_summaries[current_index + 1]
+        except ValueError:
+            pass  # Summary not found in list
+
+        dialog = DayDetailDialog(summary, next_day_summary, self)
         dialog.show()
 
     def _on_auto_refresh_changed(self, state: int):
