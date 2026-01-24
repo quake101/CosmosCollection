@@ -3603,7 +3603,8 @@ class AboutDialog(QDialog):
         try:
             from version import version_manager
             from PySide6.QtWidgets import QMessageBox
-            import webbrowser
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
 
             # Force refresh the GitHub release info
             version_manager._cached_release_info = None
@@ -3627,7 +3628,7 @@ class AboutDialog(QDialog):
                 msg.setDefaultButton(QMessageBox.Yes)
 
                 if msg.exec() == QMessageBox.Yes and version_info['github_url']:
-                    webbrowser.open(version_info['github_url'])
+                    QDesktopServices.openUrl(QUrl(version_info['github_url']))
             else:
                 QMessageBox.information(self, "No Updates",
                     f"You are running the latest version ({version_info['local_version']}).")
@@ -4433,7 +4434,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
             from version import version_manager
             from PySide6.QtWidgets import QMessageBox
-            import webbrowser
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
 
             # Get version info
             version_info = version_manager.get_version_info()
@@ -4453,7 +4455,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 msg.setDefaultButton(QMessageBox.Yes)
 
                 if msg.exec() == QMessageBox.Yes and version_info.get('github_url'):
-                    webbrowser.open(version_info['github_url'])
+                    QDesktopServices.openUrl(QUrl(version_info['github_url']))
             else:
                 logger.debug("No updates available or unable to check")
 

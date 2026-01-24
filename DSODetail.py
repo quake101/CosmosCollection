@@ -9,8 +9,8 @@ import os
 import sys
 from typing import Optional, Dict
 
-from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, QThread
-from PySide6.QtGui import QPixmap, QPainter, QAction
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, QThread, QUrl
+from PySide6.QtGui import QPixmap, QPainter, QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QLineEdit,
     QComboBox, QTextEdit, QGroupBox, QPushButton, QGridLayout,
@@ -1648,7 +1648,6 @@ class DSODetailWindow(QDialog):
     def _open_wikipedia(self):
         """Open Wikipedia page for the current DSO in the default browser"""
         try:
-            import webbrowser
             import re
 
             dso_name = self.data.get('name', '').strip()
@@ -1672,7 +1671,7 @@ class DSODetailWindow(QDialog):
             wiki_url = f"https://en.wikipedia.org/wiki/{wiki_name}"
 
             logger.debug(f"Opening Wikipedia page: {wiki_url}")
-            webbrowser.open(wiki_url)
+            QDesktopServices.openUrl(QUrl(wiki_url))
 
         except Exception as e:
             logger.error(f"Error opening Wikipedia: {str(e)}", exc_info=True)

@@ -6,7 +6,7 @@ Displays astrophotography-relevant weather data from Open-Meteo API
 
 import sys
 import logging
-import webbrowser
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
@@ -28,14 +28,14 @@ import requests
 from astropy import units as u
 from astropy.time import Time
 from astropy.coordinates import EarthLocation, AltAz, get_sun
-from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer, QUrl
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QLabel, QGroupBox, QMessageBox, QProgressBar, QScrollArea,
     QFrame, QGridLayout, QDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QApplication, QSplitter, QCheckBox, QComboBox
 )
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QDesktopServices
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
@@ -1112,21 +1112,20 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
     def _open_clear_outside(self):
         """Open Clear Outside forecast in browser"""
         if self.lat is not None and self.lon is not None:
-            #url = f"https://clearoutside.com/?lat={self.lat}&lon={self.lon}"
             url = f"https://clearoutside.com/forecast/{self.lat}/{self.lon}"
-            webbrowser.open(url)
+            QDesktopServices.openUrl(QUrl(url))
 
     def _open_astrospheric(self):
         """Open Astrospheric forecast in browser"""
         if self.lat is not None and self.lon is not None:
             url = f"https://www.astrospheric.com/?Latitude={self.lat}&Longitude={self.lon}"
-            webbrowser.open(url)
+            QDesktopServices.openUrl(QUrl(url))
 
     def _open_noaa(self):
         """Open NOAA 7-day forecast in browser"""
         if self.lat is not None and self.lon is not None:
             url = f"https://forecast.weather.gov/MapClick.php?lat={self.lat}&lon={self.lon}"
-            webbrowser.open(url)
+            QDesktopServices.openUrl(QUrl(url))
 
     def _load_location(self):
         """Load location from database"""

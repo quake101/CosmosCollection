@@ -5,13 +5,12 @@ import ssl
 import threading
 import urllib.parse
 import urllib.request
-import webbrowser
-
 from PySide6.QtCore import Qt, QUrl, QTimer, QSettings
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout,
     QComboBox, QCheckBox, QPushButton, QMessageBox
 )
+from PySide6.QtGui import QDesktopServices
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
@@ -351,7 +350,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             browser_url = f"{base_url}{'&'.join(url_params)}"
 
             logger.debug(f"Opening Aladin Lite in browser: {browser_url}")
-            webbrowser.open(browser_url)
+            QDesktopServices.openUrl(QUrl(browser_url))
 
             # Show a message to the user
             QMessageBox.information(self, "Opened in Browser",
