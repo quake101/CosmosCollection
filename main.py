@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
     QVBoxLayout, QWidget, QLabel, QDialog,
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
-    QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout, QSpinBox, QFileDialog
+    QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout, QSpinBox, QFileDialog, QSizePolicy
 )
 
 # Local imports (always needed)
@@ -1525,39 +1525,6 @@ class SettingsDialog(QDialog):
 
         location_layout.addWidget(location_group)
         
-        # Timezone settings group
-        timezone_group = QGroupBox("Time Zone Settings")
-        timezone_group_layout = QVBoxLayout(timezone_group)
-        
-        tz_layout = QHBoxLayout()
-        tz_label = QLabel("Time Zone:")
-        tz_label.setMinimumWidth(120)
-        self.timezone_combo = QComboBox()
-        self.timezone_combo.setEditable(True)
-        
-        # Add common timezones
-        common_timezones = [
-            "America/New_York",
-            "America/Chicago", 
-            "America/Denver",
-            "America/Los_Angeles",
-            "America/Phoenix",
-            "America/Anchorage",
-            "Pacific/Honolulu",
-            "UTC",
-            "Europe/London",
-            "Europe/Paris",
-            "Europe/Berlin",
-            "Asia/Tokyo",
-            "Australia/Sydney"
-        ]
-        self.timezone_combo.addItems(common_timezones)
-        tz_layout.addWidget(tz_label)
-        tz_layout.addWidget(self.timezone_combo)
-        timezone_group_layout.addLayout(tz_layout)
-        
-        location_layout.addWidget(timezone_group)
-        
         # Help text
         help_text = QLabel("""
 <b>Tips:</b>
@@ -1579,8 +1546,12 @@ class SettingsDialog(QDialog):
         location_layout.addStretch()
 
         # Application Settings tab
+        app_settings_scroll = QScrollArea()
+        app_settings_scroll.setWidgetResizable(True)
+        app_settings_scroll.setFrameShape(QScrollArea.NoFrame)
         app_settings_tab = QWidget()
         app_settings_layout = QVBoxLayout(app_settings_tab)
+        app_settings_scroll.setWidget(app_settings_tab)
 
         # UI Preferences group
         ui_prefs_group = QGroupBox("User Interface Preferences")
@@ -1600,6 +1571,48 @@ class SettingsDialog(QDialog):
             "When enabled, automatically checks for application updates when the program starts"
         )
         ui_prefs_layout.addWidget(self.check_updates_checkbox)
+
+        # Time format setting
+        time_format_layout = QHBoxLayout()
+        time_format_label = QLabel("Time Format:")
+        time_format_label.setMinimumWidth(120)
+        self.time_format_combo = QComboBox()
+        self.time_format_combo.addItems(["12-hour", "24-hour"])
+        self.time_format_combo.setToolTip(
+            "12-hour: displays times like 2:30 PM\n"
+            "24-hour: displays times like 14:30"
+        )
+        time_format_layout.addWidget(time_format_label)
+        time_format_layout.addWidget(self.time_format_combo)
+        time_format_layout.addStretch()
+        ui_prefs_layout.addLayout(time_format_layout)
+
+        # Time zone setting
+        tz_layout = QHBoxLayout()
+        tz_label = QLabel("Time Zone:")
+        tz_label.setMinimumWidth(120)
+        self.timezone_combo = QComboBox()
+        self.timezone_combo.setEditable(True)
+        common_timezones = [
+            "America/New_York",
+            "America/Chicago",
+            "America/Denver",
+            "America/Los_Angeles",
+            "America/Phoenix",
+            "America/Anchorage",
+            "Pacific/Honolulu",
+            "UTC",
+            "Europe/London",
+            "Europe/Paris",
+            "Europe/Berlin",
+            "Asia/Tokyo",
+            "Australia/Sydney"
+        ]
+        self.timezone_combo.addItems(common_timezones)
+        tz_layout.addWidget(tz_label)
+        tz_layout.addWidget(self.timezone_combo)
+        tz_layout.addStretch()
+        ui_prefs_layout.addLayout(tz_layout)
 
         app_settings_layout.addWidget(ui_prefs_group)
 
@@ -1683,6 +1696,7 @@ class SettingsDialog(QDialog):
             "This speeds up gallery loading on subsequent launches. Cache files can be safely deleted."
         )
         cache_help.setWordWrap(True)
+        cache_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         cache_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 20px; }}")
         perf_settings_layout.addWidget(cache_help)
 
@@ -1715,6 +1729,7 @@ class SettingsDialog(QDialog):
         )
         astap_help.setOpenExternalLinks(True)
         astap_help.setWordWrap(True)
+        astap_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         astap_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
         plate_solve_layout.addWidget(astap_help)
 
@@ -1745,6 +1760,7 @@ class SettingsDialog(QDialog):
         )
         api_key_help.setOpenExternalLinks(True)
         api_key_help.setWordWrap(True)
+        api_key_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         api_key_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
         plate_solve_layout.addWidget(api_key_help)
 
@@ -1804,8 +1820,8 @@ class SettingsDialog(QDialog):
         backup_restore_layout.addStretch()
 
         # Add tabs
-        tab_widget.addTab(app_settings_tab, "Application Settings")
-        tab_widget.addTab(location_tab, "Location && Time Zone")
+        tab_widget.addTab(app_settings_scroll, "Application Settings")
+        tab_widget.addTab(location_tab, "Location Manager")
         tab_widget.addTab(backup_restore_tab, "Backup && Restore")
 
         layout.addWidget(tab_widget)
@@ -1872,6 +1888,12 @@ class SettingsDialog(QDialog):
 
             check_updates = settings.value("check_updates_on_startup", True, type=bool)
             self.check_updates_checkbox.setChecked(check_updates)
+
+            # Load time format setting
+            time_format = settings.value("time_format", "12-hour", type=str)
+            index = self.time_format_combo.findText(time_format)
+            if index >= 0:
+                self.time_format_combo.setCurrentIndex(index)
 
             # Load thread count setting
             import os
@@ -2027,6 +2049,7 @@ class SettingsDialog(QDialog):
             settings = QSettings("CosmosCollection", "CosmosCollection")
             settings.setValue("show_observer_location", self.show_observer_location_checkbox.isChecked())
             settings.setValue("check_updates_on_startup", self.check_updates_checkbox.isChecked())
+            settings.setValue("time_format", self.time_format_combo.currentText())
             settings.setValue("max_threads", self.thread_count_spinbox.value())
             settings.setValue("cache_thumbnails_to_disk", self.cache_thumbnails_checkbox.isChecked())
 

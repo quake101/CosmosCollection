@@ -26,6 +26,7 @@ warnings.filterwarnings('ignore')
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS
+from TimeFormatHelper import format_time
 
 class NumericTableWidgetItem(QTableWidgetItem):
     """Custom QTableWidgetItem that sorts by numeric value stored in UserRole"""
@@ -1085,7 +1086,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self.results_table.setItem(row, 4, alt_item)
 
             # Best time - store time as sortable value
-            time_str = dso_data["optimal_time"].strftime("%H:%M")
+            time_str = format_time(dso_data["optimal_time"])
             time_item = NumericTableWidgetItem()
             time_item.setData(Qt.DisplayRole, time_str)
             time_item.setData(Qt.UserRole, dso_data["optimal_time"].hour * 60 + dso_data["optimal_time"].minute)

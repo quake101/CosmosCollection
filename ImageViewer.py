@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from Theme import COLORS
 from WindowPositionManager import WindowPositionManager
 from ResourceManager import ResourceManager
+from TimeFormatHelper import format_datetime
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -598,8 +599,8 @@ class ImageViewerWindow(QDialog):
                 file_size = f"{file_size_bytes / (1024 * 1024 * 1024):.1f} GB"
 
             # Dates
-            created_time = datetime.fromtimestamp(file_stats.st_ctime).strftime('%Y-%m-%d %H:%M:%S')
-            modified_time = datetime.fromtimestamp(file_stats.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+            created_time = format_datetime(datetime.fromtimestamp(file_stats.st_ctime), seconds=True)
+            modified_time = format_datetime(datetime.fromtimestamp(file_stats.st_mtime), seconds=True)
 
             # Image dimensions
             if self.original_pixmap:

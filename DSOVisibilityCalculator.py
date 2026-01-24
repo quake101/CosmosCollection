@@ -45,6 +45,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # Import DatabaseManager from separate file
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
+from TimeFormatHelper import format_time
 
 
 class DSOVisibilityCalculator:
@@ -978,7 +979,7 @@ class VisibilityPlot(FigureCanvas):
         time_labels = []
         for i in range(0, len(hours_from_start), max(1, len(hours_from_start) // 6)):
             time_ticks.append(hours_from_start[i])
-            time_labels.append(local_times[i].strftime('%H:%M'))
+            time_labels.append(format_time(local_times[i]))
         ax1.set_xticks(time_ticks)
         ax1.set_xticklabels(time_labels)
 
@@ -1208,7 +1209,7 @@ class VisibilityPlot(FigureCanvas):
 
         # Create hover text
         hover_text = (
-            f"Time: {local_time.strftime('%H:%M:%S')} {tz_name}\n"
+            f"Time: {format_time(local_time, seconds=True)} {tz_name}\n"
             f"{dso_name} Alt: {dso_alt:.1f}°\n"
             f"{dso_name} Az: {dso_az:.0f}° ({direction})\n"
             f"Sun Alt: {sun_alt:.1f}° ({twilight})\n"
@@ -1589,7 +1590,7 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         # Determine if we're in EST or EDT
         tz_name = max_alt_time_local.strftime('%Z')
 
-        text += f"Maximum altitude: {max_altitude:.1f}° at {max_alt_time_local.strftime('%H:%M')} {tz_name}\n"
+        text += f"Maximum altitude: {max_altitude:.1f}° at {format_time(max_alt_time_local)} {tz_name}\n"
         text += f"Direction at max altitude: {max_direction} ({max_azimuth:.0f}°)\n\n"
 
         # Find viewing windows
@@ -1619,8 +1620,8 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
                 mid_az = dso_altaz.az.deg[mid_idx]
                 mid_direction = DSOVisibilityCalculator.azimuth_to_direction(mid_az)
 
-                text += f"From: {start_time_local.strftime('%H:%M')} {tz_name}\n"
-                text += f"To:   {end_time_local.strftime('%H:%M')} {tz_name}\n"
+                text += f"From: {format_time(start_time_local)} {tz_name}\n"
+                text += f"To:   {format_time(end_time_local)} {tz_name}\n"
                 text += f"Duration: {duration:.1f} hours\n"
                 text += f"Mid-window direction: {mid_direction} ({mid_az:.0f}°)\n"
                 text += f"Azimuth range: {start_az:.0f}° → {end_az:.0f}°\n"

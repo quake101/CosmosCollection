@@ -40,6 +40,7 @@ from PySide6.QtGui import QColor
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS
+from TimeFormatHelper import format_time, format_datetime, get_time_format_24h
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -601,7 +602,7 @@ class HourlyAstroChart(FigureCanvas):
         for idx, hour_data in enumerate(self.hourly_data):
             # Use sequential index for x position (works for both views)
             x_positions.append(idx)
-            hour_labels.append(f"{hour_data.time.hour:02d}:00")
+            hour_labels.append(format_time(hour_data.time))
             score = calculate_astro_score(
                 hour_data.cloud_cover,
                 hour_data.humidity,
@@ -775,21 +776,21 @@ class DayDetailDialog(QDialog):
         layout.addWidget(header_group)
 
         # View mode toggle
-        self.midnight_view_checkbox = QCheckBox("Center on Midnight (show tonight's hours: 18:00-05:00)")
+        if get_time_format_24h():
+            midnight_label = "Center on Midnight (show tonight's hours: 18:00-05:00)"
+            midnight_tip = "Show evening hours (18:00-23:00) of this day plus morning hours (00:00-05:00) of the next day"
+        else:
+            midnight_label = "Center on Midnight (show tonight's hours: 6:00 PM-5:00 AM)"
+            midnight_tip = "Show evening hours (6:00 PM-11:00 PM) of this day plus morning hours (12:00 AM-5:00 AM) of the next day"
+        self.midnight_view_checkbox = QCheckBox(midnight_label)
         self.midnight_view_checkbox.setEnabled(self.next_day_summary is not None)
         self.midnight_view_checkbox.setToolTip(
-            "Show evening hours (18:00-23:00) of this day plus morning hours (00:00-05:00) of the next day"
+            midnight_tip
             if self.next_day_summary is not None
             else "Not available - no forecast data for the next day"
         )
         self.midnight_view_checkbox.toggled.connect(self._on_midnight_view_toggled)
         layout.addWidget(self.midnight_view_checkbox)
-
-        # Restore saved state (after connecting signal so view updates)
-        settings = QSettings("CosmosCollection", "CosmosCollection")
-        saved_midnight_view = settings.value("weather_center_on_midnight", False, type=bool)
-        if saved_midnight_view and self.next_day_summary is not None:
-            self.midnight_view_checkbox.setChecked(True)
 
         # Hourly astro score chart
         chart_group = QGroupBox("Hourly Astro Score")
@@ -829,6 +830,12 @@ class DayDetailDialog(QDialog):
 
         table_layout.addWidget(self.table)
         layout.addWidget(table_group)
+
+        # Restore saved midnight view state (after chart and table are created)
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        saved_midnight_view = settings.value("weather_center_on_midnight", False, type=bool)
+        if saved_midnight_view and self.next_day_summary is not None:
+            self.midnight_view_checkbox.setChecked(True)
 
         # Close button
         button_layout = QHBoxLayout()
@@ -876,7 +883,7 @@ class DayDetailDialog(QDialog):
             is_night = hour_data.time.hour >= 18 or hour_data.time.hour < 6
 
             # Time
-            time_item = QTableWidgetItem(hour_data.time.strftime("%H:%M"))
+            time_item = QTableWidgetItem(format_time(hour_data.time))
             time_item.setTextAlignment(Qt.AlignCenter)
             if is_night:
                 time_item.setBackground(QColor(COLORS['background_lighter']))
@@ -1238,11 +1245,11 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
             status_text = f"Using cached data (fetched {age_str})"
         else:
             now = datetime.now()
-            status_text = f"Last updated: {now.strftime('%Y-%m-%d %I:%M %p')}"
+            status_text = f"Last updated: {format_datetime(now)}"
 
         # Append next refresh time if auto-refresh is enabled
         if self.next_refresh_time is not None:
-            status_text += f" | Next refresh: {self.next_refresh_time.strftime('%I:%M %p')}"
+            status_text += f" | Next refresh: {format_time(self.next_refresh_time)}"
 
         self.status_label.setText(status_text)
         self.status_label.setStyleSheet("")
@@ -1332,7 +1339,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
             current_text = current_text.split(" | Next refresh:")[0]
 
         if self.next_refresh_time is not None:
-            current_text += f" | Next refresh: {self.next_refresh_time.strftime('%I:%M %p')}"
+            current_text += f" | Next refresh: {format_time(self.next_refresh_time)}"
 
         self.status_label.setText(current_text)
 
