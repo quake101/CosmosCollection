@@ -9,7 +9,7 @@ import os
 import sys
 from typing import Optional, Dict
 
-from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, QThread, QSettings
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, QThread
 from PySide6.QtGui import QPixmap, QPainter, QAction
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QLineEdit,
@@ -423,21 +423,21 @@ class DSODetailWindow(QDialog):
 
     def _defer_heavy_calculations(self):
         """Perform heavy calculations after window is shown"""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
-        show_location = settings.value("show_observer_location", True, type=bool)
-
-        if not show_location:
-            self.location_groupbox.setVisible(False)
-        else:
-            self._load_user_location()
-            lat_val = self.location_lat_edit.text().strip()
-            lon_val = self.location_lon_edit.text().strip()
-            if lat_val and lon_val:
-                self.location_groupbox.setVisible(False)
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 LIMIT 1")
+                row = cursor.fetchone()
+                if not row:
+                    cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
+                    row = cursor.fetchone()
+            if row and row[0] is not None and row[1] is not None:
                 QTimer.singleShot(500, self._set_season_label_from_location)
             else:
-                self.location_groupbox.setVisible(True)
-                self.season_label.setText("Enter your location above and press Save to see viewing season/dates.")
+                self.season_label.setText("Set your location in Settings to see viewing season.")
+        except Exception as e:
+            logger.error(f"Error checking location in deferred calculations: {str(e)}")
+            self.season_label.setText("Set your location in Settings to see viewing season.")
 
         QTimer.singleShot(300, self._load_user_images)
         QTimer.singleShot(400, self._query_emission_data)
@@ -942,36 +942,6 @@ class DSODetailWindow(QDialog):
             self.emission_groupbox.setLayout(emission_layout)
             right_layout.addWidget(self.emission_groupbox)
 
-            # --- Observer Location GroupBox (NEW or Conditional) ---
-            self.location_groupbox = QGroupBox("Observer Location")
-            self.location_groupbox.setStyleSheet(
-                "QGroupBox:title { subcontrol-position: top center; font-size: 16pt; font-weight: bold; }")
-            location_layout = QVBoxLayout()
-
-            lat_layout = QHBoxLayout()
-            lat_label = QLabel("Latitude (deg):")
-            self.location_lat_edit = QLineEdit()
-            self.location_lat_edit.setPlaceholderText("e.g., 40.7128")
-            lat_layout.addWidget(lat_label)
-            lat_layout.addWidget(self.location_lat_edit)
-            location_layout.addLayout(lat_layout)
-
-            lon_layout = QHBoxLayout()
-            lon_label = QLabel("Longitude (deg):")
-            self.location_lon_edit = QLineEdit()
-            self.location_lon_edit.setPlaceholderText("e.g., -74.0060")
-            lon_layout.addWidget(lon_label)
-            lon_layout.addWidget(self.location_lon_edit)
-            location_layout.addLayout(lon_layout)
-
-            # Save button for location
-            location_save_btn = QPushButton("Save")
-            location_save_btn.clicked.connect(self._on_save_location_clicked)
-            location_layout.addWidget(location_save_btn)
-
-            self.location_groupbox.setLayout(location_layout)
-            right_layout.addWidget(self.location_groupbox)
-
             # --- Season / Dates GroupBox ---
             season_groupbox = QGroupBox("Viewing Season / Dates")
             season_groupbox.setStyleSheet(
@@ -1010,15 +980,7 @@ class DSODetailWindow(QDialog):
                 # Hide image information form
                 self.info_form_container.setVisible(False)
 
-                # Set default visibility for location groupbox - will be updated in deferred calculations
-                # Check user preference for showing observer location
-                settings = QSettings("CosmosCollection", "CosmosCollection")
-                show_location = settings.value("show_observer_location", True, type=bool)
-                if show_location:
-                    self.location_groupbox.setVisible(True)
-                    self.season_label.setText("Loading location information...")
-                else:
-                    self.location_groupbox.setVisible(False)
+                self.season_label.setText("Loading location information...")
 
                 # Ensure the window is properly sized before showing
                 self.adjustSize()
@@ -1131,80 +1093,25 @@ class DSODetailWindow(QDialog):
         self.date_edit.setText(self.data.get('date_taken', ''))
         self.notes_edit.setText(self.data.get('notes', ''))
 
-    def _on_save_location_clicked(self):
-        """Handler for saving observer location and updating UI."""
-        lat_val = self.location_lat_edit.text().strip()
-        lon_val = self.location_lon_edit.text().strip()
-        try:
-            lat = float(lat_val)
-            lon = float(lon_val)
-        except ValueError:
-            QMessageBox.warning(self, "Invalid Input", "Please enter valid numeric latitude and longitude.")
-            return
-
-        # Save to DB
-        try:
-            with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("INSERT INTO usersettings (location_lat, location_lon) VALUES (?, ?)", (lat, lon))
-                conn.commit()
-            # Hide location groupbox after successful save (location is now configured)
-            # This respects the existing behavior of hiding the input fields once location is set
-            self.location_groupbox.setVisible(False)
-            self._set_season_label_from_location()
-        except Exception as e:
-            QMessageBox.critical(self, "Database Error", f"Could not save location: {str(e)}")
-
-    def _load_user_location(self):
-        """Load user location from the usersettings table"""
-        try:
-            with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
-                row = cursor.fetchone()
-                if row:
-                    lat, lon = row
-                    self.location_lat_edit.setText(str(lat))
-                    self.location_lon_edit.setText(str(lon))
-                    logger.debug(f"Loaded user location from DB: lat={lat}, lon={lon}")
-                else:
-                    logger.debug("No user location found in database")
-        except Exception as e:
-            logger.error(f"Error loading user location: {str(e)}")
-
-    def _save_user_location(self):
-        """Save the user location to the usersettings table"""
-        try:
-            lat = float(self.location_lat_edit.text().strip())
-            lon = float(self.location_lon_edit.text().strip())
-        except ValueError:
-            QMessageBox.warning(self, "Invalid Input", "Please enter valid numeric latitude and longitude.")
-            return
-        try:
-            with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("INSERT INTO usersettings (location_lat, location_lon) VALUES (?, ?)", (lat, lon))
-                conn.commit()
-                logger.debug(f"Saved user location to DB: lat={lat}, lon={lon}")
-            self._set_season_label_from_location()
-        except Exception as e:
-            logger.error(f"Error saving user location: {str(e)}")
-            QMessageBox.critical(self, "Database Error", f"Failed to save location: {str(e)}")
-
     def _set_season_label_from_location(self):
         """
         Set the season_label text with the visibility season/dates string based on user location.
-        Uses background thread for heavy calculations.
+        Reads location directly from the database. Uses background thread for heavy calculations.
         """
         try:
-            lat_text = self.location_lat_edit.text().strip()
-            lon_text = self.location_lon_edit.text().strip()
-            if not lat_text or not lon_text:
-                self.season_label.setText("Enter your location to see viewing season information.")
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 LIMIT 1")
+                row = cursor.fetchone()
+                if not row:
+                    cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
+                    row = cursor.fetchone()
+            if not row or row[0] is None or row[1] is None:
+                self.season_label.setText("Set your location in Settings to see viewing season.")
                 return
 
-            lat = float(lat_text)
-            lon = float(lon_text)
+            lat = float(row[0])
+            lon = float(row[1])
             ra_deg = self.data.get("ra_deg")
             dec_deg = self.data.get("dec_deg")
             object_name = self.data.get("name")

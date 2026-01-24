@@ -88,6 +88,19 @@ class DatabaseManager:
                     # Column already exists, ignore
                     pass
 
+                # Add is_active column to usersettings for multi-location support
+                try:
+                    cursor.execute("ALTER TABLE usersettings ADD COLUMN is_active INTEGER DEFAULT 0")
+                    # Mark most recent record as active for migration
+                    cursor.execute("""
+                        UPDATE usersettings SET is_active = 1
+                        WHERE id = (SELECT id FROM usersettings ORDER BY id DESC LIMIT 1)
+                    """)
+                    logger.debug("Added is_active column to usersettings table")
+                except sqlite3.OperationalError:
+                    # Column already exists, ignore
+                    pass
+
                 # Create usertargetlist table for user's observing target list
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS usertargetlist (

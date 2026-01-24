@@ -29,7 +29,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
     QVBoxLayout, QWidget, QLabel, QDialog,
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
-    QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout, QSpinBox, QFileDialog, QSizePolicy
+    QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout, QSpinBox, QFileDialog, QSizePolicy,
+    QListWidget, QListWidgetItem
 )
 
 # Local imports (always needed)
@@ -1461,7 +1462,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings - Cosmos Collection")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setModal(True)
-        self.resize(500, 400)
+        self.resize(700, 450)
         
         self.db_manager = DatabaseManager()
         self._setup_ui()
@@ -1477,43 +1478,99 @@ class SettingsDialog(QDialog):
         
         # Location settings tab
         location_tab = QWidget()
-        location_layout = QVBoxLayout(location_tab)
-        
-        # Location group
-        location_group = QGroupBox("Observer Location")
-        location_group_layout = QVBoxLayout(location_group)
-        
+        location_layout = QHBoxLayout(location_tab)
+
+        # Track which location is being edited
+        self.editing_location_id = None
+
+        # --- Left Panel: Saved Locations List ---
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        saved_label = QLabel("Saved Locations:")
+        saved_label.setStyleSheet("font-weight: bold;")
+        left_layout.addWidget(saved_label)
+
+        self.location_list = QListWidget()
+        self.location_list.setMinimumWidth(220)
+        self.location_list.currentItemChanged.connect(self._on_location_selected)
+        left_layout.addWidget(self.location_list)
+
+        left_btn_layout = QHBoxLayout()
+        self.delete_location_btn = QPushButton("Delete")
+        self.delete_location_btn.setToolTip("Delete the selected location")
+        self.delete_location_btn.clicked.connect(self._delete_location)
+        self.set_active_btn = QPushButton("Set as Active")
+        self.set_active_btn.setToolTip("Set the selected location as the active observer location")
+        self.set_active_btn.clicked.connect(self._set_active_location)
+        left_btn_layout.addWidget(self.delete_location_btn)
+        left_btn_layout.addWidget(self.set_active_btn)
+        left_layout.addLayout(left_btn_layout)
+
+        location_layout.addWidget(left_panel)
+
+        # --- Right Panel: Location Details Form ---
+        right_panel = QGroupBox("Location Details")
+        right_layout = QVBoxLayout(right_panel)
+
         # Latitude input
         lat_layout = QHBoxLayout()
-        lat_label = QLabel("Latitude (degrees):")
-        lat_label.setMinimumWidth(120)
+        lat_label = QLabel("Latitude:")
+        lat_label.setMinimumWidth(100)
         self.latitude_input = QLineEdit()
-        self.latitude_input.setPlaceholderText("e.g., 40.7128 (positive for North, negative for South)")
+        self.latitude_input.setPlaceholderText("e.g., 40.7128")
         lat_layout.addWidget(lat_label)
         lat_layout.addWidget(self.latitude_input)
-        location_group_layout.addLayout(lat_layout)
-        
+        right_layout.addLayout(lat_layout)
+
         # Longitude input
         lon_layout = QHBoxLayout()
-        lon_label = QLabel("Longitude (degrees):")
-        lon_label.setMinimumWidth(120)
+        lon_label = QLabel("Longitude:")
+        lon_label.setMinimumWidth(100)
         self.longitude_input = QLineEdit()
-        self.longitude_input.setPlaceholderText("e.g., -74.0060 (positive for East, negative for West)")
+        self.longitude_input.setPlaceholderText("e.g., -74.0060")
         lon_layout.addWidget(lon_label)
         lon_layout.addWidget(self.longitude_input)
-        location_group_layout.addLayout(lon_layout)
-        
-        # Location name (optional)
+        right_layout.addLayout(lon_layout)
+
+        # Location name
         name_layout = QHBoxLayout()
-        name_label = QLabel("Location Name:")
-        name_label.setMinimumWidth(120)
+        name_label = QLabel("Name:")
+        name_label.setMinimumWidth(100)
         self.location_name_input = QLineEdit()
-        self.location_name_input.setPlaceholderText("e.g., New York City (optional)")
+        self.location_name_input.setPlaceholderText("e.g., Home Observatory (optional)")
         name_layout.addWidget(name_label)
         name_layout.addWidget(self.location_name_input)
-        location_group_layout.addLayout(name_layout)
+        right_layout.addLayout(name_layout)
 
-        # Add map selection button
+        # Timezone
+        tz_layout = QHBoxLayout()
+        tz_label = QLabel("Time Zone:")
+        tz_label.setMinimumWidth(100)
+        self.timezone_combo = QComboBox()
+        self.timezone_combo.setEditable(True)
+        common_timezones = [
+            "America/New_York",
+            "America/Chicago",
+            "America/Denver",
+            "America/Los_Angeles",
+            "America/Phoenix",
+            "America/Anchorage",
+            "Pacific/Honolulu",
+            "UTC",
+            "Europe/London",
+            "Europe/Paris",
+            "Europe/Berlin",
+            "Asia/Tokyo",
+            "Australia/Sydney"
+        ]
+        self.timezone_combo.addItems(common_timezones)
+        tz_layout.addWidget(tz_label)
+        tz_layout.addWidget(self.timezone_combo)
+        right_layout.addLayout(tz_layout)
+
+        # Map picker button
         map_button_layout = QHBoxLayout()
         map_button = QPushButton("Select Location from Map")
         map_button.setToolTip("Open an interactive map to visually select your location")
@@ -1521,29 +1578,21 @@ class SettingsDialog(QDialog):
         map_button_layout.addStretch()
         map_button_layout.addWidget(map_button)
         map_button_layout.addStretch()
-        location_group_layout.addLayout(map_button_layout)
+        right_layout.addLayout(map_button_layout)
 
-        location_layout.addWidget(location_group)
-        
-        # Help text
-        help_text = QLabel("""
-<b>Tips:</b>
-• Latitude: Positive values for Northern Hemisphere, negative for Southern
-• Longitude: Positive values for Eastern Hemisphere, negative for Western
-• Use "Select Location from Map" for easy coordinate selection
-• You can search locations by name or click directly on the map
-• Time zone affects visibility calculation displays and times
-        """)
-        help_text.setWordWrap(True)
-        help_text.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; }}")
-        location_layout.addWidget(help_text)
+        # Save / Clear buttons
+        form_btn_layout = QHBoxLayout()
+        self.save_location_btn = QPushButton("Save Location")
+        self.save_location_btn.clicked.connect(self._save_location)
+        self.clear_form_btn = QPushButton("Clear Form")
+        self.clear_form_btn.clicked.connect(self._clear_location_form)
+        form_btn_layout.addStretch()
+        form_btn_layout.addWidget(self.save_location_btn)
+        form_btn_layout.addWidget(self.clear_form_btn)
+        right_layout.addLayout(form_btn_layout)
 
-        # Test location button
-        self.test_button = QPushButton("Test Location")
-        self.test_button.clicked.connect(self._test_location)
-        location_layout.addWidget(self.test_button)
-
-        location_layout.addStretch()
+        right_layout.addStretch()
+        location_layout.addWidget(right_panel)
 
         # Application Settings tab
         app_settings_scroll = QScrollArea()
@@ -1586,33 +1635,6 @@ class SettingsDialog(QDialog):
         time_format_layout.addWidget(self.time_format_combo)
         time_format_layout.addStretch()
         ui_prefs_layout.addLayout(time_format_layout)
-
-        # Time zone setting
-        tz_layout = QHBoxLayout()
-        tz_label = QLabel("Time Zone:")
-        tz_label.setMinimumWidth(120)
-        self.timezone_combo = QComboBox()
-        self.timezone_combo.setEditable(True)
-        common_timezones = [
-            "America/New_York",
-            "America/Chicago",
-            "America/Denver",
-            "America/Los_Angeles",
-            "America/Phoenix",
-            "America/Anchorage",
-            "Pacific/Honolulu",
-            "UTC",
-            "Europe/London",
-            "Europe/Paris",
-            "Europe/Berlin",
-            "Asia/Tokyo",
-            "Australia/Sydney"
-        ]
-        self.timezone_combo.addItems(common_timezones)
-        tz_layout.addWidget(tz_label)
-        tz_layout.addWidget(self.timezone_combo)
-        tz_layout.addStretch()
-        ui_prefs_layout.addLayout(tz_layout)
 
         app_settings_layout.addWidget(ui_prefs_group)
 
@@ -1848,42 +1870,12 @@ class SettingsDialog(QDialog):
         self.setLayout(layout)
         
     def _load_current_settings(self):
-        """Load current settings from database"""
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
-                row = cursor.fetchone()
-                if row:
-                    lat, lon = row
-                    self.latitude_input.setText(str(lat))
-                    self.longitude_input.setText(str(lon))
-                
-                # Try to get location name if it exists (we'll need to add this column)
-                try:
-                    cursor.execute("PRAGMA table_info(usersettings)")
-                    columns = [column[1] for column in cursor.fetchall()]
-                    if 'location_name' in columns:
-                        cursor.execute("SELECT location_name FROM usersettings ORDER BY id DESC LIMIT 1")
-                        name_row = cursor.fetchone()
-                        if name_row and name_row[0]:
-                            self.location_name_input.setText(name_row[0])
-                    
-                    if 'timezone' in columns:
-                        cursor.execute("SELECT timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-                        tz_row = cursor.fetchone()
-                        if tz_row and tz_row[0]:
-                            # Set timezone in combo box
-                            index = self.timezone_combo.findText(tz_row[0])
-                            if index >= 0:
-                                self.timezone_combo.setCurrentIndex(index)
-                            else:
-                                self.timezone_combo.setEditText(tz_row[0])
-                except Exception:
-                    # Columns don't exist yet, that's ok
-                    pass
+        """Load current settings from database and QSettings"""
+        # Populate location list
+        self._refresh_location_list()
 
-            # Load UI preferences from QSettings
+        # Load UI preferences from QSettings
+        try:
             settings = QSettings("CosmosCollection", "CosmosCollection")
             show_observer_location = settings.value("show_observer_location", True, type=bool)
             self.show_observer_location_checkbox.setChecked(show_observer_location)
@@ -1933,121 +1925,206 @@ class SettingsDialog(QDialog):
         except Exception as e:
             logger.error(f"Error loading settings: {str(e)}")
             
-    def _test_location(self):
-        """Test if the entered coordinates are valid"""
+    def _refresh_location_list(self):
+        """Refresh the location list widget from database"""
+        self.location_list.clear()
+        active_item = None
         try:
-            lat_text = self.latitude_input.text().strip()
-            lon_text = self.longitude_input.text().strip()
-            
-            if not lat_text or not lon_text:
-                QMessageBox.warning(self, "Invalid Input", "Please enter both latitude and longitude.")
-                return
-                
-            lat = float(lat_text)
-            lon = float(lon_text)
-            
-            # Validate ranges
-            if not (-90 <= lat <= 90):
-                QMessageBox.warning(self, "Invalid Latitude", "Latitude must be between -90 and 90 degrees.")
-                return
-                
-            if not (-180 <= lon <= 180):
-                QMessageBox.warning(self, "Invalid Longitude", "Longitude must be between -180 and 180 degrees.")
-                return
-            
-            # Format coordinates nicely for display
-            lat_str = f"{abs(lat):.4f}°{'N' if lat >= 0 else 'S'}"
-            lon_str = f"{abs(lon):.4f}°{'W' if lon < 0 else 'E'}"
-            
-            QMessageBox.information(self, "Location Test", 
-                f"Location coordinates are valid!\n\n"
-                f"Latitude: {lat_str}\n"
-                f"Longitude: {lon_str}\n\n"
-                f"These coordinates will be used for visibility calculations.")
-                
-        except ValueError:
-            QMessageBox.warning(self, "Invalid Input", 
-                "Please enter valid numeric values for latitude and longitude.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Error testing location: {str(e)}")
-            
-    def _save_settings(self):
-        """Save settings to database"""
-        try:
-            lat_text = self.latitude_input.text().strip()
-            lon_text = self.longitude_input.text().strip()
-            
-            if not lat_text or not lon_text:
-                QMessageBox.warning(self, "Missing Information", 
-                    "Please enter both latitude and longitude before saving.")
-                return
-                
-            lat = float(lat_text)
-            lon = float(lon_text)
-            
-            # Validate ranges
-            if not (-90 <= lat <= 90):
-                QMessageBox.warning(self, "Invalid Latitude", 
-                    "Latitude must be between -90 and 90 degrees.")
-                return
-                
-            if not (-180 <= lon <= 180):
-                QMessageBox.warning(self, "Invalid Longitude", 
-                    "Longitude must be between -180 and 180 degrees.")
-                return
-            
-            # Get additional settings
-            location_name = self.location_name_input.text().strip() or None
-            timezone = self.timezone_combo.currentText().strip() or "America/New_York"
-            
-            # Validate timezone
-            try:
-                import pytz
-                pytz.timezone(timezone)  # This will raise an exception if invalid
-            except Exception:
-                QMessageBox.warning(self, "Invalid Timezone", 
-                    f"'{timezone}' is not a valid timezone identifier.")
-                return
-            
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                
-                # First, ensure the new columns exist
-                try:
-                    cursor.execute("ALTER TABLE usersettings ADD COLUMN location_name TEXT")
-                except Exception:
-                    pass  # Column already exists
-                    
-                try:
-                    cursor.execute("ALTER TABLE usersettings ADD COLUMN timezone TEXT")
-                except Exception:
-                    pass  # Column already exists
-                
-                # Insert new settings
-                cursor.execute("""
-                    INSERT INTO usersettings (location_lat, location_lon, location_name, timezone)
-                    VALUES (?, ?, ?, ?)
-                """, (lat, lon, location_name, timezone))
+                cursor.execute("SELECT id, location_lat, location_lon, location_name, timezone, is_active FROM usersettings ORDER BY id")
+                rows = cursor.fetchall()
+                for row in rows:
+                    loc_id, lat, lon, name, tz, is_active = row
+                    if name:
+                        display = name
+                    else:
+                        display = f"{lat:.4f}, {lon:.4f}"
+                    if is_active:
+                        display = "(Active) " + display
+                    if tz:
+                        display += f" [{tz}]"
+                    item = QListWidgetItem(display)
+                    item.setData(Qt.UserRole, loc_id)
+                    if is_active:
+                        item.setBackground(QColor(COLORS.get('accent', '#0078d7')).darker(300))
+                        active_item = item
+                    self.location_list.addItem(item)
+            if active_item:
+                self.location_list.setCurrentItem(active_item)
+        except Exception as e:
+            logger.error(f"Error loading location list: {str(e)}")
+
+    def _on_location_selected(self, current, previous):
+        """Handle location list selection - populate form for editing"""
+        if not current:
+            return
+        loc_id = current.data(Qt.UserRole)
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT location_lat, location_lon, location_name, timezone, is_active FROM usersettings WHERE id = ?", (loc_id,))
+                row = cursor.fetchone()
+                if row:
+                    lat, lon, name, tz, is_active = row
+                    self.set_active_btn.setEnabled(not is_active)
+                    self.latitude_input.setText(str(lat) if lat is not None else "")
+                    self.longitude_input.setText(str(lon) if lon is not None else "")
+                    self.location_name_input.setText(name if name else "")
+                    if tz:
+                        index = self.timezone_combo.findText(tz)
+                        if index >= 0:
+                            self.timezone_combo.setCurrentIndex(index)
+                        else:
+                            self.timezone_combo.setEditText(tz)
+                    else:
+                        self.timezone_combo.setCurrentIndex(0)
+                    self.editing_location_id = loc_id
+                    self.save_location_btn.setText("Update Location")
+        except Exception as e:
+            logger.error(f"Error loading location details: {str(e)}")
+
+    def _clear_location_form(self):
+        """Clear the location form and reset to add mode"""
+        self.latitude_input.clear()
+        self.longitude_input.clear()
+        self.location_name_input.clear()
+        self.timezone_combo.setCurrentIndex(0)
+        self.editing_location_id = None
+        self.save_location_btn.setText("Save Location")
+        self.location_list.clearSelection()
+
+    def _save_location(self):
+        """Save or update a location in the database"""
+        try:
+            lat_text = self.latitude_input.text().strip()
+            lon_text = self.longitude_input.text().strip()
+
+            if not lat_text or not lon_text:
+                QMessageBox.warning(self, "Missing Information",
+                    "Please enter both latitude and longitude.")
+                return
+
+            lat = float(lat_text)
+            lon = float(lon_text)
+
+            if not (-90 <= lat <= 90):
+                QMessageBox.warning(self, "Invalid Latitude",
+                    "Latitude must be between -90 and 90 degrees.")
+                return
+
+            if not (-180 <= lon <= 180):
+                QMessageBox.warning(self, "Invalid Longitude",
+                    "Longitude must be between -180 and 180 degrees.")
+                return
+
+            location_name = self.location_name_input.text().strip() or None
+            timezone = self.timezone_combo.currentText().strip() or "America/New_York"
+
+            try:
+                import pytz
+                pytz.timezone(timezone)
+            except Exception:
+                QMessageBox.warning(self, "Invalid Timezone",
+                    f"'{timezone}' is not a valid timezone identifier.")
+                return
+
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                if self.editing_location_id:
+                    # Update existing location
+                    cursor.execute("""
+                        UPDATE usersettings SET location_lat = ?, location_lon = ?, location_name = ?, timezone = ?
+                        WHERE id = ?
+                    """, (lat, lon, location_name, timezone, self.editing_location_id))
+                else:
+                    # Insert new location
+                    cursor.execute("""
+                        INSERT INTO usersettings (location_lat, location_lon, location_name, timezone, is_active)
+                        VALUES (?, ?, ?, ?, 0)
+                    """, (lat, lon, location_name, timezone))
+
+                    # If it's the only location, auto-set as active
+                    cursor.execute("SELECT COUNT(*) FROM usersettings")
+                    count = cursor.fetchone()[0]
+                    if count == 1:
+                        cursor.execute("UPDATE usersettings SET is_active = 1 WHERE id = (SELECT id FROM usersettings LIMIT 1)")
+
                 conn.commit()
 
-                logger.debug(f"Settings saved to database: lat={lat}, lon={lon}, name={location_name}, timezone={timezone}")
+            self._clear_location_form()
+            self._refresh_location_list()
+            logger.debug(f"Location saved: lat={lat}, lon={lon}, name={location_name}, tz={timezone}")
 
-                # Read back the saved settings to verify they were saved correctly
-                cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-                verify_row = cursor.fetchone()
-                if verify_row:
-                    saved_lat, saved_lon, saved_name, saved_tz = verify_row
-                    logger.debug(f"Verification - Read back from database: lat={saved_lat}, lon={saved_lon}, name={saved_name}, timezone={saved_tz}")
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input",
+                "Please enter valid numeric values for latitude and longitude.")
+        except Exception as e:
+            logger.error(f"Error saving location: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to save location: {str(e)}")
 
-                    # Check if saved values match what we tried to save
-                    if saved_lat == lat and saved_lon == lon:
-                        logger.debug("✓ Verification SUCCESS: Saved coordinates match!")
-                    else:
-                        logger.error(f"✗ Verification FAILED: Coordinates don't match! Expected lat={lat}, lon={lon} but got lat={saved_lat}, lon={saved_lon}")
-                else:
-                    logger.error("✗ Verification FAILED: Could not read back saved settings from database!")
+    def _delete_location(self):
+        """Delete the selected location"""
+        current = self.location_list.currentItem()
+        if not current:
+            QMessageBox.warning(self, "No Selection", "Please select a location to delete.")
+            return
 
-            # Save UI preferences to QSettings
+        loc_id = current.data(Qt.UserRole)
+        reply = QMessageBox.question(self, "Confirm Delete",
+            "Are you sure you want to delete this location?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                # Check if we're deleting the active location
+                cursor.execute("SELECT is_active FROM usersettings WHERE id = ?", (loc_id,))
+                was_active = cursor.fetchone()[0]
+
+                cursor.execute("DELETE FROM usersettings WHERE id = ?", (loc_id,))
+
+                if was_active:
+                    # Set the most recent remaining location as active
+                    cursor.execute("""
+                        UPDATE usersettings SET is_active = 1
+                        WHERE id = (SELECT id FROM usersettings ORDER BY id DESC LIMIT 1)
+                    """)
+
+                conn.commit()
+
+            self._clear_location_form()
+            self._refresh_location_list()
+        except Exception as e:
+            logger.error(f"Error deleting location: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to delete location: {str(e)}")
+
+    def _set_active_location(self):
+        """Set the selected location as the active one"""
+        current = self.location_list.currentItem()
+        if not current:
+            QMessageBox.warning(self, "No Selection", "Please select a location to set as active.")
+            return
+
+        loc_id = current.data(Qt.UserRole)
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE usersettings SET is_active = 0 WHERE is_active = 1")
+                cursor.execute("UPDATE usersettings SET is_active = 1 WHERE id = ?", (loc_id,))
+                conn.commit()
+
+            self._refresh_location_list()
+        except Exception as e:
+            logger.error(f"Error setting active location: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to set active location: {str(e)}")
+
+    def _save_settings(self):
+        """Save application settings (QSettings only - locations are saved separately)"""
+        try:
             settings = QSettings("CosmosCollection", "CosmosCollection")
             settings.setValue("show_observer_location", self.show_observer_location_checkbox.isChecked())
             settings.setValue("check_updates_on_startup", self.check_updates_checkbox.isChecked())
@@ -2065,10 +2142,7 @@ class SettingsDialog(QDialog):
             settings.setValue("astrometry_api_key", self.astrometry_api_key_input.text().strip())
 
             self.accept()
-            
-        except ValueError:
-            QMessageBox.warning(self, "Invalid Input", 
-                "Please enter valid numeric values for latitude and longitude.")
+
         except Exception as e:
             logger.error(f"Error saving settings: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to save settings: {str(e)}")
@@ -3827,8 +3901,11 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         try:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
+                cursor.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 LIMIT 1")
                 row = cursor.fetchone()
+                if not row:
+                    cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
+                    row = cursor.fetchone()
 
                 if not row or row[0] is None or row[1] is None:
                     # Location not configured, show dialog

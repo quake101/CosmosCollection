@@ -96,8 +96,11 @@ class DSOVisibilityCalculator:
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
+                cursor.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 LIMIT 1")
                 row = cursor.fetchone()
+                if not row:
+                    cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
+                    row = cursor.fetchone()
                 if row and row[0] is not None and row[1] is not None:
                     self.set_location(row[0], row[1])
         except Exception:
@@ -109,8 +112,11 @@ class DSOVisibilityCalculator:
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                cursor.execute("SELECT timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
                 row = cursor.fetchone()
+                if not row:
+                    cursor.execute("SELECT timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                    row = cursor.fetchone()
                 if row and row[0]:
                     self.set_timezone(row[0])
         except Exception:
@@ -1439,37 +1445,17 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                # Try to get location_name and timezone, but fall back if columns don't exist
-                try:
+                cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
+                row = cursor.fetchone()
+                if not row:
                     cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
                     row = cursor.fetchone()
-                    if row:
-                        lat, lon, location_name, timezone = row
-                        self.user_timezone = timezone  # Store for later use
-                    else:
-                        lat, lon, location_name, timezone = None, None, None, None
-                        self.user_timezone = None
-                except Exception:
-                    # Fallback to old query if new columns don't exist
-                    try:
-                        cursor.execute("SELECT location_lat, location_lon, location_name FROM usersettings ORDER BY id DESC LIMIT 1")
-                        row = cursor.fetchone()
-                        if row:
-                            lat, lon, location_name = row
-                            self.user_timezone = None
-                        else:
-                            lat, lon, location_name = None, None, None
-                            self.user_timezone = None
-                    except Exception:
-                        # Fallback to basic query
-                        cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
-                        row = cursor.fetchone()
-                        if row:
-                            lat, lon, location_name = row[0], row[1], None
-                            self.user_timezone = None
-                        else:
-                            lat, lon, location_name = None, None, None
-                            self.user_timezone = None
+                if row:
+                    lat, lon, location_name, timezone = row
+                    self.user_timezone = timezone
+                else:
+                    lat, lon, location_name, timezone = None, None, None, None
+                    self.user_timezone = None
 
                 if lat is not None and lon is not None:
                     # Format coordinates nicely

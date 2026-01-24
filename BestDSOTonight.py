@@ -89,8 +89,11 @@ class DSOCalculationThread(QThread):
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
+                cursor.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 LIMIT 1")
                 row = cursor.fetchone()
+                if not row:
+                    cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
+                    row = cursor.fetchone()
                 if row:
                     lat, lon = row
                     if lat is not None and lon is not None:
@@ -108,8 +111,11 @@ class DSOCalculationThread(QThread):
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                cursor.execute("SELECT timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
                 row = cursor.fetchone()
+                if not row:
+                    cursor.execute("SELECT timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                    row = cursor.fetchone()
                 if row and row[0]:
                     return pytz.timezone(row[0])
         except Exception:
@@ -790,9 +796,12 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
                 row = cursor.fetchone()
-                
+                if not row:
+                    cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                    row = cursor.fetchone()
+
                 if row:
                     lat, lon, location_name, timezone = row
                     if lat is not None and lon is not None:
@@ -833,8 +842,11 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
                 location_row = cursor.fetchone()
+                if not location_row:
+                    cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                    location_row = cursor.fetchone()
 
                 if not location_row or None in location_row:
                     # No location configured, use default

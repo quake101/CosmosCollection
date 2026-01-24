@@ -1143,9 +1143,15 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT location_lat, location_lon, location_name, timezone "
-                    "FROM usersettings ORDER BY id DESC LIMIT 1"
+                    "FROM usersettings WHERE is_active = 1 LIMIT 1"
                 )
                 row = cursor.fetchone()
+                if not row:
+                    cursor.execute(
+                        "SELECT location_lat, location_lon, location_name, timezone "
+                        "FROM usersettings ORDER BY id DESC LIMIT 1"
+                    )
+                    row = cursor.fetchone()
 
                 if row:
                     self.lat, self.lon, location_name, timezone = row
