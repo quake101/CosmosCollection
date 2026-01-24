@@ -1784,6 +1784,7 @@ class SettingsDialog(QDialog):
             "• Application settings (location, timezone)"
         )
         backup_description.setWordWrap(True)
+        backup_description.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         backup_group_layout.addWidget(backup_description)
 
         backup_btn_layout = QHBoxLayout()
@@ -1806,6 +1807,7 @@ class SettingsDialog(QDialog):
             "It is recommended to create a backup of your current data first."
         )
         restore_description.setWordWrap(True)
+        restore_description.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         restore_group_layout.addWidget(restore_description)
 
         restore_btn_layout = QHBoxLayout()
