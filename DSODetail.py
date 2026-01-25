@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager
 from Theme import COLORS
+from NINAIntegration import NINAIntegration
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -642,8 +643,8 @@ class DSODetailWindow(QDialog):
 
             # Add Aladin Lite button
             aladin_button = QToolButton()
-            aladin_button.setText("Aladin Lite\\FOV Simulator")
-            aladin_button.setToolTip("Open Aladin Lite interactive sky atlas with telescope field of view simulator")
+            aladin_button.setText("FOV Simulator")
+            aladin_button.setToolTip("Open interactive sky atlas with telescope field of view simulator")
             aladin_button.clicked.connect(lambda: self._open_aladin_lite(self.data))
             menubar.addWidget(aladin_button)
 
@@ -684,6 +685,14 @@ class DSODetailWindow(QDialog):
             target_button.setMenu(target_menu)
             target_button.setPopupMode(QToolButton.InstantPopup)
             menubar.addWidget(target_button)
+
+            # Add NINA button if integration is enabled
+            if NINAIntegration.is_enabled():
+                nina_button = QToolButton()
+                nina_button.setText("Send to NINA")
+                nina_button.setToolTip("Send coordinates to NINA Framing Assistant")
+                nina_button.clicked.connect(self._send_to_nina)
+                menubar.addWidget(nina_button)
 
             # Create main vertical layout to hold menubar and content
             window_layout = QVBoxLayout()
@@ -2194,6 +2203,13 @@ class DSODetailWindow(QDialog):
         except Exception as e:
             logger.error(f"Error adding to target list: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to add to target list: {str(e)}")
+
+    def _send_to_nina(self):
+        """Send DSO coordinates to NINA Framing Assistant"""
+        NINAIntegration.send_to_framing_assistant(
+            self.data.get('ra_deg'), self.data.get('dec_deg'),
+            self.data.get('name', 'Unknown'), self
+        )
 
     def _extract_month_ranges_from_visibility(self, visibility_text):
         """Extract only month ranges from visibility text"""

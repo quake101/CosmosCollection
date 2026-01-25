@@ -27,6 +27,7 @@ from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS
 from TimeFormatHelper import format_time
+from NINAIntegration import NINAIntegration
 
 class NumericTableWidgetItem(QTableWidgetItem):
     """Custom QTableWidgetItem that sorts by numeric value stored in UserRole"""
@@ -1276,8 +1277,13 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         visibility_action = context_menu.addAction("Visibility Calculator")
         visibility_action.triggered.connect(lambda: self._context_open_visibility(row))
 
-        aladin_action = context_menu.addAction("Aladin Lite\\FOV Simulator")
+        aladin_action = context_menu.addAction("FOV Simulator")
         aladin_action.triggered.connect(lambda: self._context_open_aladin(row))
+
+        if NINAIntegration.is_enabled():
+            context_menu.addSeparator()
+            nina_action = context_menu.addAction("Send to NINA Framing Assistant")
+            nina_action.triggered.connect(lambda: self._context_send_to_nina(row))
 
         context_menu.addSeparator()
 
@@ -1418,6 +1424,30 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                     QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open Aladin Lite: {str(e)}")
+
+    def _context_send_to_nina(self, row):
+        """Send DSO coordinates to NINA Framing Assistant"""
+        name_item = self.results_table.item(row, 0)
+        if not name_item:
+            return
+
+        dso_data = name_item.data(Qt.UserRole)
+        if not dso_data:
+            QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
+            return
+
+        # Get coordinates from SkyCoord object or fallback to dso_info
+        coordinates = dso_data.get("coordinates")
+        if coordinates:
+            ra_deg = coordinates.ra.degree
+            dec_deg = coordinates.dec.degree
+        else:
+            dso_info = dso_data.get("dso_info", {})
+            ra_deg = dso_info.get("ra_deg")
+            dec_deg = dso_info.get("dec_deg")
+
+        target_name = dso_data.get("dso_info", {}).get("name", "Unknown")
+        NINAIntegration.send_to_framing_assistant(ra_deg, dec_deg, target_name, self)
 
     def _context_add_to_target_list(self, row):
         """Add DSO to target list from context menu"""

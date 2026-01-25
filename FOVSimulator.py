@@ -23,7 +23,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
     WINDOW_POSITION_KEY = "AladinLite"
     def __init__(self, data: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"{data['name']} - Aladin Lite - Cosmos Collection")
+        self.setWindowTitle(f"{data['name']} - FOV Simulator - Cosmos Collection")
         self.resize(1200, 800)
         self.setup_window_position()
 

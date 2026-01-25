@@ -20,6 +20,7 @@ from DatabaseManager import DatabaseManager
 from BestDSOTonight import BestDSOTonightWindow
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS
+from NINAIntegration import NINAIntegration
 import logging
 
 # Set up logging
@@ -1348,8 +1349,12 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         visibility_action = context_menu.addAction("Visibility Calculator")
         visibility_action.triggered.connect(lambda: self._context_open_visibility(row))
 
-        aladin_action = context_menu.addAction("Aladin Lite\\FOV Simulator")
+        aladin_action = context_menu.addAction("FOV Simulator")
         aladin_action.triggered.connect(lambda: self._context_open_aladin(row))
+
+        if NINAIntegration.is_enabled():
+            nina_action = context_menu.addAction("Send to NINA Framing Assistant")
+            nina_action.triggered.connect(lambda: self._context_send_to_nina(row))
 
         context_menu.addSeparator()
 
@@ -1448,6 +1453,18 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         except Exception as e:
             logger.error(f"Error opening Aladin Lite: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to open Aladin Lite: {str(e)}")
+
+    def _context_send_to_nina(self, row):
+        """Send target coordinates to NINA Framing Assistant"""
+        name_item = self.targets_table.item(row, 0)
+        if not name_item:
+            return
+
+        target_data = name_item.data(Qt.UserRole)
+        NINAIntegration.send_to_framing_assistant(
+            target_data.get("ra_deg"), target_data.get("dec_deg"),
+            target_data.get("name", "Unknown"), self
+        )
 
     def _context_edit_target(self, row):
         """Edit target from context menu"""

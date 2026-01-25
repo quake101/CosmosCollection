@@ -2,6 +2,9 @@ import argparse
 import logging
 import os
 import sys
+import urllib.request
+import urllib.error
+import json
 from typing import Optional, Dict
 
 # Configure SSL certificates BEFORE any network imports (CRITICAL for PyInstaller)
@@ -42,6 +45,7 @@ from Theme import apply_theme, COLORS
 from ImageViewer import ImageViewerWindow
 from DSODetail import DSODetailWindow
 from FOVSimulator import AladinLiteWindow
+from NINAIntegration import NINAIntegration
 
 # Import astroquery at module level so PyInstaller detects it
 try:
@@ -1787,6 +1791,70 @@ class SettingsDialog(QDialog):
         plate_solve_layout.addWidget(api_key_help)
 
         app_settings_layout.addWidget(plate_solve_group)
+
+        # NINA Integration group
+        nina_group = QGroupBox("NINA Integration")
+        nina_layout = QVBoxLayout(nina_group)
+
+        # Enable checkbox
+        self.nina_enabled_checkbox = QCheckBox("Enable NINA Integration")
+        self.nina_enabled_checkbox.setToolTip(
+            "When enabled, 'Send to NINA Framing Assistant' options will appear\n"
+            "in context menus throughout the application."
+        )
+        nina_layout.addWidget(self.nina_enabled_checkbox)
+
+        nina_ip_layout = QHBoxLayout()
+        nina_ip_label = QLabel("API Host:")
+        nina_ip_label.setMinimumWidth(120)
+        self.nina_ip_input = QLineEdit()
+        self.nina_ip_input.setText("localhost")
+        self.nina_ip_input.setPlaceholderText("localhost or IP address")
+        self.nina_ip_input.setToolTip(
+            "IP address or hostname of the machine running NINA.\n"
+            "Use 'localhost' if NINA is running on this machine."
+        )
+        nina_ip_layout.addWidget(nina_ip_label)
+        nina_ip_layout.addWidget(self.nina_ip_input)
+        nina_layout.addLayout(nina_ip_layout)
+
+        nina_port_layout = QHBoxLayout()
+        nina_port_label = QLabel("API Port:")
+        nina_port_label.setMinimumWidth(120)
+        self.nina_port_spinbox = QSpinBox()
+        self.nina_port_spinbox.setMinimum(1)
+        self.nina_port_spinbox.setMaximum(65535)
+        self.nina_port_spinbox.setValue(1888)
+        self.nina_port_spinbox.setToolTip(
+            "Port number for NINA's Advanced API.\n"
+            "Default: 1888"
+        )
+        nina_port_layout.addWidget(nina_port_label)
+        nina_port_layout.addWidget(self.nina_port_spinbox)
+        nina_port_layout.addStretch()
+        nina_layout.addLayout(nina_port_layout)
+
+        # Test connection button
+        nina_test_layout = QHBoxLayout()
+        nina_test_spacer = QLabel("")
+        nina_test_spacer.setMinimumWidth(120)
+        self.nina_test_btn = QPushButton("Test Connection")
+        self.nina_test_btn.setToolTip("Test the connection to NINA's Advanced API")
+        self.nina_test_btn.clicked.connect(self._test_nina_connection)
+        nina_test_layout.addWidget(nina_test_spacer)
+        nina_test_layout.addWidget(self.nina_test_btn)
+        nina_test_layout.addStretch()
+        nina_layout.addLayout(nina_test_layout)
+
+        nina_help = QLabel(
+            "Configure the port used by NINA's Advanced API plugin.<br>"
+            "Requires the <b>Advanced API</b> plugin to be installed and enabled in NINA."
+        )
+        nina_help.setWordWrap(True)
+        nina_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; }}")
+        nina_layout.addWidget(nina_help)
+
+        app_settings_layout.addWidget(nina_group)
         app_settings_layout.addStretch()
 
         # Backup/Restore tab
@@ -1921,6 +1989,14 @@ class SettingsDialog(QDialog):
 
             astrometry_api_key = settings.value("astrometry_api_key", "", type=str)
             self.astrometry_api_key_input.setText(astrometry_api_key)
+
+            # Load NINA settings
+            nina_enabled = settings.value("nina_integration_enabled", False, type=bool)
+            self.nina_enabled_checkbox.setChecked(nina_enabled)
+            nina_ip = settings.value("nina_api_host", "localhost", type=str)
+            self.nina_ip_input.setText(nina_ip)
+            nina_port = settings.value("nina_api_port", 1888, type=int)
+            self.nina_port_spinbox.setValue(nina_port)
 
         except Exception as e:
             logger.error(f"Error loading settings: {str(e)}")
@@ -2141,6 +2217,11 @@ class SettingsDialog(QDialog):
             settings.setValue("astap_path", self.astap_path_input.text().strip())
             settings.setValue("astrometry_api_key", self.astrometry_api_key_input.text().strip())
 
+            # Save NINA settings
+            settings.setValue("nina_integration_enabled", self.nina_enabled_checkbox.isChecked())
+            settings.setValue("nina_api_host", self.nina_ip_input.text().strip() or "localhost")
+            settings.setValue("nina_api_port", self.nina_port_spinbox.value())
+
             self.accept()
 
         except Exception as e:
@@ -2208,6 +2289,27 @@ class SettingsDialog(QDialog):
         )
         if file_path:
             self.astap_path_input.setText(file_path)
+
+    def _test_nina_connection(self):
+        """Test the connection to NINA's Advanced API"""
+        nina_host = self.nina_ip_input.text().strip() or "localhost"
+        nina_port = self.nina_port_spinbox.value()
+
+        try:
+            self.nina_test_btn.setEnabled(False)
+            self.nina_test_btn.setText("Testing...")
+            QApplication.processEvents()
+
+            success, message, version = NINAIntegration.test_connection(nina_host, nina_port)
+
+            if success:
+                QMessageBox.information(self, "Connection Successful", message)
+            else:
+                QMessageBox.warning(self, "Connection Failed", message)
+
+        finally:
+            self.nina_test_btn.setEnabled(True)
+            self.nina_test_btn.setText("Test Connection")
 
     def _perform_backup(self):
         """Perform a backup of all user data to a JSON file"""
@@ -3184,7 +3286,7 @@ class TelescopeDialog(QDialog):
         # Bottom buttons
         bottom_layout = QHBoxLayout()
         
-        help_text = QLabel("Tip: Enable telescopes to make them available in the Aladin Lite FOV Simulator. Multiple telescopes can be enabled.")
+        help_text = QLabel("Tip: Enable telescopes to make them available in the FOV Simulator. Multiple telescopes can be enabled.")
         help_text.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
         bottom_layout.addWidget(help_text)
         
@@ -3879,8 +3981,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         toolbar.addAction(visibility_action)
 
         # Aladin Lite action
-        aladin_lite_action = QAction("Aladin Lite\\FOV Simulator", self)
-        aladin_lite_action.setToolTip("Open Aladin Lite sky viewer")
+        aladin_lite_action = QAction("FOV Simulator", self)
+        aladin_lite_action.setToolTip("Open interactive sky atlas with telescope field of view simulator")
         aladin_lite_action.triggered.connect(self._show_aladin_lite_from_toolbar)
         toolbar.addAction(aladin_lite_action)
 
@@ -4908,8 +5010,13 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         visibility_action = context_menu.addAction("Visibility Calculator")
         visibility_action.triggered.connect(lambda: self._context_open_visibility(row))
 
-        aladin_action = context_menu.addAction("Aladin Lite\\FOV Simulator")
+        aladin_action = context_menu.addAction("FOV Simulator")
         aladin_action.triggered.connect(lambda: self._context_open_aladin(row))
+
+        if NINAIntegration.is_enabled():
+            context_menu.addSeparator()
+            nina_action = context_menu.addAction("Send to NINA Framing Assistant")
+            nina_action.triggered.connect(lambda: self._context_send_to_nina(row))
 
         context_menu.addSeparator()
 
@@ -5038,6 +5145,14 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         except Exception as e:
             logger.error(f"Error adding to target list: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to add to target list: {str(e)}")
+
+    def _context_send_to_nina(self, row):
+        """Send DSO coordinates to NINA Framing Assistant"""
+        entry = self.model.filtered_data[row]
+        NINAIntegration.send_to_framing_assistant(
+            entry.get("ra_deg"), entry.get("dec_deg"),
+            entry.get("name", "Unknown"), self
+        )
 
     def _format_ra(self, ra_deg):
         """Convert RA in degrees to hms format"""
