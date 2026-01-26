@@ -35,12 +35,13 @@ from PySide6.QtWidgets import (
     QFrame, QGridLayout, QDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QApplication, QSplitter, QCheckBox, QComboBox
 )
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import QColor
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS
 from TimeFormatHelper import format_time, format_datetime, get_time_format_24h
+from UrlOpener import open_url
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -1113,19 +1114,19 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         """Open Clear Outside forecast in browser"""
         if self.lat is not None and self.lon is not None:
             url = f"https://clearoutside.com/forecast/{self.lat}/{self.lon}"
-            QDesktopServices.openUrl(QUrl(url))
+            open_url(url)
 
     def _open_astrospheric(self):
         """Open Astrospheric forecast in browser"""
         if self.lat is not None and self.lon is not None:
             url = f"https://www.astrospheric.com/?Latitude={self.lat}&Longitude={self.lon}"
-            QDesktopServices.openUrl(QUrl(url))
+            open_url(url)
 
     def _open_noaa(self):
         """Open NOAA 7-day forecast in browser"""
         if self.lat is not None and self.lon is not None:
             url = f"https://forecast.weather.gov/MapClick.php?lat={self.lat}&lon={self.lon}"
-            QDesktopServices.openUrl(QUrl(url))
+            open_url(url)
 
     def _load_location(self):
         """Load location from database"""

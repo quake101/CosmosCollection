@@ -10,11 +10,10 @@ from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout,
     QComboBox, QCheckBox, QPushButton, QMessageBox
 )
-from PySide6.QtGui import QDesktopServices
-
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS
+from UrlOpener import open_url
 
 logger = logging.getLogger(__name__)
 
@@ -350,7 +349,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             browser_url = f"{base_url}{'&'.join(url_params)}"
 
             logger.debug(f"Opening Aladin Lite in browser: {browser_url}")
-            QDesktopServices.openUrl(QUrl(browser_url))
+            open_url(browser_url)
 
             # Show a message to the user
             QMessageBox.information(self, "Opened in Browser",

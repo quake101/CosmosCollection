@@ -10,7 +10,7 @@ import sys
 from typing import Optional, Dict
 
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, QThread, QUrl
-from PySide6.QtGui import QPixmap, QPainter, QAction, QDesktopServices
+from PySide6.QtGui import QPixmap, QPainter, QAction
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QLineEdit,
     QComboBox, QTextEdit, QGroupBox, QPushButton, QGridLayout,
@@ -21,6 +21,7 @@ from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager
 from Theme import COLORS
 from NINAIntegration import NINAIntegration
+from UrlOpener import open_url
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -1680,7 +1681,7 @@ class DSODetailWindow(QDialog):
             wiki_url = f"https://en.wikipedia.org/wiki/{wiki_name}"
 
             logger.debug(f"Opening Wikipedia page: {wiki_url}")
-            QDesktopServices.openUrl(QUrl(wiki_url))
+            open_url(wiki_url)
 
         except Exception as e:
             logger.error(f"Error opening Wikipedia: {str(e)}", exc_info=True)
