@@ -5,6 +5,8 @@ Provides cross-platform URL opening that avoids shell-related issues on Linux
 """
 
 import logging
+import os
+import shutil
 import subprocess
 import sys
 
@@ -18,8 +20,9 @@ def open_url(url):
     """
     Open a URL in the default browser.
 
-    On Linux, uses xdg-open directly to avoid shell-related issues
-    (e.g., readline symbol errors on Arch Linux).
+    On Linux, uses direct browser invocation or gio/xdg-open with a clean
+    environment to avoid shell-related issues (e.g., readline symbol errors
+    on Arch Linux).
     On other platforms, uses Qt's QDesktopServices.
 
     Args:
@@ -36,16 +39,7 @@ def open_url(url):
 
     try:
         if sys.platform.startswith('linux'):
-            # On Linux, use xdg-open directly to avoid shell/readline issues
-            # Using start_new_session=True to fully detach from parent process
-            subprocess.Popen(
-                ['xdg-open', url_str],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True
-            )
-            logger.debug(f"Opened URL via xdg-open: {url_str}")
-            return True
+            return _open_url_linux(url_str)
         else:
             # On Windows/macOS, Qt's QDesktopServices works fine
             qurl = QUrl(url_str) if not isinstance(url, QUrl) else url
@@ -58,10 +52,79 @@ def open_url(url):
 
     except Exception as e:
         logger.error(f"Error opening URL {url_str}: {e}")
-        # Fallback to QDesktopServices
+        return False
+
+
+def _open_url_linux(url_str):
+    """
+    Open URL on Linux with workarounds for shell/readline issues.
+
+    Tries multiple methods in order of preference:
+    1. gio open (modern GNOME/freedesktop method)
+    2. xdg-open with clean environment
+    3. Direct browser invocation
+    """
+    # Create a clean environment without variables that can cause library conflicts
+    clean_env = os.environ.copy()
+    # Remove variables that can cause readline/library symbol issues
+    for var in ['LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH']:
+        clean_env.pop(var, None)
+
+    # Method 1: Try gio open (GNOME/modern freedesktop)
+    if shutil.which('gio'):
         try:
-            qurl = QUrl(url_str) if not isinstance(url, QUrl) else url
-            return QDesktopServices.openUrl(qurl)
-        except Exception as fallback_e:
-            logger.error(f"Fallback URL open also failed: {fallback_e}")
-            return False
+            subprocess.Popen(
+                ['gio', 'open', url_str],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                env=clean_env,
+                shell=False
+            )
+            logger.debug(f"Opened URL via gio: {url_str}")
+            return True
+        except Exception as e:
+            logger.debug(f"gio open failed: {e}, trying xdg-open")
+
+    # Method 2: Try xdg-open with clean environment
+    if shutil.which('xdg-open'):
+        try:
+            subprocess.Popen(
+                ['xdg-open', url_str],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                env=clean_env,
+                shell=False
+            )
+            logger.debug(f"Opened URL via xdg-open: {url_str}")
+            return True
+        except Exception as e:
+            logger.debug(f"xdg-open failed: {e}, trying direct browser")
+
+    # Method 3: Try common browsers directly
+    browsers = ['firefox', 'chromium', 'google-chrome', 'brave', 'vivaldi', 'opera']
+    for browser in browsers:
+        if shutil.which(browser):
+            try:
+                subprocess.Popen(
+                    [browser, url_str],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    env=clean_env,
+                    shell=False
+                )
+                logger.debug(f"Opened URL via {browser}: {url_str}")
+                return True
+            except Exception as e:
+                logger.debug(f"{browser} failed: {e}")
+                continue
+
+    # Method 4: Last resort - QDesktopServices (may still have issues)
+    logger.warning("All Linux URL open methods failed, falling back to QDesktopServices")
+    try:
+        return QDesktopServices.openUrl(QUrl(url_str))
+    except Exception as e:
+        logger.error(f"QDesktopServices fallback also failed: {e}")
+        return False
