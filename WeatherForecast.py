@@ -12,12 +12,12 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
 import matplotlib
-matplotlib.use('Qt5Agg')
+matplotlib.use('QtAgg')
 
 # Suppress matplotlib font_manager debug messages
 logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
 
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
@@ -704,9 +704,10 @@ class HourlyAstroChart(FigureCanvas):
         if not self.sun_altitudes or len(self.sun_altitudes) != num_hours:
             return
 
-        # Define darkness thresholds and colors (from lightest to darkest)
+        # Define sun altitude thresholds and colors
         # Format: (sun_max, sun_min, color, alpha)
         darkness_levels = [
+            (90, 0, '#4a4a3a', 0.5),      # Daylight - warm tint
             (0, -6, '#2a3a4a', 0.6),      # Civil twilight - light blue-gray
             (-6, -12, '#1a2535', 0.7),    # Nautical twilight - medium blue
             (-12, -18, '#101520', 0.8),   # Astronomical twilight - dark blue
