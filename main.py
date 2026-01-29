@@ -3958,6 +3958,13 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         weather_action.triggered.connect(self._show_weather_forecast)
         toolbar.addAction(weather_action)
 
+        # NINA Dashboard action (only visible if NINA integration is enabled)
+        self.nina_dashboard_action = QAction("NINA Dashboard", self)
+        self.nina_dashboard_action.setToolTip("View real-time NINA status, imaging, and guiding")
+        self.nina_dashboard_action.triggered.connect(self._show_nina_dashboard)
+        toolbar.addAction(self.nina_dashboard_action)
+        self.nina_dashboard_action.setVisible(NINAIntegration.is_enabled())
+
         toolbar.addSeparator()
 
         # DSO Image Gallery action
@@ -3998,6 +4005,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Show the settings dialog"""
         settings_dialog = SettingsDialog(self)
         settings_dialog.exec()
+        # Update NINA Dashboard action visibility based on current settings
+        self.nina_dashboard_action.setVisible(NINAIntegration.is_enabled())
 
     def _check_location_on_startup(self):
         """Check if user has configured their location and prompt if not"""
@@ -4069,6 +4078,29 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             QMessageBox.warning(self, "Import Error", f"Could not load Weather Forecast: {e}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not open Weather Forecast: {e}")
+
+    def _show_nina_dashboard(self):
+        """Show the NINA Dashboard window"""
+        from NINAIntegration import NINAIntegration
+        if not NINAIntegration.is_enabled():
+            QMessageBox.information(
+                self, "NINA Integration",
+                "NINA integration is not enabled.\n\n"
+                "Please enable it in Settings > NINA Integration."
+            )
+            return
+
+        try:
+            from NINADashboard import NINADashboardWindow
+            if not hasattr(self, 'nina_dashboard_window') or not self.nina_dashboard_window.isVisible():
+                self.nina_dashboard_window = NINADashboardWindow()
+            self.nina_dashboard_window.show()
+            self.nina_dashboard_window.raise_()
+            self.nina_dashboard_window.activateWindow()
+        except ImportError as e:
+            QMessageBox.warning(self, "Import Error", f"Could not load NINA Dashboard: {e}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not open NINA Dashboard: {e}")
 
     def _show_best_dso_tonight(self):
         """Show the Best DSO Tonight window"""

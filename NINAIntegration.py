@@ -169,3 +169,277 @@ class NINAIntegration:
             if parent_widget:
                 QMessageBox.warning(parent_widget, "Error", f"Failed to send to NINA: {str(e)}")
             return False
+
+    # -------------------------------------------------------------------------
+    # Dashboard API Methods
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def get_camera_info(host, port):
+        """
+        Get camera equipment information from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            dict: Camera info dict on success, None on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/camera/info"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('Success'):
+                    resp = result.get('Response')
+                    return resp if isinstance(resp, dict) else None
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting camera info: {e}")
+            return None
+
+    @staticmethod
+    def get_mount_info(host, port):
+        """
+        Get mount equipment information from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            dict: Mount info dict on success, None on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/mount/info"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('Success'):
+                    resp = result.get('Response')
+                    return resp if isinstance(resp, dict) else None
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting mount info: {e}")
+            return None
+
+    @staticmethod
+    def get_guider_info(host, port):
+        """
+        Get guider equipment information from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            dict: Guider info dict on success, None on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/guider/info"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('Success'):
+                    resp = result.get('Response')
+                    return resp if isinstance(resp, dict) else None
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting guider info: {e}")
+            return None
+
+    @staticmethod
+    def get_image_count(host, port):
+        """
+        Get the count of images by probing for the highest valid index.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            int: Number of images (highest index + 1), or 0 if no images
+        """
+        # The /v2/api/image/count endpoint is unreliable (returns 500)
+        # Instead, probe for images by trying indices until we get a 404
+        # Use binary search for efficiency
+
+        # First check if there are any images at all
+        if not NINAIntegration._image_exists(host, port, 0):
+            return 0
+
+        # Binary search to find the highest valid index
+        low, high = 0, 1
+
+        # First, find an upper bound by doubling
+        while NINAIntegration._image_exists(host, port, high):
+            low = high
+            high *= 2
+            if high > 1000:  # Safety limit
+                break
+
+        # Binary search between low and high
+        while low < high - 1:
+            mid = (low + high) // 2
+            if NINAIntegration._image_exists(host, port, mid):
+                low = mid
+            else:
+                high = mid
+
+        # low is now the highest valid index
+        count = low + 1
+        logger.debug(f"Probed image count: {count} (highest index: {low})")
+        return count
+
+    @staticmethod
+    def _image_exists(host, port, index):
+        """Check if an image exists at the given index."""
+        url = f"http://{host}:{port}/v2/api/image/thumbnail/{index}?size=50&stream=true"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=3) as response:
+                content_type = response.headers.get('Content-Type', '')
+                # Read a small amount to verify it's an image
+                data = response.read(100)
+                exists = 'image' in content_type and len(data) > 0
+                logger.debug(f"Image exists check index {index}: {exists} (content-type: {content_type})")
+                return exists
+        except urllib.error.HTTPError as e:
+            logger.debug(f"Image exists check index {index}: False (HTTP {e.code})")
+            return False
+        except Exception as e:
+            logger.debug(f"Image exists check index {index}: False ({e})")
+            return False
+
+    @staticmethod
+    def get_image_thumbnail(host, port, index=0, size=300):
+        """
+        Get an image thumbnail from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            index: Image index (0 = most recent, or use negative for latest)
+            size: Thumbnail size in pixels (default 300)
+
+        Returns:
+            tuple: (bytes image data, dict metadata) on success, (None, None) on failure
+        """
+        # The API uses /image/thumbnail/{index} with size as query param
+        # Try index -1 for latest, or 0 for first
+        url = f"http://{host}:{port}/v2/api/image/thumbnail/{index}?size={size}&stream=true"
+
+        logger.debug(f"Fetching image thumbnail from: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                content_type = response.headers.get('Content-Type', '')
+                logger.debug(f"Thumbnail response Content-Type: {content_type}")
+                if 'image' in content_type:
+                    data = response.read()
+                    logger.debug(f"Thumbnail data size: {len(data)} bytes")
+                    return data, {}
+                # API returned JSON - log it to see the error
+                data = response.read().decode('utf-8')
+                logger.debug(f"Thumbnail JSON response: {data[:500]}")
+                return None, None
+        except urllib.error.HTTPError as e:
+            # Try alternative URL format without stream parameter
+            if "stream" in url:
+                alt_url = f"http://{host}:{port}/v2/api/image/thumbnail/{index}?size={size}"
+                logger.debug(f"Trying alternative URL: {alt_url}")
+                try:
+                    request = urllib.request.Request(alt_url)
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        content_type = response.headers.get('Content-Type', '')
+                        if 'image' in content_type:
+                            data = response.read()
+                            logger.debug(f"Alt thumbnail data size: {len(data)} bytes")
+                            return data, {}
+                except Exception:
+                    pass
+            logger.debug(f"HTTP Error getting image thumbnail: {e.code} {e.reason} for URL {url}")
+            return None, None
+        except Exception as e:
+            logger.debug(f"Error getting image thumbnail: {e}")
+            return None, None
+
+    @staticmethod
+    def get_livestack_status(host, port):
+        """
+        Get live stacking status from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            dict: Livestack status dict on success, None on failure
+        """
+        url = f"http://{host}:{port}/v2/api/livestack/status"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('Success'):
+                    resp = result.get('Response')
+                    return resp if isinstance(resp, dict) else None
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting livestack status: {e}")
+            return None
+
+    @staticmethod
+    def get_livestack_image(host, port):
+        """
+        Get the current live-stacked image from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            bytes: Image data (JPEG) on success, None on failure
+        """
+        url = f"http://{host}:{port}/v2/api/livestack/image"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                content_type = response.headers.get('Content-Type', '')
+                if 'image' in content_type:
+                    return response.read()
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting livestack image: {e}")
+            return None
+
+    @staticmethod
+    def get_guiding_graph_data(host, port):
+        """
+        Get guiding graph data (RA/Dec deviations) from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            list: List of guiding data points on success, None on failure
+        """
+        url = f"http://{host}:{port}/v2/api/guider/graph"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('Success'):
+                    resp = result.get('Response')
+                    return resp if isinstance(resp, list) else None
+                return None
+        except urllib.error.HTTPError as e:
+            # 404 is expected when guider is not connected or guiding not active
+            if e.code != 404:
+                logger.debug(f"Error getting guiding graph data: {e}")
+            return None
+        except Exception as e:
+            logger.debug(f"Error getting guiding graph data: {e}")
+            return None
