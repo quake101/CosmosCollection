@@ -152,10 +152,11 @@ class WeatherWorker(QThread):
     error_occurred = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, lat: float, lon: float):
+    def __init__(self, lat: float, lon: float, timezone: str = None):
         super().__init__()
         self.lat = lat
         self.lon = lon
+        self.timezone = timezone
 
     def run(self):
         """Fetch weather data from Open-Meteo API"""
@@ -232,7 +233,7 @@ class WeatherWorker(QThread):
 
         # Calculate sun altitudes for all hourly records (vectorized for efficiency)
         all_times = [record.time for record in hourly_records]
-        sun_altitudes = calculate_sun_altitudes(self.lat, self.lon, all_times)
+        sun_altitudes = calculate_sun_altitudes(self.lat, self.lon, all_times, self.timezone)
         sun_alt_map = dict(zip(all_times, sun_altitudes))
 
         # Create daily summaries
@@ -444,20 +445,38 @@ def get_rating_label(score: int) -> str:
         return "Poor"
 
 
-def calculate_sun_altitudes(lat: float, lon: float, times: List[datetime]) -> List[float]:
+def calculate_sun_altitudes(lat: float, lon: float, times: List[datetime], timezone: str = None) -> List[float]:
     """
     Calculate sun altitude for each time point.
 
     Args:
         lat: Observer latitude in degrees
         lon: Observer longitude in degrees
-        times: List of datetime objects for each hour
+        times: List of datetime objects for each hour (in local time)
+        timezone: Optional timezone string (e.g., 'America/New_York') for converting local times to UTC
 
     Returns:
         List of sun altitudes in degrees for each time point
     """
     if not times:
         return []
+
+    # Convert naive local times to UTC if timezone is provided
+    if timezone:
+        try:
+            import pytz
+            local_tz = pytz.timezone(timezone)
+            utc_times = []
+            for t in times:
+                if t.tzinfo is None:
+                    local_dt = local_tz.localize(t)
+                    utc_dt = local_dt.astimezone(pytz.UTC)
+                    utc_times.append(utc_dt.replace(tzinfo=None))  # astropy works with naive UTC
+                else:
+                    utc_times.append(t)
+            times = utc_times
+        except Exception as e:
+            logger.warning(f"Could not convert times to UTC: {e}")
 
     location = EarthLocation(lat=lat * u.deg, lon=lon * u.deg)
     astropy_times = Time([t.isoformat() for t in times])
@@ -559,12 +578,13 @@ class HourlyAstroChart(FigureCanvas):
     """Matplotlib chart showing hourly astro scores for a day"""
     hour_hovered = Signal(int)  # Emits the row index when hovering over a bar
 
-    def __init__(self, hourly_data: List[HourlyWeatherData], parent=None):
+    def __init__(self, hourly_data: List[HourlyWeatherData], sun_altitudes: List[float] = None, parent=None):
         self.figure = Figure(figsize=(10, 3), facecolor='#2b2b2b')
         super().__init__(self.figure)
         self.setParent(parent)
 
         self.hourly_data = hourly_data
+        self.sun_altitudes = sun_altitudes
         self.bars = None
         self.ax = None
         self._last_hovered_index = -1
@@ -573,9 +593,10 @@ class HourlyAstroChart(FigureCanvas):
         # Connect mouse motion event
         self.mpl_connect('motion_notify_event', self._on_mouse_move)
 
-    def refresh(self, hourly_data: List[HourlyWeatherData]):
+    def refresh(self, hourly_data: List[HourlyWeatherData], sun_altitudes: List[float] = None):
         """Refresh the chart with new hourly data"""
         self.hourly_data = hourly_data
+        self.sun_altitudes = sun_altitudes
         self._last_hovered_index = -1
         self._create_chart()
 
@@ -613,6 +634,11 @@ class HourlyAstroChart(FigureCanvas):
             scores.append(score)
             colors.append(get_rating_color(score))
 
+        num_hours = len(self.hourly_data)
+
+        # Add darkness shading based on sun altitude (before bars so it's behind them)
+        self._add_darkness_shading(num_hours)
+
         # Create bar chart using sequential indices
         self.bars = self.ax.bar(x_positions, scores, color=colors, edgecolor='none', width=0.8)
 
@@ -621,17 +647,10 @@ class HourlyAstroChart(FigureCanvas):
         self.ax.axhline(y=60, color=COLORS['info'], linestyle='--', alpha=0.5, linewidth=1)
         self.ax.axhline(y=40, color=COLORS['warning'], linestyle='--', alpha=0.5, linewidth=1)
 
-        num_hours = len(self.hourly_data)
-
         if is_midnight_view:
-            # For midnight view, shade the entire chart area (all hours are nighttime)
-            self.ax.axvspan(-0.5, num_hours - 0.5, alpha=0.15, color='#4444ff', label='Night')
             self.ax.set_xlabel('Time (Evening → Morning)', color=COLORS['text'], fontsize=9)
             self.ax.set_title('Tonight\'s Astrophotography Conditions', color=COLORS['text'], fontsize=10, fontweight='bold')
         else:
-            # Highlight nighttime hours (6pm - 6am) with background shading
-            self.ax.axvspan(-0.5, 5.5, alpha=0.15, color='#4444ff', label='Night')
-            self.ax.axvspan(17.5, 23.5, alpha=0.15, color='#4444ff')
             self.ax.set_xlabel('Hour of Day', color=COLORS['text'], fontsize=9)
             self.ax.set_title('Hourly Astrophotography Conditions', color=COLORS['text'], fontsize=10, fontweight='bold')
 
@@ -672,6 +691,36 @@ class HourlyAstroChart(FigureCanvas):
         self.figure.tight_layout()
         self.draw()
 
+    def _add_darkness_shading(self, num_hours: int):
+        """Add background shading to show darkness levels based on sun altitude.
+
+        Colors represent (matching DSO Visibility Calculator):
+        - Daylight (sun > 0°): No shading (default background)
+        - Civil twilight (0° to -6°): Light shade
+        - Nautical twilight (-6° to -12°): Medium shade
+        - Astronomical twilight (-12° to -18°): Dark shade
+        - Night (< -18°): Darkest shade
+        """
+        if not self.sun_altitudes or len(self.sun_altitudes) != num_hours:
+            return
+
+        # Define darkness thresholds and colors (from lightest to darkest)
+        # Format: (sun_max, sun_min, color, alpha)
+        darkness_levels = [
+            (0, -6, '#2a3a4a', 0.6),      # Civil twilight - light blue-gray
+            (-6, -12, '#1a2535', 0.7),    # Nautical twilight - medium blue
+            (-12, -18, '#101520', 0.8),   # Astronomical twilight - dark blue
+            (-18, -90, '#080a10', 0.9),   # Night - very dark blue/black
+        ]
+
+        # For each hour, shade based on its sun altitude
+        for i, sun_alt in enumerate(self.sun_altitudes):
+            for sun_max, sun_min, color, alpha in darkness_levels:
+                if sun_alt <= sun_max and sun_alt > sun_min:
+                    # Shade this bar's column
+                    self.ax.axvspan(i - 0.5, i + 0.5, facecolor=color, alpha=alpha, zorder=0)
+                    break  # Only apply one darkness level per hour
+
     def _on_mouse_move(self, event):
         """Handle mouse movement to detect bar hover"""
         if event.inaxes != self.ax or self.bars is None:
@@ -697,10 +746,14 @@ class HourlyAstroChart(FigureCanvas):
 class DayDetailDialog(QDialog):
     """Dialog showing detailed hourly weather data for a day"""
 
-    def __init__(self, summary: DailyWeatherSummary, next_day_summary: Optional[DailyWeatherSummary] = None, parent=None):
+    def __init__(self, summary: DailyWeatherSummary, next_day_summary: Optional[DailyWeatherSummary] = None,
+                 lat: float = None, lon: float = None, timezone: str = None, parent=None):
         super().__init__(parent)
         self.summary = summary
         self.next_day_summary = next_day_summary
+        self.lat = lat
+        self.lon = lon
+        self.timezone = timezone
         self.setWindowTitle(f"Weather Details - {summary.date.strftime('%A, %B %d, %Y')} - Cosmos Collection")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setModal(False)
@@ -713,6 +766,14 @@ class DayDetailDialog(QDialog):
         self.precip_unit = settings.value("precip_visibility_unit", "Metric (mm, km)", type=str)
 
         self._setup_ui()
+
+    def _get_sun_altitudes(self, hours: List[HourlyWeatherData]) -> Optional[List[float]]:
+        """Calculate sun altitudes for the given hours"""
+        if self.lat is None or self.lon is None:
+            return None
+
+        times = [h.time for h in hours]
+        return calculate_sun_altitudes(self.lat, self.lon, times, self.timezone)
 
     def _convert_temp(self, celsius: float) -> float:
         """Convert temperature based on user preference"""
@@ -796,7 +857,8 @@ class DayDetailDialog(QDialog):
         # Hourly astro score chart
         chart_group = QGroupBox("Hourly Astro Score")
         chart_layout = QVBoxLayout(chart_group)
-        self.chart = HourlyAstroChart(self.summary.hourly_data, self)
+        initial_sun_alts = self._get_sun_altitudes(self.summary.hourly_data)
+        self.chart = HourlyAstroChart(self.summary.hourly_data, initial_sun_alts, self)
         self.chart.setMinimumHeight(200)
         self.chart.setMaximumHeight(250)
         self.chart.hour_hovered.connect(self._on_chart_hover)
@@ -873,7 +935,8 @@ class DayDetailDialog(QDialog):
     def _update_view(self):
         """Refresh chart and table when view mode changes"""
         display_hours = self._get_display_hours()
-        self.chart.refresh(display_hours)
+        sun_altitudes = self._get_sun_altitudes(display_hours)
+        self.chart.refresh(display_hours, sun_altitudes)
         self._populate_table(display_hours)
 
     def _populate_table(self, hourly_data: List[HourlyWeatherData]):
@@ -1154,7 +1217,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
                     row = cursor.fetchone()
 
                 if row:
-                    self.lat, self.lon, location_name, timezone = row
+                    self.lat, self.lon, location_name, self.timezone = row
                     if self.lat is not None and self.lon is not None:
                         lat_str = f"{abs(self.lat):.2f}{'N' if self.lat >= 0 else 'S'}"
                         lon_str = f"{abs(self.lon):.2f}{'W' if self.lon < 0 else 'E'}"
@@ -1168,6 +1231,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
             # No location configured
             self.lat = None
             self.lon = None
+            self.timezone = None
             self.location_label.setText("Location: Not configured")
             self.status_label.setText("Please configure your location in Settings to view weather forecast.")
             self.status_label.setStyleSheet(f"color: {COLORS['warning']};")
@@ -1203,7 +1267,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self.status_label.setStyleSheet("")
 
         # Start worker thread
-        self.worker = WeatherWorker(self.lat, self.lon)
+        self.worker = WeatherWorker(self.lat, self.lon, self.timezone)
         self.worker.weather_loaded.connect(self._on_weather_loaded)
         self.worker.error_occurred.connect(self._on_error)
         self.worker.progress.connect(self._on_progress)
@@ -1279,7 +1343,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         except ValueError:
             pass  # Summary not found in list
 
-        dialog = DayDetailDialog(summary, next_day_summary, self)
+        dialog = DayDetailDialog(summary, next_day_summary, self.lat, self.lon, self.timezone, self)
         dialog.show()
 
     def _on_auto_refresh_changed(self, state: int):
