@@ -142,6 +142,7 @@ class DailyWeatherSummary:
     avg_wind_speed: float
     max_wind_speed: float
     avg_precipitation_prob: float
+    tonight_avg_cloud_cover: float  # avg cloud cover for dark hours only (sun_alt < -12°)
     astro_score: int  # 0-100
     seeing_estimate: str  # Excellent/Good/Moderate/Poor
 
@@ -276,6 +277,12 @@ class WeatherWorker(QThread):
                 # No dark hours (e.g., polar summer) - score is 0
                 astro_score = 0
 
+            # Calculate tonight's average cloud cover (dark hours only)
+            if tonight_hours:
+                tonight_avg_cloud = sum(h.cloud_cover for h in tonight_hours) / len(tonight_hours)
+            else:
+                tonight_avg_cloud = avg_cloud  # Fallback to full day average
+
             # Estimate seeing based on tonight's hours
             if tonight_hours:
                 night_humidity = sum(h.humidity for h in tonight_hours) / len(tonight_hours)
@@ -301,6 +308,7 @@ class WeatherWorker(QThread):
                 avg_wind_speed=avg_wind,
                 max_wind_speed=max(winds),
                 avg_precipitation_prob=avg_precip,
+                tonight_avg_cloud_cover=tonight_avg_cloud,
                 astro_score=astro_score,
                 seeing_estimate=seeing
             )
@@ -539,8 +547,8 @@ class DayWeatherCard(QFrame):
 
         layout.addSpacing(5)
 
-        # Cloud cover
-        cloud_label = QLabel(f"{self.summary.avg_cloud_cover:.0f}%")
+        # Cloud cover (tonight's average - dark hours only)
+        cloud_label = QLabel(f"{self.summary.tonight_avg_cloud_cover:.0f}%")
         cloud_label.setAlignment(Qt.AlignCenter)
         cloud_label.setStyleSheet("font-size: 16pt; font-weight: bold;")
         layout.addWidget(cloud_label)
@@ -548,6 +556,7 @@ class DayWeatherCard(QFrame):
         cloud_text = QLabel("clouds")
         cloud_text.setAlignment(Qt.AlignCenter)
         cloud_text.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt;")
+        cloud_text.setToolTip("Average cloud cover for dark hours (sun altitude < -12°)")
         layout.addWidget(cloud_text)
 
         layout.addSpacing(5)
@@ -816,25 +825,21 @@ class DayDetailDialog(QDialog):
         seeing_label = QLabel(f"Seeing Estimate: {self.summary.seeing_estimate}")
         header_layout.addWidget(seeing_label, 0, 1)
 
-        # Cloud cover
-        cloud_label = QLabel(f"Cloud Cover: {self.summary.min_cloud_cover:.0f}% - {self.summary.max_cloud_cover:.0f}% (avg: {self.summary.avg_cloud_cover:.0f}%)")
-        header_layout.addWidget(cloud_label, 1, 0)
+        # Cloud cover (dynamic - updates based on view mode)
+        self.cloud_label = QLabel()
+        header_layout.addWidget(self.cloud_label, 1, 0)
 
-        # Temperature
-        min_temp = self._convert_temp(self.summary.min_temperature)
-        max_temp = self._convert_temp(self.summary.max_temperature)
-        temp_label = QLabel(f"Temperature: {min_temp:.1f} - {max_temp:.1f}{self._temp_suffix()}")
-        header_layout.addWidget(temp_label, 1, 1)
+        # Temperature (dynamic - updates based on view mode)
+        self.temp_label = QLabel()
+        header_layout.addWidget(self.temp_label, 1, 1)
 
-        # Wind
-        avg_wind = self._convert_wind(self.summary.avg_wind_speed)
-        max_wind = self._convert_wind(self.summary.max_wind_speed)
-        wind_label = QLabel(f"Wind: avg {avg_wind:.1f} {self._wind_suffix()}, max {max_wind:.1f} {self._wind_suffix()}")
-        header_layout.addWidget(wind_label, 2, 0)
+        # Wind (dynamic - updates based on view mode)
+        self.wind_label = QLabel()
+        header_layout.addWidget(self.wind_label, 2, 0)
 
-        # Humidity
-        humidity_label = QLabel(f"Humidity: {self.summary.avg_humidity:.0f}%")
-        header_layout.addWidget(humidity_label, 2, 1)
+        # Humidity (dynamic - updates based on view mode)
+        self.humidity_label = QLabel()
+        header_layout.addWidget(self.humidity_label, 2, 1)
 
         layout.addWidget(header_group)
 
@@ -895,6 +900,9 @@ class DayDetailDialog(QDialog):
         table_layout.addWidget(self.table)
         layout.addWidget(table_group)
 
+        # Initialize header stats for default view
+        self._update_header_stats()
+
         # Restore saved midnight view state (after chart and table are created)
         settings = QSettings("CosmosCollection", "CosmosCollection")
         saved_midnight_view = settings.value("weather_center_on_midnight", False, type=bool)
@@ -933,12 +941,41 @@ class DayDetailDialog(QDialog):
         else:
             return self.summary.hourly_data
 
+    def _update_header_stats(self):
+        """Update header to reflect current view mode"""
+        display_hours = self._get_display_hours()
+        if not display_hours:
+            return
+
+        # Cloud cover stats
+        clouds = [h.cloud_cover for h in display_hours]
+        min_cloud, max_cloud, avg_cloud = min(clouds), max(clouds), sum(clouds) / len(clouds)
+        self.cloud_label.setText(f"Cloud Cover: {min_cloud:.0f}% - {max_cloud:.0f}% (avg: {avg_cloud:.0f}%)")
+
+        # Temperature stats
+        temps = [h.temperature for h in display_hours]
+        min_temp = self._convert_temp(min(temps))
+        max_temp = self._convert_temp(max(temps))
+        self.temp_label.setText(f"Temperature: {min_temp:.1f} - {max_temp:.1f}{self._temp_suffix()}")
+
+        # Wind stats
+        winds = [h.wind_speed for h in display_hours]
+        avg_wind = self._convert_wind(sum(winds) / len(winds))
+        max_wind = self._convert_wind(max(winds))
+        self.wind_label.setText(f"Wind: avg {avg_wind:.1f} {self._wind_suffix()}, max {max_wind:.1f} {self._wind_suffix()}")
+
+        # Humidity stats
+        humidities = [h.humidity for h in display_hours]
+        avg_humidity = sum(humidities) / len(humidities)
+        self.humidity_label.setText(f"Humidity: {avg_humidity:.0f}%")
+
     def _update_view(self):
         """Refresh chart and table when view mode changes"""
         display_hours = self._get_display_hours()
         sun_altitudes = self._get_sun_altitudes(display_hours)
         self.chart.refresh(display_hours, sun_altitudes)
         self._populate_table(display_hours)
+        self._update_header_stats()
 
     def _populate_table(self, hourly_data: List[HourlyWeatherData]):
         """Populate the table with hourly weather data"""
