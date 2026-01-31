@@ -227,6 +227,27 @@ QListWidget::item:selected {{
 QCalendarWidget {{
     background-color: var(--bg-light);
 }}
+
+/* Dock Widgets --------------------------------------------------- */
+QDockWidget {{
+    titlebar-close-icon: url(none);
+    titlebar-normal-icon: url(none);
+}}
+QDockWidget::title {{
+    background-color: {COLORS['background_light']};
+    color: {COLORS['text']};
+    padding: 6px 10px;
+    border-bottom: 1px solid {COLORS['border']};
+    text-align: left;
+}}
+QDockWidget::close-button, QDockWidget::float-button {{
+    border: none;
+    background: transparent;
+    padding: 2px;
+}}
+QDockWidget::close-button:hover, QDockWidget::float-button:hover {{
+    background: rgba(0,120,212,0.2);
+}}
 """
 
 # --------------------------------------------------------------------

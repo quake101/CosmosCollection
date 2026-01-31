@@ -23,11 +23,12 @@ import matplotlib.pyplot as plt
 # Set dark theme for matplotlib
 plt.style.use('dark_background')
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings, QByteArray
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
-    QLabel, QGroupBox, QProgressBar, QComboBox, QSplitter, QFrame,
-    QGridLayout, QSizePolicy
+    QLabel, QGroupBox, QProgressBar, QComboBox, QFrame,
+    QGridLayout, QSizePolicy, QDockWidget, QCheckBox, QSpinBox,
+    QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLineEdit
 )
 from PySide6.QtGui import QPixmap, QImage
 
@@ -50,11 +51,16 @@ class NINAStatusWorker(QThread):
     error_occurred = Signal(str)  # Emits error message
     connection_changed = Signal(bool, str)  # Emits connected state and version
 
+    # Adaptive polling rates
+    POLL_RATE_ACTIVE = 0.5  # when exposing/guiding
+    POLL_RATE_IDLE = 2    # when idle
+
     def __init__(self, host, port):
         super().__init__()
         self.host = host
         self.port = port
         self._running = False
+        self._poll_interval = self.POLL_RATE_IDLE  # Start with idle rate
         self._fetch_images = True
         self._was_exposing = False  # Track exposure state to detect when exposure completes
         self._exposure_end_time = None  # Expected end time of current exposure
@@ -63,6 +69,7 @@ class NINAStatusWorker(QThread):
         self._last_image_index = -1  # Track the last known image index (-1 = no images yet)
         self._last_livestack_hash = None  # Track livestack image hash
         self._consecutive_failures = 0  # Track consecutive API failures to detect disconnect
+        self._version = ""  # Store NINA version for reconnection
 
     def run(self):
         """Main polling loop."""
@@ -71,7 +78,8 @@ class NINAStatusWorker(QThread):
         # Test connection first
         success, message, version = NINAIntegration.test_connection(self.host, self.port)
         if success:
-            self.connection_changed.emit(True, version or "Unknown")
+            self._version = version or "Unknown"
+            self.connection_changed.emit(True, self._version)
         else:
             self.connection_changed.emit(False, "")
             self.error_occurred.emit(message)
@@ -94,16 +102,41 @@ class NINAStatusWorker(QThread):
                 if guider_info and isinstance(guider_info, dict):
                     status_data['guider'] = guider_info
 
+                filterwheel_info = NINAIntegration.get_filterwheel_info(self.host, self.port)
+                if filterwheel_info and isinstance(filterwheel_info, dict):
+                    status_data['filterwheel'] = filterwheel_info
+
+                focuser_info = NINAIntegration.get_focuser_info(self.host, self.port)
+                if focuser_info and isinstance(focuser_info, dict):
+                    status_data['focuser'] = focuser_info
+
+                # Always emit status update so UI can show current state
+                self.status_updated.emit(status_data)
+
+                # Adaptive polling: faster when active, slower when idle
+                camera = status_data.get('camera', {})
+                guider = status_data.get('guider', {})
+                is_exposing = camera.get('IsExposing', False) if isinstance(camera, dict) else False
+                is_guiding = (guider.get('Guiding', False) or guider.get('IsGuiding', False)) if isinstance(guider, dict) else False
+
+                if is_exposing or is_guiding:
+                    self._poll_interval = self.POLL_RATE_ACTIVE
+                else:
+                    self._poll_interval = self.POLL_RATE_IDLE
+
                 # Check if we got any data - if not, NINA might be disconnected
                 if status_data:
+                    if self._consecutive_failures >= 2:
+                        # Reconnected after being disconnected
+                        logger.debug("NINA connection restored")
+                        self.connection_changed.emit(True, self._version)
                     self._consecutive_failures = 0  # Reset on success
-                    self.status_updated.emit(status_data)
                 else:
                     self._consecutive_failures += 1
-                    if self._consecutive_failures >= 3:
-                        logger.debug("NINA connection lost (3 consecutive failures)")
+                    if self._consecutive_failures >= 2:
+                        logger.debug(f"NINA connection lost ({self._consecutive_failures} consecutive failures)")
                         self.connection_changed.emit(False, "")
-                        self._consecutive_failures = 0  # Reset to avoid repeated signals
+                        # Keep counting but don't reset - we want to stay disconnected
 
                 # Fetch image thumbnail based on exposure state
                 if self._fetch_images:
@@ -207,9 +240,14 @@ class NINAStatusWorker(QThread):
                 logger.error(f"Error in NINA status worker: {e}")
                 self.error_occurred.emit(str(e))
 
-            # Sleep for polling interval (handled by caller via timer)
+            # Sleep for polling interval
             if self._running:
-                self.msleep(100)  # Small sleep to allow thread control
+                # Sleep in small increments (50ms) so we can stop quickly
+                sleep_iterations = int(self._poll_interval * 20)  # 50ms per iteration
+                for _ in range(max(1, sleep_iterations)):
+                    if not self._running:
+                        break
+                    self.msleep(50)
 
     def stop(self):
         """Stop the polling loop."""
@@ -353,6 +391,301 @@ class GuidingGraph(FigureCanvas):
         self._create_empty_chart()
 
 
+class CaptureSettingsDialog(QDialog):
+    """Dialog for configuring capture settings."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Capture Settings")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+
+        # Form layout for settings
+        form_layout = QFormLayout()
+
+        # Duration
+        self.duration_spinbox = QDoubleSpinBox()
+        self.duration_spinbox.setRange(0.001, 3600)  # 1ms to 1 hour
+        self.duration_spinbox.setDecimals(3)
+        self.duration_spinbox.setSuffix(" s")
+        form_layout.addRow("Duration:", self.duration_spinbox)
+
+        # Gain
+        self.gain_spinbox = QSpinBox()
+        self.gain_spinbox.setRange(-1, 1000)  # -1 means use camera default
+        self.gain_spinbox.setSpecialValueText("Default")
+        form_layout.addRow("Gain:", self.gain_spinbox)
+
+        # Image type
+        self.image_type_combo = QComboBox()
+        self.image_type_combo.addItems(["SNAPSHOT", "LIGHT", "DARK", "BIAS", "FLAT"])
+        form_layout.addRow("Image Type:", self.image_type_combo)
+
+        # Save to disk
+        self.save_checkbox = QCheckBox()
+        form_layout.addRow("Save to Disk:", self.save_checkbox)
+
+        layout.addLayout(form_layout)
+
+        # Dialog buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._on_accepted)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        # Load saved settings
+        self._load_settings()
+
+    def _load_settings(self):
+        """Load saved capture settings."""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        self.duration_spinbox.setValue(settings.value("capture_duration", 1.0, type=float))
+        self.gain_spinbox.setValue(settings.value("capture_gain", -1, type=int))
+        self.image_type_combo.setCurrentText(settings.value("capture_image_type", "SNAPSHOT", type=str))
+        self.save_checkbox.setChecked(settings.value("capture_save", True, type=bool))
+
+    def _save_settings(self):
+        """Save capture settings."""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue("capture_duration", self.duration_spinbox.value())
+        settings.setValue("capture_gain", self.gain_spinbox.value())
+        settings.setValue("capture_image_type", self.image_type_combo.currentText())
+        settings.setValue("capture_save", self.save_checkbox.isChecked())
+
+    def _on_accepted(self):
+        """Handle dialog accepted - save settings and close."""
+        self._save_settings()
+        self.accept()
+
+    def get_settings(self):
+        """Return the capture settings as a dict."""
+        gain = self.gain_spinbox.value()
+        return {
+            'duration': self.duration_spinbox.value(),
+            'gain': gain if gain >= 0 else None,  # None means use camera default
+            'image_type': self.image_type_combo.currentText(),
+            'save': self.save_checkbox.isChecked()
+        }
+
+
+class SlewDialog(QDialog):
+    """Dialog for entering slew coordinates."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Slew to Coordinates")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+
+        # Search group
+        search_group = QGroupBox("Search Object")
+        search_layout = QHBoxLayout(search_group)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("e.g., M31, NGC 7000, Vega...")
+        self.search_input.returnPressed.connect(self._on_search)
+        search_layout.addWidget(self.search_input)
+
+        self.search_btn = QPushButton("Search")
+        self.search_btn.clicked.connect(self._on_search)
+        search_layout.addWidget(self.search_btn)
+
+        layout.addWidget(search_group)
+
+        self.search_status_label = QLabel("")
+        self.search_status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        layout.addWidget(self.search_status_label)
+
+        # Form layout for coordinates
+        form_layout = QFormLayout()
+
+        # RA input (hours)
+        ra_widget = QWidget()
+        ra_layout = QHBoxLayout(ra_widget)
+        ra_layout.setContentsMargins(0, 0, 0, 0)
+        ra_layout.setSpacing(2)
+
+        self.ra_h_spinbox = QSpinBox()
+        self.ra_h_spinbox.setRange(0, 23)
+        self.ra_h_spinbox.setSuffix("h")
+        ra_layout.addWidget(self.ra_h_spinbox)
+
+        self.ra_m_spinbox = QSpinBox()
+        self.ra_m_spinbox.setRange(0, 59)
+        self.ra_m_spinbox.setSuffix("m")
+        ra_layout.addWidget(self.ra_m_spinbox)
+
+        self.ra_s_spinbox = QDoubleSpinBox()
+        self.ra_s_spinbox.setRange(0, 59.99)
+        self.ra_s_spinbox.setDecimals(2)
+        self.ra_s_spinbox.setSuffix("s")
+        ra_layout.addWidget(self.ra_s_spinbox)
+
+        form_layout.addRow("RA:", ra_widget)
+
+        # Dec input (degrees)
+        dec_widget = QWidget()
+        dec_layout = QHBoxLayout(dec_widget)
+        dec_layout.setContentsMargins(0, 0, 0, 0)
+        dec_layout.setSpacing(2)
+
+        self.dec_sign_combo = QComboBox()
+        self.dec_sign_combo.addItems(["+", "-"])
+        dec_layout.addWidget(self.dec_sign_combo)
+
+        self.dec_d_spinbox = QSpinBox()
+        self.dec_d_spinbox.setRange(0, 90)
+        self.dec_d_spinbox.setSuffix("°")
+        dec_layout.addWidget(self.dec_d_spinbox)
+
+        self.dec_m_spinbox = QSpinBox()
+        self.dec_m_spinbox.setRange(0, 59)
+        self.dec_m_spinbox.setSuffix("'")
+        dec_layout.addWidget(self.dec_m_spinbox)
+
+        self.dec_s_spinbox = QDoubleSpinBox()
+        self.dec_s_spinbox.setRange(0, 59.99)
+        self.dec_s_spinbox.setDecimals(2)
+        self.dec_s_spinbox.setSuffix('"')
+        dec_layout.addWidget(self.dec_s_spinbox)
+
+        form_layout.addRow("Dec:", dec_widget)
+
+        layout.addLayout(form_layout)
+
+        # Dialog buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._on_accepted)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        # Load saved coordinates
+        self._load_settings()
+
+    def _load_settings(self):
+        """Load saved slew coordinates."""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        self.ra_h_spinbox.setValue(settings.value("slew_ra_h", 0, type=int))
+        self.ra_m_spinbox.setValue(settings.value("slew_ra_m", 0, type=int))
+        self.ra_s_spinbox.setValue(settings.value("slew_ra_s", 0.0, type=float))
+        self.dec_sign_combo.setCurrentText(settings.value("slew_dec_sign", "+", type=str))
+        self.dec_d_spinbox.setValue(settings.value("slew_dec_d", 0, type=int))
+        self.dec_m_spinbox.setValue(settings.value("slew_dec_m", 0, type=int))
+        self.dec_s_spinbox.setValue(settings.value("slew_dec_s", 0.0, type=float))
+
+    def _save_settings(self):
+        """Save slew coordinates."""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue("slew_ra_h", self.ra_h_spinbox.value())
+        settings.setValue("slew_ra_m", self.ra_m_spinbox.value())
+        settings.setValue("slew_ra_s", self.ra_s_spinbox.value())
+        settings.setValue("slew_dec_sign", self.dec_sign_combo.currentText())
+        settings.setValue("slew_dec_d", self.dec_d_spinbox.value())
+        settings.setValue("slew_dec_m", self.dec_m_spinbox.value())
+        settings.setValue("slew_dec_s", self.dec_s_spinbox.value())
+
+    def _on_accepted(self):
+        """Handle dialog accepted - save settings and close."""
+        self._save_settings()
+        self.accept()
+
+    def get_coordinates_degrees(self):
+        """Return RA and Dec in degrees."""
+        # Convert RA from hours to degrees (1h = 15°)
+        ra_hours = self.ra_h_spinbox.value() + self.ra_m_spinbox.value() / 60 + self.ra_s_spinbox.value() / 3600
+        ra_deg = ra_hours * 15
+
+        # Convert Dec from DMS to degrees
+        dec_deg = self.dec_d_spinbox.value() + self.dec_m_spinbox.value() / 60 + self.dec_s_spinbox.value() / 3600
+        if self.dec_sign_combo.currentText() == "-":
+            dec_deg = -dec_deg
+
+        return ra_deg, dec_deg
+
+    def _on_search(self):
+        """Search for an object by name using CDS Sesame resolver."""
+        import urllib.request
+        import urllib.parse
+        import re
+
+        object_name = self.search_input.text().strip()
+        if not object_name:
+            self.search_status_label.setText("Enter an object name to search")
+            self.search_status_label.setStyleSheet(f"color: {COLORS['warning']};")
+            return
+
+        self.search_status_label.setText(f"Searching for '{object_name}'...")
+        self.search_status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.search_btn.setEnabled(False)
+
+        # Force UI update
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        try:
+            # Use CDS Sesame name resolver
+            encoded_name = urllib.parse.quote(object_name)
+            url = f"http://cdsweb.u-strasbg.fr/cgi-bin/nph-sesame/-ox/SNV?{encoded_name}"
+
+            request = urllib.request.Request(url)
+            request.add_header('User-Agent', 'CosmosCollection/1.0')
+
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = response.read().decode('utf-8')
+
+            # Parse XML response for coordinates
+            # Look for <jradeg> and <jdedeg> tags (J2000 coordinates in degrees)
+            ra_match = re.search(r'<jradeg>([^<]+)</jradeg>', data)
+            dec_match = re.search(r'<jdedeg>([^<]+)</jdedeg>', data)
+
+            if ra_match and dec_match:
+                ra_deg = float(ra_match.group(1))
+                dec_deg = float(dec_match.group(1))
+
+                # Convert RA from degrees to hours
+                ra_hours = ra_deg / 15.0
+                ra_h = int(ra_hours)
+                ra_m = int((ra_hours - ra_h) * 60)
+                ra_s = ((ra_hours - ra_h) * 60 - ra_m) * 60
+
+                # Convert Dec to DMS
+                dec_sign = "+" if dec_deg >= 0 else "-"
+                dec_abs = abs(dec_deg)
+                dec_d = int(dec_abs)
+                dec_m = int((dec_abs - dec_d) * 60)
+                dec_s = ((dec_abs - dec_d) * 60 - dec_m) * 60
+
+                # Update the coordinate fields
+                self.ra_h_spinbox.setValue(ra_h)
+                self.ra_m_spinbox.setValue(ra_m)
+                self.ra_s_spinbox.setValue(round(ra_s, 2))
+                self.dec_sign_combo.setCurrentText(dec_sign)
+                self.dec_d_spinbox.setValue(dec_d)
+                self.dec_m_spinbox.setValue(dec_m)
+                self.dec_s_spinbox.setValue(round(dec_s, 2))
+
+                # Try to get the object's canonical name
+                name_match = re.search(r'<oname>([^<]+)</oname>', data)
+                found_name = name_match.group(1) if name_match else object_name
+
+                self.search_status_label.setText(f"Found: {found_name}")
+                self.search_status_label.setStyleSheet(f"color: {COLORS['success']};")
+            else:
+                self.search_status_label.setText(f"Object '{object_name}' not found")
+                self.search_status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+        except urllib.error.URLError as e:
+            self.search_status_label.setText(f"Network error: {e.reason}")
+            self.search_status_label.setStyleSheet(f"color: {COLORS['error']};")
+        except Exception as e:
+            self.search_status_label.setText(f"Search failed: {str(e)}")
+            self.search_status_label.setStyleSheet(f"color: {COLORS['error']};")
+        finally:
+            self.search_btn.setEnabled(True)
+
+
 class NINADashboardWindow(WindowPositionMixin, QMainWindow):
     """Main NINA Dashboard window."""
     WINDOW_POSITION_KEY = "NINADashboard"
@@ -364,31 +697,27 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.setup_window_position()
 
         self.worker = None
-        self.poll_timer = QTimer(self)
-        self.poll_timer.timeout.connect(self._poll_nina)
-        self.countdown_timer = QTimer(self)
-        self.countdown_timer.timeout.connect(self._update_countdown)
 
         self._connected = False
         self._version = ""
         self._last_update = None
-        self._next_refresh_seconds = 0
         self._exposure_start_time = None
         self._exposure_end_time = None
-        self._user_adjusted_splitter = False  # Track if user manually adjusted splitter
         self._current_image_pixmap = None  # Store original pixmap for rescaling
         self._current_livestack_pixmap = None  # Store original livestack pixmap
 
         self._setup_ui()
         self._auto_connect()
-        # Defer settings restore until after window is shown (splitters need visible geometry)
+        # Defer settings restore until after window is shown (dock widgets need visible geometry)
         QTimer.singleShot(100, self._restore_settings)
 
     def _setup_ui(self):
-        """Set up the main window UI."""
+        """Set up the main window UI with dockable panels."""
+        # Central widget - contains header, image panel, and status bar
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(5, 5, 5, 5)
 
         # Header bar
         header_layout = QHBoxLayout()
@@ -404,98 +733,372 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         header_layout.addStretch()
 
-        header_layout.addWidget(QLabel("Refresh:"))
-        self.refresh_combo = QComboBox()
-        self.refresh_combo.addItem("2s", 2)
-        self.refresh_combo.addItem("5s", 5)
-        self.refresh_combo.addItem("10s", 10)
-        self.refresh_combo.addItem("15s", 15)
-        self.refresh_combo.addItem("30s", 30)
-        self.refresh_combo.setCurrentIndex(1)  # Default 5s
-        self.refresh_combo.currentIndexChanged.connect(self._on_refresh_changed)
-        header_layout.addWidget(self.refresh_combo)
-
         main_layout.addLayout(header_layout)
 
-        # Main content area with splitter
-        self.horizontal_splitter = QSplitter(Qt.Horizontal)
+        # Image panel in central widget (main content area)
+        self._create_image_panel(main_layout)
 
-        # Left panel - Equipment Status
-        status_group = QGroupBox("Equipment Status")
-        status_layout = QVBoxLayout(status_group)
-        status_layout.setSpacing(10)
+        # Status bar at bottom of central widget
+        status_layout_h = QHBoxLayout()
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        status_layout_h.addWidget(self.status_label)
+        status_layout_h.addStretch()
+        self.countdown_label = QLabel("")
+        self.countdown_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        status_layout_h.addWidget(self.countdown_label)
+        main_layout.addLayout(status_layout_h)
 
-        # Camera status
-        camera_frame = QFrame()
-        camera_frame.setFrameShape(QFrame.StyledPanel)
-        camera_layout = QGridLayout(camera_frame)
+        # Create dock widgets (added to window in _restore_settings)
+        self._create_equipment_docks()
+        self._create_actions_docks()
+        self._create_guiding_dock()
+
+        # Set up View menu
+        self._setup_view_menu()
+
+    def _create_equipment_docks(self):
+        """Create individual dock widgets for each equipment type."""
+        dock_features = (
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable |
+            QDockWidget.DockWidgetClosable
+        )
+        dock_areas = (
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea |
+            Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea
+        )
+
+        # Camera dock
+        self.camera_dock = QDockWidget("Camera", self)
+        self.camera_dock.setObjectName("CameraDock")
+        self.camera_dock.setAllowedAreas(dock_areas)
+        self.camera_dock.setFeatures(dock_features)
+
+        camera_widget = QWidget()
+        camera_layout = QGridLayout(camera_widget)
         camera_layout.setContentsMargins(8, 8, 8, 8)
 
-        camera_layout.addWidget(QLabel("<b>Camera</b>"), 0, 0, 1, 2)
-        camera_layout.addWidget(QLabel("Name:"), 1, 0)
+        camera_layout.addWidget(QLabel("Name:"), 0, 0)
         self.camera_name_label = QLabel("--")
-        camera_layout.addWidget(self.camera_name_label, 1, 1)
-        camera_layout.addWidget(QLabel("Status:"), 2, 0)
+        camera_layout.addWidget(self.camera_name_label, 0, 1)
+        camera_layout.addWidget(QLabel("Status:"), 1, 0)
         self.camera_status_label = QLabel("--")
-        camera_layout.addWidget(self.camera_status_label, 2, 1)
-        camera_layout.addWidget(QLabel("Exposure:"), 3, 0)
+        camera_layout.addWidget(self.camera_status_label, 1, 1)
+        camera_layout.addWidget(QLabel("Exposure:"), 2, 0)
         self.camera_exposure_label = QLabel("--")
-        camera_layout.addWidget(self.camera_exposure_label, 3, 1)
-        camera_layout.addWidget(QLabel("Progress:"), 4, 0)
+        camera_layout.addWidget(self.camera_exposure_label, 2, 1)
+        camera_layout.addWidget(QLabel("Progress:"), 3, 0)
         self.camera_progress = QProgressBar()
         self.camera_progress.setMaximum(100)
         self.camera_progress.setValue(0)
-        camera_layout.addWidget(self.camera_progress, 4, 1)
+        camera_layout.addWidget(self.camera_progress, 3, 1)
+        camera_layout.addWidget(QLabel("Temp:"), 4, 0)
+        self.camera_temp_label = QLabel("--")
+        camera_layout.addWidget(self.camera_temp_label, 4, 1)
 
-        status_layout.addWidget(camera_frame)
+        # Cooling controls
+        camera_layout.addWidget(QLabel("Cooling:"), 5, 0)
+        cooling_widget = QWidget()
+        cooling_layout = QHBoxLayout(cooling_widget)
+        cooling_layout.setContentsMargins(0, 0, 0, 0)
+        cooling_layout.setSpacing(5)
+        self.camera_cooling_checkbox = QCheckBox("On")
+        self.camera_cooling_checkbox.setChecked(False)  # Explicitly start unchecked
+        self.camera_cooling_checkbox.setToolTip("Enable/disable camera cooling")
+        self.camera_cooling_checkbox.stateChanged.connect(self._on_cooling_changed)
+        logger.debug(f"[Cooling] Checkbox created, initial checked state: {self.camera_cooling_checkbox.isChecked()}")
+        cooling_layout.addWidget(self.camera_cooling_checkbox)
+        self.camera_target_temp_spinbox = QSpinBox()
+        self.camera_target_temp_spinbox.setRange(-40, 20)
+        self.camera_target_temp_spinbox.setValue(-10)
+        self.camera_target_temp_spinbox.setSuffix("°C")
+        self.camera_target_temp_spinbox.setToolTip("Target cooling temperature")
+        self.camera_target_temp_spinbox.valueChanged.connect(self._on_target_temp_changed)
+        cooling_layout.addWidget(self.camera_target_temp_spinbox)
+        cooling_layout.addStretch()
+        camera_layout.addWidget(cooling_widget, 5, 1)
 
-        # Mount status
-        mount_frame = QFrame()
-        mount_frame.setFrameShape(QFrame.StyledPanel)
-        mount_layout = QGridLayout(mount_frame)
+        # Dew heater control
+        camera_layout.addWidget(QLabel("Dew Heater:"), 6, 0)
+        self.camera_dewheater_checkbox = QCheckBox("On")
+        self.camera_dewheater_checkbox.setToolTip("Enable/disable dew heater")
+        self.camera_dewheater_checkbox.stateChanged.connect(self._on_dewheater_changed)
+        camera_layout.addWidget(self.camera_dewheater_checkbox, 6, 1)
+
+        camera_layout.setRowStretch(7, 1)
+
+        # Track if we're updating from API to avoid triggering callbacks
+        self._updating_camera_controls = False
+        # Track if user recently changed settings (prevents sync from overriding)
+        self._user_changing_cooling = False
+        self._user_changing_dewheater = False
+        # Track the last cooling state we intentionally set (to avoid duplicate API calls)
+        self._last_cooling_enabled = None
+        self._last_cooling_temp = None
+        # Timers to clear the user-changing flags
+        self._cooling_change_timer = QTimer(self)
+        self._cooling_change_timer.setSingleShot(True)
+        self._cooling_change_timer.timeout.connect(self._clear_cooling_change_flag)
+        self._dewheater_change_timer = QTimer(self)
+        self._dewheater_change_timer.setSingleShot(True)
+        self._dewheater_change_timer.timeout.connect(self._clear_dewheater_change_flag)
+
+        self.camera_dock.setWidget(camera_widget)
+
+        # Mount dock
+        self.mount_dock = QDockWidget("Mount", self)
+        self.mount_dock.setObjectName("MountDock")
+        self.mount_dock.setAllowedAreas(dock_areas)
+        self.mount_dock.setFeatures(dock_features)
+
+        mount_widget = QWidget()
+        mount_layout = QGridLayout(mount_widget)
         mount_layout.setContentsMargins(8, 8, 8, 8)
 
-        mount_layout.addWidget(QLabel("<b>Mount</b>"), 0, 0, 1, 2)
-        mount_layout.addWidget(QLabel("Name:"), 1, 0)
+        mount_layout.addWidget(QLabel("Name:"), 0, 0)
         self.mount_name_label = QLabel("--")
-        mount_layout.addWidget(self.mount_name_label, 1, 1)
-        mount_layout.addWidget(QLabel("Status:"), 2, 0)
+        mount_layout.addWidget(self.mount_name_label, 0, 1)
+        mount_layout.addWidget(QLabel("Status:"), 1, 0)
         self.mount_status_label = QLabel("--")
-        mount_layout.addWidget(self.mount_status_label, 2, 1)
-        mount_layout.addWidget(QLabel("RA/Dec:"), 3, 0)
+        mount_layout.addWidget(self.mount_status_label, 1, 1)
+        mount_layout.addWidget(QLabel("RA/Dec:"), 2, 0)
         self.mount_coords_label = QLabel("--")
-        mount_layout.addWidget(self.mount_coords_label, 3, 1)
+        mount_layout.addWidget(self.mount_coords_label, 2, 1)
+        mount_layout.setRowStretch(3, 1)
 
-        status_layout.addWidget(mount_frame)
+        self.mount_dock.setWidget(mount_widget)
 
-        # Guider status
-        guider_frame = QFrame()
-        guider_frame.setFrameShape(QFrame.StyledPanel)
-        guider_layout = QGridLayout(guider_frame)
+        # Guider dock
+        self.guider_dock = QDockWidget("Guider", self)
+        self.guider_dock.setObjectName("GuiderDock")
+        self.guider_dock.setAllowedAreas(dock_areas)
+        self.guider_dock.setFeatures(dock_features)
+
+        guider_widget = QWidget()
+        guider_layout = QGridLayout(guider_widget)
         guider_layout.setContentsMargins(8, 8, 8, 8)
 
-        guider_layout.addWidget(QLabel("<b>Guider</b>"), 0, 0, 1, 2)
-        guider_layout.addWidget(QLabel("Name:"), 1, 0)
+        guider_layout.addWidget(QLabel("Name:"), 0, 0)
         self.guider_name_label = QLabel("--")
-        guider_layout.addWidget(self.guider_name_label, 1, 1)
-        guider_layout.addWidget(QLabel("Status:"), 2, 0)
+        guider_layout.addWidget(self.guider_name_label, 0, 1)
+        guider_layout.addWidget(QLabel("Status:"), 1, 0)
         self.guider_status_label = QLabel("--")
-        guider_layout.addWidget(self.guider_status_label, 2, 1)
-        guider_layout.addWidget(QLabel("RMS:"), 3, 0)
+        guider_layout.addWidget(self.guider_status_label, 1, 1)
+        guider_layout.addWidget(QLabel("RMS:"), 2, 0)
         self.guider_rms_label = QLabel("--")
-        guider_layout.addWidget(self.guider_rms_label, 3, 1)
+        guider_layout.addWidget(self.guider_rms_label, 2, 1)
+        guider_layout.setRowStretch(3, 1)
 
-        status_layout.addWidget(guider_frame)
-        status_layout.addStretch()
+        self.guider_dock.setWidget(guider_widget)
 
-        self.horizontal_splitter.addWidget(status_group)
+        # Filter Wheel dock
+        self.filterwheel_dock = QDockWidget("Filter Wheel", self)
+        self.filterwheel_dock.setObjectName("FilterWheelDock")
+        self.filterwheel_dock.setAllowedAreas(dock_areas)
+        self.filterwheel_dock.setFeatures(dock_features)
 
-        # Right panel - Images
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
+        filterwheel_widget = QWidget()
+        filterwheel_layout = QGridLayout(filterwheel_widget)
+        filterwheel_layout.setContentsMargins(8, 8, 8, 8)
 
-        # Current Image
+        filterwheel_layout.addWidget(QLabel("Name:"), 0, 0)
+        self.filterwheel_name_label = QLabel("--")
+        filterwheel_layout.addWidget(self.filterwheel_name_label, 0, 1)
+        filterwheel_layout.addWidget(QLabel("Status:"), 1, 0)
+        self.filterwheel_status_label = QLabel("--")
+        filterwheel_layout.addWidget(self.filterwheel_status_label, 1, 1)
+        filterwheel_layout.addWidget(QLabel("Filter:"), 2, 0)
+        self.filterwheel_combo = QComboBox()
+        self.filterwheel_combo.setToolTip("Select filter to change to")
+        self.filterwheel_combo.setEnabled(False)
+        self.filterwheel_combo.currentIndexChanged.connect(self._on_filter_changed)
+        filterwheel_layout.addWidget(self.filterwheel_combo, 2, 1)
+        filterwheel_layout.setRowStretch(3, 1)
+
+        # Track filter wheel state to prevent feedback loops
+        self._updating_filterwheel = False
+        self._user_changing_filter = False
+        self._last_filter_id = None
+        self._available_filters = []  # List of {'Id': int, 'Name': str}
+
+        self.filterwheel_dock.setWidget(filterwheel_widget)
+
+        # Focuser dock
+        self.focuser_dock = QDockWidget("Focuser", self)
+        self.focuser_dock.setObjectName("FocuserDock")
+        self.focuser_dock.setAllowedAreas(dock_areas)
+        self.focuser_dock.setFeatures(dock_features)
+
+        focuser_widget = QWidget()
+        focuser_layout = QGridLayout(focuser_widget)
+        focuser_layout.setContentsMargins(8, 8, 8, 8)
+
+        focuser_layout.addWidget(QLabel("Name:"), 0, 0)
+        self.focuser_name_label = QLabel("--")
+        focuser_layout.addWidget(self.focuser_name_label, 0, 1)
+        focuser_layout.addWidget(QLabel("Status:"), 1, 0)
+        self.focuser_status_label = QLabel("--")
+        focuser_layout.addWidget(self.focuser_status_label, 1, 1)
+        focuser_layout.addWidget(QLabel("Position:"), 2, 0)
+        self.focuser_position_label = QLabel("--")
+        focuser_layout.addWidget(self.focuser_position_label, 2, 1)
+        focuser_layout.addWidget(QLabel("Temp:"), 3, 0)
+        self.focuser_temp_label = QLabel("--")
+        focuser_layout.addWidget(self.focuser_temp_label, 3, 1)
+        focuser_layout.setRowStretch(4, 1)
+
+        self.focuser_dock.setWidget(focuser_widget)
+
+    def _create_actions_docks(self):
+        """Create action dock widgets (Imaging, etc.)."""
+        dock_features = (
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable |
+            QDockWidget.DockWidgetClosable
+        )
+        dock_areas = (
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea |
+            Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea
+        )
+
+        # Imaging dock
+        self.imaging_dock = QDockWidget("Imaging", self)
+        self.imaging_dock.setObjectName("ImagingDock")
+        self.imaging_dock.setAllowedAreas(dock_areas)
+        self.imaging_dock.setFeatures(dock_features)
+
+        imaging_widget = QWidget()
+        imaging_layout = QHBoxLayout(imaging_widget)
+        imaging_layout.setContentsMargins(8, 8, 8, 8)
+
+        # Capture group
+        capture_group = QGroupBox("Capture")
+        capture_layout = QHBoxLayout(capture_group)
+        capture_layout.setContentsMargins(8, 4, 8, 4)
+
+        self.imaging_start_btn = QPushButton("Start")
+        self.imaging_start_btn.clicked.connect(self._on_imaging_start)
+        self.imaging_start_btn.setEnabled(False)  # Disabled until connected
+        self.imaging_stop_btn = QPushButton("Stop")
+        self.imaging_stop_btn.clicked.connect(self._on_imaging_stop)
+        self.imaging_stop_btn.setEnabled(False)  # Disabled until exposing
+
+        capture_layout.addWidget(self.imaging_start_btn)
+        capture_layout.addWidget(self.imaging_stop_btn)
+
+        # AutoFocus group
+        autofocus_group = QGroupBox("AutoFocus")
+        autofocus_layout = QHBoxLayout(autofocus_group)
+        autofocus_layout.setContentsMargins(8, 4, 8, 4)
+
+        self.autofocus_start_btn = QPushButton("Start")
+        self.autofocus_start_btn.clicked.connect(self._on_autofocus_start)
+        self.autofocus_start_btn.setEnabled(False)  # Disabled until connected
+        self.autofocus_cancel_btn = QPushButton("Cancel")
+        self.autofocus_cancel_btn.clicked.connect(self._on_autofocus_cancel)
+        self.autofocus_cancel_btn.setEnabled(False)  # Disabled until autofocus running
+
+        autofocus_layout.addWidget(self.autofocus_start_btn)
+        autofocus_layout.addWidget(self.autofocus_cancel_btn)
+
+        imaging_layout.addWidget(capture_group)
+        imaging_layout.addWidget(autofocus_group)
+
+        imaging_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self.imaging_dock.setWidget(imaging_widget)
+
+        # Guider dock
+        self.guider_action_dock = QDockWidget("Guider", self)
+        self.guider_action_dock.setObjectName("GuiderActionDock")
+        self.guider_action_dock.setAllowedAreas(dock_areas)
+        self.guider_action_dock.setFeatures(dock_features)
+
+        guider_action_widget = QWidget()
+        guider_action_layout = QHBoxLayout(guider_action_widget)
+        guider_action_layout.setContentsMargins(8, 8, 8, 8)
+
+        # Guiding group
+        guiding_group = QGroupBox("Guiding")
+        guiding_layout = QHBoxLayout(guiding_group)
+        guiding_layout.setContentsMargins(8, 4, 8, 4)
+
+        self.guiding_start_btn = QPushButton("Start")
+        self.guiding_start_btn.clicked.connect(self._on_guiding_start)
+        self.guiding_start_btn.setEnabled(False)  # Disabled until connected
+        self.guiding_stop_btn = QPushButton("Stop")
+        self.guiding_stop_btn.clicked.connect(self._on_guiding_stop)
+        self.guiding_stop_btn.setEnabled(False)  # Disabled until guiding
+
+        guiding_layout.addWidget(self.guiding_start_btn)
+        guiding_layout.addWidget(self.guiding_stop_btn)
+
+        guider_action_layout.addWidget(guiding_group)
+
+        guider_action_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self.guider_action_dock.setWidget(guider_action_widget)
+
+        # Mount dock
+        self.mount_action_dock = QDockWidget("Mount", self)
+        self.mount_action_dock.setObjectName("MountActionDock")
+        self.mount_action_dock.setAllowedAreas(dock_areas)
+        self.mount_action_dock.setFeatures(dock_features)
+
+        mount_action_widget = QWidget()
+        mount_action_layout = QHBoxLayout(mount_action_widget)
+        mount_action_layout.setContentsMargins(8, 8, 8, 8)
+
+        # Parking group
+        parking_group = QGroupBox("Parking")
+        parking_layout = QHBoxLayout(parking_group)
+        parking_layout.setContentsMargins(8, 4, 8, 4)
+
+        self.mount_home_btn = QPushButton("Home")
+        self.mount_home_btn.clicked.connect(self._on_mount_home)
+        self.mount_home_btn.setEnabled(False)  # Disabled until connected
+        self.mount_park_btn = QPushButton("Park")
+        self.mount_park_btn.clicked.connect(self._on_mount_park)
+        self.mount_park_btn.setEnabled(False)  # Disabled until connected
+        self.mount_unpark_btn = QPushButton("Unpark")
+        self.mount_unpark_btn.clicked.connect(self._on_mount_unpark)
+        self.mount_unpark_btn.setEnabled(False)  # Disabled until connected
+
+        parking_layout.addWidget(self.mount_home_btn)
+        parking_layout.addWidget(self.mount_park_btn)
+        parking_layout.addWidget(self.mount_unpark_btn)
+
+        # Slew group
+        slew_group = QGroupBox("Slew")
+        slew_layout = QHBoxLayout(slew_group)
+        slew_layout.setContentsMargins(8, 4, 8, 4)
+
+        self.mount_slew_btn = QPushButton("Slew...")
+        self.mount_slew_btn.clicked.connect(self._on_mount_slew)
+        self.mount_slew_btn.setEnabled(False)  # Disabled until connected
+
+        slew_layout.addWidget(self.mount_slew_btn)
+
+        mount_action_layout.addWidget(parking_group)
+        mount_action_layout.addWidget(slew_group)
+
+        mount_action_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self.mount_action_dock.setWidget(mount_action_widget)
+
+        # Spacer dock - absorbs extra space so action docks stay compact
+        self.actions_spacer_dock = QDockWidget("", self)
+        self.actions_spacer_dock.setObjectName("ActionsSpacerDock")
+        self.actions_spacer_dock.setAllowedAreas(dock_areas)
+        self.actions_spacer_dock.setFeatures(QDockWidget.DockWidgetMovable)  # No close button
+        self.actions_spacer_dock.setTitleBarWidget(QWidget())  # Hide title bar
+
+        spacer_widget = QWidget()
+        spacer_widget.setMinimumWidth(0)
+        spacer_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.actions_spacer_dock.setWidget(spacer_widget)
+
+    def _create_image_panel(self, parent_layout):
+        """Create the Current Image panel in the central widget."""
+        # Image group box
         image_group = QGroupBox("Current Image")
         image_layout = QVBoxLayout(image_group)
         image_layout.setContentsMargins(5, 5, 5, 5)
@@ -507,15 +1110,13 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.image_label.setStyleSheet(f"background-color: {COLORS['background_light']}; border: 1px solid {COLORS['border']};")
         self.image_label.setText("No image available")
-        image_layout.addWidget(self.image_label, 1)  # Stretch factor 1 - takes all available space
+        image_layout.addWidget(self.image_label, 1)
 
         self.image_info_label = QLabel("Target: -- | Exp: --")
         self.image_info_label.setAlignment(Qt.AlignCenter)
         self.image_info_label.setFixedHeight(20)
         self.image_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
-        image_layout.addWidget(self.image_info_label, 0)  # Stretch factor 0 - fixed size
-
-        right_layout.addWidget(image_group, 1)  # Image group takes most space
+        image_layout.addWidget(self.image_info_label, 0)
 
         # Live Stack (hidden by default)
         self.livestack_group = QGroupBox("Live Stack")
@@ -529,28 +1130,34 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.livestack_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.livestack_label.setStyleSheet(f"background-color: {COLORS['background_light']}; border: 1px solid {COLORS['border']};")
         self.livestack_label.setText("Live stack not active")
-        livestack_layout.addWidget(self.livestack_label, 1)  # Stretch factor 1
+        livestack_layout.addWidget(self.livestack_label, 1)
 
         self.livestack_info_label = QLabel("Stack: -- frames | -- total")
         self.livestack_info_label.setAlignment(Qt.AlignCenter)
         self.livestack_info_label.setFixedHeight(20)
         self.livestack_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
-        livestack_layout.addWidget(self.livestack_info_label, 0)  # Stretch factor 0
+        livestack_layout.addWidget(self.livestack_info_label, 0)
 
-        right_layout.addWidget(self.livestack_group, 0)  # Livestack group is smaller
+        image_layout.addWidget(self.livestack_group, 0)
         self.livestack_group.setVisible(False)
 
-        self.horizontal_splitter.addWidget(right_panel)
+        parent_layout.addWidget(image_group, 1)  # stretch factor 1 to expand
 
-        # Set initial horizontal splitter sizes and stretch factors
-        # Stretch 0 for left panel (fixed), 1 for right panel (stretches)
-        self.horizontal_splitter.setStretchFactor(0, 0)
-        self.horizontal_splitter.setStretchFactor(1, 1)
-        self.horizontal_splitter.setSizes([250, 550])
+    def _create_guiding_dock(self):
+        """Create the Guiding Graph dock widget."""
+        self.guiding_dock = QDockWidget("Guiding Graph", self)
+        self.guiding_dock.setObjectName("GuidingGraphDock")
+        self.guiding_dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea |
+            Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea
+        )
+        self.guiding_dock.setFeatures(
+            QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable
+        )
 
-        # Guiding graph
-        guiding_group = QGroupBox("Guiding Graph")
-        guiding_layout = QVBoxLayout(guiding_group)
+        # Guiding graph content
+        guiding_widget = QWidget()
+        guiding_layout = QVBoxLayout(guiding_widget)
         guiding_layout.setContentsMargins(5, 5, 5, 5)
 
         self.guiding_graph = GuidingGraph(self)
@@ -558,84 +1165,152 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.guiding_graph.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         guiding_layout.addWidget(self.guiding_graph)
 
-        # Vertical splitter to make guiding graph resizable
-        self.vertical_splitter = QSplitter(Qt.Vertical)
-        self.vertical_splitter.addWidget(self.horizontal_splitter)
-        self.vertical_splitter.addWidget(guiding_group)
-        self.vertical_splitter.setSizes([450, 200])  # Default sizes
-        self.vertical_splitter.setChildrenCollapsible(False)  # Prevent fully collapsing panels
+        self.guiding_dock.setWidget(guiding_widget)
 
-        main_layout.addWidget(self.vertical_splitter, 1)
+    def _setup_view_menu(self):
+        """Set up the View menu for panel visibility and layout reset."""
+        view_menu = self.menuBar().addMenu("View")
 
-        # Status bar
-        status_layout_h = QHBoxLayout()
-        self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
-        status_layout_h.addWidget(self.status_label)
-        status_layout_h.addStretch()
-        self.countdown_label = QLabel("")
-        self.countdown_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
-        status_layout_h.addWidget(self.countdown_label)
-        main_layout.addLayout(status_layout_h)
+        # Actions docks
+        actions_menu = view_menu.addMenu("Actions")
+        actions_menu.addAction(self.imaging_dock.toggleViewAction())
+        actions_menu.addAction(self.guider_action_dock.toggleViewAction())
+        actions_menu.addAction(self.mount_action_dock.toggleViewAction())
 
-        # Track when user manually adjusts splitter (to distinguish from automatic layout changes)
-        self.horizontal_splitter.splitterMoved.connect(self._on_splitter_moved)
-        self.vertical_splitter.splitterMoved.connect(self._on_splitter_moved)
+        # Equipment docks
+        equipment_menu = view_menu.addMenu("Equipment")
+        equipment_menu.addAction(self.camera_dock.toggleViewAction())
+        equipment_menu.addAction(self.mount_dock.toggleViewAction())
+        equipment_menu.addAction(self.guider_dock.toggleViewAction())
+        equipment_menu.addAction(self.filterwheel_dock.toggleViewAction())
+        equipment_menu.addAction(self.focuser_dock.toggleViewAction())
 
-    def _on_splitter_moved(self):
-        """Track when user manually moves a splitter."""
-        self._user_adjusted_splitter = True
+        view_menu.addAction(self.guiding_dock.toggleViewAction())
+        view_menu.addSeparator()
+        reset_action = view_menu.addAction("Reset Layout")
+        reset_action.triggered.connect(self._reset_layout)
+
+    def _set_default_layout(self):
+        """Set default dock positions (matches original layout)."""
+        # Configure corners so top dock spans full width and bottom dock spans full width
+        self.setCorner(Qt.TopLeftCorner, Qt.TopDockWidgetArea)
+        self.setCorner(Qt.TopRightCorner, Qt.TopDockWidgetArea)
+        self.setCorner(Qt.BottomLeftCorner, Qt.BottomDockWidgetArea)
+        self.setCorner(Qt.BottomRightCorner, Qt.BottomDockWidgetArea)
+
+        # Action docks at top, side by side with spacer absorbing extra space
+        self.addDockWidget(Qt.TopDockWidgetArea, self.imaging_dock)
+        self.addDockWidget(Qt.TopDockWidgetArea, self.guider_action_dock)
+        self.addDockWidget(Qt.TopDockWidgetArea, self.mount_action_dock)
+        self.addDockWidget(Qt.TopDockWidgetArea, self.actions_spacer_dock)
+        # Arrange horizontally: Imaging | Guider | Mount | Spacer
+        self.splitDockWidget(self.imaging_dock, self.guider_action_dock, Qt.Horizontal)
+        self.splitDockWidget(self.guider_action_dock, self.mount_action_dock, Qt.Horizontal)
+        self.splitDockWidget(self.mount_action_dock, self.actions_spacer_dock, Qt.Horizontal)
+
+        # Add equipment docks to left area, tabified together
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.camera_dock)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.mount_dock)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.guider_dock)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.filterwheel_dock)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.focuser_dock)
+
+        # Stack them vertically in the left area
+        self.splitDockWidget(self.camera_dock, self.mount_dock, Qt.Vertical)
+        self.splitDockWidget(self.mount_dock, self.guider_dock, Qt.Vertical)
+        self.splitDockWidget(self.guider_dock, self.filterwheel_dock, Qt.Vertical)
+        self.splitDockWidget(self.filterwheel_dock, self.focuser_dock, Qt.Vertical)
+
+        # Add guiding graph at bottom
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.guiding_dock)
+
+        # Set initial sizes
+        self.resizeDocks([self.imaging_dock], [60], Qt.Vertical)  # Compact height for imaging
+        self.resizeDocks([self.camera_dock], [250], Qt.Horizontal)
+        self.resizeDocks([self.guiding_dock], [200], Qt.Vertical)
+
+    def _reset_layout(self):
+        """Reset dock layout to defaults."""
+        # Remove all docks first
+        self.removeDockWidget(self.imaging_dock)
+        self.removeDockWidget(self.guider_action_dock)
+        self.removeDockWidget(self.mount_action_dock)
+        self.removeDockWidget(self.actions_spacer_dock)
+        self.removeDockWidget(self.camera_dock)
+        self.removeDockWidget(self.mount_dock)
+        self.removeDockWidget(self.guider_dock)
+        self.removeDockWidget(self.filterwheel_dock)
+        self.removeDockWidget(self.focuser_dock)
+        self.removeDockWidget(self.guiding_dock)
+
+        # Re-add in default positions
+        self._set_default_layout()
+
+        # Show all docks
+        self.imaging_dock.show()
+        self.guider_action_dock.show()
+        self.mount_action_dock.show()
+        self.actions_spacer_dock.show()
+        self.camera_dock.show()
+        self.mount_dock.show()
+        self.guider_dock.show()
+        self.filterwheel_dock.show()
+        self.focuser_dock.show()
+        self.guiding_dock.show()
 
     def _restore_settings(self):
-        """Restore saved panel sizes and refresh rate."""
+        """Restore saved dock layout and refresh rate."""
         settings = QSettings("CosmosCollection", "CosmosCollection")
 
-        # Restore refresh rate
-        refresh_index = settings.value("nina_dashboard_refresh_index", 1, type=int)
-        if 0 <= refresh_index < self.refresh_combo.count():
-            self.refresh_combo.setCurrentIndex(refresh_index)
+        # Check for saved dock state
+        dock_state = settings.value("nina_dashboard_dock_state")
 
-        # Restore horizontal splitter sizes (stored as comma-separated string)
-        h_sizes_str = settings.value("nina_dashboard_h_splitter", "", type=str)
-        if h_sizes_str:
-            try:
-                sizes = [int(s.strip()) for s in h_sizes_str.split(",")]
-                if len(sizes) == 2:
-                    self.horizontal_splitter.setSizes(sizes)
-                    logger.debug(f"Restored h_splitter: {sizes}")
-            except (ValueError, TypeError):
-                pass
+        if dock_state is not None:
+            # Handle different types that QSettings might return
+            if isinstance(dock_state, QByteArray):
+                state_bytes = dock_state
+            elif isinstance(dock_state, bytes):
+                state_bytes = QByteArray(dock_state)
+            else:
+                logger.debug(f"Unexpected dock_state type: {type(dock_state)}")
+                self._set_default_layout()
+                return
 
-        # Restore vertical splitter sizes (stored as comma-separated string)
-        v_sizes_str = settings.value("nina_dashboard_v_splitter", "", type=str)
-        if v_sizes_str:
-            try:
-                sizes = [int(s.strip()) for s in v_sizes_str.split(",")]
-                if len(sizes) == 2:
-                    self.vertical_splitter.setSizes(sizes)
-                    logger.debug(f"Restored v_splitter: {sizes}")
-            except (ValueError, TypeError):
-                pass
+            if not state_bytes.isEmpty():
+                # Add docks first (required for restoreState), then restore positions
+                self.addDockWidget(Qt.TopDockWidgetArea, self.imaging_dock)
+                self.addDockWidget(Qt.TopDockWidgetArea, self.guider_action_dock)
+                self.addDockWidget(Qt.TopDockWidgetArea, self.mount_action_dock)
+                self.addDockWidget(Qt.TopDockWidgetArea, self.actions_spacer_dock)
+                self.addDockWidget(Qt.LeftDockWidgetArea, self.camera_dock)
+                self.addDockWidget(Qt.LeftDockWidgetArea, self.mount_dock)
+                self.addDockWidget(Qt.LeftDockWidgetArea, self.guider_dock)
+                self.addDockWidget(Qt.LeftDockWidgetArea, self.filterwheel_dock)
+                self.addDockWidget(Qt.LeftDockWidgetArea, self.focuser_dock)
+                self.addDockWidget(Qt.BottomDockWidgetArea, self.guiding_dock)
+                self.restoreState(state_bytes)
+                logger.debug(f"Restored dock state, size={state_bytes.size()}")
+            else:
+                self._set_default_layout()
+        else:
+            self._set_default_layout()
 
     def _save_settings(self):
-        """Save panel sizes and refresh rate."""
+        """Save dock layout and refresh rate."""
         settings = QSettings("CosmosCollection", "CosmosCollection")
 
-        # Save refresh rate
-        settings.setValue("nina_dashboard_refresh_index", self.refresh_combo.currentIndex())
+        # Only save dock state if docks are properly attached to the window
+        camera_area = self.dockWidgetArea(self.camera_dock)
+        if camera_area == Qt.NoDockWidgetArea:
+            logger.debug("Skipping dock state save - docks not attached")
+            settings.sync()
+            return
 
-        # Only save splitter sizes if user manually adjusted them
-        # This prevents automatic layout changes from overwriting saved values
-        if self._user_adjusted_splitter:
-            h_sizes = self.horizontal_splitter.sizes()
-            settings.setValue("nina_dashboard_h_splitter", f"{h_sizes[0]},{h_sizes[1]}")
-
-            v_sizes = self.vertical_splitter.sizes()
-            settings.setValue("nina_dashboard_v_splitter", f"{v_sizes[0]},{v_sizes[1]}")
-
-            logger.debug(f"Saved splitter sizes: h={h_sizes}, v={v_sizes}")
-        else:
-            logger.debug("Skipped saving splitter sizes (no user adjustment)")
+        # Save dock state
+        dock_state = self.saveState()
+        state_bytes = bytes(dock_state.data())
+        settings.setValue("nina_dashboard_dock_state", state_bytes)
+        logger.debug(f"Saved dock state, size={dock_state.size()}")
 
         settings.sync()
 
@@ -659,7 +1334,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         # Get settings
         host, port = NINAIntegration.get_settings()
 
-        # Create and start worker
+        # Create and start worker (uses adaptive polling)
         self.worker = NINAStatusWorker(host, port)
         self.worker.connection_changed.connect(self._on_connection_changed)
         self.worker.status_updated.connect(self._on_status_updated)
@@ -670,10 +1345,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.worker.start()
 
     def _stop_worker(self):
-        """Stop the worker thread and timers."""
-        self.poll_timer.stop()
-        self.countdown_timer.stop()
-
+        """Stop the worker thread."""
         if self.worker:
             self.worker.stop()
             self.worker.wait(2000)
@@ -687,52 +1359,50 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         if connected:
             self.connection_label.setText(f"Connection: Connected to NINA {version}")
             self.connection_label.setStyleSheet(f"color: {COLORS['success']};")
-            self.status_label.setText("Connected - polling for data...")
-
-            # Start polling timer
-            interval = self.refresh_combo.currentData() * 1000
-            self.poll_timer.start(interval)
-            self._next_refresh_seconds = self.refresh_combo.currentData()
-            self.countdown_timer.start(1000)
+            self.status_label.setText("Connected - adaptive polling active")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            # Enable start buttons (stop/cancel remain disabled until active)
+            self.imaging_start_btn.setEnabled(True)
+            self.autofocus_start_btn.setEnabled(True)
+            self.guiding_start_btn.setEnabled(True)
+            self.mount_home_btn.setEnabled(True)
+            self.mount_park_btn.setEnabled(True)
+            self.mount_unpark_btn.setEnabled(True)
+            self.mount_slew_btn.setEnabled(True)
         else:
             self.connection_label.setText("Connection: Disconnected")
             self.connection_label.setStyleSheet(f"color: {COLORS['error']};")
             self.status_label.setText("NINA disconnected - click Reconnect to retry")
             self.status_label.setStyleSheet(f"color: {COLORS['warning']};")
-
-    def _on_refresh_changed(self, index):
-        """Handle refresh interval change."""
-        self._save_settings()
-        if self._connected:
-            interval = self.refresh_combo.currentData() * 1000
-            self.poll_timer.start(interval)
-            self._next_refresh_seconds = self.refresh_combo.currentData()
-
-    def _poll_nina(self):
-        """Trigger a poll cycle."""
-        if self.worker and self.worker.isRunning():
-            # Worker will poll on next iteration
-            self._next_refresh_seconds = self.refresh_combo.currentData()
-
-    def _update_countdown(self):
-        """Update the countdown display."""
-        if self._next_refresh_seconds > 0:
-            self._next_refresh_seconds -= 1
-
-        if self._last_update:
-            update_str = format_time(self._last_update)
-            self.countdown_label.setText(f"Last update: {update_str} | Next refresh in {self._next_refresh_seconds}s")
-        else:
-            self.countdown_label.setText(f"Next refresh in {self._next_refresh_seconds}s")
+            # Disable all action buttons when disconnected
+            self.imaging_start_btn.setEnabled(False)
+            self.imaging_stop_btn.setEnabled(False)
+            self.autofocus_start_btn.setEnabled(False)
+            self.autofocus_cancel_btn.setEnabled(False)
+            self.guiding_start_btn.setEnabled(False)
+            self.guiding_stop_btn.setEnabled(False)
+            self.mount_home_btn.setEnabled(False)
+            self.mount_park_btn.setEnabled(False)
+            self.mount_unpark_btn.setEnabled(False)
+            self.mount_slew_btn.setEnabled(False)
 
     def _on_status_updated(self, status_data):
         """Handle status update from worker."""
         self._last_update = datetime.now()
 
+        # Update last update display
+        update_str = format_time(self._last_update)
+        self.countdown_label.setText(f"Last update: {update_str}")
+
         # Update camera info
         camera = status_data.get('camera', {})
         if camera:
             is_exposing = camera.get('IsExposing', False)
+            camera_connected = camera.get('Connected', False)
+
+            # Update imaging button states based on connection and exposure status
+            self.imaging_start_btn.setEnabled(self._connected and camera_connected and not is_exposing)
+            self.imaging_stop_btn.setEnabled(self._connected and camera_connected and is_exposing)
 
             name = camera.get('Name') or camera.get('DeviceName', '--')
             self.camera_name_label.setText(name)
@@ -743,8 +1413,23 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.camera_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
                 self.camera_exposure_label.setText("--")
                 self.camera_progress.setValue(0)
+                self.camera_temp_label.setText("--")
                 self._exposure_start_time = None
                 self._exposure_end_time = None
+                # Disable controls when disconnected (block signals to prevent callbacks)
+                self.camera_cooling_checkbox.blockSignals(True)
+                self.camera_cooling_checkbox.setChecked(False)
+                self.camera_cooling_checkbox.setEnabled(False)
+                self.camera_cooling_checkbox.blockSignals(False)
+
+                self.camera_target_temp_spinbox.blockSignals(True)
+                self.camera_target_temp_spinbox.setEnabled(False)
+                self.camera_target_temp_spinbox.blockSignals(False)
+
+                self.camera_dewheater_checkbox.blockSignals(True)
+                self.camera_dewheater_checkbox.setChecked(False)
+                self.camera_dewheater_checkbox.setEnabled(False)
+                self.camera_dewheater_checkbox.blockSignals(False)
             else:
                 # Determine camera state
                 if is_exposing:
@@ -800,29 +1485,108 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                     self._exposure_start_time = None
                     self._exposure_end_time = None
 
+                # Camera temperature
+                temp = camera.get('Temperature')
+                if temp is not None:
+                    self.camera_temp_label.setText(f"{temp:.1f}°C")
+                else:
+                    self.camera_temp_label.setText("--")
+
+                # Sync cooling controls with camera state (skip if user recently changed)
+                self.camera_cooling_checkbox.setEnabled(True)
+                self.camera_target_temp_spinbox.setEnabled(True)
+                self.camera_dewheater_checkbox.setEnabled(True)
+
+                # Only sync cooling on/off state on initial load (when we haven't set it yet)
+                # After user sets it, we respect their choice and don't override
+                # Note: We don't sync target temp - that's user-controlled only
+                cooling_on_raw = camera.get('CoolerOn', False)
+                cooler_power = camera.get('CoolerPower', 0)
+                target_temp = camera.get('TargetTemp') or camera.get('TemperatureSetPoint')
+                at_target = camera.get('AtTargetTemp', False)
+
+                # Handle potential string values from API
+                if isinstance(cooling_on_raw, str):
+                    cooling_on = cooling_on_raw.lower() in ('true', '1', 'yes')
+                else:
+                    cooling_on = bool(cooling_on_raw)
+                    logger.debug(f"[Cooling Sync] API: CoolerOn={cooling_on_raw!r}, CoolerPower={cooler_power}, TargetTemp={target_temp}, AtTarget={at_target}")
+
+                if self._last_cooling_enabled is None and not self._user_changing_cooling:
+                    logger.debug(f"[Cooling Sync] Initial sync - setting checkbox to {cooling_on}")
+                    # Block signals to prevent triggering callbacks
+                    self.camera_cooling_checkbox.blockSignals(True)
+                    self.camera_cooling_checkbox.setChecked(cooling_on)
+                    self.camera_cooling_checkbox.blockSignals(False)
+                    logger.debug(f"[Cooling Sync] After setChecked({cooling_on}), checkbox is now: {self.camera_cooling_checkbox.isChecked()}")
+                    # Mark as synced so we don't repeat
+                    self._last_cooling_enabled = cooling_on
+
+                # Only sync dew heater state if user isn't actively changing it
+                dewheater_on = camera.get('DewHeaterOn', False)
+                logger.debug(f"[DewHeater Sync] API DewHeaterOn={dewheater_on}, _user_changing_dewheater={self._user_changing_dewheater}")
+                if not self._user_changing_dewheater:
+                    self.camera_dewheater_checkbox.blockSignals(True)
+                    self.camera_dewheater_checkbox.setChecked(dewheater_on)
+                    self.camera_dewheater_checkbox.blockSignals(False)
+        else:
+            # No camera data from API - show as disconnected
+            self.camera_name_label.setText("--")
+            self.camera_status_label.setText("Disconnected")
+            self.camera_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+            self.camera_exposure_label.setText("--")
+            self.camera_progress.setValue(0)
+            self.camera_temp_label.setText("--")
+            self.camera_cooling_checkbox.blockSignals(True)
+            self.camera_cooling_checkbox.setChecked(False)
+            self.camera_cooling_checkbox.setEnabled(False)
+            self.camera_cooling_checkbox.blockSignals(False)
+            self.camera_target_temp_spinbox.setEnabled(False)
+            self.camera_dewheater_checkbox.blockSignals(True)
+            self.camera_dewheater_checkbox.setChecked(False)
+            self.camera_dewheater_checkbox.setEnabled(False)
+            self.camera_dewheater_checkbox.blockSignals(False)
+            self._last_cooling_enabled = None
+
         # Update mount info
         mount = status_data.get('mount', {})
         if mount:
             name = mount.get('Name') or mount.get('DeviceName', '--')
             self.mount_name_label.setText(name)
 
-            connected = mount.get('Connected', False)
-            if not connected:
+            mount_connected = mount.get('Connected', False)
+            if not mount_connected:
                 self.mount_status_label.setText("Disconnected")
                 self.mount_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
                 self.mount_coords_label.setText("--")
+                # Disable mount buttons when mount disconnected
+                self.mount_home_btn.setEnabled(False)
+                self.mount_park_btn.setEnabled(False)
+                self.mount_unpark_btn.setEnabled(False)
+                self.mount_slew_btn.setEnabled(False)
             else:
                 tracking = mount.get('TrackingEnabled', False) or mount.get('Tracking', False)
                 slewing = mount.get('Slewing', False)
+                at_park = mount.get('AtPark', False)
+
                 if slewing:
                     self.mount_status_label.setText("Slewing")
                     self.mount_status_label.setStyleSheet(f"color: {COLORS['info']};")
+                elif at_park:
+                    self.mount_status_label.setText("Parked")
+                    self.mount_status_label.setStyleSheet(f"color: {COLORS['text']};")
                 elif tracking:
                     self.mount_status_label.setText("Tracking")
                     self.mount_status_label.setStyleSheet(f"color: {COLORS['success']};")
                 else:
-                    self.mount_status_label.setText("Parked/Idle")
+                    self.mount_status_label.setText("Idle")
                     self.mount_status_label.setStyleSheet(f"color: {COLORS['text']};")
+
+                # Update mount button states based on park status
+                self.mount_home_btn.setEnabled(self._connected and not at_park and not slewing)
+                self.mount_park_btn.setEnabled(self._connected and not at_park and not slewing)
+                self.mount_unpark_btn.setEnabled(self._connected and at_park)
+                self.mount_slew_btn.setEnabled(self._connected and not at_park and not slewing)
 
                 # Coordinates
                 ra = mount.get('RightAscension', 0) or mount.get('RA', 0)
@@ -840,6 +1604,17 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                     self.mount_coords_label.setText(f"{ra_h:02d}h{ra_m:02d}m / {dec_sign}{dec_d}d{dec_m:02d}m")
                 else:
                     self.mount_coords_label.setText("--")
+        else:
+            # No mount data from API - show as disconnected
+            self.mount_name_label.setText("--")
+            self.mount_status_label.setText("Disconnected")
+            self.mount_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+            self.mount_coords_label.setText("--")
+            # Disable mount buttons when no mount data
+            self.mount_home_btn.setEnabled(False)
+            self.mount_park_btn.setEnabled(False)
+            self.mount_unpark_btn.setEnabled(False)
+            self.mount_slew_btn.setEnabled(False)
 
         # Update guider info
         guider = status_data.get('guider', {})
@@ -847,19 +1622,26 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             name = guider.get('Name') or guider.get('DeviceName', '--')
             self.guider_name_label.setText(name)
 
-            connected = guider.get('Connected', False)
-            if not connected:
+            guider_connected = guider.get('Connected', False)
+            if not guider_connected:
                 self.guider_status_label.setText("Disconnected")
                 self.guider_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
                 self.guider_rms_label.setText("--")
+                # Disable guiding buttons when guider disconnected
+                self.guiding_start_btn.setEnabled(False)
+                self.guiding_stop_btn.setEnabled(False)
             else:
-                guiding = guider.get('Guiding', False) or guider.get('IsGuiding', False)
-                if guiding:
+                is_guiding = guider.get('Guiding', False) or guider.get('IsGuiding', False)
+                if is_guiding:
                     self.guider_status_label.setText("Guiding")
                     self.guider_status_label.setStyleSheet(f"color: {COLORS['success']};")
                 else:
                     self.guider_status_label.setText("Idle")
                     self.guider_status_label.setStyleSheet(f"color: {COLORS['text']};")
+
+                # Update guiding button states
+                self.guiding_start_btn.setEnabled(self._connected and not is_guiding)
+                self.guiding_stop_btn.setEnabled(self._connected and is_guiding)
 
                 # RMS
                 rms_ra = guider.get('RMSErrorRA', 0) or 0
@@ -870,6 +1652,137 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                     self.guider_rms_label.setText(f'{total_rms:.2f}"')
                 else:
                     self.guider_rms_label.setText("--")
+        else:
+            # No guider data from API - show as disconnected
+            self.guider_name_label.setText("--")
+            self.guider_status_label.setText("Disconnected")
+            self.guider_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+            self.guider_rms_label.setText("--")
+            # Disable guiding buttons when no guider data
+            self.guiding_start_btn.setEnabled(False)
+            self.guiding_stop_btn.setEnabled(False)
+
+        # Update filter wheel info
+        filterwheel = status_data.get('filterwheel', {})
+        if filterwheel:
+            name = filterwheel.get('Name') or filterwheel.get('DeviceName', '--')
+            self.filterwheel_name_label.setText(name)
+
+            connected = filterwheel.get('Connected', False)
+            is_moving = filterwheel.get('IsMoving', False)
+
+            if not connected:
+                self.filterwheel_status_label.setText("Disconnected")
+                self.filterwheel_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+                self.filterwheel_combo.setEnabled(False)
+                self._updating_filterwheel = True
+                self.filterwheel_combo.clear()
+                self._updating_filterwheel = False
+                self._available_filters = []
+                self._last_filter_id = None
+            else:
+                if is_moving:
+                    self.filterwheel_status_label.setText("Moving...")
+                    self.filterwheel_status_label.setStyleSheet(f"color: {COLORS['warning']};")
+                    self.filterwheel_combo.setEnabled(False)
+                else:
+                    self.filterwheel_status_label.setText("Connected")
+                    self.filterwheel_status_label.setStyleSheet(f"color: {COLORS['success']};")
+                    # Only enable if user isn't actively changing
+                    if not self._user_changing_filter:
+                        self.filterwheel_combo.setEnabled(True)
+
+                # Update available filters list if changed
+                available = filterwheel.get('AvailableFilters', [])
+                if available != self._available_filters:
+                    logger.debug(f"[FilterWheel] Available filters changed: {available}")
+                    self._available_filters = available
+                    self._updating_filterwheel = True
+                    self.filterwheel_combo.clear()
+                    for f in available:
+                        filter_name = f.get('Name', f'Filter {f.get("Id", "?")}')
+                        filter_id = f.get('Id', -1)
+                        self.filterwheel_combo.addItem(filter_name, filter_id)
+                    self._updating_filterwheel = False
+
+                # Sync current filter selection (only if user isn't actively changing)
+                if not self._user_changing_filter:
+                    selected = filterwheel.get('SelectedFilter') or filterwheel.get('Filter')
+                    if selected and isinstance(selected, dict):
+                        current_id = selected.get('Id')
+                        if current_id is not None and current_id != self._last_filter_id:
+                            logger.debug(f"[FilterWheel Sync] Current filter changed: ID={current_id}, last={self._last_filter_id}")
+                            self._last_filter_id = current_id
+                            # Find and select the matching filter in combo
+                            self._updating_filterwheel = True
+                            for i in range(self.filterwheel_combo.count()):
+                                if self.filterwheel_combo.itemData(i) == current_id:
+                                    self.filterwheel_combo.setCurrentIndex(i)
+                                    break
+                            self._updating_filterwheel = False
+        else:
+            # No filter wheel data from API - show as disconnected
+            self.filterwheel_name_label.setText("--")
+            self.filterwheel_status_label.setText("Disconnected")
+            self.filterwheel_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+            self.filterwheel_combo.setEnabled(False)
+            self._updating_filterwheel = True
+            self.filterwheel_combo.clear()
+            self._updating_filterwheel = False
+            self._available_filters = []
+            self._last_filter_id = None
+
+        # Update focuser info
+        focuser = status_data.get('focuser', {})
+        if focuser:
+            name = focuser.get('Name') or focuser.get('DeviceName', '--')
+            self.focuser_name_label.setText(name)
+
+            focuser_connected = focuser.get('Connected', False)
+            if not focuser_connected:
+                self.focuser_status_label.setText("Disconnected")
+                self.focuser_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+                self.focuser_position_label.setText("--")
+                self.focuser_temp_label.setText("--")
+                # Disable autofocus buttons when focuser disconnected
+                self.autofocus_start_btn.setEnabled(False)
+                self.autofocus_cancel_btn.setEnabled(False)
+            else:
+                is_moving = focuser.get('IsMoving', False)
+                if is_moving:
+                    self.focuser_status_label.setText("Moving")
+                    self.focuser_status_label.setStyleSheet(f"color: {COLORS['info']};")
+                else:
+                    self.focuser_status_label.setText("Connected")
+                    self.focuser_status_label.setStyleSheet(f"color: {COLORS['success']};")
+
+                # Update autofocus button states based on focuser movement
+                self.autofocus_start_btn.setEnabled(self._connected and not is_moving)
+                self.autofocus_cancel_btn.setEnabled(self._connected and is_moving)
+
+                # Position
+                position = focuser.get('Position')
+                if position is not None:
+                    self.focuser_position_label.setText(str(position))
+                else:
+                    self.focuser_position_label.setText("--")
+
+                # Temperature
+                temp = focuser.get('Temperature')
+                if temp is not None:
+                    self.focuser_temp_label.setText(f"{temp:.1f}°C")
+                else:
+                    self.focuser_temp_label.setText("--")
+        else:
+            # No focuser data from API - show as disconnected
+            self.focuser_name_label.setText("--")
+            self.focuser_status_label.setText("Disconnected")
+            self.focuser_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+            self.focuser_position_label.setText("--")
+            self.focuser_temp_label.setText("--")
+            # Disable autofocus buttons when no focuser data
+            self.autofocus_start_btn.setEnabled(False)
+            self.autofocus_cancel_btn.setEnabled(False)
 
     def _on_image_updated(self, image_data, image_meta):
         """Handle image update from worker."""
@@ -951,6 +1864,331 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         """Handle error from worker."""
         self.status_label.setText(f"Error: {error_message}")
         self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_cooling_changed(self, state):
+        """Handle cooling checkbox change."""
+        if self._updating_camera_controls:
+            logger.debug(f"[Cooling] Ignoring change - _updating_camera_controls is True")
+            return
+
+        enabled = state == Qt.Checked.value if hasattr(Qt.Checked, 'value') else state == 2
+        temp = self.camera_target_temp_spinbox.value() if enabled else None
+
+        logger.debug(f"[Cooling] User changed: enabled={enabled}, temp={temp}, last_enabled={self._last_cooling_enabled}, last_temp={self._last_cooling_temp}")
+
+        # Skip if this is the same state we already sent
+        if enabled == self._last_cooling_enabled and (not enabled or temp == self._last_cooling_temp):
+            logger.debug(f"[Cooling] Skipping - same state already sent")
+            return
+
+        # Set flag and start timer to clear it after 15 seconds
+        self._user_changing_cooling = True
+        self._cooling_change_timer.start(15000)
+        logger.debug(f"[Cooling] Set _user_changing_cooling=True, started 15s timer")
+
+        if enabled:
+            self.status_label.setText(f"Setting cooling to {temp}°C...")
+        else:
+            self.status_label.setText("Disabling cooling...")
+
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.set_camera_cooling(host, port, enabled, temp)
+
+        if success:
+            self._last_cooling_enabled = enabled
+            self._last_cooling_temp = temp
+            logger.debug(f"[Cooling] Success - updated last_enabled={enabled}, last_temp={temp}")
+            self.status_label.setText("Cooling " + ("enabled" if enabled else "disabled"))
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        else:
+            logger.debug(f"[Cooling] Failed - reverting checkbox")
+            self.status_label.setText("Failed to change cooling - check console")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            # Revert checkbox state
+            self.camera_cooling_checkbox.blockSignals(True)
+            self.camera_cooling_checkbox.setChecked(not enabled)
+            self.camera_cooling_checkbox.blockSignals(False)
+            # Clear the flag since we reverted
+            self._user_changing_cooling = False
+            self._cooling_change_timer.stop()
+
+    def _clear_cooling_change_flag(self):
+        """Clear the cooling change flag after timeout."""
+        logger.debug(f"[Cooling] Timer expired - clearing _user_changing_cooling flag")
+        self._user_changing_cooling = False
+
+    def _on_target_temp_changed(self):
+        """Handle target temperature change."""
+        if self._updating_camera_controls:
+            logger.debug(f"[Cooling] Target temp change ignored - _updating_camera_controls is True")
+            return
+
+        temp = self.camera_target_temp_spinbox.value()
+
+        # Skip if cooling is off - just remember the temp for when it's turned on
+        if not self.camera_cooling_checkbox.isChecked():
+            logger.debug(f"[Cooling] Target temp change ignored - cooling is off")
+            return
+
+        # Skip if this is the same temp we already sent
+        if temp == self._last_cooling_temp:
+            logger.debug(f"[Cooling] Target temp change ignored - same as last ({temp})")
+            return
+
+        logger.debug(f"[Cooling] User changed target temp: {temp}°C (last was {self._last_cooling_temp})")
+
+        # Set flag to prevent sync from overriding
+        self._user_changing_cooling = True
+        self._cooling_change_timer.start(15000)
+
+        self.status_label.setText(f"Setting target temp to {temp}°C...")
+
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.set_camera_cooling(host, port, True, temp)
+
+        if success:
+            self._last_cooling_temp = temp
+            logger.debug(f"[Cooling] Target temp success - last_temp={temp}")
+            self.status_label.setText(f"Target temp set to {temp}°C")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        else:
+            logger.debug(f"[Cooling] Target temp failed")
+            self.status_label.setText("Failed to set target temperature")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_dewheater_changed(self, state):
+        """Handle dew heater checkbox change."""
+        if self._updating_camera_controls:
+            logger.debug(f"[DewHeater] Ignoring change - _updating_camera_controls is True")
+            return
+
+        # Set flag and start timer to clear it after 15 seconds
+        self._user_changing_dewheater = True
+        self._dewheater_change_timer.start(15000)
+
+        enabled = state == Qt.Checked.value if hasattr(Qt.Checked, 'value') else state == 2
+        logger.debug(f"[DewHeater] User changed: enabled={enabled}")
+        self.status_label.setText("Turning dew heater " + ("on" if enabled else "off") + "...")
+
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.set_camera_dew_heater(host, port, enabled)
+
+        if success:
+            logger.debug(f"[DewHeater] Success")
+            self.status_label.setText("Dew heater " + ("enabled" if enabled else "disabled"))
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        else:
+            logger.debug(f"[DewHeater] Failed - reverting checkbox")
+            self.status_label.setText("Failed to change dew heater")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            # Revert checkbox state
+            self._updating_camera_controls = True
+            self.camera_dewheater_checkbox.setChecked(not enabled)
+            self._updating_camera_controls = False
+            # Clear the flag since we reverted
+            self._user_changing_dewheater = False
+            self._dewheater_change_timer.stop()
+
+    def _clear_dewheater_change_flag(self):
+        """Clear the dew heater change flag after timeout."""
+        logger.debug(f"[DewHeater] Timer expired - clearing _user_changing_dewheater flag")
+        self._user_changing_dewheater = False
+
+    def _on_imaging_start(self):
+        """Start a camera capture."""
+        dialog = CaptureSettingsDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        settings = dialog.get_settings()
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.capture_image(
+            host, port,
+            duration=settings['duration'],
+            gain=settings['gain'],
+            save=settings['save'],
+            image_type=settings['image_type']
+        )
+        if success:
+            self.status_label.setText(f"Capture started ({settings['duration']}s)")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            self.imaging_start_btn.setEnabled(False)
+            self.imaging_stop_btn.setEnabled(True)
+        else:
+            self.status_label.setText("Failed to start capture")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_imaging_stop(self):
+        """Abort the current exposure."""
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.abort_exposure(host, port)
+        if success:
+            self.status_label.setText("Exposure aborted")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            self.imaging_start_btn.setEnabled(True)
+            self.imaging_stop_btn.setEnabled(False)
+        else:
+            self.status_label.setText("Failed to abort exposure")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_autofocus_start(self):
+        """Start an autofocus run."""
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.start_autofocus(host, port)
+        if success:
+            self.status_label.setText("AutoFocus started")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            self.autofocus_start_btn.setEnabled(False)
+            self.autofocus_cancel_btn.setEnabled(True)
+        else:
+            self.status_label.setText("Failed to start AutoFocus")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_autofocus_cancel(self):
+        """Cancel the running autofocus."""
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.cancel_autofocus(host, port)
+        if success:
+            self.status_label.setText("AutoFocus cancelled")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            self.autofocus_start_btn.setEnabled(True)
+            self.autofocus_cancel_btn.setEnabled(False)
+        else:
+            self.status_label.setText("Failed to cancel AutoFocus")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_guiding_start(self):
+        """Start guiding."""
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.start_guiding(host, port)
+        if success:
+            self.status_label.setText("Guiding started")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            self.guiding_start_btn.setEnabled(False)
+            self.guiding_stop_btn.setEnabled(True)
+        else:
+            self.status_label.setText("Failed to start guiding")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_guiding_stop(self):
+        """Stop guiding."""
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.stop_guiding(host, port)
+        if success:
+            self.status_label.setText("Guiding stopped")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            self.guiding_start_btn.setEnabled(True)
+            self.guiding_stop_btn.setEnabled(False)
+        else:
+            self.status_label.setText("Failed to stop guiding")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_mount_home(self):
+        """Home the mount."""
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.home_mount(host, port)
+        if success:
+            self.status_label.setText("Mount homing...")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        else:
+            self.status_label.setText("Failed to home mount")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_mount_park(self):
+        """Park the mount."""
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.park_mount(host, port)
+        if success:
+            self.status_label.setText("Mount parking...")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            self.mount_park_btn.setEnabled(False)
+            self.mount_unpark_btn.setEnabled(True)
+        else:
+            self.status_label.setText("Failed to park mount")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_mount_unpark(self):
+        """Unpark the mount."""
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.unpark_mount(host, port)
+        if success:
+            self.status_label.setText("Mount unparking...")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            self.mount_park_btn.setEnabled(True)
+            self.mount_unpark_btn.setEnabled(False)
+        else:
+            self.status_label.setText("Failed to unpark mount")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_mount_slew(self):
+        """Slew the mount to coordinates."""
+        dialog = SlewDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        ra_deg, dec_deg = dialog.get_coordinates_degrees()
+        host, port = NINAIntegration.get_settings()
+
+        self.status_label.setText(f"Slewing to RA={ra_deg:.4f}° Dec={dec_deg:.4f}°...")
+        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+
+        success = NINAIntegration.slew_mount(host, port, ra_deg, dec_deg)
+        if success:
+            self.status_label.setText("Slew started")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        else:
+            self.status_label.setText("Failed to start slew")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_filter_changed(self, index):
+        """Handle filter selection change."""
+        if self._updating_filterwheel:
+            logger.debug(f"[FilterWheel] Ignoring change - _updating_filterwheel is True")
+            return
+
+        if index < 0:
+            return
+
+        filter_id = self.filterwheel_combo.itemData(index)
+        filter_name = self.filterwheel_combo.itemText(index)
+
+        # Skip if this is the same filter we already have
+        if filter_id == self._last_filter_id:
+            logger.debug(f"[FilterWheel] Skipping - same filter already selected (ID={filter_id})")
+            return
+
+        logger.debug(f"[FilterWheel] User selected: {filter_name} (ID={filter_id}), last={self._last_filter_id}")
+
+        # Set flag to prevent sync from overriding during change
+        self._user_changing_filter = True
+        self.filterwheel_combo.setEnabled(False)
+        self.status_label.setText(f"Changing to {filter_name}...")
+        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+
+        host, port = NINAIntegration.get_settings()
+        success = NINAIntegration.change_filter(host, port, filter_id)
+
+        if success:
+            self._last_filter_id = filter_id
+            logger.debug(f"[FilterWheel] Success - filter changed to {filter_name}")
+            self.status_label.setText(f"Filter changed to {filter_name}")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        else:
+            logger.debug(f"[FilterWheel] Failed - reverting selection")
+            self.status_label.setText("Failed to change filter")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            # Revert combo selection to last known good filter
+            if self._last_filter_id is not None:
+                self._updating_filterwheel = True
+                for i in range(self.filterwheel_combo.count()):
+                    if self.filterwheel_combo.itemData(i) == self._last_filter_id:
+                        self.filterwheel_combo.setCurrentIndex(i)
+                        break
+                self._updating_filterwheel = False
+
+        # Clear the flag and re-enable combo
+        self._user_changing_filter = False
+        self.filterwheel_combo.setEnabled(True)
 
     def _scale_image_to_label(self, label, pixmap):
         """Scale a pixmap to fit within a label while maintaining aspect ratio."""

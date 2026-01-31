@@ -187,10 +187,12 @@ class NINAIntegration:
             dict: Camera info dict on success, None on failure
         """
         url = f"http://{host}:{port}/v2/api/equipment/camera/info"
+        #logger.debug(f"API Request: {url}")
         try:
             request = urllib.request.Request(url)
             with urllib.request.urlopen(request, timeout=5) as response:
                 result = json.loads(response.read().decode('utf-8'))
+                #logger.debug(f"API Response: {result}")
                 if result.get('Success'):
                     resp = result.get('Response')
                     return resp if isinstance(resp, dict) else None
@@ -198,6 +200,212 @@ class NINAIntegration:
         except Exception as e:
             logger.debug(f"Error getting camera info: {e}")
             return None
+
+    @staticmethod
+    def set_camera_cooling(host, port, enabled, temperature=None):
+        """
+        Enable or disable camera cooling.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            enabled: True to enable cooling, False to disable
+            temperature: Target temperature in Celsius (optional, only used when enabling)
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        if enabled:
+            if temperature is not None:
+                # Use minutes=-1 for default duration
+                url = f"http://{host}:{port}/v2/api/equipment/camera/cool?temperature={temperature}&minutes=-1"
+        else:
+            # Cancel cooling
+            url = f"http://{host}:{port}/v2/api/equipment/camera/cool?cancel=true"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to set camera cooling: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error setting camera cooling: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error setting camera cooling: {e}")
+            return False
+
+    @staticmethod
+    def set_camera_dew_heater(host, port, enabled):
+        """
+        Enable or disable camera dew heater.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            enabled: True to enable dew heater, False to disable
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/camera/dew-heater?power={'true' if enabled else 'false'}"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to set dew heater: {result.get('Error', 'Unknown error')}")
+                return success
+        except Exception as e:
+            logger.error(f"Error setting dew heater: {e}")
+            return False
+
+    @staticmethod
+    def home_mount(host, port):
+        """
+        Home the mount.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/mount/home"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=60) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to home mount: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error homing mount: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error homing mount: {e}")
+            return False
+
+    @staticmethod
+    def park_mount(host, port):
+        """
+        Park the mount.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/mount/park"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to park mount: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error parking mount: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error parking mount: {e}")
+            return False
+
+    @staticmethod
+    def slew_mount(host, port, ra_deg, dec_deg, wait_for_result=False):
+        """
+        Slew the mount to specified coordinates.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            ra_deg: Right Ascension in degrees
+            dec_deg: Declination in degrees
+            wait_for_result: Whether to wait for slew to complete
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        params = [f"ra={ra_deg}", f"dec={dec_deg}"]
+        if wait_for_result:
+            params.append("waitForResult=true")
+
+        url = f"http://{host}:{port}/v2/api/equipment/mount/slew?{'&'.join(params)}"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            # Longer timeout if waiting for result
+            timeout = 120 if wait_for_result else 10
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to slew mount: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error slewing mount: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error slewing mount: {e}")
+            return False
+
+    @staticmethod
+    def unpark_mount(host, port):
+        """
+        Unpark the mount.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/mount/unpark"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to unpark mount: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error unparking mount: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error unparking mount: {e}")
+            return False
 
     @staticmethod
     def get_mount_info(host, port):
@@ -212,10 +420,12 @@ class NINAIntegration:
             dict: Mount info dict on success, None on failure
         """
         url = f"http://{host}:{port}/v2/api/equipment/mount/info"
+        #logger.debug(f"API Request: {url}")
         try:
             request = urllib.request.Request(url)
             with urllib.request.urlopen(request, timeout=5) as response:
                 result = json.loads(response.read().decode('utf-8'))
+                #logger.debug(f"API Response: {result}")
                 if result.get('Success'):
                     resp = result.get('Response')
                     return resp if isinstance(resp, dict) else None
@@ -223,6 +433,73 @@ class NINAIntegration:
         except Exception as e:
             logger.debug(f"Error getting mount info: {e}")
             return None
+
+    @staticmethod
+    def start_guiding(host, port, calibrate=False):
+        """
+        Start guiding.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            calibrate: Whether to force calibration before guiding
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/guider/start"
+        if calibrate:
+            url += "?calibrate=true"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to start guiding: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error starting guiding: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error starting guiding: {e}")
+            return False
+
+    @staticmethod
+    def stop_guiding(host, port):
+        """
+        Stop guiding.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/guider/stop"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to stop guiding: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error stopping guiding: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error stopping guiding: {e}")
+            return False
 
     @staticmethod
     def get_guider_info(host, port):
@@ -237,16 +514,243 @@ class NINAIntegration:
             dict: Guider info dict on success, None on failure
         """
         url = f"http://{host}:{port}/v2/api/equipment/guider/info"
+        #logger.debug(f"API Request: {url}")
         try:
             request = urllib.request.Request(url)
             with urllib.request.urlopen(request, timeout=5) as response:
                 result = json.loads(response.read().decode('utf-8'))
+                #logger.debug(f"API Response: {result}")
                 if result.get('Success'):
                     resp = result.get('Response')
                     return resp if isinstance(resp, dict) else None
                 return None
         except Exception as e:
             logger.debug(f"Error getting guider info: {e}")
+            return None
+
+    @staticmethod
+    def get_filterwheel_info(host, port):
+        """
+        Get filter wheel equipment information from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            dict: Filter wheel info dict on success, None on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/filterwheel/info"
+        #logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                #logger.debug(f"API Response: {result}")
+                if result.get('Success'):
+                    resp = result.get('Response')
+                    return resp if isinstance(resp, dict) else None
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting filter wheel info: {e}")
+            return None
+
+    @staticmethod
+    def change_filter(host, port, filter_id):
+        """
+        Change the active filter on the filter wheel.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            filter_id: The ID of the filter to change to
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/filterwheel/change-filter?filterId={filter_id}"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to change filter: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error changing filter: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error changing filter: {e}")
+            return False
+
+    @staticmethod
+    def capture_image(host, port, duration=None, gain=None, save=True, image_type="SNAPSHOT"):
+        """
+        Start a camera capture.
+
+        Args:
+            host: NINA host
+            port: NINA port
+            duration: Exposure duration in seconds (optional)
+            gain: Camera gain (optional)
+            save: Save image to disk (default True)
+            image_type: LIGHT, DARK, BIAS, FLAT, or SNAPSHOT
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        params = [f"imageType={image_type}", f"save={'true' if save else 'false'}"]
+        if duration is not None:
+            params.append(f"duration={duration}")
+        if gain is not None:
+            params.append(f"gain={gain}")
+
+        url = f"http://{host}:{port}/v2/api/equipment/camera/capture?{'&'.join(params)}"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to capture image: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error capturing image: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error capturing image: {e}")
+            return False
+
+    @staticmethod
+    def abort_exposure(host, port):
+        """
+        Abort the current camera exposure.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/camera/abort-exposure"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to abort exposure: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error aborting exposure: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error aborting exposure: {e}")
+            return False
+
+    @staticmethod
+    def start_autofocus(host, port):
+        """
+        Start an autofocus run.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/focuser/auto-focus"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to start autofocus: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error starting autofocus: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error starting autofocus: {e}")
+            return False
+
+    @staticmethod
+    def cancel_autofocus(host, port):
+        """
+        Cancel a running autofocus.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            bool: True on success, False on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/focuser/auto-focus?cancel=true"
+
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                success = result.get('Success', False)
+                if not success:
+                    logger.warning(f"Failed to cancel autofocus: {result.get('Error', 'Unknown error')}")
+                return success
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            logger.error(f"HTTP Error canceling autofocus: {e.code} {e.reason} - {error_body}")
+            return False
+        except Exception as e:
+            logger.error(f"Error canceling autofocus: {e}")
+            return False
+
+    @staticmethod
+    def get_focuser_info(host, port):
+        """
+        Get focuser equipment information from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            dict: Focuser info dict on success, None on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/focuser/info"
+        #logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                #logger.debug(f"API Response: {result}")
+                if result.get('Success'):
+                    resp = result.get('Response')
+                    return resp if isinstance(resp, dict) else None
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting focuser info: {e}")
             return None
 
     @staticmethod
@@ -378,10 +882,12 @@ class NINAIntegration:
             dict: Livestack status dict on success, None on failure
         """
         url = f"http://{host}:{port}/v2/api/livestack/status"
+        #logger.debug(f"API Request: {url}")
         try:
             request = urllib.request.Request(url)
             with urllib.request.urlopen(request, timeout=5) as response:
                 result = json.loads(response.read().decode('utf-8'))
+                #logger.debug(f"API Response: {result}")
                 if result.get('Success'):
                     resp = result.get('Response')
                     return resp if isinstance(resp, dict) else None
@@ -403,12 +909,16 @@ class NINAIntegration:
             bytes: Image data (JPEG) on success, None on failure
         """
         url = f"http://{host}:{port}/v2/api/livestack/image"
+        #logger.debug(f"API Request: {url}")
         try:
             request = urllib.request.Request(url)
             with urllib.request.urlopen(request, timeout=10) as response:
                 content_type = response.headers.get('Content-Type', '')
+                #logger.debug(f"API Response Content-Type: {content_type}")
                 if 'image' in content_type:
-                    return response.read()
+                    data = response.read()
+                    logger.debug(f"API Response: image data, {len(data)} bytes")
+                    return data
                 return None
         except Exception as e:
             logger.debug(f"Error getting livestack image: {e}")
@@ -427,10 +937,12 @@ class NINAIntegration:
             list: List of guiding data points on success, None on failure
         """
         url = f"http://{host}:{port}/v2/api/guider/graph"
+        #logger.debug(f"API Request: {url}")
         try:
             request = urllib.request.Request(url)
             with urllib.request.urlopen(request, timeout=5) as response:
                 result = json.loads(response.read().decode('utf-8'))
+                #logger.debug(f"API Response: {result}")
                 if result.get('Success'):
                     resp = result.get('Response')
                     return resp if isinstance(resp, list) else None
