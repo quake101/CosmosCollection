@@ -6,6 +6,7 @@ Displays real-time NINA status, current imaging, live stack images, and guiding 
 
 import hashlib
 import logging
+import sys
 from collections import deque
 from datetime import datetime
 from io import BytesIO
@@ -605,10 +606,9 @@ class SlewDialog(QDialog):
         return ra_deg, dec_deg
 
     def _on_search(self):
-        """Search for an object by name using CDS Sesame resolver."""
-        import urllib.request
-        import urllib.parse
+        """Search for an object by name in the local database."""
         import re
+        from DatabaseManager import DatabaseManager
 
         object_name = self.search_input.text().strip()
         if not object_name:
@@ -625,60 +625,80 @@ class SlewDialog(QDialog):
         QApplication.processEvents()
 
         try:
-            # Use CDS Sesame name resolver
-            encoded_name = urllib.parse.quote(object_name)
-            url = f"http://cdsweb.u-strasbg.fr/cgi-bin/nph-sesame/-ox/SNV?{encoded_name}"
-
-            request = urllib.request.Request(url)
-            request.add_header('User-Agent', 'CosmosCollection/1.0')
-
-            with urllib.request.urlopen(request, timeout=10) as response:
-                data = response.read().decode('utf-8')
-
-            # Parse XML response for coordinates
-            # Look for <jradeg> and <jdedeg> tags (J2000 coordinates in degrees)
-            ra_match = re.search(r'<jradeg>([^<]+)</jradeg>', data)
-            dec_match = re.search(r'<jdedeg>([^<]+)</jdedeg>', data)
-
-            if ra_match and dec_match:
-                ra_deg = float(ra_match.group(1))
-                dec_deg = float(dec_match.group(1))
-
-                # Convert RA from degrees to hours
-                ra_hours = ra_deg / 15.0
-                ra_h = int(ra_hours)
-                ra_m = int((ra_hours - ra_h) * 60)
-                ra_s = ((ra_hours - ra_h) * 60 - ra_m) * 60
-
-                # Convert Dec to DMS
-                dec_sign = "+" if dec_deg >= 0 else "-"
-                dec_abs = abs(dec_deg)
-                dec_d = int(dec_abs)
-                dec_m = int((dec_abs - dec_d) * 60)
-                dec_s = ((dec_abs - dec_d) * 60 - dec_m) * 60
-
-                # Update the coordinate fields
-                self.ra_h_spinbox.setValue(ra_h)
-                self.ra_m_spinbox.setValue(ra_m)
-                self.ra_s_spinbox.setValue(round(ra_s, 2))
-                self.dec_sign_combo.setCurrentText(dec_sign)
-                self.dec_d_spinbox.setValue(dec_d)
-                self.dec_m_spinbox.setValue(dec_m)
-                self.dec_s_spinbox.setValue(round(dec_s, 2))
-
-                # Try to get the object's canonical name
-                name_match = re.search(r'<oname>([^<]+)</oname>', data)
-                found_name = name_match.group(1) if name_match else object_name
-
-                self.search_status_label.setText(f"Found: {found_name}")
-                self.search_status_label.setStyleSheet(f"color: {COLORS['success']};")
+            # Normalize search term (e.g., "M31" -> "M 31", "NGC7000" -> "NGC 7000")
+            search_upper = object_name.upper().strip()
+            match = re.match(r'^([A-Z]+)\s*(\d+)([A-Z]?)$', search_upper)
+            if match:
+                catalog = match.group(1)
+                number = match.group(2)
+                suffix = match.group(3)
+                search_catalog = catalog
+                search_designation = f"{number}{suffix}"
             else:
-                self.search_status_label.setText(f"Object '{object_name}' not found")
-                self.search_status_label.setStyleSheet(f"color: {COLORS['error']};")
+                search_catalog = None
+                search_designation = search_upper
 
-        except urllib.error.URLError as e:
-            self.search_status_label.setText(f"Network error: {e.reason}")
-            self.search_status_label.setStyleSheet(f"color: {COLORS['error']};")
+            db = DatabaseManager()
+
+            # Search by catalogue and designation
+            if search_catalog:
+                # Try exact match first
+                rows = db.execute_query("""
+                    SELECT d.ra, d.dec, c.catalogue, c.designation
+                    FROM dsodetail d
+                    JOIN cataloguenr c ON d.id = c.dsodetailid
+                    WHERE UPPER(c.catalogue) = ? AND UPPER(c.designation) = ?
+                    LIMIT 1
+                """, (search_catalog, search_designation))
+            else:
+                rows = []
+
+            if not rows:
+                # Try partial match on designation
+                rows = db.execute_query("""
+                    SELECT d.ra, d.dec, c.catalogue, c.designation
+                    FROM dsodetail d
+                    JOIN cataloguenr c ON d.id = c.dsodetailid
+                    WHERE UPPER(c.catalogue || ' ' || c.designation) LIKE ?
+                       OR UPPER(c.catalogue || c.designation) LIKE ?
+                    LIMIT 1
+                """, (f"%{search_upper}%", f"%{search_upper.replace(' ', '')}%"))
+
+            if not rows:
+                self.search_status_label.setText(f"'{object_name}' not found in database")
+                self.search_status_label.setStyleSheet(f"color: {COLORS['error']};")
+                return
+
+            row = rows[0]
+            ra_deg = float(row[0])
+            dec_deg = float(row[1])
+            found_name = f"{row[2]} {row[3]}"
+
+            # Convert RA from degrees to hours
+            ra_hours = ra_deg / 15.0
+            ra_h = int(ra_hours)
+            ra_m = int((ra_hours - ra_h) * 60)
+            ra_s = ((ra_hours - ra_h) * 60 - ra_m) * 60
+
+            # Convert Dec to DMS
+            dec_sign = "+" if dec_deg >= 0 else "-"
+            dec_abs = abs(dec_deg)
+            dec_d = int(dec_abs)
+            dec_m = int((dec_abs - dec_d) * 60)
+            dec_s = ((dec_abs - dec_d) * 60 - dec_m) * 60
+
+            # Update the coordinate fields
+            self.ra_h_spinbox.setValue(ra_h)
+            self.ra_m_spinbox.setValue(ra_m)
+            self.ra_s_spinbox.setValue(round(ra_s, 2))
+            self.dec_sign_combo.setCurrentText(dec_sign)
+            self.dec_d_spinbox.setValue(dec_d)
+            self.dec_m_spinbox.setValue(dec_m)
+            self.dec_s_spinbox.setValue(round(dec_s, 2))
+
+            self.search_status_label.setText(f"Found: {found_name}")
+            self.search_status_label.setStyleSheet(f"color: {COLORS['success']};")
+
         except Exception as e:
             self.search_status_label.setText(f"Search failed: {str(e)}")
             self.search_status_label.setStyleSheet(f"color: {COLORS['error']};")
