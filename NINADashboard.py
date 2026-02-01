@@ -185,7 +185,7 @@ class NINAStatusWorker(QThread):
 
     status_updated = Signal(dict)  # Emits combined status data
     image_updated = Signal(bytes, dict)  # Emits image data and metadata
-    livestack_updated = Signal(bytes, dict)  # Emits livestack image and status
+    livestack_updated = Signal(bytes, dict, list)  # Emits livestack image, status, and available stacks
     guiding_updated = Signal(list)  # Emits guiding graph data points
     event_occurred = Signal(dict)  # Emits new NINA event data
     error_occurred = Signal(str)  # Emits error message
@@ -209,6 +209,8 @@ class NINAStatusWorker(QThread):
         self._last_image_index = -1  # Track the last known image index (-1 = no images yet)
         self._last_livestack_hash = None  # Track livestack image hash
         self._last_livestack_running = False  # Track if livestack was running
+        self._livestack_target = None  # User-selected livestack target
+        self._livestack_filter = None  # User-selected livestack filter
         self._consecutive_failures = 0  # Track consecutive API failures to detect disconnect
         self._version = ""  # Store NINA version for reconnection
         self._last_event_time = None  # Track last processed event timestamp
@@ -366,24 +368,32 @@ class NINAStatusWorker(QThread):
                                    isinstance(livestack_status, dict) and
                                    livestack_status.get('running', False))
                 if is_livestacking:
-                    livestack_image = NINAIntegration.get_livestack_image(self.host, self.port)
+                    # Get available stacks for the dropdown
+                    available_stacks = NINAIntegration.get_livestack_available(self.host, self.port)
+
+                    livestack_image, actual_target, actual_filter = NINAIntegration.get_livestack_image(
+                        self.host, self.port, self._livestack_target, self._livestack_filter
+                    )
                     if livestack_image:
                         # Emit if livestack image changed
                         current_hash = hashlib.md5(livestack_image).hexdigest()
                         if current_hash != self._last_livestack_hash:
                             self._last_livestack_hash = current_hash
                             self._last_livestack_running = True
-                            self.livestack_updated.emit(livestack_image, livestack_status)
+                            # Include selected target/filter in status
+                            livestack_status['selected_target'] = actual_target
+                            livestack_status['selected_filter'] = actual_filter
+                            self.livestack_updated.emit(livestack_image, livestack_status, available_stacks)
                     elif not self._last_livestack_running:
                         # Livestacking is running but no image yet - emit status to update tab
                         self._last_livestack_running = True
-                        self.livestack_updated.emit(b'', livestack_status)
+                        self.livestack_updated.emit(b'', livestack_status, available_stacks)
                 else:
                     # Emit empty to reset tab (only if state changed)
                     if self._last_livestack_running or self._last_livestack_hash is not None:
                         self._last_livestack_hash = None
                         self._last_livestack_running = False
-                        self.livestack_updated.emit(b'', {'running': False})
+                        self.livestack_updated.emit(b'', {'running': False}, [])
 
                 # Fetch guiding graph data only if guider is connected and guiding
                 guider = status_data.get('guider', {})
@@ -425,6 +435,11 @@ class NINAStatusWorker(QThread):
     def set_fetch_images(self, enabled):
         """Enable or disable image fetching."""
         self._fetch_images = enabled
+
+    def set_livestack_selection(self, target, filter_name):
+        """Set the livestack target and filter to fetch."""
+        self._livestack_target = target
+        self._livestack_filter = filter_name
 
 
 class GuidingGraph(FigureCanvas):
@@ -1313,6 +1328,31 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         livestack_layout.setContentsMargins(5, 5, 5, 5)
         livestack_layout.setSpacing(2)
 
+        # Selection row for target and filter
+        selection_layout = QHBoxLayout()
+        selection_layout.setSpacing(8)
+
+        selection_layout.addWidget(QLabel("Target:"))
+        self.livestack_target_combo = QComboBox()
+        self.livestack_target_combo.setToolTip("Select livestack target")
+        self.livestack_target_combo.setMinimumWidth(120)
+        self.livestack_target_combo.currentIndexChanged.connect(self._on_livestack_selection_changed)
+        selection_layout.addWidget(self.livestack_target_combo)
+
+        selection_layout.addWidget(QLabel("Filter:"))
+        self.livestack_filter_combo = QComboBox()
+        self.livestack_filter_combo.setToolTip("Select livestack filter")
+        self.livestack_filter_combo.setMinimumWidth(80)
+        self.livestack_filter_combo.currentIndexChanged.connect(self._on_livestack_selection_changed)
+        selection_layout.addWidget(self.livestack_filter_combo)
+
+        selection_layout.addStretch()
+        livestack_layout.addLayout(selection_layout, 0)
+
+        # Track available stacks to avoid unnecessary updates
+        self._livestack_available_stacks = []
+        self._updating_livestack_combos = False
+
         self.livestack_label = ZoomableImageWidget(placeholder_text="Live stack not active")
         livestack_layout.addWidget(self.livestack_label, 1)
 
@@ -2032,10 +2072,13 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         else:
             self.image_info_label.setText("Target: -- | Exp: --")
 
-    def _on_livestack_updated(self, image_data, status):
+    def _on_livestack_updated(self, image_data, status, available_stacks):
         """Handle livestack update from worker."""
         is_running = status.get('running', False)
         if is_running:
+            # Update comboboxes if available stacks changed
+            self._update_livestack_combos(available_stacks, status)
+
             # Update livestack tab with indicator
             self.image_tabs.setTabText(1, "Live Stack *")
             if image_data:
@@ -2045,7 +2088,13 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                     if not pixmap.isNull():
                         self._current_livestack_pixmap = pixmap
                         self.livestack_label.setPixmap(pixmap)
-                        self.livestack_info_label.setText("Live stack active")
+                        # Show current target/filter in info label
+                        target = status.get('selected_target', '')
+                        filter_name = status.get('selected_filter', '')
+                        if target and filter_name:
+                            self.livestack_info_label.setText(f"{target} - {filter_name}")
+                        else:
+                            self.livestack_info_label.setText("Live stack active")
                 except Exception as e:
                     logger.error(f"Error loading livestack image: {e}")
             else:
@@ -2060,6 +2109,64 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.livestack_label.setPixmap(None)
             self._current_livestack_pixmap = None
             self.livestack_info_label.setText("")
+            # Clear comboboxes when not running
+            self._updating_livestack_combos = True
+            self.livestack_target_combo.clear()
+            self.livestack_filter_combo.clear()
+            self._livestack_available_stacks = []
+            self._updating_livestack_combos = False
+
+    def _update_livestack_combos(self, available_stacks, status):
+        """Update the livestack target and filter comboboxes."""
+        if not available_stacks:
+            return
+
+        # Check if stacks have changed
+        if available_stacks == self._livestack_available_stacks:
+            return
+
+        self._livestack_available_stacks = available_stacks
+        self._updating_livestack_combos = True
+
+        # Extract unique targets and filters
+        targets = sorted(set(s.get('Target', '') for s in available_stacks if s.get('Target')))
+        filters = sorted(set(s.get('Filter', '') for s in available_stacks if s.get('Filter')))
+
+        # Update target combo
+        current_target = self.livestack_target_combo.currentText()
+        self.livestack_target_combo.clear()
+        self.livestack_target_combo.addItems(targets)
+
+        # Restore selection or select from status
+        if current_target in targets:
+            self.livestack_target_combo.setCurrentText(current_target)
+        elif status.get('selected_target') in targets:
+            self.livestack_target_combo.setCurrentText(status.get('selected_target'))
+
+        # Update filter combo
+        current_filter = self.livestack_filter_combo.currentText()
+        self.livestack_filter_combo.clear()
+        self.livestack_filter_combo.addItems(filters)
+
+        # Restore selection or select from status
+        if current_filter in filters:
+            self.livestack_filter_combo.setCurrentText(current_filter)
+        elif status.get('selected_filter') in filters:
+            self.livestack_filter_combo.setCurrentText(status.get('selected_filter'))
+
+        self._updating_livestack_combos = False
+
+    def _on_livestack_selection_changed(self):
+        """Handle user changing the livestack target or filter selection."""
+        if self._updating_livestack_combos:
+            return
+
+        target = self.livestack_target_combo.currentText() or None
+        filter_name = self.livestack_filter_combo.currentText() or None
+
+        # Update worker with new selection
+        if hasattr(self, 'worker') and self.worker:
+            self.worker.set_livestack_selection(target, filter_name)
 
     def _on_guiding_updated(self, guiding_data):
         """Handle guiding data update from worker."""
