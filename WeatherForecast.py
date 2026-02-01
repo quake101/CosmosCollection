@@ -1269,10 +1269,15 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         scroll_area.setWidget(self.cards_widget)
         overview_layout.addWidget(scroll_area)
 
-        # Help text
-        help_text = QLabel("Double-click a day card for detailed hourly forecast")
+        # Help text with attribution
+        help_text = QLabel(
+            'Double-click a day card for detailed hourly forecast. '
+            'Weather data provided by <a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a>.'
+        )
         help_text.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
         help_text.setAlignment(Qt.AlignCenter)
+        help_text.setOpenExternalLinks(False)
+        help_text.linkActivated.connect(lambda url: open_url(url))
         overview_layout.addWidget(help_text)
 
         main_layout.addWidget(overview_group, 1)  # Give stretch factor to expand
