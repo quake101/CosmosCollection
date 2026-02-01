@@ -1353,8 +1353,11 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         aladin_action.triggered.connect(lambda: self._context_open_aladin(row))
 
         if NINAIntegration.is_enabled():
-            nina_action = context_menu.addAction("Send to NINA Framing Assistant")
+            nina_menu = context_menu.addMenu("NINA")
+            nina_action = nina_menu.addAction("Send to Framing Assistant")
             nina_action.triggered.connect(lambda: self._context_send_to_nina(row))
+            slew_action = nina_menu.addAction("Slew to Target")
+            slew_action.triggered.connect(lambda: self._context_slew_to_target(row))
 
         context_menu.addSeparator()
 
@@ -1462,6 +1465,18 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
 
         target_data = name_item.data(Qt.UserRole)
         NINAIntegration.send_to_framing_assistant(
+            target_data.get("ra_deg"), target_data.get("dec_deg"),
+            target_data.get("name", "Unknown"), self
+        )
+
+    def _context_slew_to_target(self, row):
+        """Slew mount to target coordinates"""
+        name_item = self.targets_table.item(row, 0)
+        if not name_item:
+            return
+
+        target_data = name_item.data(Qt.UserRole)
+        NINAIntegration.slew_to_coordinates(
             target_data.get("ra_deg"), target_data.get("dec_deg"),
             target_data.get("name", "Unknown"), self
         )

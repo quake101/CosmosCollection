@@ -1282,8 +1282,11 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         if NINAIntegration.is_enabled():
             context_menu.addSeparator()
-            nina_action = context_menu.addAction("Send to NINA Framing Assistant")
+            nina_menu = context_menu.addMenu("NINA")
+            nina_action = nina_menu.addAction("Send to Framing Assistant")
             nina_action.triggered.connect(lambda: self._context_send_to_nina(row))
+            slew_action = nina_menu.addAction("Slew to Target")
+            slew_action.triggered.connect(lambda: self._context_slew_to_target(row))
 
         context_menu.addSeparator()
 
@@ -1448,6 +1451,30 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         target_name = dso_data.get("dso_info", {}).get("name", "Unknown")
         NINAIntegration.send_to_framing_assistant(ra_deg, dec_deg, target_name, self)
+
+    def _context_slew_to_target(self, row):
+        """Slew mount to DSO coordinates"""
+        name_item = self.results_table.item(row, 0)
+        if not name_item:
+            return
+
+        dso_data = name_item.data(Qt.UserRole)
+        if not dso_data:
+            QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
+            return
+
+        # Get coordinates from SkyCoord object or fallback to dso_info
+        coordinates = dso_data.get("coordinates")
+        if coordinates:
+            ra_deg = coordinates.ra.degree
+            dec_deg = coordinates.dec.degree
+        else:
+            dso_info = dso_data.get("dso_info", {})
+            ra_deg = dso_info.get("ra_deg")
+            dec_deg = dso_info.get("dec_deg")
+
+        target_name = dso_data.get("dso_info", {}).get("name", "Unknown")
+        NINAIntegration.slew_to_coordinates(ra_deg, dec_deg, target_name, self)
 
     def _context_add_to_target_list(self, row):
         """Add DSO to target list from context menu"""

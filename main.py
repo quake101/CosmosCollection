@@ -5046,8 +5046,11 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
         if NINAIntegration.is_enabled():
             context_menu.addSeparator()
-            nina_action = context_menu.addAction("Send to NINA Framing Assistant")
+            nina_menu = context_menu.addMenu("NINA")
+            nina_action = nina_menu.addAction("Send to Framing Assistant")
             nina_action.triggered.connect(lambda: self._context_send_to_nina(row))
+            slew_action = nina_menu.addAction("Slew to Target")
+            slew_action.triggered.connect(lambda: self._context_slew_to_target(row))
 
         context_menu.addSeparator()
 
@@ -5181,6 +5184,14 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Send DSO coordinates to NINA Framing Assistant"""
         entry = self.model.filtered_data[row]
         NINAIntegration.send_to_framing_assistant(
+            entry.get("ra_deg"), entry.get("dec_deg"),
+            entry.get("name", "Unknown"), self
+        )
+
+    def _context_slew_to_target(self, row):
+        """Slew mount to DSO coordinates"""
+        entry = self.model.filtered_data[row]
+        NINAIntegration.slew_to_coordinates(
             entry.get("ra_deg"), entry.get("dec_deg"),
             entry.get("name", "Unknown"), self
         )

@@ -170,6 +170,126 @@ class NINAIntegration:
                 QMessageBox.warning(parent_widget, "Error", f"Failed to send to NINA: {str(e)}")
             return False
 
+    @staticmethod
+    def slew_to_coordinates(ra_deg, dec_deg, target_name, parent_widget=None):
+        """
+        Slew mount to specified coordinates with confirmation dialog.
+
+        Args:
+            ra_deg: Right Ascension in degrees
+            dec_deg: Declination in degrees
+            target_name: Name of the target (for display)
+            parent_widget: Parent widget for message boxes (optional)
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if ra_deg is None or dec_deg is None:
+            if parent_widget:
+                QMessageBox.warning(parent_widget, "Error", "Target coordinates not available")
+            logger.warning(f"Cannot slew to {target_name}: coordinates not available")
+            return False
+
+        host, port = NINAIntegration.get_settings()
+
+        # Format coordinates for display
+        ra_h = ra_deg / 15.0
+        ra_hours = int(ra_h)
+        ra_min = int((ra_h - ra_hours) * 60)
+        ra_sec = ((ra_h - ra_hours) * 60 - ra_min) * 60
+
+        dec_sign = '+' if dec_deg >= 0 else '-'
+        dec_abs = abs(dec_deg)
+        dec_d = int(dec_abs)
+        dec_m = int((dec_abs - dec_d) * 60)
+        dec_s = ((dec_abs - dec_d) * 60 - dec_m) * 60
+
+        coord_str = f"RA: {ra_hours:02d}h {ra_min:02d}m {ra_sec:05.2f}s\nDec: {dec_sign}{dec_d:02d}° {dec_m:02d}' {dec_s:04.1f}\""
+
+        # Show confirmation dialog
+        if parent_widget:
+            reply = QMessageBox.question(
+                parent_widget,
+                "Confirm Slew",
+                f"Slew mount to {target_name}?\n\n{coord_str}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return False
+
+        logger.info(f"Slewing mount to {target_name}: RA={ra_deg}, Dec={dec_deg}")
+
+        try:
+            success = NINAIntegration.slew_mount(host, port, ra_deg, dec_deg, wait_for_result=True)
+
+            if success:
+                logger.info(f"Slew to {target_name} completed successfully")
+                if parent_widget:
+                    QMessageBox.information(
+                        parent_widget,
+                        "Slew Complete",
+                        f"Mount slew to {target_name} completed."
+                    )
+                return True
+            else:
+                if parent_widget:
+                    QMessageBox.warning(
+                        parent_widget,
+                        "Slew Failed",
+                        f"Failed to slew to {target_name}.\n\n"
+                        "Please check:\n"
+                        "- Mount is connected in NINA\n"
+                        "- Mount is not parked\n"
+                        "- No other slew operation is in progress"
+                    )
+                return False
+
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                if parent_widget:
+                    QMessageBox.warning(
+                        parent_widget,
+                        "Slew Failed",
+                        "Mount is not available for slewing.\n\n"
+                        "Please check:\n"
+                        "- Mount is connected in NINA\n"
+                        "- Mount is not parked"
+                    )
+            else:
+                if parent_widget:
+                    QMessageBox.warning(
+                        parent_widget,
+                        "Slew Failed",
+                        f"HTTP error {e.code} when slewing.\n\n"
+                        f"Error: {e.reason}"
+                    )
+            logger.error(f"HTTP error slewing to {target_name}: {e.code} {e.reason}")
+            return False
+
+        except urllib.error.URLError as e:
+            logger.warning(f"Could not connect to NINA: {e}")
+            if parent_widget:
+                QMessageBox.warning(
+                    parent_widget,
+                    "Connection Error",
+                    "Could not connect to NINA.\n\n"
+                    "Please ensure:\n"
+                    "- NINA is running\n"
+                    "- The Advanced API plugin is enabled"
+                )
+            return False
+
+        except Exception as e:
+            logger.error(f"Error slewing to {target_name}: {e}")
+            if parent_widget:
+                QMessageBox.warning(
+                    parent_widget,
+                    "Error",
+                    f"Failed to slew to target: {str(e)}"
+                )
+            return False
+
     # -------------------------------------------------------------------------
     # Dashboard API Methods
     # -------------------------------------------------------------------------
@@ -879,7 +999,7 @@ class NINAIntegration:
             port: The API port number
 
         Returns:
-            dict: Livestack status dict on success, None on failure
+            dict: Livestack status dict with 'running' key on success, None on failure
         """
         url = f"http://{host}:{port}/v2/api/livestack/status"
         #logger.debug(f"API Request: {url}")
@@ -890,7 +1010,12 @@ class NINAIntegration:
                 #logger.debug(f"API Response: {result}")
                 if result.get('Success'):
                     resp = result.get('Response')
-                    return resp if isinstance(resp, dict) else None
+                    # API returns "running" or "stopped" string
+                    if isinstance(resp, str):
+                        return {'running': resp.lower() == 'running'}
+                    # Handle dict response for compatibility
+                    elif isinstance(resp, dict):
+                        return resp
                 return None
         except Exception as e:
             logger.debug(f"Error getting livestack status: {e}")
@@ -908,16 +1033,47 @@ class NINAIntegration:
         Returns:
             bytes: Image data (JPEG) on success, None on failure
         """
-        url = f"http://{host}:{port}/v2/api/livestack/image"
-        #logger.debug(f"API Request: {url}")
         try:
-            request = urllib.request.Request(url)
+            # First get available stacks
+            available_url = f"http://{host}:{port}/v2/api/livestack/image/available"
+            request = urllib.request.Request(available_url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if not result.get('Success') or not result.get('Response'):
+                    return None
+
+                stacks = result.get('Response', [])
+                if not stacks:
+                    return None
+
+                # Prefer RGB stack, otherwise use first available
+                selected = None
+                for stack in stacks:
+                    if stack.get('Filter') == 'RGB':
+                        selected = stack
+                        break
+                if not selected:
+                    selected = stacks[0]
+
+                filter_name = selected.get('Filter', '')
+                target_name = selected.get('Target', '')
+                if not filter_name or not target_name:
+                    return None
+
+            # Fetch the specific stack image
+            # URL format: /livestack/image/{target}/{filter}?quality=100&stream=true&resize=true&size=800x600
+            encoded_target = urllib.parse.quote(target_name, safe='')
+            encoded_filter = urllib.parse.quote(filter_name, safe='')
+            image_url = (f"http://{host}:{port}/v2/api/livestack/image/"
+                         f"{encoded_target}/{encoded_filter}"
+                         f"?quality=100&stream=true&resize=true&size=800x600")
+
+            request = urllib.request.Request(image_url)
             with urllib.request.urlopen(request, timeout=10) as response:
                 content_type = response.headers.get('Content-Type', '')
-                #logger.debug(f"API Response Content-Type: {content_type}")
                 if 'image' in content_type:
                     data = response.read()
-                    logger.debug(f"API Response: image data, {len(data)} bytes")
+                    logger.debug(f"API Response: livestack image data, {len(data)} bytes")
                     return data
                 return None
         except Exception as e:
@@ -934,9 +1090,9 @@ class NINAIntegration:
             port: The API port number
 
         Returns:
-            list: List of guiding data points on success, None on failure
+            list: List of guiding data points (GuideSteps) on success, None on failure
         """
-        url = f"http://{host}:{port}/v2/api/guider/graph"
+        url = f"http://{host}:{port}/v2/api/equipment/guider/graph"
         #logger.debug(f"API Request: {url}")
         try:
             request = urllib.request.Request(url)
@@ -944,8 +1100,12 @@ class NINAIntegration:
                 result = json.loads(response.read().decode('utf-8'))
                 #logger.debug(f"API Response: {result}")
                 if result.get('Success'):
-                    resp = result.get('Response')
-                    return resp if isinstance(resp, list) else None
+                    resp = result.get('Response', {})
+                    if isinstance(resp, dict):
+                        # Response contains GuideSteps array with the graph data
+                        guide_steps = resp.get('GuideSteps', [])
+                        return guide_steps if isinstance(guide_steps, list) else None
+                    return None
                 return None
         except urllib.error.HTTPError as e:
             # 404 is expected when guider is not connected or guiding not active

@@ -24,14 +24,15 @@ import matplotlib.pyplot as plt
 # Set dark theme for matplotlib
 plt.style.use('dark_background')
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings, QByteArray
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings, QByteArray, QPointF, QRectF
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QLabel, QGroupBox, QProgressBar, QComboBox, QFrame,
     QGridLayout, QSizePolicy, QDockWidget, QCheckBox, QSpinBox,
-    QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLineEdit
+    QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLineEdit,
+    QTabWidget
 )
-from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent
 
 from NINAIntegration import NINAIntegration
 from WindowPositionManager import WindowPositionMixin
@@ -40,6 +41,143 @@ from TimeFormatHelper import format_time
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+
+class ZoomableImageWidget(QWidget):
+    """Widget that displays an image with zoom (mouse wheel) and pan (drag) support."""
+
+    def __init__(self, parent=None, placeholder_text="No image available"):
+        super().__init__(parent)
+        self._pixmap = None
+        self._zoom = 1.0
+        self._min_zoom = 0.1
+        self._max_zoom = 10.0
+        self._pan_offset = QPointF(0, 0)
+        self._last_mouse_pos = None
+        self._placeholder_text = placeholder_text
+
+        self.setMinimumSize(200, 150)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.WheelFocus)
+
+    def setPixmap(self, pixmap):
+        """Set the image to display."""
+        self._pixmap = pixmap
+        self._reset_view()
+        self.update()
+
+    def setPlaceholderText(self, text):
+        """Set the placeholder text shown when no image is loaded."""
+        self._placeholder_text = text
+        self.update()
+
+    def _reset_view(self):
+        """Reset zoom and pan to fit the image in the widget."""
+        self._zoom = 1.0
+        self._pan_offset = QPointF(0, 0)
+
+    def _get_fit_zoom(self):
+        """Calculate the zoom level that fits the image in the widget."""
+        if not self._pixmap or self._pixmap.isNull():
+            return 1.0
+        widget_size = self.size()
+        pixmap_size = self._pixmap.size()
+        scale_x = (widget_size.width() - 10) / pixmap_size.width()
+        scale_y = (widget_size.height() - 10) / pixmap_size.height()
+        return min(scale_x, scale_y, 1.0)  # Don't upscale beyond 100%
+
+    def paintEvent(self, event):
+        """Paint the image with current zoom and pan."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        # Fill background
+        painter.fillRect(self.rect(), Qt.black)
+
+        if not self._pixmap or self._pixmap.isNull():
+            # Draw placeholder text
+            painter.setPen(Qt.gray)
+            painter.drawText(self.rect(), Qt.AlignCenter, self._placeholder_text)
+            return
+
+        # Calculate the effective zoom (fit zoom * user zoom)
+        fit_zoom = self._get_fit_zoom()
+        effective_zoom = fit_zoom * self._zoom
+
+        # Calculate scaled image size
+        scaled_width = self._pixmap.width() * effective_zoom
+        scaled_height = self._pixmap.height() * effective_zoom
+
+        # Center the image, then apply pan offset
+        x = (self.width() - scaled_width) / 2 + self._pan_offset.x()
+        y = (self.height() - scaled_height) / 2 + self._pan_offset.y()
+
+        # Draw the image
+        target_rect = QRectF(x, y, scaled_width, scaled_height)
+        source_rect = QRectF(0, 0, self._pixmap.width(), self._pixmap.height())
+        painter.drawPixmap(target_rect, self._pixmap, source_rect)
+
+        # Draw zoom indicator if zoomed
+        if self._zoom != 1.0:
+            zoom_text = f"{self._zoom * 100:.0f}%"
+            painter.setPen(Qt.white)
+            painter.drawText(10, 20, zoom_text)
+
+    def wheelEvent(self, event: QWheelEvent):
+        """Handle mouse wheel for zooming."""
+        if not self._pixmap or self._pixmap.isNull():
+            return
+
+        # Get zoom delta from wheel
+        delta = event.angleDelta().y()
+        zoom_factor = 1.15 if delta > 0 else 1 / 1.15
+
+        # Calculate new zoom, clamped to limits
+        new_zoom = self._zoom * zoom_factor
+        new_zoom = max(self._min_zoom, min(self._max_zoom, new_zoom))
+
+        if new_zoom != self._zoom:
+            # Zoom toward mouse position
+            mouse_pos = event.position()
+            old_zoom = self._zoom
+            self._zoom = new_zoom
+
+            # Adjust pan to zoom toward mouse position
+            zoom_change = new_zoom / old_zoom
+            center = QPointF(self.width() / 2, self.height() / 2)
+            mouse_offset = mouse_pos - center - self._pan_offset
+            self._pan_offset = self._pan_offset - mouse_offset * (zoom_change - 1)
+
+            self.update()
+
+    def mousePressEvent(self, event: QMouseEvent):
+        """Start panning on mouse press."""
+        if event.button() == Qt.LeftButton:
+            self._last_mouse_pos = event.position()
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        """Pan the image on mouse drag."""
+        if self._last_mouse_pos is not None and self._pixmap and not self._pixmap.isNull():
+            delta = event.position() - self._last_mouse_pos
+            self._pan_offset += delta
+            self._last_mouse_pos = event.position()
+            self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        """End panning on mouse release."""
+        if event.button() == Qt.LeftButton:
+            self._last_mouse_pos = None
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        """Reset view on double-click."""
+        self._reset_view()
+        self.update()
+
+    def resizeEvent(self, event):
+        """Handle widget resize."""
+        super().resizeEvent(event)
+        self.update()
 
 
 class NINAStatusWorker(QThread):
@@ -69,6 +207,7 @@ class NINAStatusWorker(QThread):
         self._initial_image_check_done = False  # Have we done the initial image check?
         self._last_image_index = -1  # Track the last known image index (-1 = no images yet)
         self._last_livestack_hash = None  # Track livestack image hash
+        self._last_livestack_running = False  # Track if livestack was running
         self._consecutive_failures = 0  # Track consecutive API failures to detect disconnect
         self._version = ""  # Store NINA version for reconnection
 
@@ -118,7 +257,8 @@ class NINAStatusWorker(QThread):
                 camera = status_data.get('camera', {})
                 guider = status_data.get('guider', {})
                 is_exposing = camera.get('IsExposing', False) if isinstance(camera, dict) else False
-                is_guiding = (guider.get('Guiding', False) or guider.get('IsGuiding', False)) if isinstance(guider, dict) else False
+                guider_state = guider.get('State', '') if isinstance(guider, dict) else ''
+                is_guiding = guider.get('Connected', False) and guider_state == 'Guiding' if isinstance(guider, dict) else False
 
                 if is_exposing or is_guiding:
                     self._poll_interval = self.POLL_RATE_ACTIVE
@@ -213,25 +353,33 @@ class NINAStatusWorker(QThread):
 
                 # Fetch livestack status and image
                 livestack_status = NINAIntegration.get_livestack_status(self.host, self.port)
-                if livestack_status and isinstance(livestack_status, dict) and livestack_status.get('Enabled'):
+                is_livestacking = (livestack_status and
+                                   isinstance(livestack_status, dict) and
+                                   livestack_status.get('running', False))
+                if is_livestacking:
                     livestack_image = NINAIntegration.get_livestack_image(self.host, self.port)
                     if livestack_image:
-                        # Only emit if livestack image changed
+                        # Emit if livestack image changed
                         current_hash = hashlib.md5(livestack_image).hexdigest()
                         if current_hash != self._last_livestack_hash:
                             self._last_livestack_hash = current_hash
+                            self._last_livestack_running = True
                             self.livestack_updated.emit(livestack_image, livestack_status)
+                    elif not self._last_livestack_running:
+                        # Livestacking is running but no image yet - emit status to update tab
+                        self._last_livestack_running = True
+                        self.livestack_updated.emit(b'', livestack_status)
                 else:
-                    # Emit empty to hide livestack panel (only if it was visible)
-                    if self._last_livestack_hash is not None:
+                    # Emit empty to reset tab (only if state changed)
+                    if self._last_livestack_running or self._last_livestack_hash is not None:
                         self._last_livestack_hash = None
-                        self.livestack_updated.emit(b'', {})
+                        self._last_livestack_running = False
+                        self.livestack_updated.emit(b'', {'running': False})
 
                 # Fetch guiding graph data only if guider is connected and guiding
                 guider = status_data.get('guider', {})
-                is_guiding = guider.get('Connected', False) and (
-                    guider.get('Guiding', False) or guider.get('IsGuiding', False)
-                )
+                guider_state = guider.get('State', '') if isinstance(guider, dict) else ''
+                is_guiding = guider.get('Connected', False) and guider_state == 'Guiding'
                 if is_guiding:
                     guiding_data = NINAIntegration.get_guiding_graph_data(self.host, self.port)
                     if guiding_data and isinstance(guiding_data, list):
@@ -1117,19 +1265,18 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.actions_spacer_dock.setWidget(spacer_widget)
 
     def _create_image_panel(self, parent_layout):
-        """Create the Current Image panel in the central widget."""
-        # Image group box
-        image_group = QGroupBox("Current Image")
-        image_layout = QVBoxLayout(image_group)
+        """Create the image display panel with tabs for Latest Image and Live Stack."""
+        # Create tab widget instead of group box
+        self.image_tabs = QTabWidget()
+        self.image_tabs.setDocumentMode(True)
+
+        # Tab 1: Latest Image
+        image_widget = QWidget()
+        image_layout = QVBoxLayout(image_widget)
         image_layout.setContentsMargins(5, 5, 5, 5)
         image_layout.setSpacing(2)
 
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(200, 150)
-        self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.image_label.setStyleSheet(f"background-color: {COLORS['background_light']}; border: 1px solid {COLORS['border']};")
-        self.image_label.setText("No image available")
+        self.image_label = ZoomableImageWidget(placeholder_text="No image available")
         image_layout.addWidget(self.image_label, 1)
 
         self.image_info_label = QLabel("Target: -- | Exp: --")
@@ -1138,30 +1285,26 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.image_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
         image_layout.addWidget(self.image_info_label, 0)
 
-        # Live Stack (hidden by default)
-        self.livestack_group = QGroupBox("Live Stack")
-        livestack_layout = QVBoxLayout(self.livestack_group)
+        self.image_tabs.addTab(image_widget, "Latest Image")
+
+        # Tab 2: Live Stack
+        livestack_widget = QWidget()
+        livestack_layout = QVBoxLayout(livestack_widget)
         livestack_layout.setContentsMargins(5, 5, 5, 5)
         livestack_layout.setSpacing(2)
 
-        self.livestack_label = QLabel()
-        self.livestack_label.setAlignment(Qt.AlignCenter)
-        self.livestack_label.setMinimumSize(200, 100)
-        self.livestack_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.livestack_label.setStyleSheet(f"background-color: {COLORS['background_light']}; border: 1px solid {COLORS['border']};")
-        self.livestack_label.setText("Live stack not active")
+        self.livestack_label = ZoomableImageWidget(placeholder_text="Live stack not active")
         livestack_layout.addWidget(self.livestack_label, 1)
 
-        self.livestack_info_label = QLabel("Stack: -- frames | -- total")
+        self.livestack_info_label = QLabel("")
         self.livestack_info_label.setAlignment(Qt.AlignCenter)
         self.livestack_info_label.setFixedHeight(20)
         self.livestack_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
         livestack_layout.addWidget(self.livestack_info_label, 0)
 
-        image_layout.addWidget(self.livestack_group, 0)
-        self.livestack_group.setVisible(False)
+        self.image_tabs.addTab(livestack_widget, "Live Stack")
 
-        parent_layout.addWidget(image_group, 1)  # stretch factor 1 to expand
+        parent_layout.addWidget(self.image_tabs, 1)  # stretch factor 1 to expand
 
     def _create_guiding_dock(self):
         """Create the Guiding Graph dock widget."""
@@ -1651,10 +1794,21 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.guiding_start_btn.setEnabled(False)
                 self.guiding_stop_btn.setEnabled(False)
             else:
-                is_guiding = guider.get('Guiding', False) or guider.get('IsGuiding', False)
+                # Check State field for guiding status
+                guider_state = guider.get('State', 'Stopped')
+                is_guiding = guider_state == 'Guiding'
                 if is_guiding:
                     self.guider_status_label.setText("Guiding")
                     self.guider_status_label.setStyleSheet(f"color: {COLORS['success']};")
+                elif guider_state == 'Calibrating':
+                    self.guider_status_label.setText("Calibrating")
+                    self.guider_status_label.setStyleSheet(f"color: {COLORS['warning']};")
+                elif guider_state == 'Looping':
+                    self.guider_status_label.setText("Looping")
+                    self.guider_status_label.setStyleSheet(f"color: {COLORS['text']};")
+                elif guider_state == 'LostLock':
+                    self.guider_status_label.setText("Lost Lock")
+                    self.guider_status_label.setStyleSheet(f"color: {COLORS['error']};")
                 else:
                     self.guider_status_label.setText("Idle")
                     self.guider_status_label.setStyleSheet(f"color: {COLORS['text']};")
@@ -1663,13 +1817,19 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.guiding_start_btn.setEnabled(self._connected and not is_guiding)
                 self.guiding_stop_btn.setEnabled(self._connected and is_guiding)
 
-                # RMS
-                rms_ra = guider.get('RMSErrorRA', 0) or 0
-                rms_dec = guider.get('RMSErrorDec', 0) or 0
-                if rms_ra or rms_dec:
-                    import math
-                    total_rms = math.sqrt(rms_ra**2 + rms_dec**2)
-                    self.guider_rms_label.setText(f'{total_rms:.2f}"')
+                # RMS - extract from nested RMSError object
+                rms_error = guider.get('RMSError', {})
+                if isinstance(rms_error, dict):
+                    # RMSError contains RA, Dec, Total objects with Pixel and Arcseconds values
+                    rms_total = rms_error.get('Total', {})
+                    if isinstance(rms_total, dict):
+                        total_arcsec = rms_total.get('Arcseconds', 0) or 0
+                        if total_arcsec:
+                            self.guider_rms_label.setText(f'{total_arcsec:.2f}"')
+                        else:
+                            self.guider_rms_label.setText("--")
+                    else:
+                        self.guider_rms_label.setText("--")
                 else:
                     self.guider_rms_label.setText("--")
         else:
@@ -1812,7 +1972,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 pixmap.loadFromData(image_data)
                 if not pixmap.isNull():
                     self._current_image_pixmap = pixmap
-                    self._scale_image_to_label(self.image_label, pixmap)
+                    self.image_label.setPixmap(pixmap)
             except Exception as e:
                 logger.error(f"Error loading image: {e}")
 
@@ -1853,27 +2013,32 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
     def _on_livestack_updated(self, image_data, status):
         """Handle livestack update from worker."""
-        if image_data and status.get('Enabled'):
-            self.livestack_group.setVisible(True)
-            try:
-                pixmap = QPixmap()
-                pixmap.loadFromData(image_data)
-                if not pixmap.isNull():
-                    self._current_livestack_pixmap = pixmap
-                    self._scale_image_to_label(self.livestack_label, pixmap)
-            except Exception as e:
-                logger.error(f"Error loading livestack image: {e}")
-
-            # Update info
-            frames = status.get('StackedImages', 0) or status.get('FrameCount', 0)
-            total_exp = status.get('TotalExposure', 0)
-            if total_exp:
-                minutes = total_exp / 60
-                self.livestack_info_label.setText(f"Stack: {frames} frames | {minutes:.1f} min total")
+        is_running = status.get('running', False)
+        if is_running:
+            # Update livestack tab with indicator
+            self.image_tabs.setTabText(1, "Live Stack *")
+            if image_data:
+                try:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(image_data)
+                    if not pixmap.isNull():
+                        self._current_livestack_pixmap = pixmap
+                        self.livestack_label.setPixmap(pixmap)
+                        self.livestack_info_label.setText("Live stack active")
+                except Exception as e:
+                    logger.error(f"Error loading livestack image: {e}")
             else:
-                self.livestack_info_label.setText(f"Stack: {frames} frames")
+                # Running but no image yet
+                self.livestack_label.setPlaceholderText("Waiting for first image...")
+                self.livestack_label.setPixmap(None)
+                self.livestack_info_label.setText("Live stack active")
         else:
-            self.livestack_group.setVisible(False)
+            # Reset tab text and show inactive message
+            self.image_tabs.setTabText(1, "Live Stack")
+            self.livestack_label.setPlaceholderText("Live stack not active")
+            self.livestack_label.setPixmap(None)
+            self._current_livestack_pixmap = None
+            self.livestack_info_label.setText("")
 
     def _on_guiding_updated(self, guiding_data):
         """Handle guiding data update from worker."""
@@ -2106,39 +2271,64 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
     def _on_mount_home(self):
         """Home the mount."""
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.home_mount(host, port)
-        if success:
-            self.status_label.setText("Mount homing...")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
-        else:
-            self.status_label.setText("Failed to home mount")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+        self.mount_home_btn.setEnabled(False)
+        self.status_label.setText("Homing mount...")
+        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+
+        def do_home():
+            return NINAIntegration.home_mount(host, port)
+
+        def on_home_complete(success):
+            if success:
+                self.status_label.setText("Mount homing...")
+            else:
+                self.status_label.setText("Failed to home mount")
+                self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            # Button state will be updated by status polling
+
+        self._run_in_background(do_home, on_home_complete)
 
     def _on_mount_park(self):
         """Park the mount."""
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.park_mount(host, port)
-        if success:
-            self.status_label.setText("Mount parking...")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
-            self.mount_park_btn.setEnabled(False)
-            self.mount_unpark_btn.setEnabled(True)
-        else:
-            self.status_label.setText("Failed to park mount")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+        self.mount_park_btn.setEnabled(False)
+        self.status_label.setText("Parking mount...")
+        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+
+        def do_park():
+            return NINAIntegration.park_mount(host, port)
+
+        def on_park_complete(success):
+            if success:
+                self.status_label.setText("Mount parking...")
+                self.mount_unpark_btn.setEnabled(True)
+            else:
+                self.status_label.setText("Failed to park mount")
+                self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+                self.mount_park_btn.setEnabled(True)
+
+        self._run_in_background(do_park, on_park_complete)
 
     def _on_mount_unpark(self):
         """Unpark the mount."""
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.unpark_mount(host, port)
-        if success:
-            self.status_label.setText("Mount unparking...")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
-            self.mount_park_btn.setEnabled(True)
-            self.mount_unpark_btn.setEnabled(False)
-        else:
-            self.status_label.setText("Failed to unpark mount")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+        self.mount_unpark_btn.setEnabled(False)
+        self.status_label.setText("Unparking mount...")
+        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+
+        def do_unpark():
+            return NINAIntegration.unpark_mount(host, port)
+
+        def on_unpark_complete(success):
+            if success:
+                self.status_label.setText("Mount unparking...")
+                self.mount_park_btn.setEnabled(True)
+            else:
+                self.status_label.setText("Failed to unpark mount")
+                self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+                self.mount_unpark_btn.setEnabled(True)
+
+        self._run_in_background(do_unpark, on_unpark_complete)
 
     def _on_mount_slew(self):
         """Slew the mount to coordinates."""
@@ -2151,14 +2341,22 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         self.status_label.setText(f"Slewing to RA={ra_deg:.4f}° Dec={dec_deg:.4f}°...")
         self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.mount_slew_btn.setEnabled(False)
 
-        success = NINAIntegration.slew_mount(host, port, ra_deg, dec_deg)
-        if success:
-            self.status_label.setText("Slew started")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
-        else:
-            self.status_label.setText("Failed to start slew")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+        # Run slew in background thread to avoid blocking UI
+        def do_slew():
+            return NINAIntegration.slew_mount(host, port, ra_deg, dec_deg)
+
+        def on_slew_complete(success):
+            if success:
+                self.status_label.setText("Slew started")
+                self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            else:
+                self.status_label.setText("Failed to start slew")
+                self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            # Button will be re-enabled by status updates when slew completes
+
+        self._run_in_background(do_slew, on_slew_complete)
 
     def _on_filter_changed(self, index):
         """Handle filter selection change."""
@@ -2210,31 +2408,33 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._user_changing_filter = False
         self.filterwheel_combo.setEnabled(True)
 
-    def _scale_image_to_label(self, label, pixmap):
-        """Scale a pixmap to fit within a label while maintaining aspect ratio."""
-        if pixmap is None or pixmap.isNull():
-            return
+    def _run_in_background(self, func, callback):
+        """Run a function in a background thread and call callback with result on completion."""
+        class BackgroundWorker(QThread):
+            finished_with_result = Signal(object)
 
-        # Get the label's current size
-        label_size = label.size()
-        max_width = max(100, label_size.width() - 10)
-        max_height = max(100, label_size.height() - 10)
+            def __init__(self, func):
+                super().__init__()
+                self._func = func
 
-        scaled = pixmap.scaled(
-            max_width, max_height,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        )
-        label.setPixmap(scaled)
+            def run(self):
+                result = self._func()
+                self.finished_with_result.emit(result)
+
+        worker = BackgroundWorker(func)
+        worker.finished_with_result.connect(callback)
+        worker.finished.connect(worker.deleteLater)
+        # Keep reference to prevent garbage collection
+        if not hasattr(self, '_background_workers'):
+            self._background_workers = []
+        self._background_workers.append(worker)
+        worker.finished.connect(lambda: self._background_workers.remove(worker) if worker in self._background_workers else None)
+        worker.start()
 
     def resizeEvent(self, event):
-        """Handle window resize - rescale images to fit."""
+        """Handle window resize."""
         super().resizeEvent(event)
-        # Rescale images to fit new size
-        if self._current_image_pixmap:
-            self._scale_image_to_label(self.image_label, self._current_image_pixmap)
-        if self._current_livestack_pixmap:
-            self._scale_image_to_label(self.livestack_label, self._current_livestack_pixmap)
+        # ZoomableImageWidget handles its own resizing
 
     def closeEvent(self, event):
         """Clean up when window is closed."""
