@@ -27,7 +27,7 @@ plt.style.use('dark_background')
 import requests
 from astropy import units as u
 from astropy.time import Time
-from astropy.coordinates import EarthLocation, AltAz, get_sun
+from astropy.coordinates import EarthLocation, AltAz, get_sun, get_body
 from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer, QUrl
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
@@ -112,6 +112,15 @@ class WeatherCache:
 
 
 @dataclass
+class MoonPhaseData:
+    """Moon phase information for a date"""
+    phase_angle: float      # 0-180 degrees (elongation from sun)
+    illumination: float     # 0-100 percentage
+    phase_name: str         # "New Moon", "Waxing Crescent", etc.
+    phase_emoji: str        # Moon phase emoji
+
+
+@dataclass
 class HourlyWeatherData:
     """Dataclass for hourly weather data"""
     time: datetime
@@ -145,6 +154,7 @@ class DailyWeatherSummary:
     tonight_avg_cloud_cover: float  # avg cloud cover for dark hours only (sun_alt < -12°)
     astro_score: int  # 0-100
     seeing_estimate: str  # Excellent/Good/Moderate/Poor
+    moon_phase: Optional[MoonPhaseData] = None
 
 
 class WeatherWorker(QThread):
@@ -295,6 +305,9 @@ class WeatherWorker(QThread):
 
             seeing = estimate_seeing(night_humidity, night_wind, night_temp_dew_spread)
 
+            # Calculate moon phase for this date
+            moon_phase = calculate_moon_phase(datetime.combine(date, datetime.min.time()), self.lat, self.lon)
+
             summary = DailyWeatherSummary(
                 date=datetime.combine(date, datetime.min.time()),
                 hourly_data=hours,
@@ -310,7 +323,8 @@ class WeatherWorker(QThread):
                 avg_precipitation_prob=avg_precip,
                 tonight_avg_cloud_cover=tonight_avg_cloud,
                 astro_score=astro_score,
-                seeing_estimate=seeing
+                seeing_estimate=seeing,
+                moon_phase=moon_phase
             )
             daily_summaries.append(summary)
 
@@ -494,6 +508,73 @@ def calculate_sun_altitudes(lat: float, lon: float, times: List[datetime], timez
     return sun_altaz.alt.deg.tolist()
 
 
+def _get_moon_phase_name(phase_angle: float) -> tuple:
+    """
+    Map phase angle (elongation) to moon phase name and emoji.
+
+    Args:
+        phase_angle: Elongation from sun in degrees (0-180)
+
+    Returns:
+        Tuple of (phase_name, phase_emoji)
+    """
+    # Phase angle ranges and their corresponding names/emojis
+    # Note: We need to determine if waxing or waning based on whether moon is
+    # ahead of or behind the sun, but for simplicity we'll use elongation only
+    # and assume waxing for 0-180 (new to full)
+    if phase_angle < 22.5:
+        return ("New Moon", "🌑")
+    elif phase_angle < 67.5:
+        return ("Waxing Crescent", "🌒")
+    elif phase_angle < 112.5:
+        return ("First Quarter", "🌓")
+    elif phase_angle < 157.5:
+        return ("Waxing Gibbous", "🌔")
+    else:
+        return ("Full Moon", "🌕")
+
+
+def calculate_moon_phase(date: datetime, lat: float = 0, lon: float = 0) -> MoonPhaseData:
+    """
+    Calculate moon phase information for a given date.
+
+    Args:
+        date: The date to calculate moon phase for
+        lat: Observer latitude (not used for phase, but kept for consistency)
+        lon: Observer longitude (not used for phase, but kept for consistency)
+
+    Returns:
+        MoonPhaseData with phase angle, illumination, name, and emoji
+    """
+    import numpy as np
+
+    # Use midnight of the date for calculation
+    obs_time = Time(date.isoformat())
+
+    # Get sun and moon positions
+    sun = get_sun(obs_time)
+    moon = get_body('moon', obs_time)
+
+    # Calculate elongation (angular separation between sun and moon)
+    elongation = sun.separation(moon)
+    phase_angle = elongation.deg
+
+    # Calculate illumination fraction
+    # Illumination = (1 - cos(elongation)) / 2
+    # This gives 0% at new moon (0°) and 100% at full moon (180°)
+    illumination = (1 - np.cos(elongation.rad)) / 2 * 100
+
+    # Get phase name and emoji
+    phase_name, phase_emoji = _get_moon_phase_name(phase_angle)
+
+    return MoonPhaseData(
+        phase_angle=phase_angle,
+        illumination=illumination,
+        phase_name=phase_name,
+        phase_emoji=phase_emoji
+    )
+
+
 class DayWeatherCard(QFrame):
     """Clickable card widget for displaying daily weather summary"""
     clicked = Signal(object)  # Emits DailyWeatherSummary
@@ -574,6 +655,13 @@ class DayWeatherCard(QFrame):
         score_label.setAlignment(Qt.AlignCenter)
         score_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt;")
         layout.addWidget(score_label)
+
+        # Moon phase (compact display)
+        if self.summary.moon_phase:
+            moon_label = QLabel(f"{self.summary.moon_phase.phase_emoji} {self.summary.moon_phase.illumination:.0f}%")
+            moon_label.setAlignment(Qt.AlignCenter)
+            moon_label.setToolTip(f"{self.summary.moon_phase.phase_name}")
+            layout.addWidget(moon_label)
 
         layout.addStretch()
 
@@ -824,6 +912,13 @@ class DayDetailDialog(QDialog):
         # Seeing estimate
         seeing_label = QLabel(f"Seeing Estimate: {self.summary.seeing_estimate}")
         header_layout.addWidget(seeing_label, 0, 1)
+
+        # Moon phase (detailed)
+        if self.summary.moon_phase:
+            mp = self.summary.moon_phase
+            moon_label = QLabel(f"Moon: {mp.phase_emoji} {mp.phase_name} ({mp.illumination:.0f}%)")
+            moon_label.setToolTip("Lower illumination is better for astrophotography")
+            header_layout.addWidget(moon_label, 0, 2)
 
         # Cloud cover (dynamic - updates based on view mode)
         self.cloud_label = QLabel()
