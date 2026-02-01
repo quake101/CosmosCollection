@@ -12,12 +12,12 @@ from datetime import datetime
 from io import BytesIO
 
 import matplotlib
-matplotlib.use('Qt5Agg')
+matplotlib.use('QtAgg')
 
 # Suppress matplotlib font_manager debug messages
 logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
 
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
