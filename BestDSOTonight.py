@@ -655,6 +655,8 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         # DSO Type filter
         settings_row1.addWidget(QLabel("Type:"))
         self.dso_type_combo = QComboBox()
+        self.dso_type_combo.setMinimumWidth(150)
+        self.dso_type_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.load_dso_type_options()
         self.dso_type_combo.setToolTip("Filter by DSO type (ignored when using target list)")
         settings_row1.addWidget(self.dso_type_combo)
@@ -921,42 +923,31 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self.available_catalogs = ["M", "NGC", "IC"]  # Fallback default catalogs
     
     def load_dso_type_options(self):
-        """Load available DSO types from database with friendly names"""
-        try:
-            db_manager = DatabaseManager()
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT DISTINCT dsotype FROM dsodetail WHERE dsotype IS NOT NULL ORDER BY dsotype")
-                dso_types = [row[0] for row in cursor.fetchall()]
+        """Load curated list of common DSO types for astrophotography"""
+        # Curated list of common types for astrophotography planning
+        common_types = [
+            ("GALXY", "Galaxy"),
+            ("BRTNB", "Bright Nebula"),
+            ("DRKNB", "Dark Nebula"),
+            ("PLNNB", "Planetary Nebula"),
+            ("SNREM", "Supernova Remnant"),
+            ("CL+NB", "Cluster + Nebula"),
+            ("OPNCL", "Open Cluster"),
+            ("GLOCL", "Globular Cluster"),
+            ("GALCL", "Galaxy Cluster"),
+        ]
 
-                # Add "All Types" option first
-                self.dso_type_combo.addItem("All Types")
+        # Add "All Types" option first
+        self.dso_type_combo.addItem("All Types")
 
-                # Add DSO types with friendly names, ordered by frequency/popularity
-                priority_types = [
-                    "GALXY", "DRKNB", "OPNCL", "PLNNB", "BRTNB", "SNREM",
-                    "GALCL", "GLOCL", "ASTER", "2STAR", "CL+NB", "GX+DN",
-                    "3STAR", "4STAR", "1STAR", "LMCOC", "LMCCN", "LMCGC",
-                    "LMCDN", "SMCGC", "SMCCN", "SMCOC", "SMCDN", "QUASR", "NONEX"
-                ]
+        # Add curated types sorted alphabetically by friendly name
+        for dso_type, friendly_name in sorted(common_types, key=lambda x: x[1]):
+            self.dso_type_combo.addItem(friendly_name, dso_type)
 
-                # Add priority types first if they exist in database
-                for dso_type in priority_types:
-                    if dso_type in dso_types:
-                        friendly_name = self._get_friendly_type_name(dso_type)
-                        self.dso_type_combo.addItem(friendly_name, dso_type)
+        self.dso_type_combo.setCurrentText("All Types")
 
-                # Add any remaining types that weren't in priority list
-                for dso_type in sorted(dso_types):
-                    if dso_type not in priority_types:
-                        friendly_name = self._get_friendly_type_name(dso_type)
-                        self.dso_type_combo.addItem(friendly_name, dso_type)
-
-                self.dso_type_combo.setCurrentText("All Types")
-        except Exception as e:
-            print(f"Error loading DSO type options: {e}")
-            # Add default option if database query fails
-            self.dso_type_combo.addItem("All Types")
+        # Ensure dropdown view is wide enough to show full text
+        self.dso_type_combo.view().setMinimumWidth(self.dso_type_combo.minimumSizeHint().width())
     
 
     def _on_target_list_checkbox_changed(self, checked):

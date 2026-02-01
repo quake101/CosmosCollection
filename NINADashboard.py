@@ -189,7 +189,7 @@ class NINAStatusWorker(QThread):
     guiding_updated = Signal(list)  # Emits guiding graph data points
     event_occurred = Signal(dict)  # Emits new NINA event data
     error_occurred = Signal(str)  # Emits error message
-    connection_changed = Signal(bool, str)  # Emits connected state and version
+    connection_changed = Signal(bool, str, str, int)  # Emits connected state, version, host, port
 
     # Adaptive polling rates
     POLL_RATE_ACTIVE = 0.5  # when exposing/guiding
@@ -223,7 +223,7 @@ class NINAStatusWorker(QThread):
         success, message, version = NINAIntegration.test_connection(self.host, self.port)
         if success:
             self._version = version or "Unknown"
-            self.connection_changed.emit(True, self._version)
+            self.connection_changed.emit(True, self._version, self.host, self.port)
             # Initialize event time to skip old events on startup
             events = NINAIntegration.get_event_history(self.host, self.port)
             if events:
@@ -232,7 +232,7 @@ class NINAStatusWorker(QThread):
                 if latest_time:
                     self._last_event_time = latest_time
         else:
-            self.connection_changed.emit(False, "")
+            self.connection_changed.emit(False, "", self.host, self.port)
             self.error_occurred.emit(message)
             return
 
@@ -281,13 +281,13 @@ class NINAStatusWorker(QThread):
                     if self._consecutive_failures >= 2:
                         # Reconnected after being disconnected
                         logger.debug("NINA connection restored")
-                        self.connection_changed.emit(True, self._version)
+                        self.connection_changed.emit(True, self._version, self.host, self.port)
                     self._consecutive_failures = 0  # Reset on success
                 else:
                     self._consecutive_failures += 1
                     if self._consecutive_failures >= 2:
                         logger.debug(f"NINA connection lost ({self._consecutive_failures} consecutive failures)")
-                        self.connection_changed.emit(False, "")
+                        self.connection_changed.emit(False, "", self.host, self.port)
                         # Keep counting but don't reset - we want to stay disconnected
 
                 # Fetch image thumbnail based on exposure state
@@ -1575,13 +1575,13 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.worker.wait(2000)
             self.worker = None
 
-    def _on_connection_changed(self, connected, version):
+    def _on_connection_changed(self, connected, version, host, port):
         """Handle connection state change."""
         self._connected = connected
         self._version = version
 
         if connected:
-            self.connection_label.setText(f"Connection: Connected to NINA {version}")
+            self.connection_label.setText(f"Connection: Connected to NINA {version} ({host}:{port})")
             self.connection_label.setStyleSheet(f"color: {COLORS['success']};")
             self.status_label.setText("Connected - adaptive polling active")
             self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")

@@ -382,8 +382,9 @@ class DataLoaderRunnable(QRunnable):
             "LMCDN": "LMC Dark Nebula",
             "LMCGC": "LMC Globular Cluster",
             "LMCOC": "LMC Open Cluster",
-            "SMCGC": "SMC Globular Cluster",
             "SMCCN": "SMC Cluster/Nebula",
+            "SMCDN": "SMC Dark Nebula",
+            "SMCGC": "SMC Globular Cluster",
             "SMCOC": "SMC Open Cluster"
         }
         return type_mapping.get(dso_type, dso_type)
