@@ -306,7 +306,7 @@ class WeatherWorker(QThread):
             seeing = estimate_seeing(night_humidity, night_wind, night_temp_dew_spread)
 
             # Calculate moon phase for this date
-            moon_phase = calculate_moon_phase(datetime.combine(date, datetime.min.time()), self.lat, self.lon)
+            moon_phase = calculate_moon_phase(datetime.combine(date, datetime.min.time()), self.timezone)
 
             summary = DailyWeatherSummary(
                 date=datetime.combine(date, datetime.min.time()),
@@ -534,19 +534,30 @@ def _get_moon_phase_name(phase_angle: float) -> tuple:
         return ("Full Moon", "🌕")
 
 
-def calculate_moon_phase(date: datetime, lat: float = 0, lon: float = 0) -> MoonPhaseData:
+def calculate_moon_phase(date: datetime, timezone: str = None) -> MoonPhaseData:
     """
     Calculate moon phase information for a given date.
 
     Args:
-        date: The date to calculate moon phase for
-        lat: Observer latitude (not used for phase, but kept for consistency)
-        lon: Observer longitude (not used for phase, but kept for consistency)
+        date: The date to calculate moon phase for (naive datetime in local time)
+        timezone: Timezone string (e.g., 'America/New_York') for converting to UTC
 
     Returns:
         MoonPhaseData with phase angle, illumination, name, and emoji
     """
     import numpy as np
+
+    # Convert local midnight to UTC if timezone is provided
+    if timezone:
+        try:
+            import pytz
+            local_tz = pytz.timezone(timezone)
+            if date.tzinfo is None:
+                local_dt = local_tz.localize(date)
+                utc_dt = local_dt.astimezone(pytz.UTC)
+                date = utc_dt.replace(tzinfo=None)  # astropy works with naive UTC
+        except Exception as e:
+            logger.warning(f"Could not convert moon phase time to UTC: {e}")
 
     # Use midnight of the date for calculation
     obs_time = Time(date.isoformat())
