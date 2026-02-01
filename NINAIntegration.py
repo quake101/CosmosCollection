@@ -1081,6 +1081,30 @@ class NINAIntegration:
             return None
 
     @staticmethod
+    def get_event_history(host, port):
+        """
+        Get event history from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            list: List of event dicts with 'Event', 'Time', and optional data fields
+        """
+        url = f"http://{host}:{port}/v2/api/event-history"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('Success'):
+                    return result.get('Response', [])
+                return []
+        except Exception as e:
+            logger.debug(f"Error getting event history: {e}")
+            return []
+
+    @staticmethod
     def get_guiding_graph_data(host, port):
         """
         Get guiding graph data (RA/Dec deviations) from NINA.

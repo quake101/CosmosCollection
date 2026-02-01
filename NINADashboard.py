@@ -187,6 +187,7 @@ class NINAStatusWorker(QThread):
     image_updated = Signal(bytes, dict)  # Emits image data and metadata
     livestack_updated = Signal(bytes, dict)  # Emits livestack image and status
     guiding_updated = Signal(list)  # Emits guiding graph data points
+    event_occurred = Signal(dict)  # Emits new NINA event data
     error_occurred = Signal(str)  # Emits error message
     connection_changed = Signal(bool, str)  # Emits connected state and version
 
@@ -210,6 +211,7 @@ class NINAStatusWorker(QThread):
         self._last_livestack_running = False  # Track if livestack was running
         self._consecutive_failures = 0  # Track consecutive API failures to detect disconnect
         self._version = ""  # Store NINA version for reconnection
+        self._last_event_time = None  # Track last processed event timestamp
 
     def run(self):
         """Main polling loop."""
@@ -220,6 +222,13 @@ class NINAStatusWorker(QThread):
         if success:
             self._version = version or "Unknown"
             self.connection_changed.emit(True, self._version)
+            # Initialize event time to skip old events on startup
+            events = NINAIntegration.get_event_history(self.host, self.port)
+            if events:
+                # Get the latest event timestamp
+                latest_time = max((e.get('Time') for e in events if e.get('Time')), default=None)
+                if latest_time:
+                    self._last_event_time = latest_time
         else:
             self.connection_changed.emit(False, "")
             self.error_occurred.emit(message)
@@ -384,6 +393,17 @@ class NINAStatusWorker(QThread):
                     guiding_data = NINAIntegration.get_guiding_graph_data(self.host, self.port)
                     if guiding_data and isinstance(guiding_data, list):
                         self.guiding_updated.emit(guiding_data)
+
+                # Fetch event history and emit new events
+                events = NINAIntegration.get_event_history(self.host, self.port)
+                if events:
+                    for event in events:
+                        event_time = event.get('Time')
+                        if event_time:
+                            # Only process events newer than last seen
+                            if self._last_event_time is None or event_time > self._last_event_time:
+                                self._last_event_time = event_time
+                                self.event_occurred.emit(event)
 
             except Exception as e:
                 logger.error(f"Error in NINA status worker: {e}")
@@ -1504,6 +1524,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.worker.image_updated.connect(self._on_image_updated)
         self.worker.livestack_updated.connect(self._on_livestack_updated)
         self.worker.guiding_updated.connect(self._on_guiding_updated)
+        self.worker.event_occurred.connect(self._on_event_occurred)
         self.worker.error_occurred.connect(self._on_error)
         self.worker.start()
 
@@ -2049,6 +2070,26 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         """Handle error from worker."""
         self.status_label.setText(f"Error: {error_message}")
         self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_event_occurred(self, event):
+        """Handle NINA event from worker."""
+        event_type = event.get('Event', '')
+
+        # Map events to user-friendly messages
+        event_messages = {
+            'AUTOFOCUS-STARTING': ("AutoFocus running...", COLORS['text_secondary']),
+            'AUTOFOCUS-FINISHED': ("AutoFocus complete", COLORS['success']),
+            'SEQUENCE-STARTING': ("Sequence started", COLORS['text_secondary']),
+            'SEQUENCE-FINISHED': ("Sequence finished", COLORS['success']),
+            'GUIDER-START': ("Guiding started", COLORS['text_secondary']),
+            'GUIDER-STOP': ("Guiding stopped", COLORS['text_secondary']),
+            'IMAGE-SAVE': ("Image saved", COLORS['text_secondary']),
+        }
+
+        if event_type in event_messages:
+            message, color = event_messages[event_type]
+            self.status_label.setText(message)
+            self.status_label.setStyleSheet(f"color: {color};")
 
     def _on_cooling_changed(self, state):
         """Handle cooling checkbox change."""
