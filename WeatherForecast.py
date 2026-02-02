@@ -134,6 +134,7 @@ class HourlyWeatherData:
     wind_speed: float  # km/h
     precipitation_probability: float  # %
     visibility: Optional[float] = None  # meters
+    surface_pressure: Optional[float] = None  # hPa
 
 
 @dataclass
@@ -180,7 +181,7 @@ class WeatherWorker(QThread):
                 f"latitude={self.lat}&longitude={self.lon}&"
                 f"hourly=cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,"
                 f"temperature_2m,dew_point_2m,relative_humidity_2m,"
-                f"wind_speed_10m,precipitation_probability,visibility&"
+                f"wind_speed_10m,precipitation_probability,visibility,surface_pressure&"
                 f"forecast_days=7&timezone=auto"
             )
 
@@ -228,7 +229,8 @@ class WeatherWorker(QThread):
                     humidity=hourly.get("relative_humidity_2m", [0] * len(times))[i] or 0,
                     wind_speed=hourly.get("wind_speed_10m", [0] * len(times))[i] or 0,
                     precipitation_probability=hourly.get("precipitation_probability", [0] * len(times))[i] or 0,
-                    visibility=hourly.get("visibility", [None] * len(times))[i]
+                    visibility=hourly.get("visibility", [None] * len(times))[i],
+                    surface_pressure=hourly.get("surface_pressure", [None] * len(times))[i]
                 ))
             except (ValueError, IndexError) as e:
                 logger.warning(f"Error parsing hourly data at index {i}: {e}")
@@ -279,7 +281,8 @@ class WeatherWorker(QThread):
             # Calculate astro score as the average of individual hourly scores
             if tonight_hours:
                 hourly_scores = [
-                    calculate_astro_score(h.cloud_cover, h.humidity, h.wind_speed, h.precipitation_probability)
+                    calculate_astro_score(h.cloud_cover, h.humidity, h.wind_speed,
+                                          h.precipitation_probability, h.visibility)
                     for h in tonight_hours
                 ]
                 astro_score = int(sum(hourly_scores) / len(hourly_scores))
@@ -298,12 +301,17 @@ class WeatherWorker(QThread):
                 night_humidity = sum(h.humidity for h in tonight_hours) / len(tonight_hours)
                 night_wind = sum(h.wind_speed for h in tonight_hours) / len(tonight_hours)
                 night_temp_dew_spread = sum(h.temperature - h.dew_point for h in tonight_hours) / len(tonight_hours)
+                # Average surface pressure for tonight (filter out None values)
+                pressure_values = [h.surface_pressure for h in tonight_hours if h.surface_pressure is not None]
+                night_pressure = sum(pressure_values) / len(pressure_values) if pressure_values else None
             else:
                 night_humidity = avg_humidity
                 night_wind = avg_wind
                 night_temp_dew_spread = sum(h.temperature - h.dew_point for h in hours) / len(hours)
+                pressure_values = [h.surface_pressure for h in hours if h.surface_pressure is not None]
+                night_pressure = sum(pressure_values) / len(pressure_values) if pressure_values else None
 
-            seeing = estimate_seeing(night_humidity, night_wind, night_temp_dew_spread)
+            seeing = estimate_seeing(night_humidity, night_wind, night_temp_dew_spread, night_pressure)
 
             # Calculate moon phase for this date
             moon_phase = calculate_moon_phase(datetime.combine(date, datetime.min.time()), self.timezone)
@@ -331,7 +339,8 @@ class WeatherWorker(QThread):
         return daily_summaries
 
 
-def calculate_astro_score(cloud_cover: float, humidity: float, wind_speed: float, precip_prob: float) -> int:
+def calculate_astro_score(cloud_cover: float, humidity: float, wind_speed: float,
+                          precip_prob: float, visibility: Optional[float] = None) -> int:
     """
     Calculate an astrophotography suitability score (0-100).
 
@@ -344,15 +353,44 @@ def calculate_astro_score(cloud_cover: float, humidity: float, wind_speed: float
     - >40% clouds: max score 70 (Good)
 
     Base scoring weights:
-    - Cloud cover (50%): lower is better
-    - Humidity (20%): ideal 30-50%
-    - Wind speed (15%): under 15 km/h is good
+    - Cloud cover (40%): lower is better
+    - Transparency/Visibility (15%): higher is better (affects deep sky objects)
+    - Humidity (15%): ideal 30-50%, affects transparency and dew risk
+    - Wind speed (15%): under 15 km/h is good for tracking/guiding
     - Precipitation (15%): 0% is ideal
+
+    Args:
+        cloud_cover: Cloud cover percentage (0-100)
+        humidity: Relative humidity percentage (0-100)
+        wind_speed: Wind speed in km/h
+        precip_prob: Precipitation probability percentage (0-100)
+        visibility: Visibility in meters (None if unavailable)
     """
     # Cloud cover score (0-100, lower clouds = higher score)
     cloud_score = max(0, 100 - cloud_cover)
 
+    # Visibility/Transparency score (0-100, higher visibility = better transparency)
+    # Open-Meteo returns visibility in meters
+    # Excellent: > 40km, Good: 20-40km, Moderate: 10-20km, Poor: < 10km
+    if visibility is not None:
+        visibility_km = visibility / 1000.0
+        if visibility_km >= 40:
+            visibility_score = 100
+        elif visibility_km >= 20:
+            # Linear interpolation from 70 to 100 between 20-40km
+            visibility_score = 70 + (visibility_km - 20) * 1.5
+        elif visibility_km >= 10:
+            # Linear interpolation from 40 to 70 between 10-20km
+            visibility_score = 40 + (visibility_km - 10) * 3
+        else:
+            # Below 10km, score drops more steeply
+            visibility_score = max(0, visibility_km * 4)
+    else:
+        # If visibility data unavailable, use a neutral score
+        visibility_score = 70
+
     # Humidity score (0-100, ideal around 40%)
+    # High humidity reduces transparency and increases dew risk
     if humidity < 30:
         humidity_score = 70 + humidity  # Slightly penalize very dry
     elif humidity <= 50:
@@ -377,8 +415,9 @@ def calculate_astro_score(cloud_cover: float, humidity: float, wind_speed: float
 
     # Weighted average
     total_score = (
-        cloud_score * 0.50 +
-        humidity_score * 0.20 +
+        cloud_score * 0.40 +
+        visibility_score * 0.15 +
+        humidity_score * 0.15 +
         wind_score * 0.15 +
         precip_score * 0.15
     )
@@ -395,14 +434,23 @@ def calculate_astro_score(cloud_cover: float, humidity: float, wind_speed: float
     return int(min(100, max(0, total_score)))
 
 
-def estimate_seeing(humidity: float, wind_speed: float, temp_dew_spread: float) -> str:
+def estimate_seeing(humidity: float, wind_speed: float, temp_dew_spread: float,
+                    surface_pressure: Optional[float] = None) -> str:
     """
     Estimate seeing quality based on atmospheric conditions.
+
+    Seeing (atmospheric turbulence) is affected by:
+    - Humidity: High humidity can indicate atmospheric instability
+    - Wind: High winds cause turbulence, but moderate wind can indicate stable laminar flow
+    - Temperature-dew spread: Indicates moisture content and potential for ground-level turbulence
+    - Surface pressure: High, stable pressure generally means better seeing;
+      low pressure systems bring unstable air masses
 
     Args:
         humidity: Relative humidity %
         wind_speed: Wind speed in km/h
         temp_dew_spread: Temperature minus dew point (larger = less moisture)
+        surface_pressure: Surface pressure in hPa (None if unavailable)
 
     Returns:
         Seeing quality string: Excellent/Good/Moderate/Poor
@@ -417,21 +465,44 @@ def estimate_seeing(humidity: float, wind_speed: float, temp_dew_spread: float) 
     elif humidity > 50:
         score -= 5
 
-    # Wind factor (calm is better)
-    if wind_speed > 25:
-        score -= 35
+    # Wind factor (calm to light is best, strong winds cause turbulence)
+    # However, very calm conditions can lead to ground-layer turbulence
+    if wind_speed > 30:
+        score -= 40  # Very high winds - severe turbulence
+    elif wind_speed > 25:
+        score -= 30
     elif wind_speed > 15:
-        score -= 20
+        score -= 15
     elif wind_speed > 10:
-        score -= 10
+        score -= 5
+    elif wind_speed < 3:
+        score -= 5  # Very calm - potential ground layer issues
 
-    # Dew risk factor (larger spread = better)
+    # Dew risk factor (larger spread = better, also indicates drier air column)
     if temp_dew_spread < 2:
-        score -= 25  # High dew risk
+        score -= 25  # High dew risk and moist air
     elif temp_dew_spread < 5:
         score -= 10
+    elif temp_dew_spread > 15:
+        score += 10  # Very dry air column - excellent
     elif temp_dew_spread > 10:
         score += 5  # Very safe from dew
+
+    # Surface pressure factor
+    # High pressure (>1020 hPa) typically indicates stable air mass = better seeing
+    # Low pressure (<1000 hPa) indicates unstable weather systems = worse seeing
+    # Normal range is roughly 980-1040 hPa
+    if surface_pressure is not None:
+        if surface_pressure >= 1025:
+            score += 15  # Strong high pressure - excellent stability
+        elif surface_pressure >= 1015:
+            score += 10  # High pressure - good stability
+        elif surface_pressure >= 1005:
+            score += 0   # Normal pressure - neutral
+        elif surface_pressure >= 995:
+            score -= 10  # Lowish pressure - some instability
+        else:
+            score -= 20  # Low pressure system - unstable air
 
     if score >= 80:
         return "Excellent"
@@ -665,6 +736,7 @@ class DayWeatherCard(QFrame):
         score_label = QLabel(f"({self.summary.astro_score})")
         score_label.setAlignment(Qt.AlignCenter)
         score_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt;")
+        score_label.setToolTip("Astro Score")
         layout.addWidget(score_label)
 
         # Moon phase (compact display)
@@ -737,7 +809,8 @@ class HourlyAstroChart(FigureCanvas):
                 hour_data.cloud_cover,
                 hour_data.humidity,
                 hour_data.wind_speed,
-                hour_data.precipitation_probability
+                hour_data.precipitation_probability,
+                hour_data.visibility
             )
             scores.append(score)
             colors.append(get_rating_color(score))
@@ -866,7 +939,7 @@ class DayDetailDialog(QDialog):
         self.setWindowTitle(f"Weather Details - {summary.date.strftime('%A, %B %d, %Y')} - Cosmos Collection")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setModal(False)
-        self.resize(900, 750)
+        self.resize(1000, 750)
 
         # Get unit preferences
         settings = QSettings("CosmosCollection", "CosmosCollection")
@@ -982,11 +1055,11 @@ class DayDetailDialog(QDialog):
         table_layout = QVBoxLayout(table_group)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(10)
+        self.table.setColumnCount(12)
         self.table.setHorizontalHeaderLabels([
             "Time", "Cloud %", "Low", "Mid", "High",
             f"Temp ({self._temp_suffix()})", f"Dew ({self._temp_suffix()})", "Humidity %",
-            f"Wind ({self._wind_suffix()})", "Precip %"
+            f"Wind ({self._wind_suffix()})", "Precip %", "Vis (km)", "Press"
         ])
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -997,7 +1070,7 @@ class DayDetailDialog(QDialog):
         # Use Fixed mode for Time column to prevent flickering during row selection
         header.setSectionResizeMode(0, QHeaderView.Fixed)
         header.resizeSection(0, 60)  # Fixed width for time column
-        for i in range(1, 10):
+        for i in range(1, 12):
             header.setSectionResizeMode(i, QHeaderView.Stretch)
 
         # Populate table with initial data
@@ -1172,6 +1245,47 @@ class DayDetailDialog(QDialog):
             elif hour_data.precipitation_probability > 20:
                 precip_item.setForeground(QColor(COLORS['warning']))
             self.table.setItem(row, 9, precip_item)
+
+            # Visibility (convert from meters to km)
+            if hour_data.visibility is not None:
+                vis_km = hour_data.visibility / 1000.0
+                vis_item = QTableWidgetItem(f"{vis_km:.0f}")
+            else:
+                vis_item = QTableWidgetItem("-")
+            vis_item.setTextAlignment(Qt.AlignCenter)
+            if is_night:
+                vis_item.setBackground(QColor(COLORS['background_lighter']))
+            # Color code visibility (transparency indicator)
+            if hour_data.visibility is not None:
+                if vis_km >= 40:
+                    vis_item.setForeground(QColor(COLORS['success']))  # Excellent
+                elif vis_km >= 20:
+                    vis_item.setForeground(QColor(COLORS['info']))  # Good
+                elif vis_km >= 10:
+                    vis_item.setForeground(QColor(COLORS['warning']))  # Moderate
+                else:
+                    vis_item.setForeground(QColor(COLORS['error']))  # Poor
+            self.table.setItem(row, 10, vis_item)
+
+            # Surface pressure
+            if hour_data.surface_pressure is not None:
+                press_item = QTableWidgetItem(f"{hour_data.surface_pressure:.0f}")
+            else:
+                press_item = QTableWidgetItem("-")
+            press_item.setTextAlignment(Qt.AlignCenter)
+            if is_night:
+                press_item.setBackground(QColor(COLORS['background_lighter']))
+            # Color code pressure (seeing indicator)
+            if hour_data.surface_pressure is not None:
+                if hour_data.surface_pressure >= 1020:
+                    press_item.setForeground(QColor(COLORS['success']))  # High pressure - stable
+                elif hour_data.surface_pressure >= 1010:
+                    press_item.setForeground(QColor(COLORS['info']))  # Normal-high
+                elif hour_data.surface_pressure >= 1000:
+                    pass  # Normal - default color
+                else:
+                    press_item.setForeground(QColor(COLORS['warning']))  # Low pressure
+            self.table.setItem(row, 11, press_item)
 
 
 class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
