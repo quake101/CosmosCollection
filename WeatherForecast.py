@@ -579,28 +579,34 @@ def calculate_sun_altitudes(lat: float, lon: float, times: List[datetime], timez
     return sun_altaz.alt.deg.tolist()
 
 
-def _get_moon_phase_name(phase_angle: float) -> tuple:
+def _get_moon_phase_name(phase_angle: float, is_waxing: bool) -> tuple:
     """
     Map phase angle (elongation) to moon phase name and emoji.
 
     Args:
         phase_angle: Elongation from sun in degrees (0-180)
+        is_waxing: True if moon is waxing (getting brighter), False if waning
 
     Returns:
         Tuple of (phase_name, phase_emoji)
     """
-    # Phase angle ranges and their corresponding names/emojis
-    # Note: We need to determine if waxing or waning based on whether moon is
-    # ahead of or behind the sun, but for simplicity we'll use elongation only
-    # and assume waxing for 0-180 (new to full)
     if phase_angle < 22.5:
         return ("New Moon", "🌑")
     elif phase_angle < 67.5:
-        return ("Waxing Crescent", "🌒")
+        if is_waxing:
+            return ("Waxing Crescent", "🌒")
+        else:
+            return ("Waning Crescent", "🌘")
     elif phase_angle < 112.5:
-        return ("First Quarter", "🌓")
+        if is_waxing:
+            return ("First Quarter", "🌓")
+        else:
+            return ("Last Quarter", "🌗")
     elif phase_angle < 157.5:
-        return ("Waxing Gibbous", "🌔")
+        if is_waxing:
+            return ("Waxing Gibbous", "🌔")
+        else:
+            return ("Waning Gibbous", "🌖")
     else:
         return ("Full Moon", "🌕")
 
@@ -617,6 +623,7 @@ def calculate_moon_phase(date: datetime, timezone: str = None) -> MoonPhaseData:
         MoonPhaseData with phase angle, illumination, name, and emoji
     """
     import numpy as np
+    from astropy.coordinates import GeocentricTrueEcliptic
 
     # Convert local midnight to UTC if timezone is provided
     if timezone:
@@ -646,8 +653,23 @@ def calculate_moon_phase(date: datetime, timezone: str = None) -> MoonPhaseData:
     # This gives 0% at new moon (0°) and 100% at full moon (180°)
     illumination = (1 - np.cos(elongation.rad)) / 2 * 100
 
+    # Determine if waxing or waning by comparing ecliptic longitudes
+    # Moon is waxing when its ecliptic longitude is ahead of (greater than) the sun's
+    sun_ecliptic = sun.transform_to(GeocentricTrueEcliptic(equinox=obs_time))
+    moon_ecliptic = moon.transform_to(GeocentricTrueEcliptic(equinox=obs_time))
+
+    sun_lon = sun_ecliptic.lon.deg
+    moon_lon = moon_ecliptic.lon.deg
+
+    # Calculate the difference (moon - sun), normalized to 0-360
+    lon_diff = (moon_lon - sun_lon) % 360
+
+    # If difference is 0-180, moon is ahead of sun = waxing
+    # If difference is 180-360, moon is behind sun = waning
+    is_waxing = lon_diff < 180
+
     # Get phase name and emoji
-    phase_name, phase_emoji = _get_moon_phase_name(phase_angle)
+    phase_name, phase_emoji = _get_moon_phase_name(phase_angle, is_waxing)
 
     return MoonPhaseData(
         phase_angle=phase_angle,
@@ -924,6 +946,32 @@ class HourlyAstroChart(FigureCanvas):
             self._last_hovered_index = -1
             self.hour_hovered.emit(-1)
 
+    def highlight_bar(self, index: int):
+        """Highlight the bar at the given index, unhighlight others"""
+        if not hasattr(self, 'bars') or self.bars is None:
+            return
+
+        for i, bar in enumerate(self.bars):
+            if i == index:
+                bar.set_edgecolor('white')
+                bar.set_linewidth(2)
+            else:
+                bar.set_edgecolor('none')
+                bar.set_linewidth(0)
+
+        self.draw_idle()
+
+    def clear_bar_highlight(self):
+        """Remove highlight from all bars"""
+        if not hasattr(self, 'bars') or self.bars is None:
+            return
+
+        for bar in self.bars:
+            bar.set_edgecolor('none')
+            bar.set_linewidth(0)
+
+        self.draw_idle()
+
 
 class DayDetailDialog(QDialog):
     """Dialog showing detailed hourly weather data for a day"""
@@ -1064,6 +1112,8 @@ class DayDetailDialog(QDialog):
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setMouseTracking(True)
+        self.table.cellEntered.connect(self._on_table_cell_hover)
 
         # Configure header
         header = self.table.horizontalHeader()
@@ -1109,6 +1159,16 @@ class DayDetailDialog(QDialog):
             self.table.scrollTo(self.table.model().index(row_index, 0))
         else:
             self.table.clearSelection()
+
+    def _on_table_cell_hover(self, row: int, column: int):
+        """Highlight bar and table row when hovering over table"""
+        self.table.selectRow(row)
+        self.chart.highlight_bar(row)
+
+    def leaveEvent(self, event):
+        """Clear bar highlight when mouse leaves the dialog"""
+        self.chart.clear_bar_highlight()
+        super().leaveEvent(event)
 
     def _get_display_hours(self) -> List[HourlyWeatherData]:
         """Get the hourly data to display based on current view mode"""
