@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget, QLabel, QDialog,
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
     QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout, QSpinBox, QFileDialog, QSizePolicy,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QCompleter, QSplitter
 )
 
 # Local imports (always needed)
@@ -3132,57 +3132,55 @@ class TelescopeDialog(QDialog):
         self.setWindowTitle("Telescope Management - Cosmos Collection")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setModal(True)
-        self.resize(800, 600)
-        
+        self.resize(900, 700)
+
         self.db_manager = DatabaseManager()
         self._setup_ui()
         self._load_telescopes()
+        self._restore_splitter_state()
         
     def _setup_ui(self):
         """Set up the telescope management UI"""
         layout = QVBoxLayout()
-        
-        # Header
-        header = QLabel("Telescope Management")
-        header.setStyleSheet("font-size: 16pt; font-weight: bold; margin-bottom: 10px;")
-        header.setAlignment(Qt.AlignCenter)
-        layout.addWidget(header)
-        
-        # Create main horizontal layout
-        main_layout = QHBoxLayout()
-        
-        # Left side - telescope list
-        list_layout = QVBoxLayout()
-        
+
+        # Create main splitter for resizable panels
+        self.main_splitter = QSplitter(Qt.Horizontal)
+
+        # Left side - telescope list (in a container widget)
+        left_widget = QWidget()
+        list_layout = QVBoxLayout(left_widget)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+
         list_label = QLabel("Your Telescopes:")
         list_label.setStyleSheet("font-weight: bold; margin-bottom: 5px;")
         list_layout.addWidget(list_label)
-        
+
         # Telescope list
-        from PySide6.QtWidgets import QListWidget, QListWidgetItem
         self.telescope_list = QListWidget()
         self.telescope_list.itemSelectionChanged.connect(self._on_telescope_selected)
         list_layout.addWidget(self.telescope_list)
-        
+
         # List action buttons
         list_button_layout = QHBoxLayout()
         self.delete_button = QPushButton("Delete Selected")
         self.delete_button.clicked.connect(self._delete_telescope)
         self.delete_button.setEnabled(False)
         list_button_layout.addWidget(self.delete_button)
-        
+
         self.set_active_button = QPushButton("Enable")
         self.set_active_button.setToolTip("Enable/disable telescope in FOV Simulator")
         self.set_active_button.clicked.connect(self._set_active_telescope)
         self.set_active_button.setEnabled(False)
         list_button_layout.addWidget(self.set_active_button)
-        
+
         list_layout.addLayout(list_button_layout)
-        main_layout.addLayout(list_layout)
+        self.main_splitter.addWidget(left_widget)
         
-        # Right side - telescope form
-        form_layout = QVBoxLayout()
-        
+        # Right side - telescope form (in a container widget)
+        right_widget = QWidget()
+        form_layout = QVBoxLayout(right_widget)
+        form_layout.setContentsMargins(0, 0, 0, 0)
+
         form_label = QLabel("Add/Edit Telescope:")
         form_label.setStyleSheet("font-weight: bold; margin-bottom: 5px;")
         form_layout.addWidget(form_label)
@@ -3262,9 +3260,12 @@ class TelescopeDialog(QDialog):
         notes_layout.addWidget(notes_label)
         notes_layout.addWidget(self.notes_input)
         form_group_layout.addLayout(notes_layout)
-        
+
         form_layout.addWidget(form_group)
-        
+
+        # Equipment section
+        self._setup_equipment_section(form_layout)
+
         # Form action buttons
         form_button_layout = QHBoxLayout()
         self.clear_button = QPushButton("Clear Form")
@@ -3279,10 +3280,15 @@ class TelescopeDialog(QDialog):
         form_button_layout.addWidget(self.save_button)
         
         form_layout.addLayout(form_button_layout)
-        main_layout.addLayout(form_layout)
-        
-        layout.addLayout(main_layout)
-        
+        self.main_splitter.addWidget(right_widget)
+
+        # Set initial splitter sizes (left panel smaller than right)
+        self.main_splitter.setSizes([250, 650])
+        self.main_splitter.setStretchFactor(0, 0)  # Left panel doesn't stretch
+        self.main_splitter.setStretchFactor(1, 1)  # Right panel stretches
+
+        layout.addWidget(self.main_splitter)
+
         # Bottom buttons
         bottom_layout = QHBoxLayout()
         
@@ -3326,7 +3332,40 @@ class TelescopeDialog(QDialog):
         except ValueError:
             self.fratio_display.setText("N/A")
             self.fratio_display.setStyleSheet(f"color: {COLORS['text_disabled']};")
-    
+
+    def _save_splitter_state(self):
+        """Save the splitter state to QSettings"""
+        try:
+            settings = QSettings("CosmosCollection", "TelescopeDialog")
+            settings.setValue("splitter_state", self.main_splitter.saveState())
+        except Exception as e:
+            logger.error(f"Error saving splitter state: {str(e)}")
+
+    def _restore_splitter_state(self):
+        """Restore the splitter state from QSettings"""
+        try:
+            settings = QSettings("CosmosCollection", "TelescopeDialog")
+            splitter_state = settings.value("splitter_state")
+            if splitter_state:
+                self.main_splitter.restoreState(splitter_state)
+        except Exception as e:
+            logger.error(f"Error restoring splitter state: {str(e)}")
+
+    def closeEvent(self, event):
+        """Handle dialog close - save splitter state"""
+        self._save_splitter_state()
+        event.accept()
+
+    def accept(self):
+        """Handle dialog accept - save splitter state"""
+        self._save_splitter_state()
+        super().accept()
+
+    def reject(self):
+        """Handle dialog reject - save splitter state"""
+        self._save_splitter_state()
+        super().reject()
+
     def _load_telescopes(self):
         """Load telescopes from database into the list"""
         try:
@@ -3431,6 +3470,9 @@ class TelescopeDialog(QDialog):
                     else:
                         self.set_active_button.setText("Enable")
 
+                    # Load equipment for this telescope
+                    self._load_equipment_for_telescope(telescope_id)
+
         except Exception as e:
             logger.error(f"Error loading telescope data: {str(e)}")
             QMessageBox.critical(self, "Database Error", f"Failed to load telescope data: {str(e)}")
@@ -3446,6 +3488,20 @@ class TelescopeDialog(QDialog):
         self.current_telescope_is_active = False
         self.save_button.setText("Save Telescope")
         self.set_active_button.setText("Enable")
+
+        # Clear equipment selections (uncheck all)
+        self.camera_list.blockSignals(True)
+        self.eyepiece_list.blockSignals(True)
+        self.barlow_list.blockSignals(True)
+        for i in range(self.camera_list.count()):
+            self.camera_list.item(i).setCheckState(Qt.Unchecked)
+        for i in range(self.eyepiece_list.count()):
+            self.eyepiece_list.item(i).setCheckState(Qt.Unchecked)
+        for i in range(self.barlow_list.count()):
+            self.barlow_list.item(i).setCheckState(Qt.Unchecked)
+        self.camera_list.blockSignals(False)
+        self.eyepiece_list.blockSignals(False)
+        self.barlow_list.blockSignals(False)
 
         # Clear selection
         self.telescope_list.clearSelection()
@@ -3611,6 +3667,732 @@ class TelescopeDialog(QDialog):
         except Exception as e:
             logger.error(f"Error toggling telescope active status: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to update telescope status: {str(e)}")
+
+    def _setup_equipment_section(self, parent_layout):
+        """Create equipment lists with checkboxes and add buttons"""
+        equipment_group = QGroupBox("Equipment for this Telescope (check items to associate)")
+        equipment_group_layout = QHBoxLayout(equipment_group)
+
+        # Camera column
+        camera_col = QVBoxLayout()
+        camera_header = QHBoxLayout()
+        camera_label = QLabel("Cameras:")
+        camera_label.setStyleSheet("font-weight: bold;")
+        add_camera_btn = QPushButton("Add New")
+        add_camera_btn.setMaximumWidth(70)
+        add_camera_btn.clicked.connect(self._show_add_camera_dialog)
+        camera_header.addWidget(camera_label)
+        camera_header.addStretch()
+        camera_header.addWidget(add_camera_btn)
+        camera_col.addLayout(camera_header)
+        self.camera_list = QListWidget()
+        self.camera_list.setMaximumHeight(100)
+        self.camera_list.itemChanged.connect(self._on_equipment_item_changed)
+        camera_col.addWidget(self.camera_list)
+        equipment_group_layout.addLayout(camera_col)
+
+        # Eyepiece column
+        eyepiece_col = QVBoxLayout()
+        eyepiece_header = QHBoxLayout()
+        eyepiece_label = QLabel("Eyepieces:")
+        eyepiece_label.setStyleSheet("font-weight: bold;")
+        add_eyepiece_btn = QPushButton("Add New")
+        add_eyepiece_btn.setMaximumWidth(70)
+        add_eyepiece_btn.clicked.connect(self._show_add_eyepiece_dialog)
+        eyepiece_header.addWidget(eyepiece_label)
+        eyepiece_header.addStretch()
+        eyepiece_header.addWidget(add_eyepiece_btn)
+        eyepiece_col.addLayout(eyepiece_header)
+        self.eyepiece_list = QListWidget()
+        self.eyepiece_list.setMaximumHeight(100)
+        self.eyepiece_list.itemChanged.connect(self._on_equipment_item_changed)
+        eyepiece_col.addWidget(self.eyepiece_list)
+        equipment_group_layout.addLayout(eyepiece_col)
+
+        # Barlow/Reducer column
+        barlow_col = QVBoxLayout()
+        barlow_header = QHBoxLayout()
+        barlow_label = QLabel("Barlows/Reducers:")
+        barlow_label.setStyleSheet("font-weight: bold;")
+        add_barlow_btn = QPushButton("Add New")
+        add_barlow_btn.setMaximumWidth(70)
+        add_barlow_btn.clicked.connect(self._show_add_barlow_dialog)
+        barlow_header.addWidget(barlow_label)
+        barlow_header.addStretch()
+        barlow_header.addWidget(add_barlow_btn)
+        barlow_col.addLayout(barlow_header)
+        self.barlow_list = QListWidget()
+        self.barlow_list.setMaximumHeight(100)
+        self.barlow_list.itemChanged.connect(self._on_equipment_item_changed)
+        barlow_col.addWidget(self.barlow_list)
+        equipment_group_layout.addLayout(barlow_col)
+
+        parent_layout.addWidget(equipment_group)
+
+        # Initialize equipment lists
+        self._populate_equipment_lists()
+
+    def _populate_equipment_lists(self):
+        """Populate equipment lists with checkable items from database"""
+        # Block signals during population
+        self.camera_list.blockSignals(True)
+        self.eyepiece_list.blockSignals(True)
+        self.barlow_list.blockSignals(True)
+
+        # Clear existing items
+        self.camera_list.clear()
+        self.eyepiece_list.clear()
+        self.barlow_list.clear()
+
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Load cameras
+                cursor.execute("""
+                    SELECT id, name, sensor_width, sensor_height
+                    FROM userequipment
+                    WHERE equipment_type = 'camera'
+                    ORDER BY name ASC
+                """)
+                for row in cursor.fetchall():
+                    eq_id, name, sensor_w, sensor_h = row
+                    display_text = f"{name} ({sensor_w}x{sensor_h}mm)" if sensor_w and sensor_h else name
+                    item = QListWidgetItem(display_text)
+                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                    item.setCheckState(Qt.Unchecked)
+                    item.setData(Qt.UserRole, {"id": eq_id, "type": "camera"})
+                    self.camera_list.addItem(item)
+
+                # Load eyepieces
+                cursor.execute("""
+                    SELECT id, name, focal_length, apparent_fov
+                    FROM userequipment
+                    WHERE equipment_type = 'eyepiece'
+                    ORDER BY name ASC
+                """)
+                for row in cursor.fetchall():
+                    eq_id, name, focal_length, apparent_fov = row
+                    display_text = f"{name} ({focal_length}mm, {apparent_fov}\u00b0)" if focal_length and apparent_fov else name
+                    item = QListWidgetItem(display_text)
+                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                    item.setCheckState(Qt.Unchecked)
+                    item.setData(Qt.UserRole, {"id": eq_id, "type": "eyepiece"})
+                    self.eyepiece_list.addItem(item)
+
+                # Load barlows and reducers
+                cursor.execute("""
+                    SELECT id, name, factor, equipment_type
+                    FROM userequipment
+                    WHERE equipment_type IN ('barlow', 'reducer')
+                    ORDER BY name ASC
+                """)
+                for row in cursor.fetchall():
+                    eq_id, name, factor, eq_type = row
+                    display_text = f"{name} ({factor}x)" if factor else name
+                    item = QListWidgetItem(display_text)
+                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                    item.setCheckState(Qt.Unchecked)
+                    item.setData(Qt.UserRole, {"id": eq_id, "type": eq_type})
+                    self.barlow_list.addItem(item)
+
+        except Exception as e:
+            logger.error(f"Error loading equipment: {str(e)}")
+
+        # Unblock signals
+        self.camera_list.blockSignals(False)
+        self.eyepiece_list.blockSignals(False)
+        self.barlow_list.blockSignals(False)
+
+    def _load_equipment_for_telescope(self, telescope_id):
+        """Load equipment assigned to the selected telescope"""
+        # Block signals during loading
+        self.camera_list.blockSignals(True)
+        self.eyepiece_list.blockSignals(True)
+        self.barlow_list.blockSignals(True)
+
+        # Uncheck all items first
+        for i in range(self.camera_list.count()):
+            self.camera_list.item(i).setCheckState(Qt.Unchecked)
+        for i in range(self.eyepiece_list.count()):
+            self.eyepiece_list.item(i).setCheckState(Qt.Unchecked)
+        for i in range(self.barlow_list.count()):
+            self.barlow_list.item(i).setCheckState(Qt.Unchecked)
+
+        if not telescope_id:
+            self.camera_list.blockSignals(False)
+            self.eyepiece_list.blockSignals(False)
+            self.barlow_list.blockSignals(False)
+            return
+
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Find all equipment assigned to this telescope via junction table
+                cursor.execute("""
+                    SELECT equipment_id
+                    FROM telescope_equipment
+                    WHERE telescope_id = ?
+                """, (telescope_id,))
+
+                assigned_ids = {row[0] for row in cursor.fetchall()}
+
+                # Check the assigned equipment in each list
+                for i in range(self.camera_list.count()):
+                    item = self.camera_list.item(i)
+                    data = item.data(Qt.UserRole)
+                    if data and data.get('id') in assigned_ids:
+                        item.setCheckState(Qt.Checked)
+
+                for i in range(self.eyepiece_list.count()):
+                    item = self.eyepiece_list.item(i)
+                    data = item.data(Qt.UserRole)
+                    if data and data.get('id') in assigned_ids:
+                        item.setCheckState(Qt.Checked)
+
+                for i in range(self.barlow_list.count()):
+                    item = self.barlow_list.item(i)
+                    data = item.data(Qt.UserRole)
+                    if data and data.get('id') in assigned_ids:
+                        item.setCheckState(Qt.Checked)
+
+        except Exception as e:
+            logger.error(f"Error loading equipment for telescope: {str(e)}")
+
+        # Unblock signals
+        self.camera_list.blockSignals(False)
+        self.eyepiece_list.blockSignals(False)
+        self.barlow_list.blockSignals(False)
+
+    def _on_equipment_item_changed(self, item):
+        """Handle equipment checkbox state change"""
+        if not self.current_telescope_id:
+            return
+
+        data = item.data(Qt.UserRole)
+        if not data:
+            return
+
+        equipment_id = data.get('id')
+        is_checked = item.checkState() == Qt.Checked
+
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                if is_checked:
+                    # Add equipment-telescope link (ignore if already exists)
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO telescope_equipment (telescope_id, equipment_id)
+                        VALUES (?, ?)
+                    """, (self.current_telescope_id, equipment_id))
+                else:
+                    # Remove equipment-telescope link
+                    cursor.execute("""
+                        DELETE FROM telescope_equipment
+                        WHERE telescope_id = ? AND equipment_id = ?
+                    """, (self.current_telescope_id, equipment_id))
+
+                conn.commit()
+
+        except Exception as e:
+            logger.error(f"Error saving equipment assignment: {str(e)}")
+
+    def _get_preset_cameras(self):
+        """Return preset camera data for autocomplete suggestions"""
+        return {
+            # DSLR cameras
+            "Canon Full Frame": {"sensor_width": 36, "sensor_height": 24},
+            "Canon APS-C": {"sensor_width": 22.3, "sensor_height": 14.9},
+            "Canon APS-H": {"sensor_width": 28.7, "sensor_height": 19.0},
+            "Nikon Full Frame": {"sensor_width": 35.9, "sensor_height": 24.0},
+            "Nikon APS-C": {"sensor_width": 23.5, "sensor_height": 15.6},
+            "Sony Full Frame": {"sensor_width": 35.8, "sensor_height": 23.8},
+            "Sony APS-C": {"sensor_width": 23.5, "sensor_height": 15.6},
+            # ZWO ASI cameras
+            "ASI6200MM Pro": {"sensor_width": 36.0, "sensor_height": 24.0},
+            "ASI2600MM Pro": {"sensor_width": 23.5, "sensor_height": 15.7},
+            "ASI533MM Pro": {"sensor_width": 11.3, "sensor_height": 7.1},
+            "ASI294MM Pro": {"sensor_width": 19.1, "sensor_height": 13.0},
+            "ASI183MM Pro": {"sensor_width": 13.2, "sensor_height": 8.8},
+            "ASI585MC": {"sensor_width": 8.3, "sensor_height": 6.2},
+            "ASI662MC (Seestar S30)": {"sensor_width": 7.4, "sensor_height": 5.6},
+            "ASI385MC": {"sensor_width": 7.7, "sensor_height": 4.9},
+            "ASI462MC (Seestar S50)": {"sensor_width": 2.9, "sensor_height": 2.9},
+            "ASI224MC": {"sensor_width": 3.9, "sensor_height": 2.8},
+            "ASI120MM": {"sensor_width": 3.8, "sensor_height": 2.8},
+            # QHY cameras
+            "QHY600M": {"sensor_width": 36.0, "sensor_height": 24.0},
+            "QHY268M": {"sensor_width": 23.5, "sensor_height": 15.7},
+            "QHY294M": {"sensor_width": 19.1, "sensor_height": 13.0},
+            "QHY183M": {"sensor_width": 13.2, "sensor_height": 8.8},
+            "QHY174M": {"sensor_width": 11.3, "sensor_height": 7.1},
+            # SBIG cameras
+            "SBIG STF-8300M": {"sensor_width": 17.96, "sensor_height": 13.52},
+            "SBIG ST-2000XM": {"sensor_width": 15.2, "sensor_height": 15.2},
+            # Atik cameras
+            "Atik 460EX": {"sensor_width": 36.0, "sensor_height": 24.0},
+            "Atik 383L+": {"sensor_width": 23.6, "sensor_height": 15.8},
+        }
+
+    def _show_add_camera_dialog(self):
+        """Dialog to add a new camera"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add New Camera")
+        dialog.setModal(True)
+        dialog.resize(400, 220)
+
+        layout = QVBoxLayout(dialog)
+
+        # Hint label
+        hint_label = QLabel("Start typing to see suggestions from preset cameras")
+        hint_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        layout.addWidget(hint_label)
+
+        # Name field with autocomplete
+        name_layout = QHBoxLayout()
+        name_label = QLabel("Name:")
+        name_label.setMinimumWidth(120)
+        name_input = QLineEdit()
+        name_input.setPlaceholderText("e.g., ASI294MM Pro")
+
+        # Set up autocomplete
+        preset_cameras = self._get_preset_cameras()
+        completer = QCompleter(list(preset_cameras.keys()))
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        name_input.setCompleter(completer)
+
+        name_layout.addWidget(name_label)
+        name_layout.addWidget(name_input)
+        layout.addLayout(name_layout)
+
+        # Sensor width field
+        width_layout = QHBoxLayout()
+        width_label = QLabel("Sensor Width (mm):")
+        width_label.setMinimumWidth(120)
+        width_input = QLineEdit()
+        width_input.setPlaceholderText("e.g., 19.1")
+        width_layout.addWidget(width_label)
+        width_layout.addWidget(width_input)
+        layout.addLayout(width_layout)
+
+        # Sensor height field
+        height_layout = QHBoxLayout()
+        height_label = QLabel("Sensor Height (mm):")
+        height_label.setMinimumWidth(120)
+        height_input = QLineEdit()
+        height_input.setPlaceholderText("e.g., 13.0")
+        height_layout.addWidget(height_label)
+        height_layout.addWidget(height_input)
+        layout.addLayout(height_layout)
+
+        # Auto-fill when a preset is selected
+        def on_completer_activated(text):
+            if text in preset_cameras:
+                data = preset_cameras[text]
+                width_input.setText(str(data["sensor_width"]))
+                height_input.setText(str(data["sensor_height"]))
+
+        completer.activated.connect(on_completer_activated)
+
+        # Also check on text change for exact matches
+        def on_name_changed(text):
+            if text in preset_cameras:
+                data = preset_cameras[text]
+                width_input.setText(str(data["sensor_width"]))
+                height_input.setText(str(data["sensor_height"]))
+
+        name_input.textChanged.connect(on_name_changed)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
+        button_layout.addStretch()
+        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(save_btn)
+        layout.addLayout(button_layout)
+
+        def save_camera():
+            name = name_input.text().strip()
+            width_text = width_input.text().strip()
+            height_text = height_input.text().strip()
+
+            if not name:
+                QMessageBox.warning(dialog, "Invalid Input", "Please enter a camera name.")
+                return
+
+            try:
+                sensor_width = float(width_text) if width_text else None
+                sensor_height = float(height_text) if height_text else None
+
+                if sensor_width is not None and sensor_width <= 0:
+                    QMessageBox.warning(dialog, "Invalid Input", "Sensor width must be positive.")
+                    return
+                if sensor_height is not None and sensor_height <= 0:
+                    QMessageBox.warning(dialog, "Invalid Input", "Sensor height must be positive.")
+                    return
+
+            except ValueError:
+                QMessageBox.warning(dialog, "Invalid Input", "Please enter valid numeric values for sensor dimensions.")
+                return
+
+            # Save to database
+            try:
+                with self.db_manager.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO userequipment (equipment_type, name, sensor_width, sensor_height)
+                        VALUES ('camera', ?, ?, ?)
+                    """, (name, sensor_width, sensor_height))
+                    conn.commit()
+
+                dialog.accept()
+                self._populate_equipment_lists()
+                QMessageBox.information(self, "Success", f"Camera '{name}' has been added.")
+
+            except Exception as e:
+                logger.error(f"Error saving camera: {str(e)}")
+                QMessageBox.critical(dialog, "Error", f"Failed to save camera: {str(e)}")
+
+        save_btn.clicked.connect(save_camera)
+        dialog.exec()
+
+    def _get_preset_eyepieces(self):
+        """Return preset eyepiece data for autocomplete suggestions"""
+        return {
+            "32mm Plossl (52 AFOV)": {"focal_length": 32, "apparent_fov": 52},
+            "25mm Plossl (52 AFOV)": {"focal_length": 25, "apparent_fov": 52},
+            "20mm Plossl (50 AFOV)": {"focal_length": 20, "apparent_fov": 50},
+            "15mm Plossl (50 AFOV)": {"focal_length": 15, "apparent_fov": 50},
+            "10mm Plossl (50 AFOV)": {"focal_length": 10, "apparent_fov": 50},
+            "6mm Plossl (50 AFOV)": {"focal_length": 6, "apparent_fov": 50},
+            # Televue Ethos (100 AFOV)
+            "Televue 21mm Ethos": {"focal_length": 21, "apparent_fov": 100},
+            "Televue 17mm Ethos": {"focal_length": 17, "apparent_fov": 100},
+            "Televue 13mm Ethos": {"focal_length": 13, "apparent_fov": 100},
+            "Televue 10mm Ethos": {"focal_length": 10, "apparent_fov": 100},
+            "Televue 8mm Ethos": {"focal_length": 8, "apparent_fov": 100},
+            "Televue 6mm Ethos": {"focal_length": 6, "apparent_fov": 100},
+            "Televue 4.7mm Ethos": {"focal_length": 4.7, "apparent_fov": 100},
+            "Televue 3.7mm Ethos": {"focal_length": 3.7, "apparent_fov": 100},
+            # Televue Nagler (82 AFOV)
+            "Televue 31mm Nagler": {"focal_length": 31, "apparent_fov": 82},
+            "Televue 22mm Nagler": {"focal_length": 22, "apparent_fov": 82},
+            "Televue 17mm Nagler": {"focal_length": 17, "apparent_fov": 82},
+            "Televue 16mm Nagler": {"focal_length": 16, "apparent_fov": 82},
+            "Televue 13mm Nagler": {"focal_length": 13, "apparent_fov": 82},
+            "Televue 12mm Nagler": {"focal_length": 12, "apparent_fov": 82},
+            "Televue 11mm Nagler": {"focal_length": 11, "apparent_fov": 82},
+            "Televue 9mm Nagler": {"focal_length": 9, "apparent_fov": 82},
+            "Televue 7mm Nagler": {"focal_length": 7, "apparent_fov": 82},
+            "Televue 5mm Nagler": {"focal_length": 5, "apparent_fov": 82},
+            "Televue 3.5mm Nagler": {"focal_length": 3.5, "apparent_fov": 82},
+            # Televue Panoptic (68 AFOV)
+            "Televue 41mm Panoptic": {"focal_length": 41, "apparent_fov": 68},
+            "Televue 35mm Panoptic": {"focal_length": 35, "apparent_fov": 68},
+            "Televue 27mm Panoptic": {"focal_length": 27, "apparent_fov": 68},
+            "Televue 24mm Panoptic": {"focal_length": 24, "apparent_fov": 68},
+            "Televue 19mm Panoptic": {"focal_length": 19, "apparent_fov": 68},
+            "Televue 15mm Panoptic": {"focal_length": 15, "apparent_fov": 68},
+            # Explore Scientific (82 AFOV)
+            "ES 30mm 82": {"focal_length": 30, "apparent_fov": 82},
+            "ES 24mm 82": {"focal_length": 24, "apparent_fov": 82},
+            "ES 18mm 82": {"focal_length": 18, "apparent_fov": 82},
+            "ES 14mm 82": {"focal_length": 14, "apparent_fov": 82},
+            "ES 11mm 82": {"focal_length": 11, "apparent_fov": 82},
+            "ES 8.8mm 82": {"focal_length": 8.8, "apparent_fov": 82},
+            "ES 6.7mm 82": {"focal_length": 6.7, "apparent_fov": 82},
+            "ES 4.7mm 82": {"focal_length": 4.7, "apparent_fov": 82},
+            # Explore Scientific (68 AFOV)
+            "ES 40mm 68": {"focal_length": 40, "apparent_fov": 68},
+            "ES 34mm 68": {"focal_length": 34, "apparent_fov": 68},
+            "ES 28mm 68": {"focal_length": 28, "apparent_fov": 68},
+            "ES 24mm 68": {"focal_length": 24, "apparent_fov": 68},
+            "ES 20mm 68": {"focal_length": 20, "apparent_fov": 68},
+            "ES 16mm 68": {"focal_length": 16, "apparent_fov": 68},
+        }
+
+    def _show_add_eyepiece_dialog(self):
+        """Dialog to add a new eyepiece"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add New Eyepiece")
+        dialog.setModal(True)
+        dialog.resize(400, 220)
+
+        layout = QVBoxLayout(dialog)
+
+        # Hint label
+        hint_label = QLabel("Start typing to see suggestions from preset eyepieces")
+        hint_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        layout.addWidget(hint_label)
+
+        # Name field with autocomplete
+        name_layout = QHBoxLayout()
+        name_label = QLabel("Name:")
+        name_label.setMinimumWidth(140)
+        name_input = QLineEdit()
+        name_input.setPlaceholderText("e.g., Televue 13mm Ethos")
+
+        # Set up autocomplete
+        preset_eyepieces = self._get_preset_eyepieces()
+        completer = QCompleter(list(preset_eyepieces.keys()))
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        name_input.setCompleter(completer)
+
+        name_layout.addWidget(name_label)
+        name_layout.addWidget(name_input)
+        layout.addLayout(name_layout)
+
+        # Focal length field
+        focal_layout = QHBoxLayout()
+        focal_label = QLabel("Focal Length (mm):")
+        focal_label.setMinimumWidth(140)
+        focal_input = QLineEdit()
+        focal_input.setPlaceholderText("e.g., 13")
+        focal_layout.addWidget(focal_label)
+        focal_layout.addWidget(focal_input)
+        layout.addLayout(focal_layout)
+
+        # Apparent FOV field
+        afov_layout = QHBoxLayout()
+        afov_label = QLabel("Apparent FOV (degrees):")
+        afov_label.setMinimumWidth(140)
+        afov_input = QLineEdit()
+        afov_input.setPlaceholderText("e.g., 100")
+        afov_layout.addWidget(afov_label)
+        afov_layout.addWidget(afov_input)
+        layout.addLayout(afov_layout)
+
+        # Auto-fill when a preset is selected
+        def on_completer_activated(text):
+            if text in preset_eyepieces:
+                data = preset_eyepieces[text]
+                focal_input.setText(str(data["focal_length"]))
+                afov_input.setText(str(data["apparent_fov"]))
+
+        completer.activated.connect(on_completer_activated)
+
+        # Also check on text change for exact matches
+        def on_name_changed(text):
+            if text in preset_eyepieces:
+                data = preset_eyepieces[text]
+                focal_input.setText(str(data["focal_length"]))
+                afov_input.setText(str(data["apparent_fov"]))
+
+        name_input.textChanged.connect(on_name_changed)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
+        button_layout.addStretch()
+        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(save_btn)
+        layout.addLayout(button_layout)
+
+        def save_eyepiece():
+            name = name_input.text().strip()
+            focal_text = focal_input.text().strip()
+            afov_text = afov_input.text().strip()
+
+            if not name:
+                QMessageBox.warning(dialog, "Invalid Input", "Please enter an eyepiece name.")
+                return
+
+            try:
+                focal_length = float(focal_text) if focal_text else None
+                apparent_fov = float(afov_text) if afov_text else None
+
+                if focal_length is not None and focal_length <= 0:
+                    QMessageBox.warning(dialog, "Invalid Input", "Focal length must be positive.")
+                    return
+                if apparent_fov is not None and (apparent_fov <= 0 or apparent_fov > 180):
+                    QMessageBox.warning(dialog, "Invalid Input", "Apparent FOV must be between 0 and 180 degrees.")
+                    return
+
+            except ValueError:
+                QMessageBox.warning(dialog, "Invalid Input", "Please enter valid numeric values.")
+                return
+
+            # Save to database
+            try:
+                with self.db_manager.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO userequipment (equipment_type, name, focal_length, apparent_fov)
+                        VALUES ('eyepiece', ?, ?, ?)
+                    """, (name, focal_length, apparent_fov))
+                    conn.commit()
+
+                dialog.accept()
+                self._populate_equipment_lists()
+                QMessageBox.information(self, "Success", f"Eyepiece '{name}' has been added.")
+
+            except Exception as e:
+                logger.error(f"Error saving eyepiece: {str(e)}")
+                QMessageBox.critical(dialog, "Error", f"Failed to save eyepiece: {str(e)}")
+
+        save_btn.clicked.connect(save_eyepiece)
+        dialog.exec()
+
+    def _get_preset_barlows(self):
+        """Return preset barlow/reducer data for autocomplete suggestions"""
+        return {
+            # Barlows
+            "1.25x Barlow": {"factor": 1.25, "type": "barlow"},
+            "1.5x Barlow": {"factor": 1.5, "type": "barlow"},
+            "2x Barlow": {"factor": 2.0, "type": "barlow"},
+            "2.5x Barlow": {"factor": 2.5, "type": "barlow"},
+            "3x Barlow": {"factor": 3.0, "type": "barlow"},
+            "4x Barlow": {"factor": 4.0, "type": "barlow"},
+            "5x Barlow": {"factor": 5.0, "type": "barlow"},
+            # Televue Powermates
+            "Televue 2x Powermate": {"factor": 2.0, "type": "barlow"},
+            "Televue 2.5x Powermate": {"factor": 2.5, "type": "barlow"},
+            "Televue 4x Powermate": {"factor": 4.0, "type": "barlow"},
+            "Televue 5x Powermate": {"factor": 5.0, "type": "barlow"},
+            # Reducers
+            "0.5x Reducer": {"factor": 0.5, "type": "reducer"},
+            "0.6x Reducer": {"factor": 0.6, "type": "reducer"},
+            "0.63x Reducer": {"factor": 0.63, "type": "reducer"},
+            "0.67x Reducer": {"factor": 0.67, "type": "reducer"},
+            "0.7x Reducer": {"factor": 0.7, "type": "reducer"},
+            "0.75x Reducer": {"factor": 0.75, "type": "reducer"},
+            "0.8x Reducer": {"factor": 0.8, "type": "reducer"},
+            # Starizona reducers
+            "Starizona SCT Corrector 0.63x": {"factor": 0.63, "type": "reducer"},
+            "Starizona Hyperstar": {"factor": 0.33, "type": "reducer"},
+        }
+
+    def _show_add_barlow_dialog(self):
+        """Dialog to add a new barlow/reducer"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add New Barlow/Reducer")
+        dialog.setModal(True)
+        dialog.resize(400, 220)
+
+        layout = QVBoxLayout(dialog)
+
+        # Hint label
+        hint_label = QLabel("Start typing to see suggestions from preset barlows/reducers")
+        hint_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        layout.addWidget(hint_label)
+
+        # Name field with autocomplete
+        name_layout = QHBoxLayout()
+        name_label = QLabel("Name:")
+        name_label.setMinimumWidth(100)
+        name_input = QLineEdit()
+        name_input.setPlaceholderText("e.g., Televue 2x Powermate")
+
+        # Set up autocomplete
+        preset_barlows = self._get_preset_barlows()
+        completer = QCompleter(list(preset_barlows.keys()))
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        name_input.setCompleter(completer)
+
+        name_layout.addWidget(name_label)
+        name_layout.addWidget(name_input)
+        layout.addLayout(name_layout)
+
+        # Type selection
+        type_layout = QHBoxLayout()
+        type_label = QLabel("Type:")
+        type_label.setMinimumWidth(100)
+        type_combo = QComboBox()
+        type_combo.addItems(["Barlow", "Reducer"])
+        type_layout.addWidget(type_label)
+        type_layout.addWidget(type_combo)
+        layout.addLayout(type_layout)
+
+        # Factor field
+        factor_layout = QHBoxLayout()
+        factor_label = QLabel("Factor:")
+        factor_label.setMinimumWidth(100)
+        factor_input = QLineEdit()
+        factor_input.setPlaceholderText("e.g., 2.0 for barlow, 0.63 for reducer")
+        factor_layout.addWidget(factor_label)
+        factor_layout.addWidget(factor_input)
+        layout.addLayout(factor_layout)
+
+        # Auto-fill when a preset is selected
+        def on_completer_activated(text):
+            if text in preset_barlows:
+                data = preset_barlows[text]
+                factor_input.setText(str(data["factor"]))
+                type_combo.setCurrentText(data["type"].title())
+
+        completer.activated.connect(on_completer_activated)
+
+        # Also check on text change for exact matches
+        def on_name_changed(text):
+            if text in preset_barlows:
+                data = preset_barlows[text]
+                factor_input.setText(str(data["factor"]))
+                type_combo.setCurrentText(data["type"].title())
+
+        name_input.textChanged.connect(on_name_changed)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
+        button_layout.addStretch()
+        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(save_btn)
+        layout.addLayout(button_layout)
+
+        def save_barlow():
+            name = name_input.text().strip()
+            factor_text = factor_input.text().strip()
+            eq_type = type_combo.currentText().lower()
+
+            if not name:
+                QMessageBox.warning(dialog, "Invalid Input", "Please enter a name.")
+                return
+
+            try:
+                factor = float(factor_text) if factor_text else None
+
+                if factor is not None and factor <= 0:
+                    QMessageBox.warning(dialog, "Invalid Input", "Factor must be positive.")
+                    return
+
+            except ValueError:
+                QMessageBox.warning(dialog, "Invalid Input", "Please enter a valid numeric factor.")
+                return
+
+            # Save to database
+            try:
+                with self.db_manager.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO userequipment (equipment_type, name, factor)
+                        VALUES (?, ?, ?)
+                    """, (eq_type, name, factor))
+                    conn.commit()
+
+                dialog.accept()
+                self._populate_equipment_lists()
+                QMessageBox.information(self, "Success", f"{eq_type.title()} '{name}' has been added.")
+
+            except Exception as e:
+                logger.error(f"Error saving barlow/reducer: {str(e)}")
+                QMessageBox.critical(dialog, "Error", f"Failed to save: {str(e)}")
+
+        save_btn.clicked.connect(save_barlow)
+        dialog.exec()
 
 
 # --- About Dialog ---

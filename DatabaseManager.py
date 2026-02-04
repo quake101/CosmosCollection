@@ -54,6 +54,32 @@ class DatabaseManager:
                         is_active BOOLEAN DEFAULT 1
                     )
                 """)
+
+                # Create userequipment table for cameras, eyepieces, barlows, and reducers
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS userequipment (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        equipment_type TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        sensor_width REAL,
+                        sensor_height REAL,
+                        focal_length REAL,
+                        apparent_fov REAL,
+                        factor REAL,
+                        notes TEXT,
+                        created_date TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # Create junction table for telescope-equipment many-to-many relationship
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS telescope_equipment (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        telescope_id INTEGER NOT NULL REFERENCES usertelescopes(id) ON DELETE CASCADE,
+                        equipment_id INTEGER NOT NULL REFERENCES userequipment(id) ON DELETE CASCADE,
+                        UNIQUE(telescope_id, equipment_id)
+                    )
+                """)
                 
                 # Create userimages table if it doesn't exist
                 cursor.execute("""

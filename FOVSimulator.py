@@ -71,6 +71,9 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         camera_label = QLabel("Camera/Eyepiece:")
         self.camera_combo = QComboBox()
 
+        # Load user equipment first
+        self._load_user_cameras_and_eyepieces()
+
         # Visual eyepieces with typical apparent FOV values
         self.camera_combo.addItem("--- EYEPIECES ---", None)
         self.camera_combo.addItem("32mm Eyepiece (52° AFOV)", {"type": "eyepiece", "focal_length": 32, "apparent_fov": 52})
@@ -130,6 +133,10 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
         # Optical accessories
         self.barlow_combo.addItem("None (1.0x)", {"factor": 1.0, "type": "none"})
+
+        # Load user barlows/reducers
+        self._load_user_barlows()
+
         self.barlow_combo.addItem("--- BARLOWS ---", None)
         self.barlow_combo.addItem("1.25x Barlow", {"factor": 1.25, "type": "barlow"})
         self.barlow_combo.addItem("1.5x Barlow", {"factor": 1.5, "type": "barlow"})
@@ -407,6 +414,96 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         except Exception as e:
             logger.error(f"Error loading telescopes: {str(e)}")
 
+    def _load_user_cameras_and_eyepieces(self):
+        """Load user cameras and eyepieces from database to populate camera combo"""
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Load user cameras
+                cursor.execute("""
+                    SELECT id, name, sensor_width, sensor_height
+                    FROM userequipment
+                    WHERE equipment_type = 'camera'
+                    ORDER BY name ASC
+                """)
+                user_cameras = cursor.fetchall()
+
+                # Load user eyepieces
+                cursor.execute("""
+                    SELECT id, name, focal_length, apparent_fov
+                    FROM userequipment
+                    WHERE equipment_type = 'eyepiece'
+                    ORDER BY name ASC
+                """)
+                user_eyepieces = cursor.fetchall()
+
+                # Add user cameras section if there are any
+                if user_cameras:
+                    self.camera_combo.addItem("--- YOUR CAMERAS ---", None)
+                    for eq_id, name, sensor_width, sensor_height in user_cameras:
+                        if sensor_width and sensor_height:
+                            display_text = f"{name} ({sensor_width}x{sensor_height}mm)"
+                            self.camera_combo.addItem(display_text, {
+                                "type": "camera",
+                                "sensor_width": sensor_width,
+                                "sensor_height": sensor_height,
+                                "source": "user",
+                                "id": eq_id
+                            })
+
+                # Add user eyepieces section if there are any
+                if user_eyepieces:
+                    self.camera_combo.addItem("--- YOUR EYEPIECES ---", None)
+                    for eq_id, name, focal_length, apparent_fov in user_eyepieces:
+                        if focal_length and apparent_fov:
+                            display_text = f"{name} ({focal_length}mm, {apparent_fov}\u00b0 AFOV)"
+                            self.camera_combo.addItem(display_text, {
+                                "type": "eyepiece",
+                                "focal_length": focal_length,
+                                "apparent_fov": apparent_fov,
+                                "source": "user",
+                                "id": eq_id
+                            })
+
+                logger.debug(f"Loaded {len(user_cameras)} user cameras and {len(user_eyepieces)} user eyepieces")
+
+        except Exception as e:
+            logger.error(f"Error loading user cameras/eyepieces: {str(e)}")
+
+    def _load_user_barlows(self):
+        """Load user barlows and reducers from database to populate barlow combo"""
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Load user barlows and reducers
+                cursor.execute("""
+                    SELECT id, name, factor, equipment_type
+                    FROM userequipment
+                    WHERE equipment_type IN ('barlow', 'reducer')
+                    ORDER BY equipment_type, factor DESC
+                """)
+                user_barlows = cursor.fetchall()
+
+                # Add user barlows/reducers section if there are any
+                if user_barlows:
+                    self.barlow_combo.addItem("--- YOUR EQUIPMENT ---", None)
+                    for eq_id, name, factor, eq_type in user_barlows:
+                        if factor:
+                            display_text = f"{name} ({factor}x)"
+                            self.barlow_combo.addItem(display_text, {
+                                "type": eq_type,
+                                "factor": factor,
+                                "source": "user",
+                                "id": eq_id
+                            })
+
+                logger.debug(f"Loaded {len(user_barlows)} user barlows/reducers")
+
+        except Exception as e:
+            logger.error(f"Error loading user barlows/reducers: {str(e)}")
+
     def _load_aladin_settings(self):
         """Load persistent Aladin Lite settings from QSettings"""
         try:
@@ -499,12 +596,67 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         if current_data:
             self.selected_telescope = current_data
             logger.debug(f"Selected telescope: {current_data['name']} ({current_data['focal_length']}mm)")
+
+            # Auto-select equipment associated with this telescope
+            self._select_telescope_equipment(current_data.get('id'))
         else:
             self.selected_telescope = None
             logger.debug("Selected default view")
 
         self._save_aladin_settings()
         self._update_aladin_view()
+
+    def _select_telescope_equipment(self, telescope_id):
+        """Auto-select equipment associated with the given telescope"""
+        if not telescope_id:
+            return
+
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Get all equipment IDs associated with this telescope
+                cursor.execute("""
+                    SELECT e.id, e.equipment_type
+                    FROM userequipment e
+                    JOIN telescope_equipment te ON e.id = te.equipment_id
+                    WHERE te.telescope_id = ?
+                    ORDER BY e.name ASC
+                """, (telescope_id,))
+
+                equipment = cursor.fetchall()
+
+                # Find first camera or eyepiece and select it
+                camera_selected = False
+                barlow_selected = False
+
+                for eq_id, eq_type in equipment:
+                    # Select first camera/eyepiece in the camera combo
+                    if not camera_selected and eq_type in ('camera', 'eyepiece'):
+                        for i in range(self.camera_combo.count()):
+                            data = self.camera_combo.itemData(i)
+                            if data and data.get('source') == 'user' and data.get('id') == eq_id:
+                                self.camera_combo.blockSignals(True)
+                                self.camera_combo.setCurrentIndex(i)
+                                self.camera_combo.blockSignals(False)
+                                camera_selected = True
+                                logger.debug(f"Auto-selected camera/eyepiece ID {eq_id} for telescope")
+                                break
+
+                    # Select first barlow/reducer in the barlow combo
+                    if not barlow_selected and eq_type in ('barlow', 'reducer'):
+                        for i in range(self.barlow_combo.count()):
+                            data = self.barlow_combo.itemData(i)
+                            if data and data.get('source') == 'user' and data.get('id') == eq_id:
+                                self.barlow_combo.blockSignals(True)
+                                self.barlow_combo.setCurrentIndex(i)
+                                self.barlow_combo.blockSignals(False)
+                                barlow_selected = True
+                                logger.debug(f"Auto-selected barlow/reducer ID {eq_id} for telescope")
+                                break
+
+        except Exception as e:
+            logger.error(f"Error selecting telescope equipment: {str(e)}")
 
     def _on_camera_changed(self):
         """Handle camera/sensor selection change"""
