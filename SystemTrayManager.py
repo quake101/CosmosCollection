@@ -147,46 +147,39 @@ class SystemTrayManager(QObject):
             return
 
         try:
-            tooltip_lines = ["Cosmos Collection", ""]
+            # Windows tooltip limit is ~127 chars, so keep it compact
+            # Format: "Cosmos Collection\nTue: ★78 ☁15% 🌔85%\nWed: ★45 ☁65%..."
+            tooltip_lines = ["Cosmos Collection"]
 
             if weather_data and len(weather_data) > 0:
-                tooltip_lines.append("Tonight's Forecast:")
-
-                # Show up to 3 days
+                # Show up to 3 days in compact format
                 for summary in weather_data[:3]:
-                    # Format the date
-                    date_str = summary.date.strftime("%a %m/%d")
+                    # Short day name
+                    day_str = summary.date.strftime("%a")
 
-                    # Get astro score description
+                    # Astro score with star
                     score = summary.astro_score
-                    if score >= 70:
-                        rating = "Excellent"
-                    elif score >= 50:
-                        rating = "Good"
-                    elif score >= 30:
-                        rating = "Moderate"
-                    else:
-                        rating = "Poor"
 
-                    # Get cloud cover for tonight
+                    # Cloud cover
                     cloud_pct = int(summary.tonight_avg_cloud_cover)
 
-                    # Get moon info
+                    # Moon info (compact)
                     moon_str = ""
                     if summary.moon_phase:
                         moon_emoji = summary.moon_phase.phase_emoji
                         moon_pct = int(summary.moon_phase.illumination)
-                        moon_str = f" | {moon_emoji} {moon_pct}%"
+                        moon_str = f" {moon_emoji}{moon_pct}%"
 
-                    line = f"{date_str}: {rating} ({score}) | {cloud_pct}% clouds{moon_str}"
+                    # Compact format: "Tue: ★78 ☁15% 🌔85%"
+                    line = f"{day_str}: ★{score} ☁{cloud_pct}%{moon_str}"
                     tooltip_lines.append(line)
             else:
-                tooltip_lines.append("Weather data not available")
-                tooltip_lines.append("Open Weather Forecast to refresh")
+                tooltip_lines.append("No weather data")
+                tooltip_lines.append("Right-click → Weather")
 
             tooltip_text = "\n".join(tooltip_lines)
             self._tray_icon.setToolTip(tooltip_text)
-            logger.debug(f"Tray tooltip updated with weather data")
+            logger.debug("Tray tooltip updated with weather data")
 
         except Exception as e:
             logger.error(f"Failed to update tray tooltip: {e}", exc_info=True)

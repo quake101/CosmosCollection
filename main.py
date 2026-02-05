@@ -6101,10 +6101,15 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         if self._tray_manager and self._tray_manager.is_available:
             self.hide()
             self._tray_manager.show()
+            # Start background weather refresh if auto-refresh is enabled
+            self._start_tray_weather_refresh()
             logger.debug("Window minimized to tray")
 
     def _restore_from_tray(self):
         """Restore window from system tray"""
+        # Stop background weather refresh
+        self._stop_tray_weather_refresh()
+
         if self._tray_manager:
             self._tray_manager.hide()
 
@@ -6113,6 +6118,99 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.raise_()
         self.activateWindow()
         logger.debug("Window restored from tray")
+
+    def _start_tray_weather_refresh(self):
+        """Start background weather refresh timer when in tray"""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+
+        # Check if auto-refresh is enabled in weather settings
+        if not settings.value("weather_auto_refresh_enabled", False, type=bool):
+            return
+
+        # Get the refresh interval (index into combo: 0=15min, 1=30min, 2=1hr, 3=2hr, 4=4hr)
+        interval_index = settings.value("weather_auto_refresh_interval", 2, type=int)
+        interval_minutes = [15, 30, 60, 120, 240][min(interval_index, 4)]
+
+        # Create timer if needed
+        if not hasattr(self, '_tray_weather_timer') or self._tray_weather_timer is None:
+            self._tray_weather_timer = QTimer(self)
+            self._tray_weather_timer.timeout.connect(self._fetch_weather_for_tray)
+
+        # Start the timer
+        self._tray_weather_timer.start(interval_minutes * 60 * 1000)
+        logger.debug(f"Started tray weather refresh timer: {interval_minutes} minutes")
+
+        # Also do an immediate refresh if cache is stale
+        self._fetch_weather_for_tray()
+
+    def _stop_tray_weather_refresh(self):
+        """Stop background weather refresh timer"""
+        if hasattr(self, '_tray_weather_timer') and self._tray_weather_timer is not None:
+            self._tray_weather_timer.stop()
+            logger.debug("Stopped tray weather refresh timer")
+
+    def _fetch_weather_for_tray(self):
+        """Fetch weather data in background for tray tooltip"""
+        try:
+            from WeatherForecast import WeatherCache, WeatherWorker
+
+            # Get user location
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT location_lat, location_lon, timezone
+                    FROM usersettings WHERE is_active = 1
+                """)
+                row = cursor.fetchone()
+
+            if not row or row[0] is None or row[1] is None:
+                logger.debug("No location configured for tray weather refresh")
+                return
+
+            lat, lon, timezone = row
+
+            # Check if cache is still valid (don't re-fetch if recently updated)
+            cache = WeatherCache()
+            cached_data = cache.get(lat, lon)
+            if cached_data:
+                logger.debug("Weather cache still valid, skipping tray refresh")
+                return
+
+            # Create worker to fetch in background
+            self._tray_weather_worker = WeatherWorker(lat, lon, timezone)
+            self._tray_weather_worker.weather_loaded.connect(self._on_tray_weather_loaded)
+            self._tray_weather_worker.error_occurred.connect(
+                lambda e: logger.debug(f"Tray weather fetch error: {e}")
+            )
+            self._tray_weather_worker.start()
+            logger.debug("Started background weather fetch for tray")
+
+        except Exception as e:
+            logger.debug(f"Error fetching weather for tray: {e}")
+
+    def _on_tray_weather_loaded(self, weather_data):
+        """Handle weather data loaded for tray"""
+        try:
+            from WeatherForecast import WeatherCache
+
+            # Get location to store in cache
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT location_lat, location_lon
+                    FROM usersettings WHERE is_active = 1
+                """)
+                row = cursor.fetchone()
+
+            if row and row[0] is not None and row[1] is not None:
+                lat, lon = row
+                # Store in cache (this will trigger the callback to update tooltip)
+                cache = WeatherCache()
+                cache.set(lat, lon, weather_data)
+                logger.debug("Tray weather data cached and tooltip updated")
+
+        except Exception as e:
+            logger.debug(f"Error caching tray weather data: {e}")
 
     def _handle_tray_action(self, action_name: str):
         """Handle quick actions from tray menu"""
@@ -6132,6 +6230,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _quit_application(self):
         """Quit the application from tray menu"""
+        # Stop weather refresh timer
+        self._stop_tray_weather_refresh()
+
         # Clean up tray manager
         if self._tray_manager:
             self._tray_manager.cleanup()
