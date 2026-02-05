@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""
+System Tray Manager for Cosmos Collection
+Provides system tray icon with mini weather forecast and quick actions
+"""
+
+import logging
+from typing import List, Optional, Callable
+
+from PySide6.QtCore import QObject, Signal, QSettings
+from PySide6.QtGui import QIcon, QAction
+from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
+
+logger = logging.getLogger(__name__)
+
+
+class SystemTrayManager(QObject):
+    """Manages the system tray icon, menu, and tooltip for Cosmos Collection"""
+
+    # Signals for communicating with the main window
+    restore_requested = Signal()
+    quit_requested = Signal()
+    action_triggered = Signal(str)  # Emits action name: "best_dso", "target_list", "weather", "gallery"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._tray_icon: Optional[QSystemTrayIcon] = None
+        self._menu: Optional[QMenu] = None
+        self._is_available = False
+        self._first_minimize = True
+
+    @property
+    def is_available(self) -> bool:
+        """Check if system tray is available on this platform"""
+        return self._is_available
+
+    def setup(self, icon: QIcon) -> bool:
+        """
+        Initialize the system tray icon and menu.
+
+        Args:
+            icon: The QIcon to use for the tray icon
+
+        Returns:
+            True if setup was successful, False otherwise
+        """
+        # Check if system tray is available
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.warning("System tray is not available on this platform")
+            self._is_available = False
+            return False
+
+        try:
+            # Create tray icon
+            self._tray_icon = QSystemTrayIcon(icon, self)
+            self._tray_icon.setToolTip("Cosmos Collection")
+
+            # Create context menu
+            self._menu = QMenu()
+            self._create_menu()
+            self._tray_icon.setContextMenu(self._menu)
+
+            # Connect signals
+            self._tray_icon.activated.connect(self._on_tray_activated)
+
+            self._is_available = True
+            logger.debug("System tray initialized successfully")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to setup system tray: {e}", exc_info=True)
+            self._is_available = False
+            return False
+
+    def _create_menu(self):
+        """Create the context menu for the tray icon"""
+        if not self._menu:
+            return
+
+        self._menu.clear()
+
+        # Show/Restore action
+        show_action = QAction("Show Cosmos Collection", self._menu)
+        show_action.triggered.connect(self._on_show_clicked)
+        self._menu.addAction(show_action)
+
+        self._menu.addSeparator()
+
+        # Quick access actions
+        best_dso_action = QAction("Best DSO Tonight", self._menu)
+        best_dso_action.triggered.connect(lambda: self._on_action_clicked("best_dso"))
+        self._menu.addAction(best_dso_action)
+
+        target_list_action = QAction("Target List", self._menu)
+        target_list_action.triggered.connect(lambda: self._on_action_clicked("target_list"))
+        self._menu.addAction(target_list_action)
+
+        weather_action = QAction("Weather Forecast", self._menu)
+        weather_action.triggered.connect(lambda: self._on_action_clicked("weather"))
+        self._menu.addAction(weather_action)
+
+        gallery_action = QAction("Image Gallery", self._menu)
+        gallery_action.triggered.connect(lambda: self._on_action_clicked("gallery"))
+        self._menu.addAction(gallery_action)
+
+        self._menu.addSeparator()
+
+        # Quit action
+        quit_action = QAction("Quit", self._menu)
+        quit_action.triggered.connect(self._on_quit_clicked)
+        self._menu.addAction(quit_action)
+
+    def show(self):
+        """Show the tray icon"""
+        if self._tray_icon and self._is_available:
+            self._tray_icon.show()
+            logger.debug("System tray icon shown")
+
+            # Show balloon message on first minimize
+            if self._first_minimize:
+                self._first_minimize = False
+                settings = QSettings("CosmosCollection", "CosmosCollection")
+                if not settings.value("tray_notification_shown", False, type=bool):
+                    self._tray_icon.showMessage(
+                        "Cosmos Collection",
+                        "The application is still running in the system tray.\n"
+                        "Double-click the icon to restore, or right-click for quick actions.",
+                        QSystemTrayIcon.Information,
+                        3000
+                    )
+                    settings.setValue("tray_notification_shown", True)
+
+    def hide(self):
+        """Hide the tray icon"""
+        if self._tray_icon:
+            self._tray_icon.hide()
+            logger.debug("System tray icon hidden")
+
+    def update_tooltip(self, weather_data: List) -> None:
+        """
+        Update the tray icon tooltip with weather forecast summary.
+
+        Args:
+            weather_data: List of DailyWeatherSummary objects (first 3 days will be used)
+        """
+        if not self._tray_icon:
+            return
+
+        try:
+            tooltip_lines = ["Cosmos Collection", ""]
+
+            if weather_data and len(weather_data) > 0:
+                tooltip_lines.append("Tonight's Forecast:")
+
+                # Show up to 3 days
+                for summary in weather_data[:3]:
+                    # Format the date
+                    date_str = summary.date.strftime("%a %m/%d")
+
+                    # Get astro score description
+                    score = summary.astro_score
+                    if score >= 70:
+                        rating = "Excellent"
+                    elif score >= 50:
+                        rating = "Good"
+                    elif score >= 30:
+                        rating = "Moderate"
+                    else:
+                        rating = "Poor"
+
+                    # Get cloud cover for tonight
+                    cloud_pct = int(summary.tonight_avg_cloud_cover)
+
+                    # Get moon info
+                    moon_str = ""
+                    if summary.moon_phase:
+                        moon_emoji = summary.moon_phase.phase_emoji
+                        moon_pct = int(summary.moon_phase.illumination)
+                        moon_str = f" | {moon_emoji} {moon_pct}%"
+
+                    line = f"{date_str}: {rating} ({score}) | {cloud_pct}% clouds{moon_str}"
+                    tooltip_lines.append(line)
+            else:
+                tooltip_lines.append("Weather data not available")
+                tooltip_lines.append("Open Weather Forecast to refresh")
+
+            tooltip_text = "\n".join(tooltip_lines)
+            self._tray_icon.setToolTip(tooltip_text)
+            logger.debug(f"Tray tooltip updated with weather data")
+
+        except Exception as e:
+            logger.error(f"Failed to update tray tooltip: {e}", exc_info=True)
+            self._tray_icon.setToolTip("Cosmos Collection")
+
+    def cleanup(self):
+        """Clean up resources before application exit"""
+        if self._tray_icon:
+            self._tray_icon.hide()
+            self._tray_icon = None
+        if self._menu:
+            self._menu.deleteLater()
+            self._menu = None
+        logger.debug("System tray cleaned up")
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason):
+        """Handle tray icon activation (click, double-click, etc.)"""
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.restore_requested.emit()
+
+    def _on_show_clicked(self):
+        """Handle Show action clicked"""
+        self.restore_requested.emit()
+
+    def _on_action_clicked(self, action_name: str):
+        """Handle quick action clicked"""
+        # First restore the window, then trigger the action
+        self.restore_requested.emit()
+        self.action_triggered.emit(action_name)
+
+    def _on_quit_clicked(self):
+        """Handle Quit action clicked"""
+        self.quit_requested.emit()

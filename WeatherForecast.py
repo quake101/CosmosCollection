@@ -60,6 +60,7 @@ class WeatherCache:
             cls._instance._data = None
             cls._instance._timestamp = None
             cls._instance._location = None
+            cls._instance._update_callbacks = []
         return cls._instance
 
     def get(self, lat: float, lon: float) -> Optional[List]:
@@ -85,11 +86,18 @@ class WeatherCache:
         return self._data
 
     def set(self, lat: float, lon: float, data: List):
-        """Store data in cache"""
+        """Store data in cache and notify callbacks"""
         self._data = data
         self._timestamp = datetime.now()
         self._location = (lat, lon)
         logger.debug("Weather data cached")
+
+        # Notify all registered callbacks
+        for callback in self._update_callbacks:
+            try:
+                callback(data)
+            except Exception as e:
+                logger.debug(f"Weather cache callback error: {e}")
 
     def get_age_str(self) -> Optional[str]:
         """Get a human-readable string of cache age"""
@@ -109,6 +117,24 @@ class WeatherCache:
         self._data = None
         self._timestamp = None
         self._location = None
+
+    def add_update_callback(self, callback):
+        """Register a callback to be called when weather data is updated.
+
+        Args:
+            callback: A callable that accepts a list of DailyWeatherSummary objects
+        """
+        if callback not in self._update_callbacks:
+            self._update_callbacks.append(callback)
+
+    def remove_update_callback(self, callback):
+        """Remove a previously registered callback."""
+        if callback in self._update_callbacks:
+            self._update_callbacks.remove(callback)
+
+    def get_cached_data(self) -> Optional[List]:
+        """Get the cached data without location/age checks (for tray updates)."""
+        return self._data
 
 
 @dataclass

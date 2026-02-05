@@ -46,6 +46,7 @@ from ImageViewer import ImageViewerWindow
 from DSODetail import DSODetailWindow
 from FOVSimulator import AladinLiteWindow
 from NINAIntegration import NINAIntegration
+from SystemTrayManager import SystemTrayManager
 
 # Import astroquery at module level so PyInstaller detects it
 try:
@@ -1625,6 +1626,14 @@ class SettingsDialog(QDialog):
         )
         ui_prefs_layout.addWidget(self.check_updates_checkbox)
 
+        # Minimize to system tray checkbox
+        self.minimize_to_tray_checkbox = QCheckBox("Minimize to system tray")
+        self.minimize_to_tray_checkbox.setToolTip(
+            "When enabled, closing or minimizing hides the window to the system tray.\n"
+            "Double-click the tray icon to restore. Right-click for quick actions."
+        )
+        ui_prefs_layout.addWidget(self.minimize_to_tray_checkbox)
+
         # Time format setting
         time_format_layout = QHBoxLayout()
         time_format_label = QLabel("Time Format:")
@@ -1951,6 +1960,9 @@ class SettingsDialog(QDialog):
             check_updates = settings.value("check_updates_on_startup", True, type=bool)
             self.check_updates_checkbox.setChecked(check_updates)
 
+            minimize_to_tray = settings.value("minimize_to_tray", False, type=bool)
+            self.minimize_to_tray_checkbox.setChecked(minimize_to_tray)
+
             # Load time format setting
             time_format = settings.value("time_format", "12-hour", type=str)
             index = self.time_format_combo.findText(time_format)
@@ -2204,6 +2216,7 @@ class SettingsDialog(QDialog):
             settings = QSettings("CosmosCollection", "CosmosCollection")
             settings.setValue("show_observer_location", self.show_observer_location_checkbox.isChecked())
             settings.setValue("check_updates_on_startup", self.check_updates_checkbox.isChecked())
+            settings.setValue("minimize_to_tray", self.minimize_to_tray_checkbox.isChecked())
             settings.setValue("time_format", self.time_format_combo.currentText())
             settings.setValue("max_threads", self.thread_count_spinbox.value())
             settings.setValue("cache_thumbnails_to_disk", self.cache_thumbnails_checkbox.isChecked())
@@ -4700,6 +4713,10 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         # Check for updates on startup if enabled
         QTimer.singleShot(2000, self._check_updates_on_startup)
 
+        # Initialize system tray if enabled
+        self._tray_manager: Optional[SystemTrayManager] = None
+        self._setup_system_tray_if_enabled()
+
         logger.debug("MainWindow initialization complete")
 
     def _create_toolbar(self):
@@ -5999,8 +6016,132 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close event"""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+
+        # If minimize to tray is enabled, minimize instead of closing
+        if settings.value("minimize_to_tray", False, type=bool):
+            if self._tray_manager and self._tray_manager.is_available:
+                event.ignore()
+                self._minimize_to_tray()
+                return
+
+        # Clean up tray manager
+        if self._tray_manager:
+            self._tray_manager.cleanup()
+
         self.db_manager.close()
         super().closeEvent(event)
+
+    def changeEvent(self, event):
+        """Handle window state changes (minimize, etc.)"""
+        if event.type() == QEvent.WindowStateChange:
+            settings = QSettings("CosmosCollection", "CosmosCollection")
+            if settings.value("minimize_to_tray", False, type=bool):
+                if self.windowState() & Qt.WindowMinimized:
+                    if self._tray_manager and self._tray_manager.is_available:
+                        # Use a timer to allow the minimize animation to complete
+                        QTimer.singleShot(100, self._minimize_to_tray)
+        super().changeEvent(event)
+
+    def _setup_system_tray_if_enabled(self):
+        """Initialize system tray if the setting is enabled"""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        if not settings.value("minimize_to_tray", False, type=bool):
+            return
+
+        try:
+            self._tray_manager = SystemTrayManager(self)
+
+            # Get the application icon
+            app_icon = QApplication.instance().windowIcon()
+            if app_icon.isNull():
+                # Fallback to loading icon directly
+                icon_path = os.path.join(APP_DIR, 'images', 'CosmosCollection.png')
+                app_icon = QIcon(icon_path)
+
+            if self._tray_manager.setup(app_icon):
+                # Connect signals
+                self._tray_manager.restore_requested.connect(self._restore_from_tray)
+                self._tray_manager.quit_requested.connect(self._quit_application)
+                self._tray_manager.action_triggered.connect(self._handle_tray_action)
+
+                # Register for weather updates
+                self._register_weather_callback()
+
+                logger.debug("System tray initialized")
+            else:
+                logger.warning("Failed to setup system tray")
+                self._tray_manager = None
+
+        except Exception as e:
+            logger.error(f"Error setting up system tray: {e}", exc_info=True)
+            self._tray_manager = None
+
+    def _register_weather_callback(self):
+        """Register callback to update tray tooltip when weather data changes"""
+        try:
+            from WeatherForecast import WeatherCache
+            cache = WeatherCache()
+            cache.add_update_callback(self._on_weather_updated)
+
+            # Also update with existing cached data if available
+            existing_data = cache.get_cached_data()
+            if existing_data:
+                self._on_weather_updated(existing_data)
+        except Exception as e:
+            logger.debug(f"Could not register weather callback: {e}")
+
+    def _on_weather_updated(self, weather_data):
+        """Called when weather data is updated"""
+        if self._tray_manager:
+            self._tray_manager.update_tooltip(weather_data)
+
+    def _minimize_to_tray(self):
+        """Hide window to system tray"""
+        if self._tray_manager and self._tray_manager.is_available:
+            self.hide()
+            self._tray_manager.show()
+            logger.debug("Window minimized to tray")
+
+    def _restore_from_tray(self):
+        """Restore window from system tray"""
+        if self._tray_manager:
+            self._tray_manager.hide()
+
+        self.show()
+        self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
+        self.raise_()
+        self.activateWindow()
+        logger.debug("Window restored from tray")
+
+    def _handle_tray_action(self, action_name: str):
+        """Handle quick actions from tray menu"""
+        # Use a short delay to ensure window is fully restored first
+        QTimer.singleShot(100, lambda: self._execute_tray_action(action_name))
+
+    def _execute_tray_action(self, action_name: str):
+        """Execute the tray action after window is restored"""
+        if action_name == "best_dso":
+            self._show_best_dso_tonight()
+        elif action_name == "target_list":
+            self._show_target_list()
+        elif action_name == "weather":
+            self._show_weather_forecast()
+        elif action_name == "gallery":
+            self._show_dso_gallery()
+
+    def _quit_application(self):
+        """Quit the application from tray menu"""
+        # Clean up tray manager
+        if self._tray_manager:
+            self._tray_manager.cleanup()
+            self._tray_manager = None
+
+        # Close database
+        self.db_manager.close()
+
+        # Quit the application
+        QApplication.instance().quit()
 
 
 # --- Command Line Interface ---
