@@ -1878,7 +1878,8 @@ class SettingsDialog(QDialog):
             "Create a backup of all your user data including:\n"
             "• User image metadata\n"
             "• Target list\n"
-            "• Telescope equipment profiles\n"
+            "• Telescope profiles\n"
+            "• Equipment (cameras, eyepieces, barlows)\n"
             "• Collage projects\n"
             "• Application settings (location, timezone)"
         )
@@ -2370,6 +2371,30 @@ class SettingsDialog(QDialog):
                     'rows': [list(row) for row in rows]
                 }
 
+                # Backup userequipment (cameras, eyepieces, barlows)
+                try:
+                    cursor.execute("SELECT * FROM userequipment")
+                    columns = [description[0] for description in cursor.description]
+                    rows = cursor.fetchall()
+                    backup_data['tables']['userequipment'] = {
+                        'columns': columns,
+                        'rows': [list(row) for row in rows]
+                    }
+                except Exception:
+                    pass  # Table might not exist
+
+                # Backup telescopeequipment (links equipment to telescopes)
+                try:
+                    cursor.execute("SELECT * FROM telescopeequipment")
+                    columns = [description[0] for description in cursor.description]
+                    rows = cursor.fetchall()
+                    backup_data['tables']['telescopeequipment'] = {
+                        'columns': columns,
+                        'rows': [list(row) for row in rows]
+                    }
+                except Exception:
+                    pass  # Table might not exist
+
                 # Backup userimages
                 cursor.execute("SELECT * FROM userimages")
                 columns = [description[0] for description in cursor.description]
@@ -2506,6 +2531,30 @@ class SettingsDialog(QDialog):
                     for row in table_data['rows']:
                         placeholders = ', '.join(['?' for _ in columns])
                         cursor.execute(f"INSERT INTO usertelescopes ({', '.join(columns)}) VALUES ({placeholders})", row)
+
+                # Restore userequipment (cameras, eyepieces, barlows)
+                if 'userequipment' in backup_data['tables']:
+                    try:
+                        cursor.execute("DELETE FROM userequipment")
+                        table_data = backup_data['tables']['userequipment']
+                        columns = table_data['columns']
+                        for row in table_data['rows']:
+                            placeholders = ', '.join(['?' for _ in columns])
+                            cursor.execute(f"INSERT INTO userequipment ({', '.join(columns)}) VALUES ({placeholders})", row)
+                    except Exception:
+                        pass  # Table might not exist
+
+                # Restore telescopeequipment (links equipment to telescopes)
+                if 'telescopeequipment' in backup_data['tables']:
+                    try:
+                        cursor.execute("DELETE FROM telescopeequipment")
+                        table_data = backup_data['tables']['telescopeequipment']
+                        columns = table_data['columns']
+                        for row in table_data['rows']:
+                            placeholders = ', '.join(['?' for _ in columns])
+                            cursor.execute(f"INSERT INTO telescopeequipment ({', '.join(columns)}) VALUES ({placeholders})", row)
+                    except Exception:
+                        pass  # Table might not exist
 
                 # Restore userimages
                 if 'userimages' in backup_data['tables']:
