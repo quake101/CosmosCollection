@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget, QLabel, QDialog,
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
     QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout, QSpinBox, QFileDialog, QSizePolicy,
-    QListWidget, QListWidgetItem, QCompleter, QSplitter
+    QListWidget, QListWidgetItem, QCompleter, QSplitter, QSystemTrayIcon
 )
 
 # Local imports (always needed)
@@ -1634,6 +1634,15 @@ class SettingsDialog(QDialog):
         )
         ui_prefs_layout.addWidget(self.minimize_to_tray_checkbox)
 
+        # Enable log file checkbox
+        self.enable_logfile_checkbox = QCheckBox("Enable log file")
+        self.enable_logfile_checkbox.setToolTip(
+            "When enabled, saves application logs to CosmosCollection.log\n"
+            "in the application directory. Useful for troubleshooting.\n"
+            "Requires application restart to take effect."
+        )
+        ui_prefs_layout.addWidget(self.enable_logfile_checkbox)
+
         # Time format setting
         time_format_layout = QHBoxLayout()
         time_format_label = QLabel("Time Format:")
@@ -1961,8 +1970,11 @@ class SettingsDialog(QDialog):
             check_updates = settings.value("check_updates_on_startup", True, type=bool)
             self.check_updates_checkbox.setChecked(check_updates)
 
-            minimize_to_tray = settings.value("minimize_to_tray", False, type=bool)
+            minimize_to_tray = settings.value("minimize_to_tray", True, type=bool)
             self.minimize_to_tray_checkbox.setChecked(minimize_to_tray)
+
+            enable_logfile = settings.value("enable_logfile", False, type=bool)
+            self.enable_logfile_checkbox.setChecked(enable_logfile)
 
             # Load time format setting
             time_format = settings.value("time_format", "12-hour", type=str)
@@ -2218,6 +2230,7 @@ class SettingsDialog(QDialog):
             settings.setValue("show_observer_location", self.show_observer_location_checkbox.isChecked())
             settings.setValue("check_updates_on_startup", self.check_updates_checkbox.isChecked())
             settings.setValue("minimize_to_tray", self.minimize_to_tray_checkbox.isChecked())
+            settings.setValue("enable_logfile", self.enable_logfile_checkbox.isChecked())
             settings.setValue("time_format", self.time_format_combo.currentText())
             settings.setValue("max_threads", self.thread_count_spinbox.value())
             settings.setValue("cache_thumbnails_to_disk", self.cache_thumbnails_checkbox.isChecked())
@@ -6068,7 +6081,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         settings = QSettings("CosmosCollection", "CosmosCollection")
 
         # If minimize to tray is enabled, minimize instead of closing
-        if settings.value("minimize_to_tray", False, type=bool):
+        if settings.value("minimize_to_tray", True, type=bool):
             if self._tray_manager and self._tray_manager.is_available:
                 event.ignore()
                 self._minimize_to_tray()
@@ -6085,7 +6098,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Handle window state changes (minimize, etc.)"""
         if event.type() == QEvent.WindowStateChange:
             settings = QSettings("CosmosCollection", "CosmosCollection")
-            if settings.value("minimize_to_tray", False, type=bool):
+            if settings.value("minimize_to_tray", True, type=bool):
                 if self.windowState() & Qt.WindowMinimized:
                     if self._tray_manager and self._tray_manager.is_available:
                         # Use a timer to allow the minimize animation to complete
@@ -6095,7 +6108,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _setup_system_tray_if_enabled(self):
         """Initialize system tray if the setting is enabled"""
         settings = QSettings("CosmosCollection", "CosmosCollection")
-        if not settings.value("minimize_to_tray", False, type=bool):
+        if not settings.value("minimize_to_tray", True, type=bool):
             return
 
         try:
@@ -6152,12 +6165,15 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self._tray_manager.show()
             # Start background weather refresh if auto-refresh is enabled
             self._start_tray_weather_refresh()
+            # Start hourly update check
+            self._start_tray_update_check()
             logger.debug("Window minimized to tray")
 
     def _restore_from_tray(self):
         """Restore window from system tray"""
-        # Stop background weather refresh
+        # Stop background timers
         self._stop_tray_weather_refresh()
+        self._stop_tray_update_check()
 
         if self._tray_manager:
             self._tray_manager.hide()
@@ -6197,6 +6213,58 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         if hasattr(self, '_tray_weather_timer') and self._tray_weather_timer is not None:
             self._tray_weather_timer.stop()
             logger.debug("Stopped tray weather refresh timer")
+
+    def _start_tray_update_check(self):
+        """Start hourly update check timer when in tray"""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+
+        # Only check if update checking is enabled
+        if not settings.value("check_updates_on_startup", True, type=bool):
+            return
+
+        # Create timer if needed
+        if not hasattr(self, '_tray_update_timer') or self._tray_update_timer is None:
+            self._tray_update_timer = QTimer(self)
+            self._tray_update_timer.timeout.connect(self._check_updates_for_tray)
+
+        # Start the timer - check every hour (60 minutes)
+        self._tray_update_timer.start(60 * 60 * 1000)
+        logger.debug("Started tray update check timer: 60 minutes")
+
+        # Also do an immediate check
+        QTimer.singleShot(5000, self._check_updates_for_tray)
+
+    def _stop_tray_update_check(self):
+        """Stop background update check timer"""
+        if hasattr(self, '_tray_update_timer') and self._tray_update_timer is not None:
+            self._tray_update_timer.stop()
+            logger.debug("Stopped tray update check timer")
+
+    def _check_updates_for_tray(self):
+        """Check for updates and show tray notification if available"""
+        try:
+            from version import version_manager
+
+            # Get version info
+            version_info = version_manager.get_version_info()
+
+            # Show tray notification if update is available
+            if version_info.get('github_available') and version_info.get('update_available'):
+                logger.info(f"Update available (tray check): {version_info.get('github_version')}")
+
+                if self._tray_manager and self._tray_manager._tray_icon:
+                    self._tray_manager._tray_icon.showMessage(
+                        "Update Available",
+                        f"Cosmos Collection {version_info['github_version']} is available.\n"
+                        f"You are running {version_info['local_version']}.",
+                        QSystemTrayIcon.Information,
+                        10000  # Show for 10 seconds
+                    )
+            else:
+                logger.debug("Tray update check: no updates available")
+
+        except Exception as e:
+            logger.debug(f"Error checking for updates in tray: {e}")
 
     def _fetch_weather_for_tray(self):
         """Fetch weather data in background for tray tooltip"""
@@ -6274,8 +6342,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _quit_application(self):
         """Quit the application from tray menu"""
-        # Stop weather refresh timer
+        # Stop background timers
         self._stop_tray_weather_refresh()
+        self._stop_tray_update_check()
 
         # Clean up tray manager
         if self._tray_manager:
@@ -6646,6 +6715,23 @@ if __name__ == "__main__":
         sys.exit(0 if cli_result else 1)
 
     # No CLI command - continue with GUI startup
+
+    # Configure file logging if enabled
+    try:
+        from PySide6.QtCore import QSettings
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        if settings.value("enable_logfile", False, type=bool):
+            log_file_path = os.path.join(APP_DIR, "CosmosCollection.log")
+            file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            ))
+            logging.getLogger().addHandler(file_handler)
+            logger.info(f"File logging enabled: {log_file_path}")
+    except Exception as e:
+        logger.warning(f"Could not configure file logging: {e}")
+
     # Set environment variables for QtWebEngine to enable WebGL
     os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--ignore-gpu-blocklist --enable-webgl --enable-webgl2 --enable-gpu-rasterization'
 
