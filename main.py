@@ -6262,12 +6262,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             logger.debug(f"Error caching tray weather data: {e}")
 
     def _handle_tray_action(self, action_name: str):
-        """Handle quick actions from tray menu"""
-        # Use a short delay to ensure window is fully restored first
-        QTimer.singleShot(100, lambda: self._execute_tray_action(action_name))
-
-    def _execute_tray_action(self, action_name: str):
-        """Execute the tray action after window is restored"""
+        """Handle quick actions from tray menu - opens tools without restoring main window"""
         if action_name == "best_dso":
             self._show_best_dso_tonight()
         elif action_name == "target_list":

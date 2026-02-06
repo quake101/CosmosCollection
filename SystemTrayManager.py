@@ -206,8 +206,7 @@ class SystemTrayManager(QObject):
 
     def _on_action_clicked(self, action_name: str):
         """Handle quick action clicked"""
-        # First restore the window, then trigger the action
-        self.restore_requested.emit()
+        # Just trigger the action - tools open independently without restoring main window
         self.action_triggered.emit(action_name)
 
     def _on_quit_clicked(self):
