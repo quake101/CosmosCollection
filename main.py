@@ -6715,23 +6715,6 @@ if __name__ == "__main__":
         sys.exit(0 if cli_result else 1)
 
     # No CLI command - continue with GUI startup
-
-    # Configure file logging if enabled
-    try:
-        from PySide6.QtCore import QSettings
-        settings = QSettings("CosmosCollection", "CosmosCollection")
-        if settings.value("enable_logfile", False, type=bool):
-            log_file_path = os.path.join(APP_DIR, "CosmosCollection.log")
-            file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
-            file_handler.setLevel(logging.DEBUG)
-            file_handler.setFormatter(logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            ))
-            logging.getLogger().addHandler(file_handler)
-            logger.info(f"File logging enabled: {log_file_path}")
-    except Exception as e:
-        logger.warning(f"Could not configure file logging: {e}")
-
     # Set environment variables for QtWebEngine to enable WebGL
     os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--ignore-gpu-blocklist --enable-webgl --enable-webgl2 --enable-gpu-rasterization'
 
@@ -6759,6 +6742,21 @@ if __name__ == "__main__":
         logger.warning("QtWebEngineCore not available - WebGL may not work")
 
     app = QApplication(sys.argv)
+
+    # Configure file logging if enabled (must be after QApplication for QSettings to work on Windows)
+    try:
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        if settings.value("enable_logfile", False, type=bool):
+            log_file_path = os.path.join(APP_DIR, "CosmosCollection.log")
+            file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            ))
+            logging.getLogger().addHandler(file_handler)
+            logger.info(f"File logging enabled: {log_file_path}")
+    except Exception as e:
+        logger.warning(f"Could not configure file logging: {e}")
 
     # Set global WebEngine profile settings
     try:
