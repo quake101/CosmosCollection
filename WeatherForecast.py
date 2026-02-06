@@ -182,6 +182,8 @@ class DailyWeatherSummary:
     astro_score: int  # 0-100
     seeing_estimate: str  # Excellent/Good/Moderate/Poor
     moon_phase: Optional[MoonPhaseData] = None
+    dark_hours_start: Optional[datetime] = None  # First dark hour (sun_alt < -12°)
+    dark_hours_end: Optional[datetime] = None  # Last dark hour (sun_alt < -12°)
 
 
 class WeatherWorker(QThread):
@@ -304,6 +306,10 @@ class WeatherWorker(QThread):
                 morning_dark = [h for h in next_hours if h.time.hour < 12 and sun_alt_map.get(h.time, 0) < -12]
             tonight_hours = evening_dark + morning_dark
 
+            # Determine dark hours start and end times
+            dark_start = tonight_hours[0].time if tonight_hours else None
+            dark_end = tonight_hours[-1].time if tonight_hours else None
+
             # Calculate astro score as the average of individual hourly scores
             if tonight_hours:
                 hourly_scores = [
@@ -358,7 +364,9 @@ class WeatherWorker(QThread):
                 tonight_avg_cloud_cover=tonight_avg_cloud,
                 astro_score=astro_score,
                 seeing_estimate=seeing,
-                moon_phase=moon_phase
+                moon_phase=moon_phase,
+                dark_hours_start=dark_start,
+                dark_hours_end=dark_end
             )
             daily_summaries.append(summary)
 
@@ -1096,13 +1104,24 @@ class DayDetailDialog(QDialog):
 
         layout.addWidget(header_group)
 
-        # View mode toggle
-        if get_time_format_24h():
-            midnight_label = "Center on Midnight (show tonight's hours: 18:00-05:00)"
-            midnight_tip = "Show evening hours (18:00-23:00) of this day plus morning hours (00:00-05:00) of the next day"
+        # View mode toggle - show actual dark hours if available
+        if self.summary.dark_hours_start and self.summary.dark_hours_end:
+            if get_time_format_24h():
+                start_str = self.summary.dark_hours_start.strftime("%H:%M")
+                end_str = self.summary.dark_hours_end.strftime("%H:%M")
+            else:
+                start_str = self.summary.dark_hours_start.strftime("%I:%M %p").lstrip("0")
+                end_str = self.summary.dark_hours_end.strftime("%I:%M %p").lstrip("0")
+            midnight_label = f"Center on Midnight (tonight's dark hours: {start_str}-{end_str})"
+            midnight_tip = "Show hours centered around midnight when sun altitude is below -12° (astronomical darkness)"
         else:
-            midnight_label = "Center on Midnight (show tonight's hours: 6:00 PM-5:00 AM)"
-            midnight_tip = "Show evening hours (6:00 PM-11:00 PM) of this day plus morning hours (12:00 AM-5:00 AM) of the next day"
+            # Fallback if no dark hours computed
+            if get_time_format_24h():
+                midnight_label = "Center on Midnight (show tonight's hours: 18:00-05:00)"
+                midnight_tip = "Show evening hours (18:00-23:00) of this day plus morning hours (00:00-05:00) of the next day"
+            else:
+                midnight_label = "Center on Midnight (show tonight's hours: 6:00 PM-5:00 AM)"
+                midnight_tip = "Show evening hours (6:00 PM-11:00 PM) of this day plus morning hours (12:00 AM-5:00 AM) of the next day"
         self.midnight_view_checkbox = QCheckBox(midnight_label)
         self.midnight_view_checkbox.setEnabled(self.next_day_summary is not None)
         self.midnight_view_checkbox.setToolTip(
@@ -1199,7 +1218,20 @@ class DayDetailDialog(QDialog):
     def _get_display_hours(self) -> List[HourlyWeatherData]:
         """Get the hourly data to display based on current view mode"""
         if self.midnight_view_checkbox.isChecked() and self.next_day_summary:
-            # Evening of current day (18:00-23:00) + morning of next day (00:00-05:00)
+            # Get evening hours from current day and morning hours from next day
+            evening_hours = [h for h in self.summary.hourly_data if h.time.hour >= 12]
+            morning_hours = [h for h in self.next_day_summary.hourly_data if h.time.hour < 12]
+            all_night_hours = evening_hours + morning_hours
+
+            # Filter to only include actual dark hours (sun altitude < -12°)
+            if self.lat is not None and self.lon is not None:
+                sun_alts = self._get_sun_altitudes(all_night_hours)
+                if sun_alts:
+                    dark_hours = [h for h, alt in zip(all_night_hours, sun_alts) if alt < -12]
+                    if dark_hours:
+                        return dark_hours
+
+            # Fallback to fixed range if sun altitudes unavailable
             evening_hours = [h for h in self.summary.hourly_data if h.time.hour >= 18]
             morning_hours = [h for h in self.next_day_summary.hourly_data if h.time.hour <= 5]
             return evening_hours + morning_hours
