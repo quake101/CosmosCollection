@@ -1634,14 +1634,22 @@ class SettingsDialog(QDialog):
         )
         ui_prefs_layout.addWidget(self.minimize_to_tray_checkbox)
 
-        # Enable log file checkbox
+        # Enable log file checkbox + open folder button
+        log_file_layout = QHBoxLayout()
         self.enable_logfile_checkbox = QCheckBox("Enable log file")
         self.enable_logfile_checkbox.setToolTip(
             "When enabled, saves application logs to CosmosCollection.log\n"
-            "in the application directory. Useful for troubleshooting.\n"
+            "in the user data directory. Useful for troubleshooting.\n"
             "Requires application restart to take effect."
         )
-        ui_prefs_layout.addWidget(self.enable_logfile_checkbox)
+        log_file_layout.addWidget(self.enable_logfile_checkbox)
+        open_log_folder_btn = QPushButton("Open Log Folder")
+        open_log_folder_btn.setToolTip("Open the folder where log files are stored")
+        open_log_folder_btn.setFixedWidth(120)
+        open_log_folder_btn.clicked.connect(self._open_log_folder)
+        log_file_layout.addWidget(open_log_folder_btn)
+        log_file_layout.addStretch()
+        ui_prefs_layout.addLayout(log_file_layout)
 
         # Time format setting
         time_format_layout = QHBoxLayout()
@@ -2222,6 +2230,12 @@ class SettingsDialog(QDialog):
         except Exception as e:
             logger.error(f"Error setting active location: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to set active location: {str(e)}")
+
+    def _open_log_folder(self):
+        """Open the folder where log files are stored"""
+        from PySide6.QtGui import QDesktopServices
+        log_dir = ResourceManager.get_data_dir()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_dir)))
 
     def _save_settings(self):
         """Save application settings (QSettings only - locations are saved separately)"""
@@ -6163,6 +6177,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         if self._tray_manager and self._tray_manager.is_available:
             self.hide()
             self._tray_manager.show()
+            # Prevent Qt from quitting when child windows (e.g. Weather) are closed
+            QApplication.instance().setQuitOnLastWindowClosed(False)
             # Start background weather refresh if auto-refresh is enabled
             self._start_tray_weather_refresh()
             # Start hourly update check
@@ -6177,6 +6193,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
         if self._tray_manager:
             self._tray_manager.hide()
+
+        # Restore default quit behavior now that the main window is visible
+        QApplication.instance().setQuitOnLastWindowClosed(True)
 
         self.show()
         self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
@@ -6747,8 +6766,13 @@ if __name__ == "__main__":
     try:
         settings = QSettings("CosmosCollection", "CosmosCollection")
         if settings.value("enable_logfile", False, type=bool):
-            log_file_path = os.path.join(APP_DIR, "CosmosCollection.log")
-            file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+            from logging.handlers import RotatingFileHandler
+            log_dir = ResourceManager.get_data_dir()
+            log_file_path = os.path.join(log_dir, "CosmosCollection.log")
+            file_handler = RotatingFileHandler(
+                log_file_path, maxBytes=5*1024*1024, backupCount=3,
+                encoding='utf-8'
+            )
             file_handler.setLevel(logging.DEBUG)
             file_handler.setFormatter(logging.Formatter(
                 '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -6757,6 +6781,9 @@ if __name__ == "__main__":
             logger.info(f"File logging enabled: {log_file_path}")
     except Exception as e:
         logger.warning(f"Could not configure file logging: {e}")
+        QMessageBox.warning(None, "Logging Error",
+            f"Could not create log file:\n{e}\n\n"
+            "Logging to file has been disabled for this session.")
 
     # Set global WebEngine profile settings
     try:

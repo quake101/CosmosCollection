@@ -19,9 +19,12 @@ from astropy import units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz, get_sun
 import pytz
+import logging
 import warnings
 
 warnings.filterwarnings('ignore')
+
+logger = logging.getLogger(__name__)
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
@@ -1167,8 +1170,6 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                     dec_deg = 0.0
             
             # Debug: log designations
-            import logging
-            logger = logging.getLogger(__name__)
             logger.debug(f"BestDSO opening detail for: {dso_data['dso_info']['name']}")
             logger.debug(f"Designations from dso_info: {dso_data['dso_info']['designations']}")
 
@@ -1538,8 +1539,6 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                 count = cursor.fetchone()[0]
                 return count > 0
         except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.error(f"Error checking if DSO is in target list: {str(e)}")
             return False
 

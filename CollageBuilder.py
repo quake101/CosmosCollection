@@ -1,7 +1,10 @@
 import os
+import logging
 from PIL import Image, ImageDraw, ImageFont
 import math
 from typing import List, Tuple, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class CollageBuilder:
@@ -656,17 +659,6 @@ try:
         except ImportError:
             DatabaseManager = None
 
-    # Import logger
-    try:
-        import logging
-        logger = logging.getLogger(__name__)
-    except ImportError:
-        # Create a simple logger fallback
-        class SimpleLogger:
-            def debug(self, msg): print(f"DEBUG: {msg}")
-            def error(self, msg, exc_info=None): print(f"ERROR: {msg}")
-        logger = SimpleLogger()
-
     # Import Theme for colors
     from Theme import COLORS
 
@@ -921,12 +913,8 @@ class ThumbnailWorker(QThread):
                                         pixmap = QPixmap.fromImage(image)
                                 else:
                                     # Log the specific error from QImageReader
-                                    import logging
-                                    logger = logging.getLogger(__name__)
                                     logger.warning(f"QImageReader cannot read file {image_path}, error: {reader.errorString()}")
                             except Exception as e:
-                                import logging
-                                logger = logging.getLogger(__name__)
                                 logger.warning(f"Error with QImageReader for {image_path}: {e}")
                                 pass  # Fall through to error handling below
 
@@ -941,8 +929,6 @@ class ThumbnailWorker(QThread):
                         self.thumbnail_ready.emit(row, col, scaled_pixmap)
                     else:
                         # Log more detailed error info
-                        import logging
-                        logger = logging.getLogger(__name__)
                         logger.warning(f"Failed to load image thumbnail: {image_path} (extension: {ext}, size: {file_size} bytes)")
                         error_msg = f"Invalid {ext.upper()}\nFormat"
                         self.thumbnail_error.emit(row, col, error_msg)
