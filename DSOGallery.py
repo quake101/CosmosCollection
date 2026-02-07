@@ -497,6 +497,7 @@ class AddImageDialog(QDialog):
 
         self._init_ui()
         self._load_dso_list()
+        self._load_equipment_list()
 
     def _init_ui(self):
         """Create the dialog UI"""
@@ -533,9 +534,17 @@ class AddImageDialog(QDialog):
         form_layout.addRow("Attach to DSO:", self.dso_combo)
 
         # Optional metadata fields
-        self.equipment_edit = QLineEdit()
-        self.equipment_edit.setPlaceholderText("e.g., 8\" SCT, ASI294MC Pro")
-        form_layout.addRow("Equipment:", self.equipment_edit)
+        self.telescope_combo = QComboBox()
+        self.telescope_combo.setEditable(True)
+        self.telescope_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.telescope_combo.lineEdit().setPlaceholderText("e.g., 8\" SCT")
+        form_layout.addRow("Telescope:", self.telescope_combo)
+
+        self.camera_combo = QComboBox()
+        self.camera_combo.setEditable(True)
+        self.camera_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.camera_combo.lineEdit().setPlaceholderText("e.g., ASI294MC Pro")
+        form_layout.addRow("Camera:", self.camera_combo)
 
         self.integration_edit = QLineEdit()
         self.integration_edit.setPlaceholderText("e.g., 2h 30m")
@@ -612,6 +621,32 @@ class AddImageDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to load DSO list: {str(e)}")
 
+    def _load_equipment_list(self):
+        """Load user telescopes and cameras into their respective dropdowns"""
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Load telescopes
+                cursor.execute("SELECT name FROM usertelescopes ORDER BY name")
+                for row in cursor.fetchall():
+                    self.telescope_combo.addItem(row[0])
+
+                # Load cameras
+                cursor.execute("SELECT name FROM userequipment WHERE equipment_type = 'camera' ORDER BY name")
+                for row in cursor.fetchall():
+                    self.camera_combo.addItem(row[0])
+
+            # Clear selection so placeholder text is shown
+            self.telescope_combo.setCurrentIndex(-1)
+            self.telescope_combo.lineEdit().clear()
+            self.camera_combo.setCurrentIndex(-1)
+            self.camera_combo.lineEdit().clear()
+
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to load equipment list: {str(e)}")
+
     def _browse_file(self):
         """Open file dialog to select an image"""
         file_name, _ = QFileDialog.getOpenFileName(
@@ -650,7 +685,8 @@ class AddImageDialog(QDialog):
         return {
             'dsodetailid': self.dso_combo.currentData(),
             'image_path': self.selected_file,
-            'equipment': self.equipment_edit.text().strip(),
+            'equipment': ', '.join(filter(None, [self.telescope_combo.currentText().strip(),
+                                                     self.camera_combo.currentText().strip()])),
             'integration_time': self.integration_edit.text().strip(),
             'date_taken': self.date_edit.text().strip(),
             'notes': self.notes_edit.text().strip()
