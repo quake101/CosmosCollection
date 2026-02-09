@@ -208,6 +208,7 @@ class NINAStatusWorker(QThread):
         self._initial_image_check_done = False  # Have we done the initial image check?
         self._last_image_index = -1  # Track the last known image index (-1 = no images yet)
         self._last_livestack_hash = None  # Track livestack image hash
+        self._last_livestack_count = None  # Track livestack stack count
         self._last_livestack_running = False  # Track if livestack was running
         self._livestack_target = None  # User-selected livestack target
         self._livestack_filter = None  # User-selected livestack filter
@@ -371,38 +372,52 @@ class NINAStatusWorker(QThread):
                     # Get available stacks for the dropdown
                     available_stacks = NINAIntegration.get_livestack_available(self.host, self.port)
 
-                    livestack_image, actual_target, actual_filter = NINAIntegration.get_livestack_image(
-                        self.host, self.port, self._livestack_target, self._livestack_filter
+                    # Resolve which target/filter to display
+                    actual_target, actual_filter = NINAIntegration.resolve_livestack_selection(
+                        available_stacks, self._livestack_target, self._livestack_filter
                     )
-                    if livestack_image:
-                        # Check if livestack image changed
-                        current_hash = hashlib.md5(livestack_image).hexdigest()
-                        image_changed = current_hash != self._last_livestack_hash
-                        if image_changed:
-                            self._last_livestack_hash = current_hash
+                    if actual_target and actual_filter:
                         self._last_livestack_running = True
-                        # Include selected target/filter in status
                         livestack_status['selected_target'] = actual_target
                         livestack_status['selected_filter'] = actual_filter
-                        # Fetch stack count info
+
+                        # Fetch lightweight info to check stack count
                         livestack_info = NINAIntegration.get_livestack_info(
                             self.host, self.port, actual_target, actual_filter
                         )
                         if livestack_info:
                             livestack_status.update(livestack_info)
-                        # Emit image only when changed, but always emit status
-                        self.livestack_updated.emit(
-                            livestack_image if image_changed else b'',
-                            livestack_status, available_stacks
-                        )
+
+                        # Determine current stack count from info
+                        current_count = None
+                        if livestack_info:
+                            current_count = (livestack_info.get('StackCount')
+                                             or livestack_info.get('RedStackCount')
+                                             or livestack_info.get('GreenStackCount')
+                                             or livestack_info.get('BlueStackCount'))
+
+                        # Only fetch the image when stack count changes (or first time)
+                        if current_count != self._last_livestack_count:
+                            self._last_livestack_count = current_count
+                            livestack_image = NINAIntegration.fetch_livestack_image_data(
+                                self.host, self.port, actual_target, actual_filter
+                            )
+                            if livestack_image:
+                                self.livestack_updated.emit(livestack_image, livestack_status, available_stacks)
+                            else:
+                                self.livestack_updated.emit(b'', livestack_status, available_stacks)
+                        else:
+                            # Stack count unchanged - emit status only (no image data)
+                            self.livestack_updated.emit(b'', livestack_status, available_stacks)
                     elif not self._last_livestack_running:
-                        # Livestacking is running but no image yet - emit status to update tab
+                        # Livestacking is running but no stacks available yet
                         self._last_livestack_running = True
                         self.livestack_updated.emit(b'', livestack_status, available_stacks)
                 else:
                     # Emit empty to reset tab (only if state changed)
-                    if self._last_livestack_running or self._last_livestack_hash is not None:
+                    if self._last_livestack_running or self._last_livestack_count is not None:
                         self._last_livestack_hash = None
+                        self._last_livestack_count = None
                         self._last_livestack_running = False
                         self.livestack_updated.emit(b'', {'running': False}, [])
 

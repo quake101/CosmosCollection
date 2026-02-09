@@ -6358,6 +6358,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self._show_weather_forecast()
         elif action_name == "gallery":
             self._show_dso_gallery()
+        elif action_name == "nina_dashboard":
+            self._show_nina_dashboard()
 
     def _quit_application(self):
         """Quit the application from tray menu"""

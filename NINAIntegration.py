@@ -1046,6 +1046,91 @@ class NINAIntegration:
             return []
 
     @staticmethod
+    def resolve_livestack_selection(stacks, target=None, filter_name=None):
+        """
+        Resolve which livestack target/filter to use from available stacks.
+
+        Args:
+            stacks: List of available stack dicts with 'Target' and 'Filter' keys
+            target: Optional target name (if None, uses first available)
+            filter_name: Optional filter name (if None, prefers RGB then first available)
+
+        Returns:
+            tuple: (str, str) - Resolved target name and filter name
+                   (None, None) on failure
+        """
+        if not stacks:
+            return None, None
+
+        selected = None
+
+        if target and filter_name:
+            for stack in stacks:
+                if stack.get('Target') == target and stack.get('Filter') == filter_name:
+                    selected = stack
+                    break
+        elif target:
+            matching = [s for s in stacks if s.get('Target') == target]
+            if matching:
+                for stack in matching:
+                    if stack.get('Filter') == 'RGB':
+                        selected = stack
+                        break
+                if not selected:
+                    selected = matching[0]
+        elif filter_name:
+            for stack in stacks:
+                if stack.get('Filter') == filter_name:
+                    selected = stack
+                    break
+
+        if not selected:
+            for stack in stacks:
+                if stack.get('Filter') == 'RGB':
+                    selected = stack
+                    break
+            if not selected:
+                selected = stacks[0]
+
+        actual_target = selected.get('Target', '')
+        actual_filter = selected.get('Filter', '')
+        if not actual_target or not actual_filter:
+            return None, None
+        return actual_target, actual_filter
+
+    @staticmethod
+    def fetch_livestack_image_data(host, port, target, filter_name):
+        """
+        Fetch the livestack image for a resolved target/filter.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            target: Resolved target name
+            filter_name: Resolved filter name
+
+        Returns:
+            bytes: JPEG image data on success, None on failure
+        """
+        try:
+            encoded_target = urllib.parse.quote(target, safe='')
+            encoded_filter = urllib.parse.quote(filter_name, safe='')
+            image_url = (f"http://{host}:{port}/v2/api/livestack/image/"
+                         f"{encoded_target}/{encoded_filter}"
+                         f"?quality=100&stream=true&resize=true&size=800x600")
+            request = urllib.request.Request(image_url)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                content_type = response.headers.get('Content-Type', '')
+                if 'image' in content_type:
+                    data = response.read()
+                    logger.debug(f"API Response: livestack image data, {len(data)} bytes")
+                    return data
+                return None
+        except Exception as e:
+            logger.debug(f"Error fetching livestack image: {e}")
+            return None
+
+    @staticmethod
     def get_livestack_image(host, port, target=None, filter_name=None):
         """
         Get the current live-stacked image from NINA.
@@ -1060,71 +1145,18 @@ class NINAIntegration:
             tuple: (bytes, str, str) - Image data (JPEG), target name, filter name on success
                    (None, None, None) on failure
         """
-        try:
-            # Get available stacks
-            stacks = NINAIntegration.get_livestack_available(host, port)
-            if not stacks:
-                return None, None, None
-
-            # Find matching stack based on parameters
-            selected = None
-
-            if target and filter_name:
-                # Find exact match
-                for stack in stacks:
-                    if stack.get('Target') == target and stack.get('Filter') == filter_name:
-                        selected = stack
-                        break
-            elif target:
-                # Match target, prefer RGB filter
-                matching = [s for s in stacks if s.get('Target') == target]
-                if matching:
-                    for stack in matching:
-                        if stack.get('Filter') == 'RGB':
-                            selected = stack
-                            break
-                    if not selected:
-                        selected = matching[0]
-            elif filter_name:
-                # Match filter, use first matching target
-                for stack in stacks:
-                    if stack.get('Filter') == filter_name:
-                        selected = stack
-                        break
-
-            # Fallback: prefer RGB stack, otherwise use first available
-            if not selected:
-                for stack in stacks:
-                    if stack.get('Filter') == 'RGB':
-                        selected = stack
-                        break
-                if not selected:
-                    selected = stacks[0]
-
-            actual_filter = selected.get('Filter', '')
-            actual_target = selected.get('Target', '')
-            if not actual_filter or not actual_target:
-                return None, None, None
-
-            # Fetch the specific stack image
-            # URL format: /livestack/image/{target}/{filter}?quality=100&stream=true&resize=true&size=800x600
-            encoded_target = urllib.parse.quote(actual_target, safe='')
-            encoded_filter = urllib.parse.quote(actual_filter, safe='')
-            image_url = (f"http://{host}:{port}/v2/api/livestack/image/"
-                         f"{encoded_target}/{encoded_filter}"
-                         f"?quality=100&stream=true&resize=true&size=800x600")
-
-            request = urllib.request.Request(image_url)
-            with urllib.request.urlopen(request, timeout=10) as response:
-                content_type = response.headers.get('Content-Type', '')
-                if 'image' in content_type:
-                    data = response.read()
-                    logger.debug(f"API Response: livestack image data, {len(data)} bytes")
-                    return data, actual_target, actual_filter
-                return None, None, None
-        except Exception as e:
-            logger.debug(f"Error getting livestack image: {e}")
+        stacks = NINAIntegration.get_livestack_available(host, port)
+        actual_target, actual_filter = NINAIntegration.resolve_livestack_selection(
+            stacks, target, filter_name
+        )
+        if not actual_target:
             return None, None, None
+        image_data = NINAIntegration.fetch_livestack_image_data(
+            host, port, actual_target, actual_filter
+        )
+        if image_data:
+            return image_data, actual_target, actual_filter
+        return None, None, None
 
     @staticmethod
     def get_livestack_info(host, port, target, filter_name):

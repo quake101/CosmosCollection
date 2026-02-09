@@ -103,6 +103,10 @@ class SystemTrayManager(QObject):
         gallery_action.triggered.connect(lambda: self._on_action_clicked("gallery"))
         self._menu.addAction(gallery_action)
 
+        nina_dashboard_action = QAction("NINA Dashboard", self._menu)
+        nina_dashboard_action.triggered.connect(lambda: self._on_action_clicked("nina_dashboard"))
+        self._menu.addAction(nina_dashboard_action)
+
         self._menu.addSeparator()
 
         # Quit action
