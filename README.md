@@ -47,6 +47,9 @@ Cosmos Collection is designed to help astrophotographers manage their image coll
   ### Weather Details
   ![Weather Details](screenshots/Weather-Details.jpg)
 
+  ### NINA Dashboard
+  ![Nina Dashboard](screenshots/NINA-Dashboard.jpg)
+
 ## Getting Started
 
 ### Download Latest Release
