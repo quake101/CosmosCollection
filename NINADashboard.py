@@ -375,15 +375,26 @@ class NINAStatusWorker(QThread):
                         self.host, self.port, self._livestack_target, self._livestack_filter
                     )
                     if livestack_image:
-                        # Emit if livestack image changed
+                        # Check if livestack image changed
                         current_hash = hashlib.md5(livestack_image).hexdigest()
-                        if current_hash != self._last_livestack_hash:
+                        image_changed = current_hash != self._last_livestack_hash
+                        if image_changed:
                             self._last_livestack_hash = current_hash
-                            self._last_livestack_running = True
-                            # Include selected target/filter in status
-                            livestack_status['selected_target'] = actual_target
-                            livestack_status['selected_filter'] = actual_filter
-                            self.livestack_updated.emit(livestack_image, livestack_status, available_stacks)
+                        self._last_livestack_running = True
+                        # Include selected target/filter in status
+                        livestack_status['selected_target'] = actual_target
+                        livestack_status['selected_filter'] = actual_filter
+                        # Fetch stack count info
+                        livestack_info = NINAIntegration.get_livestack_info(
+                            self.host, self.port, actual_target, actual_filter
+                        )
+                        if livestack_info:
+                            livestack_status.update(livestack_info)
+                        # Emit image only when changed, but always emit status
+                        self.livestack_updated.emit(
+                            livestack_image if image_changed else b'',
+                            livestack_status, available_stacks
+                        )
                     elif not self._last_livestack_running:
                         # Livestacking is running but no image yet - emit status to update tab
                         self._last_livestack_running = True
@@ -2082,25 +2093,34 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             # Update livestack tab with indicator
             self.image_tabs.setTabText(1, "Live Stack *")
             if image_data:
+                # New image data - update the pixmap
                 try:
                     pixmap = QPixmap()
                     pixmap.loadFromData(image_data)
                     if not pixmap.isNull():
                         self._current_livestack_pixmap = pixmap
                         self.livestack_label.setPixmap(pixmap)
-                        # Show current target/filter in info label
-                        target = status.get('selected_target', '')
-                        filter_name = status.get('selected_filter', '')
-                        if target and filter_name:
-                            self.livestack_info_label.setText(f"{target} - {filter_name}")
-                        else:
-                            self.livestack_info_label.setText("Live stack active")
                 except Exception as e:
                     logger.error(f"Error loading livestack image: {e}")
-            else:
+            elif not self._current_livestack_pixmap:
                 # Running but no image yet
                 self.livestack_label.setPlaceholderText("Waiting for first image...")
                 self.livestack_label.setPixmap(None)
+
+            # Always update info label with target/filter/stack count
+            target = status.get('selected_target', '')
+            filter_name = status.get('selected_filter', '')
+            # API returns per-channel counts (RedStackCount, etc.) not a unified StackCount
+            stack_count = (status.get('StackCount')
+                           or status.get('RedStackCount')
+                           or status.get('GreenStackCount')
+                           or status.get('BlueStackCount'))
+            if target and filter_name:
+                info_text = f"{target} - {filter_name}"
+                if stack_count is not None:
+                    info_text += f" | Stacks: {stack_count}"
+                self.livestack_info_label.setText(info_text)
+            elif not self._current_livestack_pixmap:
                 self.livestack_info_label.setText("Live stack active")
         else:
             # Reset tab text and show inactive message

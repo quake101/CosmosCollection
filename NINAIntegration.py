@@ -1127,6 +1127,25 @@ class NINAIntegration:
             return None, None, None
 
     @staticmethod
+    def get_livestack_info(host, port, target, filter_name):
+        """Get live stack info (stack count, etc.) from NINA."""
+        try:
+            encoded_target = urllib.parse.quote(target, safe='')
+            encoded_filter = urllib.parse.quote(filter_name, safe='')
+            url = (f"http://{host}:{port}/v2/api/livestack/image/"
+                   f"{encoded_target}/{encoded_filter}/info")
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                if data.get('Success') and data.get('Response'):
+                    logger.debug(f"API Response: livestack info for {target}/{filter_name}")
+                    return data['Response']
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting livestack info: {e}")
+            return None
+
+    @staticmethod
     def get_event_history(host, port):
         """
         Get event history from NINA.
