@@ -923,6 +923,11 @@ class VisibilityPlot(FigureCanvas):
     def plot_visibility(self, results):
         """Create visibility plot with altitude and azimuth"""
         self.figure.clear()
+        # Reset subplot parameters to defaults so tight_layout() doesn't
+        # progressively shrink the plots on repeated calculations
+        self.figure.subplots_adjust(
+            left=0.125, bottom=0.11, right=0.9, top=0.88,
+            wspace=0.2, hspace=0.2)
 
         time_range = results['time_range']
         dso_altaz = results['dso_altaz']
