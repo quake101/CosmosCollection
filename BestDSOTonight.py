@@ -9,7 +9,7 @@ import os
 import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMutex
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMutex, QSettings
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
@@ -308,6 +308,7 @@ class DSOCalculationThread(QThread):
             cursor = conn.cursor()
 
             # Query target list entries with telescope information
+            # No magnitude filter - show all target list items since user intentionally added them
             query = """
                 SELECT t.name, t.dso_type, t.constellation, t.magnitude, t.ra_deg, t.dec_deg,
                        t.size_info, t.telescope_id, tel.name as telescope_name
@@ -315,18 +316,19 @@ class DSOCalculationThread(QThread):
                 LEFT JOIN usertelescopes tel ON t.telescope_id = tel.id
                 WHERE t.ra_deg IS NOT NULL
                     AND t.dec_deg IS NOT NULL
-                    AND t.magnitude IS NOT NULL
-                    AND t.magnitude <= ?
                 ORDER BY t.magnitude ASC
             """
 
-            cursor.execute(query, [self.max_magnitude])
+            cursor.execute(query)
 
             rows = cursor.fetchall()
             dsos = []
             for row in rows:
                 name, dso_type, constellation, magnitude, ra_deg, dec_deg, size_info, telescope_id, telescope_name = row
-                if name and magnitude is not None and ra_deg is not None and dec_deg is not None:
+                if name and ra_deg is not None and dec_deg is not None:
+                    # Default NULL magnitude to 99.0 sentinel so object is still processed
+                    if magnitude is None:
+                        magnitude = 99.0
                     # Query designations from main database by matching coordinates
                     cursor.execute("""
                         SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
@@ -633,7 +635,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.min_altitude_spin.setRange(10, 90)
         self.min_altitude_spin.setValue(30)
         self.min_altitude_spin.setSuffix("°")
-        self.min_altitude_spin.setToolTip("Minimum altitude for DSO visibility (used with all calculation modes)")
+        self.min_altitude_spin.setToolTip("Minimum altitude for DSO visibility (used with all modes)")
         settings_row1.addWidget(self.min_altitude_spin)
 
         # Maximum magnitude
@@ -641,7 +643,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.max_magnitude_combo = QComboBox()
         self.max_magnitude_combo.addItems(["8.0", "10.0", "12.0", "14.0", "16.0"])
         self.max_magnitude_combo.setCurrentText("12.0")
-        self.max_magnitude_combo.setToolTip("Maximum magnitude for DSO selection (used with all calculation modes)")
+        self.max_magnitude_combo.setToolTip("Maximum magnitude for DSO selection (ignored when using Target List)")
         settings_row1.addWidget(self.max_magnitude_combo)
 
         # Catalog dropdown selection
@@ -714,11 +716,16 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.use_target_list_checkbox.setToolTip(
             "Calculate visibility only for DSOs in your target list.\n\n"
             "When checked:\n"
-            "• Min Altitude and Max Magnitude settings are still used\n"
+            "• Min Altitude setting is still used\n"
             "• Start Hour and Duration settings are still used\n"
-            "• Catalog, Type, and DSO Limit settings are ignored"
+            "• Catalog, Type, Max Magnitude, and DSO Limit settings are ignored"
         )
         self.use_target_list_checkbox.toggled.connect(self._on_target_list_checkbox_changed)
+        # Restore saved checkbox state
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        saved_use_target_list = settings.value("BestDSOTonight/use_target_list", False, type=bool)
+        if saved_use_target_list:
+            self.use_target_list_checkbox.setChecked(True)
         action_layout.addWidget(self.use_target_list_checkbox)
 
         # Horizontal layout to hold both groups side by side
@@ -953,14 +960,21 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.dso_type_combo.view().setMinimumWidth(self.dso_type_combo.minimumSizeHint().width())
     
 
+    def closeEvent(self, event):
+        """Save settings and window position when closing"""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue("BestDSOTonight/use_target_list", self.use_target_list_checkbox.isChecked())
+        super().closeEvent(event)
+
     def _on_target_list_checkbox_changed(self, checked):
         """Handle target list checkbox state change"""
         # checked is a boolean from the toggled signal
 
         # Disable/enable settings based on whether target list is used
-        # When using target list, catalog and type filters don't apply
+        # When using target list, catalog, type, and magnitude filters don't apply
         self.catalog_combo.setEnabled(not checked)
         self.dso_type_combo.setEnabled(not checked)
+        self.max_magnitude_combo.setEnabled(not checked)
 
         # DSO limit doesn't apply when using target list (uses all targets)
         self.dso_limit_spin.setEnabled(not checked)
@@ -1078,10 +1092,14 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             # Constellation
             self.results_table.setItem(row, 2, QTableWidgetItem(dso_info["constellation"]))
             
-            # Magnitude - use numeric sorting
+            # Magnitude - use numeric sorting, show "N/A" for unknown magnitude
+            mag_value = dso_info['magnitude']
             mag_item = NumericTableWidgetItem()
-            mag_item.setData(Qt.DisplayRole, f"{dso_info['magnitude']:.1f}")
-            mag_item.setData(Qt.UserRole, dso_info['magnitude'])  # Store numeric value for sorting
+            if mag_value >= 99.0:
+                mag_item.setData(Qt.DisplayRole, "N/A")
+            else:
+                mag_item.setData(Qt.DisplayRole, f"{mag_value:.1f}")
+            mag_item.setData(Qt.UserRole, mag_value)  # Store numeric value for sorting
             mag_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 3, mag_item)
 
