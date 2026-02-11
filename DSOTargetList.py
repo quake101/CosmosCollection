@@ -8,12 +8,13 @@ import sys
 import os
 import calendar
 from datetime import datetime
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QStringListModel
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
                                QHeaderView, QTextEdit, QDialog, QComboBox,
-                               QLineEdit, QCheckBox, QDateEdit, QSpinBox, QMenu)
+                               QLineEdit, QCheckBox, QDateEdit, QSpinBox, QMenu,
+                               QCompleter)
 from PySide6.QtGui import QFont
 
 from DatabaseManager import DatabaseManager
@@ -58,6 +59,15 @@ class AddTargetDialog(QDialog):
         self.db_manager = DatabaseManager()
         self.is_edit_mode = False  # Track if we're editing an existing target
         self.target_id = None  # Store the ID of the target being edited
+        self._dso_cache = {}  # Cache for autocomplete results
+
+        # Debounce timer for DSO catalog search
+        self._search_timer = QTimer()
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self._do_dso_search)
+        self._pending_search_text = ""
+
         self._setup_ui()
         
         # Pre-fill with DSO data if provided
@@ -76,6 +86,18 @@ class AddTargetDialog(QDialog):
         name_layout = QHBoxLayout()
         name_layout.addWidget(QLabel("Name:"))
         self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("e.g., M 31, NGC 7000, IC 1396")
+
+        # Set up autocomplete for DSO catalog
+        self._completer_model = QStringListModel()
+        self._completer = QCompleter()
+        self._completer.setModel(self._completer_model)
+        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._completer.setFilterMode(Qt.MatchContains)
+        self.name_edit.setCompleter(self._completer)
+        self._completer.activated.connect(self._on_dso_selected)
+        self.name_edit.textChanged.connect(self._on_name_text_changed)
+
         name_layout.addWidget(self.name_edit)
         dso_layout.addLayout(name_layout)
         
@@ -246,7 +268,137 @@ class AddTargetDialog(QDialog):
 
         # Populate best months if available
         self.months_edit.setText(self.dso_data.get("best_months", ""))
-    
+
+    def _on_name_text_changed(self, text):
+        """Handle text changes in the name field — debounce before searching"""
+        text = text.strip()
+        if len(text) < 2:
+            self._completer_model.setStringList([])
+            self._dso_cache.clear()
+            return
+        self._pending_search_text = text
+        self._search_timer.start()
+
+    def _do_dso_search(self):
+        """Execute the DSO catalog search after debounce"""
+        text = self._pending_search_text
+        if len(text) < 2:
+            return
+        self._search_dso_catalog(text)
+
+    def _search_dso_catalog(self, text):
+        """Search the DSO catalog and update completer suggestions"""
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Try to parse a catalogue prefix (e.g., "M 3", "NGC 70", "IC 13")
+                catalogue = None
+                designation_part = None
+                text_upper = text.upper().strip()
+
+                for prefix in ("NGC", "IC", "M"):
+                    if text_upper.startswith(prefix):
+                        remainder = text_upper[len(prefix):]
+                        # Ensure remainder is empty, starts with space, or a digit
+                        if remainder == "" or remainder[0] in (" ", "-") or remainder[0].isdigit():
+                            catalogue = prefix
+                            designation_part = remainder.strip()
+                            break
+
+                if catalogue and designation_part is not None:
+                    # Search within a specific catalogue
+                    cursor.execute("""
+                        SELECT c.catalogue || ' ' || c.designation as name,
+                               d.ra, d.dec, d.magnitude,
+                               d.sizemin / 60.0 as sizemin,
+                               d.sizemax / 60.0 as sizemax,
+                               d.constellation, d.dsotype
+                        FROM cataloguenr c
+                        JOIN dsodetail d ON d.id = c.dsodetailid
+                        WHERE c.catalogue = ? AND c.designation LIKE ?
+                        ORDER BY CAST(c.designation AS INTEGER), c.designation
+                        LIMIT 20
+                    """, (catalogue, designation_part + "%"))
+                else:
+                    # Search across all catalogues
+                    cursor.execute("""
+                        SELECT c.catalogue || ' ' || c.designation as name,
+                               d.ra, d.dec, d.magnitude,
+                               d.sizemin / 60.0 as sizemin,
+                               d.sizemax / 60.0 as sizemax,
+                               d.constellation, d.dsotype
+                        FROM cataloguenr c
+                        JOIN dsodetail d ON d.id = c.dsodetailid
+                        WHERE c.catalogue || ' ' || c.designation LIKE ?
+                        ORDER BY c.catalogue, CAST(c.designation AS INTEGER), c.designation
+                        LIMIT 20
+                    """, ("%" + text + "%",))
+
+                results = cursor.fetchall()
+                self._dso_cache.clear()
+                names = []
+                for row in results:
+                    name = row[0]
+                    names.append(name)
+                    self._dso_cache[name] = {
+                        "ra": row[1],
+                        "dec": row[2],
+                        "magnitude": row[3],
+                        "sizemin": row[4],
+                        "sizemax": row[5],
+                        "constellation": row[6],
+                        "dsotype": row[7],
+                    }
+
+                self._completer_model.setStringList(names)
+
+        except Exception as e:
+            logger.error(f"Error searching DSO catalog: {str(e)}")
+
+    def _on_dso_selected(self, text):
+        """Auto-fill fields when a DSO suggestion is selected"""
+        data = self._dso_cache.get(text)
+        if not data:
+            return
+
+        # Type mapping (same as DSOTargetListWindow._get_friendly_type_name)
+        type_mapping = {
+            "GALXY": "Galaxy", "DRKNB": "Dark Nebula", "OPNCL": "Open Cluster",
+            "PLNNB": "Planetary Nebula", "BRTNB": "Bright Nebula",
+            "SNREM": "Supernova Remnant", "GALCL": "Galaxy Cluster",
+            "GLOCL": "Globular Cluster", "CL+NB": "Cluster + Nebula",
+            "GX+DN": "Galaxy + Dark Nebula", "ASTER": "Asterism",
+            "2STAR": "Double Star", "3STAR": "Triple Star",
+            "4STAR": "Quadruple Star", "1STAR": "Single Star",
+            "QUASR": "Quasar", "NONEX": "Non-existent",
+        }
+
+        dsotype = data.get("dsotype", "")
+        self.type_edit.setText(type_mapping.get(dsotype, dsotype or ""))
+        self.constellation_edit.setText(data.get("constellation") or "")
+
+        ra = data.get("ra")
+        if ra is not None:
+            self.ra_edit.setText(str(round(ra, 6)))
+
+        dec = data.get("dec")
+        if dec is not None:
+            self.dec_edit.setText(str(round(dec, 6)))
+
+        mag = data.get("magnitude")
+        if mag is not None:
+            self.magnitude_edit.setText(str(round(mag, 2)))
+        else:
+            self.magnitude_edit.setText("")
+
+        sizemin = data.get("sizemin") or 0
+        sizemax = data.get("sizemax") or 0
+        if sizemin > 0 or sizemax > 0:
+            self.size_edit.setText(f"{sizemin:.1f} x {sizemax:.1f}")
+        else:
+            self.size_edit.setText("")
+
     def _save_target(self):
         """Save the target to the database"""
         try:
