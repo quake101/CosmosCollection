@@ -24,15 +24,15 @@ import matplotlib.pyplot as plt
 # Set dark theme for matplotlib
 plt.style.use('dark_background')
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings, QByteArray, QPointF, QRectF
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings, QByteArray, QPointF, QRectF, QSize
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QLabel, QGroupBox, QProgressBar, QComboBox, QFrame,
     QGridLayout, QSizePolicy, QDockWidget, QCheckBox, QSpinBox,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLineEdit,
-    QTabWidget
+    QTabWidget, QListWidget, QListWidgetItem
 )
-from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent
+from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QIcon
 
 from NINAIntegration import NINAIntegration
 from WindowPositionManager import WindowPositionMixin
@@ -62,9 +62,11 @@ class ZoomableImageWidget(QWidget):
         self.setFocusPolicy(Qt.WheelFocus)
 
     def setPixmap(self, pixmap):
-        """Set the image to display."""
+        """Set the image to display, preserving zoom/pan if already viewing an image."""
+        had_image = self._pixmap is not None and not self._pixmap.isNull()
         self._pixmap = pixmap
-        self._reset_view()
+        if not had_image:
+            self._reset_view()
         self.update()
 
     def setPlaceholderText(self, text):
@@ -190,6 +192,7 @@ class NINAStatusWorker(QThread):
     event_occurred = Signal(dict)  # Emits new NINA event data
     error_occurred = Signal(str)  # Emits error message
     connection_changed = Signal(bool, str, str, int)  # Emits connected state, version, host, port
+    history_thumbnail = Signal(int, bytes)  # Emits (index, small_thumbnail_data)
 
     # Adaptive polling rates
     POLL_RATE_ACTIVE = 0.5  # when exposing/guiding
@@ -215,6 +218,18 @@ class NINAStatusWorker(QThread):
         self._consecutive_failures = 0  # Track consecutive API failures to detect disconnect
         self._version = ""  # Store NINA version for reconnection
         self._last_event_time = None  # Track last processed event timestamp
+        # Image quality/size settings
+        self._image_quality = -1  # -1 = PNG (lossless)
+        self._image_size = "1920x1080"
+        self._livestack_quality = 100
+        self._livestack_size = "1920x1080"
+
+    def set_image_quality_settings(self, image_quality, image_size, livestack_quality, livestack_size):
+        """Update image quality/size settings (thread-safe for primitive types)."""
+        self._image_quality = image_quality
+        self._image_size = image_size
+        self._livestack_quality = livestack_quality
+        self._livestack_size = livestack_size
 
     def run(self):
         """Main polling loop."""
@@ -341,11 +356,17 @@ class NINAStatusWorker(QThread):
                         if image_count > 0:
                             self._last_image_index = image_count - 1
                             logger.debug(f"Initial image fetch (index {self._last_image_index})")
-                            image_data, image_meta = NINAIntegration.get_image_thumbnail(
-                                self.host, self.port, self._last_image_index, 400
+                            image_data, image_meta = NINAIntegration.get_image(
+                                self.host, self.port, self._last_image_index,
+                                quality=self._image_quality, size_wh=self._image_size
                             )
                             if image_data:
                                 self.image_updated.emit(image_data, image_meta or {})
+                            # Load history thumbnails for last 20 images
+                            for idx in range(self._last_image_index, max(self._last_image_index - 20, -1), -1):
+                                thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, idx, 200)
+                                if thumb_data:
+                                    self.history_thumbnail.emit(idx, thumb_data)
                         else:
                             logger.debug("No images available yet, waiting for first exposure")
 
@@ -357,11 +378,16 @@ class NINAStatusWorker(QThread):
                             logger.debug(f"New image available at index {next_index}")
                             self._last_image_index = next_index
                             self._waiting_for_new_image = False
-                            image_data, image_meta = NINAIntegration.get_image_thumbnail(
-                                self.host, self.port, next_index, 400
+                            image_data, image_meta = NINAIntegration.get_image(
+                                self.host, self.port, next_index,
+                                quality=self._image_quality, size_wh=self._image_size
                             )
                             if image_data:
                                 self.image_updated.emit(image_data, image_meta or {})
+                            # Emit history thumbnail for the new image
+                            thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, next_index, 200)
+                            if thumb_data:
+                                self.history_thumbnail.emit(next_index, thumb_data)
 
                 # Fetch livestack status and image
                 livestack_status = NINAIntegration.get_livestack_status(self.host, self.port)
@@ -400,7 +426,8 @@ class NINAStatusWorker(QThread):
                         if current_count != self._last_livestack_count:
                             self._last_livestack_count = current_count
                             livestack_image = NINAIntegration.fetch_livestack_image_data(
-                                self.host, self.port, actual_target, actual_filter
+                                self.host, self.port, actual_target, actual_filter,
+                                quality=self._livestack_quality, size=self._livestack_size
                             )
                             if livestack_image:
                                 self.livestack_updated.emit(livestack_image, livestack_status, available_stacks)
@@ -918,6 +945,7 @@ class SlewDialog(QDialog):
 class NINADashboardWindow(WindowPositionMixin, QMainWindow):
     """Main NINA Dashboard window."""
     WINDOW_POSITION_KEY = "NINADashboard"
+    _image_fetch_done = Signal(bytes)
 
     def __init__(self):
         super().__init__()
@@ -934,6 +962,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._exposure_end_time = None
         self._current_image_pixmap = None  # Store original pixmap for rescaling
         self._current_livestack_pixmap = None  # Store original livestack pixmap
+        self._restoring_settings = False  # Guard to prevent re-fetch during settings restore
+
+        self._image_fetch_done.connect(self._on_image_fetch_done)
 
         self._setup_ui()
         self._auto_connect()
@@ -982,6 +1013,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._create_equipment_docks()
         self._create_actions_docks()
         self._create_guiding_dock()
+        self._create_image_history_dock()
 
         # Set up View menu
         self._setup_view_menu()
@@ -1337,6 +1369,32 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         image_layout.setContentsMargins(5, 5, 5, 5)
         image_layout.setSpacing(2)
 
+        # Image quality/size settings row
+        image_settings_layout = QHBoxLayout()
+        image_settings_layout.setSpacing(8)
+
+        image_settings_layout.addWidget(QLabel("Quality:"))
+        self.image_quality_spin = QSpinBox()
+        self.image_quality_spin.setRange(-1, 100)
+        self.image_quality_spin.setValue(-1)
+        self.image_quality_spin.setToolTip("-1 = PNG (lossless), 1-100 = JPEG quality")
+        self.image_quality_spin.setFixedWidth(60)
+        self.image_quality_spin.valueChanged.connect(self._on_image_quality_changed)
+        image_settings_layout.addWidget(self.image_quality_spin)
+
+        image_settings_layout.addWidget(QLabel("Size:"))
+        self.image_size_combo = QComboBox()
+        self.image_size_combo.setEditable(True)
+        self.image_size_combo.addItems(["400x300", "800x600", "1280x960", "1920x1080"])
+        self.image_size_combo.setCurrentText("800x600")
+        self.image_size_combo.setToolTip("Image size (WxH). Type a custom value or select a preset.")
+        self.image_size_combo.setFixedWidth(110)
+        self.image_size_combo.currentTextChanged.connect(self._on_image_quality_changed)
+        image_settings_layout.addWidget(self.image_size_combo)
+
+        image_settings_layout.addStretch()
+        image_layout.addLayout(image_settings_layout, 0)
+
         self.image_label = ZoomableImageWidget(placeholder_text="No image available")
         image_layout.addWidget(self.image_label, 1)
 
@@ -1374,6 +1432,32 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         selection_layout.addStretch()
         livestack_layout.addLayout(selection_layout, 0)
+
+        # Livestack quality/size settings row
+        livestack_settings_layout = QHBoxLayout()
+        livestack_settings_layout.setSpacing(8)
+
+        livestack_settings_layout.addWidget(QLabel("Quality:"))
+        self.livestack_quality_spin = QSpinBox()
+        self.livestack_quality_spin.setRange(-1, 100)
+        self.livestack_quality_spin.setValue(100)
+        self.livestack_quality_spin.setToolTip("-1 = PNG (lossless), 1-100 = JPEG quality")
+        self.livestack_quality_spin.setFixedWidth(60)
+        self.livestack_quality_spin.valueChanged.connect(self._on_livestack_quality_changed)
+        livestack_settings_layout.addWidget(self.livestack_quality_spin)
+
+        livestack_settings_layout.addWidget(QLabel("Size:"))
+        self.livestack_size_combo = QComboBox()
+        self.livestack_size_combo.setEditable(True)
+        self.livestack_size_combo.addItems(["400x300", "800x600", "1280x960", "1920x1080"])
+        self.livestack_size_combo.setCurrentText("800x600")
+        self.livestack_size_combo.setToolTip("Image size (WxH). Type a custom value or select a preset.")
+        self.livestack_size_combo.setFixedWidth(110)
+        self.livestack_size_combo.currentTextChanged.connect(self._on_livestack_quality_changed)
+        livestack_settings_layout.addWidget(self.livestack_size_combo)
+
+        livestack_settings_layout.addStretch()
+        livestack_layout.addLayout(livestack_settings_layout, 0)
 
         # Track available stacks to avoid unnecessary updates
         self._livestack_available_stacks = []
@@ -1416,6 +1500,33 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         self.guiding_dock.setWidget(guiding_widget)
 
+    def _create_image_history_dock(self):
+        """Create the Image History dock widget."""
+        self.image_history_dock = QDockWidget("Image History", self)
+        self.image_history_dock.setObjectName("ImageHistoryDock")
+        self.image_history_dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea |
+            Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea
+        )
+        self.image_history_dock.setFeatures(
+            QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable
+        )
+
+        history_widget = QWidget()
+        history_layout = QVBoxLayout(history_widget)
+        history_layout.setContentsMargins(5, 5, 5, 5)
+
+        self.image_history_list = QListWidget()
+        self.image_history_list.setViewMode(QListWidget.IconMode)
+        self.image_history_list.setIconSize(QSize(80, 60))
+        self.image_history_list.setGridSize(QSize(90, 80))
+        self.image_history_list.setResizeMode(QListWidget.Adjust)
+        self.image_history_list.setMovement(QListWidget.Static)
+        self.image_history_list.itemClicked.connect(self._on_history_item_clicked)
+        history_layout.addWidget(self.image_history_list)
+
+        self.image_history_dock.setWidget(history_widget)
+
     def _setup_view_menu(self):
         """Set up the View menu for panel visibility and layout reset."""
         view_menu = self.menuBar().addMenu("View")
@@ -1435,6 +1546,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         equipment_menu.addAction(self.focuser_dock.toggleViewAction())
 
         view_menu.addAction(self.guiding_dock.toggleViewAction())
+        view_menu.addAction(self.image_history_dock.toggleViewAction())
         view_menu.addSeparator()
         reset_action = view_menu.addAction("Reset Layout")
         reset_action.triggered.connect(self._reset_layout)
@@ -1473,6 +1585,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         # Add guiding graph at bottom
         self.addDockWidget(Qt.BottomDockWidgetArea, self.guiding_dock)
 
+        # Add image history on right
+        self.addDockWidget(Qt.RightDockWidgetArea, self.image_history_dock)
+
         # Set initial sizes
         self.resizeDocks([self.imaging_dock], [60], Qt.Vertical)  # Compact height for imaging
         self.resizeDocks([self.camera_dock], [250], Qt.Horizontal)
@@ -1491,6 +1606,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.removeDockWidget(self.filterwheel_dock)
         self.removeDockWidget(self.focuser_dock)
         self.removeDockWidget(self.guiding_dock)
+        self.removeDockWidget(self.image_history_dock)
 
         # Re-add in default positions
         self._set_default_layout()
@@ -1506,10 +1622,27 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.filterwheel_dock.show()
         self.focuser_dock.show()
         self.guiding_dock.show()
+        self.image_history_dock.show()
 
     def _restore_settings(self):
-        """Restore saved dock layout and refresh rate."""
+        """Restore saved dock layout, refresh rate, and image quality settings."""
         settings = QSettings("CosmosCollection", "CosmosCollection")
+
+        # Restore image quality/size settings (suppress re-fetch during restore)
+        self._restoring_settings = True
+        image_quality = settings.value("nina_image_quality", -1, type=int)
+        image_size = settings.value("nina_image_size", "800x600", type=str)
+        livestack_quality = settings.value("nina_livestack_quality", 100, type=int)
+        livestack_size = settings.value("nina_livestack_size", "800x600", type=str)
+
+        self.image_quality_spin.setValue(image_quality)
+        self.image_size_combo.setCurrentText(image_size)
+        self.livestack_quality_spin.setValue(livestack_quality)
+        self.livestack_size_combo.setCurrentText(livestack_size)
+        self._restoring_settings = False
+
+        # Apply to worker if already running
+        self._apply_image_settings_to_worker()
 
         # Check for saved dock state
         dock_state = settings.value("nina_dashboard_dock_state")
@@ -1537,6 +1670,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.addDockWidget(Qt.LeftDockWidgetArea, self.filterwheel_dock)
                 self.addDockWidget(Qt.LeftDockWidgetArea, self.focuser_dock)
                 self.addDockWidget(Qt.BottomDockWidgetArea, self.guiding_dock)
+                self.addDockWidget(Qt.RightDockWidgetArea, self.image_history_dock)
                 self.restoreState(state_bytes)
                 logger.debug(f"Restored dock state, size={state_bytes.size()}")
             else:
@@ -1560,6 +1694,12 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         state_bytes = bytes(dock_state.data())
         settings.setValue("nina_dashboard_dock_state", state_bytes)
         logger.debug(f"Saved dock state, size={dock_state.size()}")
+
+        # Save image quality/size settings
+        settings.setValue("nina_image_quality", self.image_quality_spin.value())
+        settings.setValue("nina_image_size", self.image_size_combo.currentText())
+        settings.setValue("nina_livestack_quality", self.livestack_quality_spin.value())
+        settings.setValue("nina_livestack_size", self.livestack_size_combo.currentText())
 
         settings.sync()
 
@@ -1592,6 +1732,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.worker.guiding_updated.connect(self._on_guiding_updated)
         self.worker.event_occurred.connect(self._on_event_occurred)
         self.worker.error_occurred.connect(self._on_error)
+        self.worker.history_thumbnail.connect(self._on_history_thumbnail)
+        self._apply_image_settings_to_worker()
         self.worker.start()
 
     def _stop_worker(self):
@@ -2098,6 +2240,52 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         else:
             self.image_info_label.setText("Target: -- | Exp: --")
 
+    def _on_history_thumbnail(self, index, thumb_data):
+        """Handle a history thumbnail from the worker."""
+        pixmap = QPixmap()
+        pixmap.loadFromData(thumb_data)
+        if pixmap.isNull():
+            return
+
+        item = QListWidgetItem(QIcon(pixmap), f"#{index}")
+        item.setData(Qt.UserRole, index)
+
+        # If this index is newer than anything in the list, prepend; otherwise append
+        if self.image_history_list.count() > 0:
+            first_item = self.image_history_list.item(0)
+            existing_max = first_item.data(Qt.UserRole) if first_item else -1
+            if index > existing_max:
+                self.image_history_list.insertItem(0, item)
+                return
+        self.image_history_list.addItem(item)
+
+    def _on_history_item_clicked(self, item):
+        """Handle click on a history thumbnail - load full size in background."""
+        index = item.data(Qt.UserRole)
+        if index is None:
+            return
+
+        host, port = NINAIntegration.get_settings()
+        quality = self.image_quality_spin.value()
+        size_wh = self.image_size_combo.currentText()
+
+        def fetch():
+            image_data, _ = NINAIntegration.get_image(
+                host, port, index, quality=quality, size_wh=size_wh
+            )
+            return image_data
+
+        self._run_in_background(fetch, lambda data: self._image_fetch_done.emit(data) if data else None)
+
+    def _on_image_fetch_done(self, image_data):
+        """Handle completed background image fetch for history click."""
+        if image_data:
+            pixmap = QPixmap()
+            pixmap.loadFromData(image_data)
+            if not pixmap.isNull():
+                self._current_image_pixmap = pixmap
+                self.image_label.setPixmap(pixmap)
+
     def _on_livestack_updated(self, image_data, status, available_stacks):
         """Handle livestack update from worker."""
         is_running = status.get('running', False)
@@ -2202,6 +2390,48 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         # Update worker with new selection
         if hasattr(self, 'worker') and self.worker:
             self.worker.set_livestack_selection(target, filter_name)
+
+    def _apply_image_settings_to_worker(self):
+        """Push current quality/size settings to the worker thread."""
+        if hasattr(self, 'worker') and self.worker:
+            self.worker.set_image_quality_settings(
+                self.image_quality_spin.value(),
+                self.image_size_combo.currentText(),
+                self.livestack_quality_spin.value(),
+                self.livestack_size_combo.currentText(),
+            )
+
+    def _on_image_quality_changed(self):
+        """Handle user changing the latest-image quality or size."""
+        if self._restoring_settings:
+            return
+        self._apply_image_settings_to_worker()
+        # Re-fetch current image at new quality/size
+        if self._connected and hasattr(self, 'worker') and self.worker:
+            host, port = self.worker.host, self.worker.port
+            index = self.worker._last_image_index
+            if index >= 0:
+                quality = self.image_quality_spin.value()
+                size_wh = self.image_size_combo.currentText()
+
+                def fetch():
+                    data, _ = NINAIntegration.get_image(
+                        host, port, index, quality=quality, size_wh=size_wh
+                    )
+                    return data
+
+                self._run_in_background(
+                    fetch, lambda data: self._image_fetch_done.emit(data) if data else None
+                )
+
+    def _on_livestack_quality_changed(self):
+        """Handle user changing the livestack quality or size."""
+        if self._restoring_settings:
+            return
+        self._apply_image_settings_to_worker()
+        # Force re-fetch on next poll by resetting stack count tracker
+        if hasattr(self, 'worker') and self.worker:
+            self.worker._last_livestack_count = None
 
     def _on_guiding_updated(self, guiding_data):
         """Handle guiding data update from worker."""

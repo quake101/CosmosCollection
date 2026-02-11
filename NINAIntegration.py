@@ -937,7 +937,7 @@ class NINAIntegration:
             return False
 
     @staticmethod
-    def get_image_thumbnail(host, port, index=0, size=300):
+    def get_image_thumbnail(host, port, index=0, size=300, quality=-1, size_wh=None):
         """
         Get an image thumbnail from NINA.
 
@@ -945,14 +945,25 @@ class NINAIntegration:
             host: The hostname or IP address of the NINA instance
             port: The API port number
             index: Image index (0 = most recent, or use negative for latest)
-            size: Thumbnail size in pixels (default 300)
+            size: Thumbnail size in pixels (default 300, used as fallback)
+            quality: JPEG quality 1-100, or -1 for PNG (default -1)
+            size_wh: Size as "WxH" string (e.g. "800x600"). If provided, uses
+                     resize=true with this size instead of the simple size param.
 
         Returns:
             tuple: (bytes image data, dict metadata) on success, (None, None) on failure
         """
-        # The API uses /image/thumbnail/{index} with size as query param
-        # Try index -1 for latest, or 0 for first
-        url = f"http://{host}:{port}/v2/api/image/thumbnail/{index}?size={size}&stream=true"
+        # Build URL based on quality and size parameters
+        if size_wh and quality != -1:
+            # JPEG with resize
+            url = (f"http://{host}:{port}/v2/api/image/thumbnail/{index}"
+                   f"?quality={quality}&stream=true&resize=true&size={size_wh}")
+        elif size_wh:
+            # PNG with resize - extract width from WxH for size param
+            w = size_wh.split('x')[0] if 'x' in size_wh else size_wh
+            url = f"http://{host}:{port}/v2/api/image/thumbnail/{index}?size={w}&stream=true"
+        else:
+            url = f"http://{host}:{port}/v2/api/image/thumbnail/{index}?size={size}&stream=true"
 
         logger.debug(f"Fetching image thumbnail from: {url}")
         try:
@@ -987,6 +998,51 @@ class NINAIntegration:
             return None, None
         except Exception as e:
             logger.debug(f"Error getting image thumbnail: {e}")
+            return None, None
+
+    @staticmethod
+    def get_image(host, port, index=0, quality=-1, size_wh=None):
+        """
+        Get a full image from NINA using the /image/{index} endpoint.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            index: Image index (0 = most recent)
+            quality: JPEG quality 1-100, or -1 for PNG (default -1)
+            size_wh: Size as "WxH" string (e.g. "800x600"). If provided, uses
+                     resize=true with this size.
+
+        Returns:
+            tuple: (bytes image data, dict metadata) on success, (None, None) on failure
+        """
+        params = ["stream=true"]
+        if quality != -1:
+            params.append(f"quality={quality}")
+        if size_wh:
+            params.append("resize=true")
+            params.append(f"size={size_wh}")
+        query = "&".join(params)
+        url = f"http://{host}:{port}/v2/api/image/{index}?{query}"
+
+        logger.debug(f"Fetching image from: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=15) as response:
+                content_type = response.headers.get('Content-Type', '')
+                logger.debug(f"Image response Content-Type: {content_type}")
+                if 'image' in content_type:
+                    data = response.read()
+                    logger.debug(f"Image data size: {len(data)} bytes")
+                    return data, {}
+                data = response.read().decode('utf-8')
+                logger.debug(f"Image JSON response: {data[:500]}")
+                return None, None
+        except urllib.error.HTTPError as e:
+            logger.debug(f"HTTP Error getting image: {e.code} {e.reason} for URL {url}")
+            return None, None
+        except Exception as e:
+            logger.debug(f"Error getting image: {e}")
             return None, None
 
     @staticmethod
@@ -1099,7 +1155,7 @@ class NINAIntegration:
         return actual_target, actual_filter
 
     @staticmethod
-    def fetch_livestack_image_data(host, port, target, filter_name):
+    def fetch_livestack_image_data(host, port, target, filter_name, quality=100, size="800x600"):
         """
         Fetch the livestack image for a resolved target/filter.
 
@@ -1108,16 +1164,18 @@ class NINAIntegration:
             port: The API port number
             target: Resolved target name
             filter_name: Resolved filter name
+            quality: JPEG quality 1-100, or -1 for PNG (default 100)
+            size: Size as "WxH" string (default "800x600")
 
         Returns:
-            bytes: JPEG image data on success, None on failure
+            bytes: Image data on success, None on failure
         """
         try:
             encoded_target = urllib.parse.quote(target, safe='')
             encoded_filter = urllib.parse.quote(filter_name, safe='')
             image_url = (f"http://{host}:{port}/v2/api/livestack/image/"
                          f"{encoded_target}/{encoded_filter}"
-                         f"?quality=100&stream=true&resize=true&size=800x600")
+                         f"?quality={quality}&stream=true&resize=true&size={size}")
             request = urllib.request.Request(image_url)
             with urllib.request.urlopen(request, timeout=10) as response:
                 content_type = response.headers.get('Content-Type', '')
