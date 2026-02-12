@@ -766,26 +766,12 @@ class DayWeatherCard(QFrame):
 
         layout.addSpacing(5)
 
-        # Cloud cover (tonight's average - dark hours only)
-        cloud_label = QLabel(f"{self.summary.tonight_avg_cloud_cover:.0f}%")
-        cloud_label.setAlignment(Qt.AlignCenter)
-        cloud_label.setStyleSheet("font-size: 16pt; font-weight: bold;")
-        layout.addWidget(cloud_label)
-
-        cloud_text = QLabel("clouds")
-        cloud_text.setAlignment(Qt.AlignCenter)
-        cloud_text.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt;")
-        cloud_text.setToolTip("Average cloud cover for dark hours (sun altitude < -12°)")
-        layout.addWidget(cloud_text)
-
-        layout.addSpacing(5)
-
         # Rating
         rating_color = get_rating_color(self.summary.astro_score)
         rating_label = get_rating_label(self.summary.astro_score)
         rating_text = QLabel(rating_label)
         rating_text.setAlignment(Qt.AlignCenter)
-        rating_text.setStyleSheet(f"color: {rating_color}; font-weight: bold; font-size: 10pt;")
+        rating_text.setStyleSheet(f"color: {rating_color}; font-weight: bold; font-size: 12pt;")
         layout.addWidget(rating_text)
 
         # Score
@@ -794,6 +780,20 @@ class DayWeatherCard(QFrame):
         score_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt;")
         score_label.setToolTip("Astro Score")
         layout.addWidget(score_label)
+
+        layout.addSpacing(5)
+
+        # Cloud cover (tonight's average - dark hours only)
+        cloud_label = QLabel(f"{self.summary.tonight_avg_cloud_cover:.0f}%")
+        cloud_label.setAlignment(Qt.AlignCenter)
+        cloud_label.setStyleSheet("font-size: 12pt; font-weight: bold;")
+        layout.addWidget(cloud_label)
+
+        cloud_text = QLabel("clouds")
+        cloud_text.setAlignment(Qt.AlignCenter)
+        cloud_text.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt;")
+        cloud_text.setToolTip("Average cloud cover for dark hours (sun altitude < -12°)")
+        layout.addWidget(cloud_text)
 
         # Moon phase (compact display)
         if self.summary.moon_phase:
