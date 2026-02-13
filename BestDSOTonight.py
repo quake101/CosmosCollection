@@ -559,6 +559,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
     def __init__(self, use_target_list=False):
         super().__init__()
+        self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("Best DSO Tonight - Cosmos Collection")
         self.resize(930, 920)
         self.auto_use_target_list = use_target_list

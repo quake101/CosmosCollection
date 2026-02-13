@@ -486,6 +486,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
     
     def __init__(self):
         super().__init__()
+        self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("DSO Target List - Cosmos Collection")
         self.resize(1210, 850)
         self.setup_window_position()

@@ -949,6 +949,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("NINA Dashboard - Cosmos Collection")
         self.resize(900, 700)
         self.setup_window_position()

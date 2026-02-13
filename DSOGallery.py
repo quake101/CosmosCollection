@@ -808,6 +808,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     def __init__(self):
         """Initialize DSO Image Gallery window"""
         super().__init__()
+        self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("DSO Image Gallery - Cosmos Collection")
         self.resize(1200, 800)
 

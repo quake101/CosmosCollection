@@ -1412,6 +1412,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("Weather Forecast - Cosmos Collection")
         self.resize(815, 500)
         self.setup_window_position()
