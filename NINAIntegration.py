@@ -874,6 +874,70 @@ class NINAIntegration:
             return None
 
     @staticmethod
+    def get_capture_statistics(host, port):
+        """
+        Get capture statistics from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            dict: Capture statistics dict on success, None on failure
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/camera/capture/statistics"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('Success'):
+                    resp = result.get('Response')
+                    return resp if isinstance(resp, dict) else None
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting capture statistics: {e}")
+            return None
+
+    @staticmethod
+    def get_image_statistics(host, port, index=None):
+        """
+        Get image history/statistics from NINA using the image-history endpoint.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            index: Optional image index to get stats for a specific image.
+                   If None, gets the latest image (all=false).
+
+        Returns:
+            dict: Image history entry on success, None on failure.
+                  Keys include: Stars, HFR, HFRStDev, Median, Mean, StDev, Min, Max,
+                  ExposureTime, Filter, Gain, Offset, Temperature, TargetName,
+                  ImageType, Filename, Date, CameraName, TelescopeName, etc.
+        """
+        params = []
+        if index is not None:
+            params.append(f"index={index}")
+        else:
+            params.append("all=false")
+        params.append("imageType=LIGHT")
+        query = "&".join(params)
+        url = f"http://{host}:{port}/v2/api/image-history?{query}"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                resp = result.get('Response')
+                if isinstance(resp, list) and len(resp) > 0:
+                    return resp[-1]  # Return the last (most recent) entry
+                elif isinstance(resp, dict):
+                    return resp
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting image history: {e}")
+            return None
+
+    @staticmethod
     def get_image_count(host, port):
         """
         Get the count of images by probing for the highest valid index.
@@ -957,13 +1021,13 @@ class NINAIntegration:
         if size_wh and quality != -1:
             # JPEG with resize
             url = (f"http://{host}:{port}/v2/api/image/thumbnail/{index}"
-                   f"?quality={quality}&stream=true&resize=true&size={size_wh}")
+                   f"?quality={quality}&stream=true&resize=true&size={size_wh}&debayer=true")
         elif size_wh:
             # PNG with resize - extract width from WxH for size param
             w = size_wh.split('x')[0] if 'x' in size_wh else size_wh
-            url = f"http://{host}:{port}/v2/api/image/thumbnail/{index}?size={w}&stream=true"
+            url = f"http://{host}:{port}/v2/api/image/thumbnail/{index}?size={w}&stream=true&debayer=true"
         else:
-            url = f"http://{host}:{port}/v2/api/image/thumbnail/{index}?size={size}&stream=true"
+            url = f"http://{host}:{port}/v2/api/image/thumbnail/{index}?size={size}&stream=true&debayer=true"
 
         logger.debug(f"Fetching image thumbnail from: {url}")
         try:
@@ -1001,7 +1065,7 @@ class NINAIntegration:
             return None, None
 
     @staticmethod
-    def get_image(host, port, index=0, quality=-1, size_wh=None):
+    def get_image(host, port, index=0, quality=-1, size_wh=None, progress_callback=None):
         """
         Get a full image from NINA using the /image/{index} endpoint.
 
@@ -1012,11 +1076,13 @@ class NINAIntegration:
             quality: JPEG quality 1-100, or -1 for PNG (default -1)
             size_wh: Size as "WxH" string (e.g. "800x600"). If provided, uses
                      resize=true with this size.
+            progress_callback: Optional callable(bytes_received, total_bytes).
+                               total_bytes is -1 if Content-Length is not available.
 
         Returns:
             tuple: (bytes image data, dict metadata) on success, (None, None) on failure
         """
-        params = ["stream=true"]
+        params = ["stream=true", "debayer=true"]
         if quality != -1:
             params.append(f"quality={quality}")
         if size_wh:
@@ -1032,7 +1098,23 @@ class NINAIntegration:
                 content_type = response.headers.get('Content-Type', '')
                 logger.debug(f"Image response Content-Type: {content_type}")
                 if 'image' in content_type:
-                    data = response.read()
+                    total = int(response.headers.get('Content-Length', -1))
+                    if progress_callback and total > 0:
+                        chunks = []
+                        received = 0
+                        chunk_size = 65536
+                        while True:
+                            chunk = response.read(chunk_size)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                            received += len(chunk)
+                            progress_callback(received, total)
+                        data = b''.join(chunks)
+                    else:
+                        if progress_callback:
+                            progress_callback(0, -1)
+                        data = response.read()
                     logger.debug(f"Image data size: {len(data)} bytes")
                     return data, {}
                 data = response.read().decode('utf-8')
@@ -1044,6 +1126,37 @@ class NINAIntegration:
         except Exception as e:
             logger.debug(f"Error getting image: {e}")
             return None, None
+
+    @staticmethod
+    def get_prepared_image(host, port, quality=80, size_wh="800x600"):
+        """
+        Get the camera's current prepared image (what NINA shows in its imaging tab).
+
+        Useful for framing, focusing, and monitoring the camera in real-time.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            quality: JPEG quality 1-100 (default 80)
+            size_wh: Size as "WxH" string (default "800x600")
+
+        Returns:
+            bytes: Image data on success, None on failure
+        """
+        url = (f"http://{host}:{port}/v2/api/prepared-image"
+               f"?quality={quality}&resize=true&size={size_wh}"
+               f"&stream=true&autoPrepare=true&debayer=true")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=3) as response:
+                content_type = response.headers.get('Content-Type', '')
+                if 'image' in content_type:
+                    data = response.read()
+                    return data
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting prepared image: {e}")
+            return None
 
     @staticmethod
     def get_livestack_status(host, port):
@@ -1155,7 +1268,8 @@ class NINAIntegration:
         return actual_target, actual_filter
 
     @staticmethod
-    def fetch_livestack_image_data(host, port, target, filter_name, quality=100, size="800x600"):
+    def fetch_livestack_image_data(host, port, target, filter_name, quality=100, size="800x600",
+                                    progress_callback=None):
         """
         Fetch the livestack image for a resolved target/filter.
 
@@ -1166,6 +1280,8 @@ class NINAIntegration:
             filter_name: Resolved filter name
             quality: JPEG quality 1-100, or -1 for PNG (default 100)
             size: Size as "WxH" string (default "800x600")
+            progress_callback: Optional callable(bytes_received, total_bytes).
+                               total_bytes is -1 if Content-Length is not available.
 
         Returns:
             bytes: Image data on success, None on failure
@@ -1180,7 +1296,21 @@ class NINAIntegration:
             with urllib.request.urlopen(request, timeout=10) as response:
                 content_type = response.headers.get('Content-Type', '')
                 if 'image' in content_type:
-                    data = response.read()
+                    total = int(response.headers.get('Content-Length', -1))
+                    if progress_callback and total > 0:
+                        chunks = []
+                        received = 0
+                        chunk_size = 65536
+                        while True:
+                            chunk = response.read(chunk_size)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                            received += len(chunk)
+                            progress_callback(received, total)
+                        data = b''.join(chunks)
+                    else:
+                        data = response.read()
                     logger.debug(f"API Response: livestack image data, {len(data)} bytes")
                     return data
                 return None

@@ -187,12 +187,15 @@ class NINAStatusWorker(QThread):
 
     status_updated = Signal(dict)  # Emits combined status data
     image_updated = Signal(bytes, dict)  # Emits image data and metadata
+    image_fetching = Signal(int, int)  # Emits (bytes_received, total_bytes); total_bytes=-1 if unknown
     livestack_updated = Signal(bytes, dict, list)  # Emits livestack image, status, and available stacks
+    livestack_fetching = Signal(int, int)  # Emits (bytes_received, total_bytes); total_bytes=-1 if unknown
+    liveview_updated = Signal(bytes)  # Emits prepared image JPEG frame data
     guiding_updated = Signal(list)  # Emits guiding graph data points
     event_occurred = Signal(dict)  # Emits new NINA event data
     error_occurred = Signal(str)  # Emits error message
     connection_changed = Signal(bool, str, str, int)  # Emits connected state, version, host, port
-    history_thumbnail = Signal(int, bytes)  # Emits (index, small_thumbnail_data)
+    history_thumbnail = Signal(int, bytes, dict)  # Emits (index, small_thumbnail_data, image_stats)
 
     # Adaptive polling rates
     POLL_RATE_ACTIVE = 0.5  # when exposing/guiding
@@ -216,13 +219,20 @@ class NINAStatusWorker(QThread):
         self._livestack_target = None  # User-selected livestack target
         self._livestack_filter = None  # User-selected livestack filter
         self._consecutive_failures = 0  # Track consecutive API failures to detect disconnect
-        self._version = ""  # Store NINA version for reconnection
+        self._version = ""  # Store NINA API version
         self._last_event_time = None  # Track last processed event timestamp
         # Image quality/size settings
         self._image_quality = -1  # -1 = PNG (lossless)
         self._image_size = "1920x1080"
         self._livestack_quality = 100
         self._livestack_size = "1920x1080"
+        # Live view settings
+        self._liveview_active = False
+        self._liveview_quality = 80
+        self._liveview_size = "800x600"
+        # Active image tab (0=Live View, 1=Latest Image, 2=Live Stack)
+        self._active_image_tab = 1
+        self._pending_image_fetch = False  # New image detected while not on Latest Image tab
 
     def set_image_quality_settings(self, image_quality, image_size, livestack_quality, livestack_size):
         """Update image quality/size settings (thread-safe for primitive types)."""
@@ -277,6 +287,12 @@ class NINAStatusWorker(QThread):
                 if focuser_info and isinstance(focuser_info, dict):
                     status_data['focuser'] = focuser_info
 
+                # Use image-history endpoint for statistics (more reliable than capture/statistics)
+                if self._last_image_index >= 0:
+                    statistics = NINAIntegration.get_image_statistics(self.host, self.port, self._last_image_index)
+                    if statistics and isinstance(statistics, dict):
+                        status_data['statistics'] = statistics
+
                 # Always emit status update so UI can show current state
                 self.status_updated.emit(status_data)
 
@@ -306,7 +322,7 @@ class NINAStatusWorker(QThread):
                         self.connection_changed.emit(False, "", self.host, self.port)
                         # Keep counting but don't reset - we want to stay disconnected
 
-                # Fetch image thumbnail based on exposure state
+                # --- Exposure state tracking (always runs, no API calls) ---
                 if self._fetch_images:
                     camera = status_data.get('camera', {})
                     is_exposing = camera.get('IsExposing', False) if isinstance(camera, dict) else False
@@ -349,104 +365,146 @@ class NINAStatusWorker(QThread):
 
                     self._was_exposing = is_exposing
 
-                    # Initial fetch on startup - find and display the latest image (only once)
-                    if not self._initial_image_check_done:
-                        self._initial_image_check_done = True
-                        image_count = NINAIntegration.get_image_count(self.host, self.port)
-                        if image_count > 0:
-                            self._last_image_index = image_count - 1
-                            logger.debug(f"Initial image fetch (index {self._last_image_index})")
-                            image_data, image_meta = NINAIntegration.get_image(
-                                self.host, self.port, self._last_image_index,
-                                quality=self._image_quality, size_wh=self._image_size
-                            )
-                            if image_data:
-                                self.image_updated.emit(image_data, image_meta or {})
-                            # Load history thumbnails for last 20 images
-                            for idx in range(self._last_image_index, max(self._last_image_index - 20, -1), -1):
-                                thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, idx, 200)
-                                if thumb_data:
-                                    self.history_thumbnail.emit(idx, thumb_data)
-                        else:
-                            logger.debug("No images available yet, waiting for first exposure")
-
-                    # Keep checking for new image after exposure completes
-                    elif self._waiting_for_new_image:
-                        # If no images exist yet, check for index 0, otherwise check next index
-                        next_index = 0 if self._last_image_index == -1 else self._last_image_index + 1
-                        if NINAIntegration._image_exists(self.host, self.port, next_index):
-                            logger.debug(f"New image available at index {next_index}")
-                            self._last_image_index = next_index
-                            self._waiting_for_new_image = False
-                            image_data, image_meta = NINAIntegration.get_image(
-                                self.host, self.port, next_index,
-                                quality=self._image_quality, size_wh=self._image_size
-                            )
-                            if image_data:
-                                self.image_updated.emit(image_data, image_meta or {})
-                            # Emit history thumbnail for the new image
-                            thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, next_index, 200)
-                            if thumb_data:
-                                self.history_thumbnail.emit(next_index, thumb_data)
-
-                # Fetch livestack status and image
-                livestack_status = NINAIntegration.get_livestack_status(self.host, self.port)
-                is_livestacking = (livestack_status and
-                                   isinstance(livestack_status, dict) and
-                                   livestack_status.get('running', False))
-                if is_livestacking:
-                    # Get available stacks for the dropdown
-                    available_stacks = NINAIntegration.get_livestack_available(self.host, self.port)
-
-                    # Resolve which target/filter to display
-                    actual_target, actual_filter = NINAIntegration.resolve_livestack_selection(
-                        available_stacks, self._livestack_target, self._livestack_filter
-                    )
-                    if actual_target and actual_filter:
-                        self._last_livestack_running = True
-                        livestack_status['selected_target'] = actual_target
-                        livestack_status['selected_filter'] = actual_filter
-
-                        # Fetch lightweight info to check stack count
-                        livestack_info = NINAIntegration.get_livestack_info(
-                            self.host, self.port, actual_target, actual_filter
-                        )
-                        if livestack_info:
-                            livestack_status.update(livestack_info)
-
-                        # Determine current stack count from info
-                        current_count = None
-                        if livestack_info:
-                            current_count = (livestack_info.get('StackCount')
-                                             or livestack_info.get('RedStackCount')
-                                             or livestack_info.get('GreenStackCount')
-                                             or livestack_info.get('BlueStackCount'))
-
-                        # Only fetch the image when stack count changes (or first time)
-                        if current_count != self._last_livestack_count:
-                            self._last_livestack_count = current_count
-                            livestack_image = NINAIntegration.fetch_livestack_image_data(
-                                self.host, self.port, actual_target, actual_filter,
-                                quality=self._livestack_quality, size=self._livestack_size
-                            )
-                            if livestack_image:
-                                self.livestack_updated.emit(livestack_image, livestack_status, available_stacks)
+                    # --- Latest Image fetching (only when tab 1 is active) ---
+                    if self._active_image_tab == 1:
+                        # Initial fetch on startup - find and display the latest image (only once)
+                        if not self._initial_image_check_done:
+                            self._initial_image_check_done = True
+                            image_count = NINAIntegration.get_image_count(self.host, self.port)
+                            if image_count > 0:
+                                self._last_image_index = image_count - 1
+                                logger.debug(f"Initial image fetch (index {self._last_image_index})")
+                                self.image_fetching.emit(0, -1)
+                                image_data, _ = NINAIntegration.get_image(
+                                    self.host, self.port, self._last_image_index,
+                                    quality=self._image_quality, size_wh=self._image_size,
+                                    progress_callback=lambda recv, total: self.image_fetching.emit(recv, total)
+                                )
+                                self.image_fetching.emit(-1, -1)
+                                if image_data:
+                                    self.image_updated.emit(image_data, status_data)
+                                # Load history thumbnails for last 20 images
+                                for idx in range(self._last_image_index, max(self._last_image_index - 20, -1), -1):
+                                    thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, idx, 200)
+                                    if thumb_data:
+                                        stats = NINAIntegration.get_image_statistics(self.host, self.port, idx) or {}
+                                        self.history_thumbnail.emit(idx, thumb_data, stats)
                             else:
+                                logger.debug("No images available yet, waiting for first exposure")
+
+                        # Check for pending image that was detected while on another tab
+                        elif self._pending_image_fetch:
+                            self._pending_image_fetch = False
+                            if self._last_image_index >= 0:
+                                logger.debug(f"Fetching pending image at index {self._last_image_index}")
+                                self.image_fetching.emit(0, -1)
+                                image_data, _ = NINAIntegration.get_image(
+                                    self.host, self.port, self._last_image_index,
+                                    quality=self._image_quality, size_wh=self._image_size,
+                                    progress_callback=lambda recv, total: self.image_fetching.emit(recv, total)
+                                )
+                                self.image_fetching.emit(-1, -1)
+                                if image_data:
+                                    self.image_updated.emit(image_data, status_data)
+                                thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, self._last_image_index, 200)
+                                if thumb_data:
+                                    stats = NINAIntegration.get_image_statistics(self.host, self.port, self._last_image_index) or {}
+                                    self.history_thumbnail.emit(self._last_image_index, thumb_data, stats)
+
+                        # Keep checking for new image after exposure completes
+                        elif self._waiting_for_new_image:
+                            # If no images exist yet, check for index 0, otherwise check next index
+                            next_index = 0 if self._last_image_index == -1 else self._last_image_index + 1
+                            if NINAIntegration._image_exists(self.host, self.port, next_index):
+                                logger.debug(f"New image available at index {next_index}")
+                                self._last_image_index = next_index
+                                self._waiting_for_new_image = False
+                                self.image_fetching.emit(0, -1)
+                                image_data, _ = NINAIntegration.get_image(
+                                    self.host, self.port, next_index,
+                                    quality=self._image_quality, size_wh=self._image_size,
+                                    progress_callback=lambda recv, total: self.image_fetching.emit(recv, total)
+                                )
+                                self.image_fetching.emit(-1, -1)
+                                if image_data:
+                                    self.image_updated.emit(image_data, status_data)
+                                # Emit history thumbnail for the new image
+                                thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, next_index, 200)
+                                if thumb_data:
+                                    stats = NINAIntegration.get_image_statistics(self.host, self.port, next_index) or {}
+                                    self.history_thumbnail.emit(next_index, thumb_data, stats)
+
+                    else:
+                        # Not on Latest Image tab — still detect new images, just defer the fetch
+                        if self._waiting_for_new_image:
+                            next_index = 0 if self._last_image_index == -1 else self._last_image_index + 1
+                            if NINAIntegration._image_exists(self.host, self.port, next_index):
+                                logger.debug(f"New image at index {next_index} (deferred, tab not active)")
+                                self._last_image_index = next_index
+                                self._waiting_for_new_image = False
+                                self._pending_image_fetch = True
+
+                # --- Live Stack fetching (only when tab 2 is active) ---
+                if self._active_image_tab == 2:
+                    livestack_status = NINAIntegration.get_livestack_status(self.host, self.port)
+                    is_livestacking = (livestack_status and
+                                       isinstance(livestack_status, dict) and
+                                       livestack_status.get('running', False))
+                    if is_livestacking:
+                        # Get available stacks for the dropdown
+                        available_stacks = NINAIntegration.get_livestack_available(self.host, self.port)
+
+                        # Resolve which target/filter to display
+                        actual_target, actual_filter = NINAIntegration.resolve_livestack_selection(
+                            available_stacks, self._livestack_target, self._livestack_filter
+                        )
+                        if actual_target and actual_filter:
+                            self._last_livestack_running = True
+                            livestack_status['selected_target'] = actual_target
+                            livestack_status['selected_filter'] = actual_filter
+
+                            # Fetch lightweight info to check stack count
+                            livestack_info = NINAIntegration.get_livestack_info(
+                                self.host, self.port, actual_target, actual_filter
+                            )
+                            if livestack_info:
+                                livestack_status.update(livestack_info)
+
+                            # Determine current stack count from info
+                            current_count = None
+                            if livestack_info:
+                                current_count = (livestack_info.get('StackCount')
+                                                 or livestack_info.get('RedStackCount')
+                                                 or livestack_info.get('GreenStackCount')
+                                                 or livestack_info.get('BlueStackCount'))
+
+                            # Only fetch the image when stack count changes (or first time)
+                            if current_count != self._last_livestack_count:
+                                self._last_livestack_count = current_count
+                                self.livestack_fetching.emit(0, -1)
+                                livestack_image = NINAIntegration.fetch_livestack_image_data(
+                                    self.host, self.port, actual_target, actual_filter,
+                                    quality=self._livestack_quality, size=self._livestack_size,
+                                    progress_callback=lambda recv, total: self.livestack_fetching.emit(recv, total)
+                                )
+                                if livestack_image:
+                                    self.livestack_updated.emit(livestack_image, livestack_status, available_stacks)
+                                else:
+                                    self.livestack_updated.emit(b'', livestack_status, available_stacks)
+                            else:
+                                # Stack count unchanged - emit status only (no image data)
                                 self.livestack_updated.emit(b'', livestack_status, available_stacks)
-                        else:
-                            # Stack count unchanged - emit status only (no image data)
+                        elif not self._last_livestack_running:
+                            # Livestacking is running but no stacks available yet
+                            self._last_livestack_running = True
                             self.livestack_updated.emit(b'', livestack_status, available_stacks)
-                    elif not self._last_livestack_running:
-                        # Livestacking is running but no stacks available yet
-                        self._last_livestack_running = True
-                        self.livestack_updated.emit(b'', livestack_status, available_stacks)
-                else:
-                    # Emit empty to reset tab (only if state changed)
-                    if self._last_livestack_running or self._last_livestack_count is not None:
-                        self._last_livestack_hash = None
-                        self._last_livestack_count = None
-                        self._last_livestack_running = False
-                        self.livestack_updated.emit(b'', {'running': False}, [])
+                    else:
+                        # Emit empty to reset tab (only if state changed)
+                        if self._last_livestack_running or self._last_livestack_count is not None:
+                            self._last_livestack_hash = None
+                            self._last_livestack_count = None
+                            self._last_livestack_running = False
+                            self.livestack_updated.emit(b'', {'running': False}, [])
 
                 # Fetch guiding graph data only if guider is connected and guiding
                 guider = status_data.get('guider', {})
@@ -468,14 +526,25 @@ class NINAStatusWorker(QThread):
                                 self._last_event_time = event_time
                                 self.event_occurred.emit(event)
 
+                # Fetch live view (prepared image) — only when tab 0 is active
+                if self._active_image_tab == 0 and self._liveview_active and not is_exposing:
+                    image_data = NINAIntegration.get_prepared_image(
+                        self.host, self.port,
+                        quality=self._liveview_quality,
+                        size_wh=self._liveview_size
+                    )
+                    if image_data:
+                        self.liveview_updated.emit(image_data)
+
             except Exception as e:
                 logger.error(f"Error in NINA status worker: {e}")
                 self.error_occurred.emit(str(e))
 
             # Sleep for polling interval
+            # Use faster rate (~5 FPS) when live view is active
             if self._running:
-                # Sleep in small increments (50ms) so we can stop quickly
-                sleep_iterations = int(self._poll_interval * 20)  # 50ms per iteration
+                poll = 0.2 if (self._liveview_active and self._active_image_tab == 0) else self._poll_interval
+                sleep_iterations = int(poll * 20)  # 50ms per iteration
                 for _ in range(max(1, sleep_iterations)):
                     if not self._running:
                         break
@@ -493,6 +562,21 @@ class NINAStatusWorker(QThread):
         """Set the livestack target and filter to fetch."""
         self._livestack_target = target
         self._livestack_filter = filter_name
+        # Reset cached count so the next poll fetches the image for the new selection
+        self._last_livestack_count = None
+
+    def set_liveview_active(self, active):
+        """Start or stop live view polling."""
+        self._liveview_active = active
+
+    def set_liveview_settings(self, quality, size):
+        """Update live view quality/size settings (thread-safe for primitive types)."""
+        self._liveview_quality = quality
+        self._liveview_size = size
+
+    def set_active_image_tab(self, index):
+        """Set which image tab is active (0=Live View, 1=Latest Image, 2=Live Stack)."""
+        self._active_image_tab = index
 
 
 class GuidingGraph(FigureCanvas):
@@ -945,7 +1029,7 @@ class SlewDialog(QDialog):
 class NINADashboardWindow(WindowPositionMixin, QMainWindow):
     """Main NINA Dashboard window."""
     WINDOW_POSITION_KEY = "NINADashboard"
-    _image_fetch_done = Signal(bytes)
+    _image_fetch_done = Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -959,10 +1043,12 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._connected = False
         self._version = ""
         self._last_update = None
-        self._exposure_start_time = None
         self._exposure_end_time = None
+        self._exposure_total_time = None  # Total exposure duration captured on first detection
         self._current_image_pixmap = None  # Store original pixmap for rescaling
+        self._viewing_history_index = None  # Set when viewing a historical image (not the latest)
         self._current_livestack_pixmap = None  # Store original livestack pixmap
+        self._current_liveview_pixmap = None  # Store original liveview pixmap
         self._restoring_settings = False  # Guard to prevent re-fetch during settings restore
 
         self._image_fetch_done.connect(self._on_image_fetch_done)
@@ -1047,20 +1133,17 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         camera_layout.addWidget(QLabel("Status:"), 1, 0)
         self.camera_status_label = QLabel("--")
         camera_layout.addWidget(self.camera_status_label, 1, 1)
-        camera_layout.addWidget(QLabel("Exposure:"), 2, 0)
-        self.camera_exposure_label = QLabel("--")
-        camera_layout.addWidget(self.camera_exposure_label, 2, 1)
-        camera_layout.addWidget(QLabel("Progress:"), 3, 0)
+        camera_layout.addWidget(QLabel("Progress:"), 2, 0)
         self.camera_progress = QProgressBar()
         self.camera_progress.setMaximum(100)
         self.camera_progress.setValue(0)
-        camera_layout.addWidget(self.camera_progress, 3, 1)
-        camera_layout.addWidget(QLabel("Temp:"), 4, 0)
+        camera_layout.addWidget(self.camera_progress, 2, 1)
+        camera_layout.addWidget(QLabel("Temp:"), 3, 0)
         self.camera_temp_label = QLabel("--")
-        camera_layout.addWidget(self.camera_temp_label, 4, 1)
+        camera_layout.addWidget(self.camera_temp_label, 3, 1)
 
         # Cooling controls
-        camera_layout.addWidget(QLabel("Cooling:"), 5, 0)
+        camera_layout.addWidget(QLabel("Cooling:"), 4, 0)
         cooling_widget = QWidget()
         cooling_layout = QHBoxLayout(cooling_widget)
         cooling_layout.setContentsMargins(0, 0, 0, 0)
@@ -1079,16 +1162,16 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.camera_target_temp_spinbox.valueChanged.connect(self._on_target_temp_changed)
         cooling_layout.addWidget(self.camera_target_temp_spinbox)
         cooling_layout.addStretch()
-        camera_layout.addWidget(cooling_widget, 5, 1)
+        camera_layout.addWidget(cooling_widget, 4, 1)
 
         # Dew heater control
-        camera_layout.addWidget(QLabel("Dew Heater:"), 6, 0)
+        camera_layout.addWidget(QLabel("Dew Heater:"), 5, 0)
         self.camera_dewheater_checkbox = QCheckBox("On")
         self.camera_dewheater_checkbox.setToolTip("Enable/disable dew heater")
         self.camera_dewheater_checkbox.stateChanged.connect(self._on_dewheater_changed)
-        camera_layout.addWidget(self.camera_dewheater_checkbox, 6, 1)
+        camera_layout.addWidget(self.camera_dewheater_checkbox, 5, 1)
 
-        camera_layout.setRowStretch(7, 1)
+        camera_layout.setRowStretch(6, 1)
 
         # Track if we're updating from API to avoid triggering callbacks
         self._updating_camera_controls = False
@@ -1211,6 +1294,44 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         focuser_layout.setRowStretch(4, 1)
 
         self.focuser_dock.setWidget(focuser_widget)
+
+        # Statistics dock
+        self.statistics_dock = QDockWidget("Statistics", self)
+        self.statistics_dock.setObjectName("StatisticsDock")
+        self.statistics_dock.setAllowedAreas(dock_areas)
+        self.statistics_dock.setFeatures(dock_features)
+
+        statistics_widget = QWidget()
+        statistics_layout = QGridLayout(statistics_widget)
+        statistics_layout.setContentsMargins(8, 8, 8, 8)
+
+        statistics_layout.addWidget(QLabel("Stars:"), 0, 0)
+        self.stats_stars_label = QLabel("--")
+        statistics_layout.addWidget(self.stats_stars_label, 0, 1)
+        statistics_layout.addWidget(QLabel("HFR:"), 1, 0)
+        self.stats_hfr_label = QLabel("--")
+        statistics_layout.addWidget(self.stats_hfr_label, 1, 1)
+        statistics_layout.addWidget(QLabel("Median:"), 2, 0)
+        self.stats_median_label = QLabel("--")
+        statistics_layout.addWidget(self.stats_median_label, 2, 1)
+        statistics_layout.addWidget(QLabel("HFR StDev:"), 3, 0)
+        self.stats_hfrstdev_label = QLabel("--")
+        statistics_layout.addWidget(self.stats_hfrstdev_label, 3, 1)
+        statistics_layout.addWidget(QLabel("Mean:"), 4, 0)
+        self.stats_mean_label = QLabel("--")
+        statistics_layout.addWidget(self.stats_mean_label, 4, 1)
+        statistics_layout.addWidget(QLabel("StDev:"), 5, 0)
+        self.stats_stdev_label = QLabel("--")
+        statistics_layout.addWidget(self.stats_stdev_label, 5, 1)
+        statistics_layout.addWidget(QLabel("Min:"), 6, 0)
+        self.stats_min_label = QLabel("--")
+        statistics_layout.addWidget(self.stats_min_label, 6, 1)
+        statistics_layout.addWidget(QLabel("Max:"), 7, 0)
+        self.stats_max_label = QLabel("--")
+        statistics_layout.addWidget(self.stats_max_label, 7, 1)
+        statistics_layout.setRowStretch(8, 1)
+
+        self.statistics_dock.setWidget(statistics_widget)
 
     def _create_actions_docks(self):
         """Create action dock widgets (Imaging, etc.)."""
@@ -1359,10 +1480,70 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.actions_spacer_dock.setWidget(spacer_widget)
 
     def _create_image_panel(self, parent_layout):
-        """Create the image display panel with tabs for Latest Image and Live Stack."""
+        """Create the image display panel with tabs for Live View, Latest Image, and Live Stack."""
         # Create tab widget instead of group box
         self.image_tabs = QTabWidget()
-        self.image_tabs.setDocumentMode(True)
+        self.image_tabs.setDocumentMode(False)
+        self.image_tabs.setStyleSheet(f"""
+            QTabBar::tab {{
+                border: 1px solid {COLORS['border']};
+                border-bottom: none;
+                padding: 4px 12px;
+            }}
+            QTabBar::tab:selected {{
+                border: 2px solid {COLORS['accent']};
+                border-bottom: none;
+            }}
+        """)
+
+        # Tab 0: Live View (prepared image from NINA's imaging tab)
+        liveview_widget = QWidget()
+        liveview_layout = QVBoxLayout(liveview_widget)
+        liveview_layout.setContentsMargins(5, 5, 5, 5)
+        liveview_layout.setSpacing(2)
+
+        # Live view settings row
+        liveview_settings_layout = QHBoxLayout()
+        liveview_settings_layout.setSpacing(8)
+
+        liveview_settings_layout.addWidget(QLabel("Quality:"))
+        self.liveview_quality_spin = QSpinBox()
+        self.liveview_quality_spin.setRange(1, 100)
+        self.liveview_quality_spin.setValue(80)
+        self.liveview_quality_spin.setToolTip("JPEG quality 1-100 (lower = faster transfer)")
+        self.liveview_quality_spin.setFixedWidth(60)
+        self.liveview_quality_spin.valueChanged.connect(self._on_liveview_quality_changed)
+        liveview_settings_layout.addWidget(self.liveview_quality_spin)
+
+        liveview_settings_layout.addWidget(QLabel("Size:"))
+        self.liveview_size_combo = QComboBox()
+        self.liveview_size_combo.setEditable(True)
+        self.liveview_size_combo.addItems(["400x300", "800x600", "1280x960", "1920x1080"])
+        self.liveview_size_combo.setCurrentText("800x600")
+        self.liveview_size_combo.setToolTip("Image size (WxH). Type a custom value or select a preset.")
+        self.liveview_size_combo.setFixedWidth(110)
+        self.liveview_size_combo.currentTextChanged.connect(self._on_liveview_quality_changed)
+        liveview_settings_layout.addWidget(self.liveview_size_combo)
+
+        self.liveview_toggle_btn = QPushButton("Start")
+        self.liveview_toggle_btn.setFixedWidth(70)
+        self.liveview_toggle_btn.setToolTip("Start/stop live view from NINA's camera")
+        self.liveview_toggle_btn.clicked.connect(self._on_liveview_toggle)
+        liveview_settings_layout.addWidget(self.liveview_toggle_btn)
+
+        liveview_settings_layout.addStretch()
+        liveview_layout.addLayout(liveview_settings_layout, 0)
+
+        self.liveview_label = ZoomableImageWidget(placeholder_text="Live view not active")
+        liveview_layout.addWidget(self.liveview_label, 1)
+
+        self.liveview_info_label = QLabel("")
+        self.liveview_info_label.setAlignment(Qt.AlignCenter)
+        self.liveview_info_label.setFixedHeight(20)
+        self.liveview_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        liveview_layout.addWidget(self.liveview_info_label, 0)
+
+        self.image_tabs.addTab(liveview_widget, "Live View")
 
         # Tab 1: Latest Image
         image_widget = QWidget()
@@ -1469,11 +1650,15 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         self.livestack_info_label = QLabel("")
         self.livestack_info_label.setAlignment(Qt.AlignCenter)
-        self.livestack_info_label.setFixedHeight(20)
-        self.livestack_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.livestack_info_label.setFixedHeight(28)
+        self.livestack_info_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 16px;")
         livestack_layout.addWidget(self.livestack_info_label, 0)
 
         self.image_tabs.addTab(livestack_widget, "Live Stack")
+
+        # Default to Latest Image tab (Live View is tab 0 but off by default)
+        self.image_tabs.setCurrentIndex(1)
+        self.image_tabs.currentChanged.connect(self._on_image_tab_changed)
 
         parent_layout.addWidget(self.image_tabs, 1)  # stretch factor 1 to expand
 
@@ -1545,6 +1730,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         equipment_menu.addAction(self.guider_dock.toggleViewAction())
         equipment_menu.addAction(self.filterwheel_dock.toggleViewAction())
         equipment_menu.addAction(self.focuser_dock.toggleViewAction())
+        equipment_menu.addAction(self.statistics_dock.toggleViewAction())
 
         view_menu.addAction(self.guiding_dock.toggleViewAction())
         view_menu.addAction(self.image_history_dock.toggleViewAction())
@@ -1576,12 +1762,14 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea, self.guider_dock)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.filterwheel_dock)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.focuser_dock)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.statistics_dock)
 
         # Stack them vertically in the left area
         self.splitDockWidget(self.camera_dock, self.mount_dock, Qt.Vertical)
         self.splitDockWidget(self.mount_dock, self.guider_dock, Qt.Vertical)
         self.splitDockWidget(self.guider_dock, self.filterwheel_dock, Qt.Vertical)
         self.splitDockWidget(self.filterwheel_dock, self.focuser_dock, Qt.Vertical)
+        self.splitDockWidget(self.focuser_dock, self.statistics_dock, Qt.Vertical)
 
         # Add guiding graph at bottom
         self.addDockWidget(Qt.BottomDockWidgetArea, self.guiding_dock)
@@ -1606,6 +1794,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.removeDockWidget(self.guider_dock)
         self.removeDockWidget(self.filterwheel_dock)
         self.removeDockWidget(self.focuser_dock)
+        self.removeDockWidget(self.statistics_dock)
         self.removeDockWidget(self.guiding_dock)
         self.removeDockWidget(self.image_history_dock)
 
@@ -1622,6 +1811,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.guider_dock.show()
         self.filterwheel_dock.show()
         self.focuser_dock.show()
+        self.statistics_dock.show()
         self.guiding_dock.show()
         self.image_history_dock.show()
 
@@ -1635,11 +1825,15 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         image_size = settings.value("nina_image_size", "800x600", type=str)
         livestack_quality = settings.value("nina_livestack_quality", 100, type=int)
         livestack_size = settings.value("nina_livestack_size", "800x600", type=str)
+        liveview_quality = settings.value("nina_liveview_quality", 80, type=int)
+        liveview_size = settings.value("nina_liveview_size", "800x600", type=str)
 
         self.image_quality_spin.setValue(image_quality)
         self.image_size_combo.setCurrentText(image_size)
         self.livestack_quality_spin.setValue(livestack_quality)
         self.livestack_size_combo.setCurrentText(livestack_size)
+        self.liveview_quality_spin.setValue(liveview_quality)
+        self.liveview_size_combo.setCurrentText(liveview_size)
         self._restoring_settings = False
 
         # Apply to worker if already running
@@ -1670,6 +1864,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.addDockWidget(Qt.LeftDockWidgetArea, self.guider_dock)
                 self.addDockWidget(Qt.LeftDockWidgetArea, self.filterwheel_dock)
                 self.addDockWidget(Qt.LeftDockWidgetArea, self.focuser_dock)
+                self.addDockWidget(Qt.LeftDockWidgetArea, self.statistics_dock)
                 self.addDockWidget(Qt.BottomDockWidgetArea, self.guiding_dock)
                 self.addDockWidget(Qt.RightDockWidgetArea, self.image_history_dock)
                 self.restoreState(state_bytes)
@@ -1701,6 +1896,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         settings.setValue("nina_image_size", self.image_size_combo.currentText())
         settings.setValue("nina_livestack_quality", self.livestack_quality_spin.value())
         settings.setValue("nina_livestack_size", self.livestack_size_combo.currentText())
+        settings.setValue("nina_liveview_quality", self.liveview_quality_spin.value())
+        settings.setValue("nina_liveview_size", self.liveview_size_combo.currentText())
 
         settings.sync()
 
@@ -1729,7 +1926,10 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.worker.connection_changed.connect(self._on_connection_changed)
         self.worker.status_updated.connect(self._on_status_updated)
         self.worker.image_updated.connect(self._on_image_updated)
+        self.worker.image_fetching.connect(self._on_image_fetching)
         self.worker.livestack_updated.connect(self._on_livestack_updated)
+        self.worker.livestack_fetching.connect(self._on_livestack_fetching)
+        self.worker.liveview_updated.connect(self._on_liveview_updated)
         self.worker.guiding_updated.connect(self._on_guiding_updated)
         self.worker.event_occurred.connect(self._on_event_occurred)
         self.worker.error_occurred.connect(self._on_error)
@@ -1743,6 +1943,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.worker.stop()
             self.worker.wait(2000)
             self.worker = None
+        # Reset live view UI state
+        self.liveview_toggle_btn.setText("Start")
+        self.liveview_info_label.setText("")
 
     def _on_connection_changed(self, connected, version, host, port):
         """Handle connection state change."""
@@ -1797,6 +2000,14 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.imaging_start_btn.setEnabled(self._connected and camera_connected and not is_exposing)
             self.imaging_stop_btn.setEnabled(self._connected and camera_connected and is_exposing)
 
+            # Disable live view start when camera is busy; auto-stop if exposure begins
+            if is_exposing and hasattr(self, 'worker') and self.worker and self.worker._liveview_active:
+                self.worker.set_liveview_active(False)
+                self.liveview_toggle_btn.setText("Start")
+                self.liveview_info_label.setText("Stopped (camera busy)")
+            can_liveview = self._connected and camera_connected and not is_exposing
+            self.liveview_toggle_btn.setEnabled(can_liveview)
+
             name = camera.get('Name') or camera.get('DeviceName', '--')
             self.camera_name_label.setText(name)
 
@@ -1804,11 +2015,10 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             if not connected:
                 self.camera_status_label.setText("Disconnected")
                 self.camera_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
-                self.camera_exposure_label.setText("--")
                 self.camera_progress.setValue(0)
                 self.camera_temp_label.setText("--")
-                self._exposure_start_time = None
                 self._exposure_end_time = None
+                self._exposure_total_time = None
                 # Disable controls when disconnected (block signals to prevent callbacks)
                 self.camera_cooling_checkbox.blockSignals(True)
                 self.camera_cooling_checkbox.setChecked(False)
@@ -1841,42 +2051,29 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                         exposure_end = datetime.fromisoformat(exposure_end_str.replace('Z', '+00:00'))
                         now = datetime.now(timezone.utc) if exposure_end.tzinfo else datetime.now()
 
-                        # If exposure end time changed, this is a new exposure
+                        remaining = max(0, (exposure_end - now).total_seconds())
+
+                        # New exposure detected - capture remaining as the total
                         if self._exposure_end_time != exposure_end:
                             self._exposure_end_time = exposure_end
-                            self._exposure_start_time = now
+                            self._exposure_total_time = remaining
 
-                        # Calculate remaining and total time
-                        remaining = (exposure_end - now).total_seconds()
-                        if remaining < 0:
-                            remaining = 0
-
-                        if self._exposure_start_time:
-                            total_time = (exposure_end - self._exposure_start_time).total_seconds()
-                            if total_time > 0:
-                                elapsed = total_time - remaining
-                                progress_pct = (elapsed / total_time) * 100
-                                self.camera_progress.setValue(int(min(100, max(0, progress_pct))))
-                                self.camera_exposure_label.setText(f"{remaining:.0f}s / {total_time:.0f}s")
-                            else:
-                                self.camera_exposure_label.setText(f"{remaining:.0f}s remaining")
-                                self.camera_progress.setValue(0)
+                        if self._exposure_total_time and self._exposure_total_time > 0:
+                            elapsed = self._exposure_total_time - remaining
+                            progress_pct = (elapsed / self._exposure_total_time) * 100
+                            self.camera_progress.setValue(int(min(100, max(0, progress_pct))))
                         else:
-                            self.camera_exposure_label.setText(f"{remaining:.0f}s remaining")
                             self.camera_progress.setValue(0)
                     except (ValueError, TypeError) as e:
                         logger.debug(f"Error parsing ExposureEndTime: {e}")
-                        self.camera_exposure_label.setText("Exposing...")
                         self.camera_progress.setValue(0)
                 elif is_exposing:
                     # Exposing but no end time info
-                    self.camera_exposure_label.setText("Exposing...")
                     self.camera_progress.setValue(0)
                 else:
-                    self.camera_exposure_label.setText("--")
                     self.camera_progress.setValue(0)
-                    self._exposure_start_time = None
                     self._exposure_end_time = None
+                    self._exposure_total_time = None
 
                 # Camera temperature
                 temp = camera.get('Temperature')
@@ -1927,7 +2124,6 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.camera_name_label.setText("--")
             self.camera_status_label.setText("Disconnected")
             self.camera_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
-            self.camera_exposure_label.setText("--")
             self.camera_progress.setValue(0)
             self.camera_temp_label.setText("--")
             self.camera_cooling_checkbox.blockSignals(True)
@@ -2194,8 +2390,64 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.autofocus_start_btn.setEnabled(False)
             self.autofocus_cancel_btn.setEnabled(False)
 
+        # Update image statistics (from image-history endpoint)
+        # Skip if viewing a historical image (stats are managed by history click handler)
+        if self._viewing_history_index is None:
+            self._update_statistics_dock(status_data.get('statistics', {}))
+
+    def _update_statistics_dock(self, statistics):
+        """Update the statistics dock labels from an image-history stats dict."""
+        if statistics:
+            stars = statistics.get('Stars')
+            self.stats_stars_label.setText(str(int(stars)) if stars is not None else "--")
+
+            hfr = statistics.get('HFR')
+            self.stats_hfr_label.setText(f"{hfr:.2f}" if hfr is not None else "--")
+
+            median = statistics.get('Median')
+            self.stats_median_label.setText(str(int(median)) if median is not None else "--")
+
+            hfrstdev = statistics.get('HFRStDev')
+            self.stats_hfrstdev_label.setText(f"{hfrstdev:.2f}" if hfrstdev is not None else "--")
+
+            mean = statistics.get('Mean')
+            self.stats_mean_label.setText(str(int(mean)) if mean is not None else "--")
+
+            stdev = statistics.get('StDev')
+            self.stats_stdev_label.setText(str(int(stdev)) if stdev is not None else "--")
+
+            min_val = statistics.get('Min')
+            self.stats_min_label.setText(str(int(min_val)) if min_val is not None else "--")
+
+            max_val = statistics.get('Max')
+            self.stats_max_label.setText(str(int(max_val)) if max_val is not None else "--")
+        else:
+            self.stats_stars_label.setText("--")
+            self.stats_hfr_label.setText("--")
+            self.stats_median_label.setText("--")
+            self.stats_hfrstdev_label.setText("--")
+            self.stats_mean_label.setText("--")
+            self.stats_stdev_label.setText("--")
+            self.stats_min_label.setText("--")
+            self.stats_max_label.setText("--")
+
+    def _on_image_fetching(self, bytes_received, total_bytes):
+        """Show loading indicator while a new image is being fetched."""
+        if bytes_received == -1:
+            # Fetch complete
+            self.status_label.setText("Connected - adaptive polling active")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        elif total_bytes > 0:
+            pct = min(int(bytes_received * 100 / total_bytes), 100)
+            self.status_label.setText(f"Fetching latest image... {pct}%")
+            self.status_label.setStyleSheet(f"color: {COLORS['info']};")
+        else:
+            self.status_label.setText("Fetching latest image...")
+            self.status_label.setStyleSheet(f"color: {COLORS['info']};")
+
     def _on_image_updated(self, image_data, image_meta):
         """Handle image update from worker."""
+        self._viewing_history_index = None  # Back to viewing the latest image
         if image_data:
             try:
                 pixmap = QPixmap()
@@ -2206,42 +2458,43 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             except Exception as e:
                 logger.error(f"Error loading image: {e}")
 
-        # Update image info from metadata
+        # Update image info from image-history statistics
         if image_meta:
-            # Try various field names that might be in the history
-            target = (
-                image_meta.get('TargetName') or
-                image_meta.get('Target') or
-                image_meta.get('targetName') or
-                '--'
-            )
-            exp = (
-                image_meta.get('ExposureTime') or
-                image_meta.get('Duration') or
-                image_meta.get('Exposure') or
-                image_meta.get('exposureTime') or
-                '--'
-            )
-            if isinstance(exp, (int, float)):
-                exp = f"{exp:.0f}s"
+            statistics = image_meta.get('statistics', {})
+            camera = image_meta.get('camera', {})
+            filterwheel = image_meta.get('filterwheel', {})
 
-            # Try to get filter info
-            filter_name = (
-                image_meta.get('FilterName') or
-                image_meta.get('Filter') or
-                image_meta.get('filter') or
-                ''
-            )
+            # Exposure time from image-history, fallback to camera
+            exp = statistics.get('ExposureTime') or camera.get('LastExposureTime')
+            if isinstance(exp, (int, float)) and exp > 0:
+                exp_text = f"{exp:.0f}s"
+            else:
+                exp_text = "--"
 
-            info_text = f"Target: {target} | Exp: {exp}"
+            # Filter from image-history, fallback to filterwheel
+            filter_name = statistics.get('Filter', '')
+            if not filter_name:
+                selected_filter = filterwheel.get('SelectedFilter') or filterwheel.get('Filter')
+                if isinstance(selected_filter, dict):
+                    filter_name = selected_filter.get('Name', '')
+
+            # Stars/HFR from image-history
+            stars = statistics.get('Stars')
+            hfr = statistics.get('HFR')
+
+            info_text = f"Exp: {exp_text}"
             if filter_name:
                 info_text += f" | {filter_name}"
+            if stars is not None:
+                info_text += f" | Stars: {int(stars)}"
+            if hfr is not None:
+                info_text += f" | HFR: {hfr:.2f}"
 
             self.image_info_label.setText(info_text)
         else:
-            self.image_info_label.setText("Target: -- | Exp: --")
+            self.image_info_label.setText("")
 
-    def _on_history_thumbnail(self, index, thumb_data):
+    def _on_history_thumbnail(self, index, thumb_data, stats):
         """Handle a history thumbnail from the worker."""
         pixmap = QPixmap()
         pixmap.loadFromData(thumb_data)
@@ -2250,6 +2503,39 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         item = QListWidgetItem(QIcon(pixmap), f"#{index}")
         item.setData(Qt.UserRole, index)
+
+        # Build tooltip from image statistics
+        if stats:
+            lines = []
+            target = stats.get('TargetName')
+            if target:
+                lines.append(f"Target: {target}")
+            exp = stats.get('ExposureTime')
+            if exp is not None:
+                lines.append(f"Exposure: {exp:.0f}s")
+            filt = stats.get('Filter')
+            if filt:
+                lines.append(f"Filter: {filt}")
+            gain = stats.get('Gain')
+            if gain is not None:
+                lines.append(f"Gain: {gain}")
+            stars = stats.get('Stars')
+            if stars is not None:
+                lines.append(f"Stars: {int(stars)}")
+            hfr = stats.get('HFR')
+            if hfr is not None:
+                lines.append(f"HFR: {hfr:.2f}")
+            median = stats.get('Median')
+            if median is not None:
+                lines.append(f"Median: {int(median)}")
+            mean = stats.get('Mean')
+            if mean is not None:
+                lines.append(f"Mean: {int(mean)}")
+            temp = stats.get('Temperature')
+            if temp:
+                lines.append(f"Temp: {temp}")
+            if lines:
+                item.setToolTip("\n".join(lines))
 
         # If this index is newer than anything in the list, prepend; otherwise append
         if self.image_history_list.count() > 0:
@@ -2266,6 +2552,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         if index is None:
             return
 
+        self._viewing_history_index = index
+
         host, port = NINAIntegration.get_settings()
         quality = self.image_quality_spin.value()
         size_wh = self.image_size_combo.currentText()
@@ -2274,12 +2562,14 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             image_data, _ = NINAIntegration.get_image(
                 host, port, index, quality=quality, size_wh=size_wh
             )
-            return image_data
+            stats = NINAIntegration.get_image_statistics(host, port, index)
+            return image_data, stats
 
-        self._run_in_background(fetch, lambda data: self._image_fetch_done.emit(data) if data else None)
+        self._run_in_background(fetch, lambda result: self._image_fetch_done.emit(result) if result else None)
 
-    def _on_image_fetch_done(self, image_data):
+    def _on_image_fetch_done(self, result):
         """Handle completed background image fetch for history click."""
+        image_data, stats = result if isinstance(result, tuple) else (result, None)
         if image_data:
             pixmap = QPixmap()
             pixmap.loadFromData(image_data)
@@ -2287,15 +2577,52 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self._current_image_pixmap = pixmap
                 self.image_label.setPixmap(pixmap)
 
+        # Show image info with history indicator and update statistics dock
+        index = self._viewing_history_index
+        if index is not None:
+            info_parts = [f"Image #{index}"]
+            if stats and isinstance(stats, dict):
+                target = stats.get('TargetName')
+                if target:
+                    info_parts.append(target)
+                exp = stats.get('ExposureTime')
+                if isinstance(exp, (int, float)) and exp > 0:
+                    info_parts.append(f"{exp:.0f}s")
+                filt = stats.get('Filter')
+                if filt:
+                    info_parts.append(filt)
+                stars = stats.get('Stars')
+                if stars is not None:
+                    info_parts.append(f"Stars: {int(stars)}")
+                hfr = stats.get('HFR')
+                if hfr is not None:
+                    info_parts.append(f"HFR: {hfr:.2f}")
+                self._update_statistics_dock(stats)
+            self.image_info_label.setText(" | ".join(info_parts))
+
+    def _on_livestack_fetching(self, bytes_received, total_bytes):
+        """Show loading indicator while a new livestack image is being fetched."""
+        if total_bytes > 0:
+            pct = min(int(bytes_received * 100 / total_bytes), 100)
+            self.status_label.setText(f"Fetching live stack image... {pct}%")
+            self.status_label.setStyleSheet(f"color: {COLORS['info']};")
+        elif bytes_received == 0 and total_bytes == -1:
+            self.status_label.setText("Fetching live stack image...")
+            self.status_label.setStyleSheet(f"color: {COLORS['info']};")
+
     def _on_livestack_updated(self, image_data, status, available_stacks):
         """Handle livestack update from worker."""
+        # Clear fetching status
+        self.status_label.setText("Connected - adaptive polling active")
+        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+
         is_running = status.get('running', False)
         if is_running:
             # Update comboboxes if available stacks changed
             self._update_livestack_combos(available_stacks, status)
 
             # Update livestack tab with indicator
-            self.image_tabs.setTabText(1, "Live Stack *")
+            self.image_tabs.setTabText(2, "Live Stack *")
             if image_data:
                 # New image data - update the pixmap
                 try:
@@ -2328,7 +2655,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.livestack_info_label.setText("Live stack active")
         else:
             # Reset tab text and show inactive message
-            self.image_tabs.setTabText(1, "Live Stack")
+            self.image_tabs.setTabText(2, "Live Stack")
             self.livestack_label.setPlaceholderText("Live stack not active")
             self.livestack_label.setPixmap(None)
             self._current_livestack_pixmap = None
@@ -2433,6 +2760,51 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         # Force re-fetch on next poll by resetting stack count tracker
         if hasattr(self, 'worker') and self.worker:
             self.worker._last_livestack_count = None
+
+    def _on_liveview_updated(self, image_data):
+        """Handle live view frame from worker."""
+        try:
+            pixmap = QPixmap()
+            pixmap.loadFromData(image_data)
+            if not pixmap.isNull():
+                self._current_liveview_pixmap = pixmap
+                self.liveview_label.setPixmap(pixmap)
+        except Exception as e:
+            logger.error(f"Error loading live view image: {e}")
+
+    def _on_liveview_toggle(self):
+        """Handle live view start/stop button click."""
+        if not hasattr(self, 'worker') or not self.worker:
+            return
+        active = not self.worker._liveview_active
+        self.worker.set_liveview_active(active)
+        if active:
+            self.liveview_toggle_btn.setText("Stop")
+            self.liveview_info_label.setText("Live view active")
+            self.liveview_label.setPlaceholderText("Waiting for image...")
+            # Push current settings to worker
+            self.worker.set_liveview_settings(
+                self.liveview_quality_spin.value(),
+                self.liveview_size_combo.currentText()
+            )
+        else:
+            self.liveview_toggle_btn.setText("Start")
+            self.liveview_info_label.setText("")
+
+    def _on_liveview_quality_changed(self):
+        """Handle user changing the live view quality or size."""
+        if self._restoring_settings:
+            return
+        if hasattr(self, 'worker') and self.worker and self.worker._liveview_active:
+            self.worker.set_liveview_settings(
+                self.liveview_quality_spin.value(),
+                self.liveview_size_combo.currentText()
+            )
+
+    def _on_image_tab_changed(self, index):
+        """Handle image tab switch — tell worker which tab is active."""
+        if hasattr(self, 'worker') and self.worker:
+            self.worker.set_active_image_tab(index)
 
     def _on_guiding_updated(self, guiding_data):
         """Handle guiding data update from worker."""
