@@ -1054,6 +1054,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._viewing_history_index = None  # Set when viewing a historical image (not the latest)
         self._current_livestack_pixmap = None  # Store original livestack pixmap
         self._current_liveview_pixmap = None  # Store original liveview pixmap
+        self._sub_exposure_by_target = {}  # {target_name: exposure_time} from image history
         self._restoring_settings = False  # Guard to prevent re-fetch during settings restore
 
         self._image_fetch_done.connect(self._on_image_fetch_done)
@@ -2400,6 +2401,13 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         if self._viewing_history_index is None:
             self._update_statistics_dock(status_data.get('statistics', {}))
 
+        # Track per-sub exposure time per target for integration time calculation
+        stats = status_data.get('statistics', {})
+        exp = stats.get('ExposureTime')
+        target_name = stats.get('TargetName')
+        if isinstance(exp, (int, float)) and exp > 0 and target_name:
+            self._sub_exposure_by_target[target_name] = exp
+
     def _update_statistics_dock(self, statistics):
         """Update the statistics dock labels from an image-history stats dict."""
         if statistics:
@@ -2655,6 +2663,19 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 info_text = f"{target} - {filter_name}"
                 if stack_count is not None:
                     info_text += f" | Stacks: {stack_count}"
+                    sub_exp = self._sub_exposure_by_target.get(target)
+                    if sub_exp and stack_count:
+                        total_secs = int(stack_count) * sub_exp
+                        if total_secs >= 3600:
+                            h = int(total_secs // 3600)
+                            m = int((total_secs % 3600) // 60)
+                            info_text += f" | Int: {h}h {m}m"
+                        elif total_secs >= 60:
+                            m = int(total_secs // 60)
+                            s = int(total_secs % 60)
+                            info_text += f" | Int: {m}m {s}s"
+                        else:
+                            info_text += f" | Int: {int(total_secs)}s"
                 self.livestack_info_label.setText(info_text)
             elif not self._current_livestack_pixmap:
                 self.livestack_info_label.setText("Live stack active")
