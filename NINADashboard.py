@@ -435,7 +435,7 @@ class NINAStatusWorker(QThread):
                                     self.history_thumbnail.emit(next_index, thumb_data, stats)
 
                     else:
-                        # Not on Latest Image tab — still detect new images, just defer the fetch
+                        # Not on Latest Image tab — still detect new images, just defer the full fetch
                         if self._waiting_for_new_image:
                             next_index = 0 if self._last_image_index == -1 else self._last_image_index + 1
                             if NINAIntegration._image_exists(self.host, self.port, next_index):
@@ -443,6 +443,11 @@ class NINAStatusWorker(QThread):
                                 self._last_image_index = next_index
                                 self._waiting_for_new_image = False
                                 self._pending_image_fetch = True
+                                # Always emit history thumbnail — the dock is visible on all tabs
+                                thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, next_index, 200)
+                                if thumb_data:
+                                    stats = NINAIntegration.get_image_statistics(self.host, self.port, next_index) or {}
+                                    self.history_thumbnail.emit(next_index, thumb_data, stats)
 
                 # --- Live Stack fetching (only when tab 2 is active) ---
                 if self._active_image_tab == 2:
