@@ -485,19 +485,22 @@ class DataLoaderRunnable(QRunnable):
             self.signals.load_error.emit(str(e))
 
 
-class AddImageDialog(QDialog):
+class AddImageDialog(WindowPositionMixin, QDialog):
     """Dialog for adding a new image to a DSO"""
+
+    WINDOW_POSITION_KEY = "AddImageDialog"
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add Image to DSO")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(250)
         self.selected_file = None
         self.dso_data = []  # List of (dsodetailid, name) tuples
 
         self._init_ui()
         self._load_dso_list()
         self._load_equipment_list()
+        self.setup_window_position()
 
     def _init_ui(self):
         """Create the dialog UI"""
@@ -664,6 +667,11 @@ class AddImageDialog(QDialog):
             self.selected_file = file_name
             self.file_path_edit.setText(file_name)
 
+    def set_file_path(self, path):
+        """Pre-populate the file path (e.g. from drag-and-drop)"""
+        self.selected_file = path
+        self.file_path_edit.setText(path)
+
     def _validate_and_accept(self):
         """Validate inputs before accepting"""
         if not self.selected_file:
@@ -804,6 +812,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     """Main window for DSO Image Gallery"""
 
     WINDOW_POSITION_KEY = "DSOGallery"
+    _SUPPORTED_DROP_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.fits', '.fit', '.fts'}
 
     def __init__(self):
         """Initialize DSO Image Gallery window"""
@@ -879,6 +888,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.scroll_debounce_timer.setSingleShot(True)
         self.scroll_debounce_timer.timeout.connect(self._on_scroll_debounced)
         self.visible_buffer_rows = 2  # Load this many extra rows above/below visible area
+
+        # Enable drag-and-drop of image files from file manager
+        self.setAcceptDrops(True)
 
         # Initialize UI
         self._init_ui()
@@ -1764,9 +1776,11 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.equipment_combo.setCurrentText("All")
         self._apply_filters()
 
-    def _show_add_image_dialog(self):
+    def _show_add_image_dialog(self, file_path=None):
         """Show dialog to add a new image to a DSO"""
         dialog = AddImageDialog(self)
+        if file_path:
+            dialog.set_file_path(file_path)
         if dialog.exec() == QDialog.Accepted:
             image_data = dialog.get_image_data()
             self._add_image_to_database(image_data)
@@ -1897,6 +1911,27 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         # Restart timer to debounce resize events (300ms delay reduces rebuild frequency)
         self.resize_timer.start(300)
+
+    def dragEnterEvent(self, event):
+        """Accept drag if it is a single supported image file"""
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if len(urls) == 1 and urls[0].isLocalFile():
+                ext = os.path.splitext(urls[0].toLocalFile())[1].lower()
+                if ext in self._SUPPORTED_DROP_EXTENSIONS:
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):
+        """Open AddImageDialog with the dropped file path pre-filled"""
+        urls = event.mimeData().urls()
+        if urls and urls[0].isLocalFile():
+            file_path = urls[0].toLocalFile()
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in self._SUPPORTED_DROP_EXTENSIONS:
+                event.acceptProposedAction()
+                self._show_add_image_dialog(file_path)
 
     def closeEvent(self, event):
         """Handle window close - cleanup thread pool and cursor"""
