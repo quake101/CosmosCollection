@@ -201,6 +201,7 @@ class SystemTrayManager(QObject):
 
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason):
         """Handle tray icon activation (click, double-click, etc.)"""
+        logger.debug(f"Tray icon activated with reason: {reason}")
         if reason == QSystemTrayIcon.DoubleClick:
             self.restore_requested.emit()
 
@@ -215,4 +216,5 @@ class SystemTrayManager(QObject):
 
     def _on_quit_clicked(self):
         """Handle Quit action clicked"""
+        logger.debug(f"Tray icon quit triggered.")
         self.quit_requested.emit()
