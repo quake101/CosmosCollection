@@ -777,23 +777,25 @@ class DayWeatherCard(QFrame):
         # Score
         score_label = QLabel(f"({self.summary.astro_score})")
         score_label.setAlignment(Qt.AlignCenter)
-        score_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt;")
+        score_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10pt;")
         score_label.setToolTip("Astro Score")
         layout.addWidget(score_label)
 
         layout.addSpacing(5)
 
+        cloud_text = QLabel("Clouds")
+        cloud_text.setAlignment(Qt.AlignCenter)
+        cloud_text.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12pt;")
+        cloud_text.setToolTip("Average cloud cover for dark hours (sun altitude < -12°)")
+        layout.addWidget(cloud_text)
+
         # Cloud cover (tonight's average - dark hours only)
         cloud_label = QLabel(f"{self.summary.tonight_avg_cloud_cover:.0f}%")
         cloud_label.setAlignment(Qt.AlignCenter)
-        cloud_label.setStyleSheet("font-size: 12pt; font-weight: bold;")
+        cloud_label.setStyleSheet("font-size: 10pt; font-weight: bold;")
         layout.addWidget(cloud_label)
 
-        cloud_text = QLabel("clouds")
-        cloud_text.setAlignment(Qt.AlignCenter)
-        cloud_text.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt;")
-        cloud_text.setToolTip("Average cloud cover for dark hours (sun altitude < -12°)")
-        layout.addWidget(cloud_text)
+        layout.addSpacing(5)
 
         # Moon phase (compact display)
         if self.summary.moon_phase:
@@ -1712,7 +1714,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.status_label.setText(f"Error: {error_message}")
         self.status_label.setStyleSheet(f"color: {COLORS['error']};")
-        QMessageBox.warning(self, "Weather Fetch Error", error_message)
+        logger.error(f"Weather Fetch Error: {str(error_message)}")
 
     def _show_day_detail(self, summary: DailyWeatherSummary):
         """Show detailed dialog for a day"""
