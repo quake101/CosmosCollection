@@ -93,7 +93,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self.camera_combo.addItem("Sony Full Frame (35.8x23.8mm)", {"type": "camera", "sensor_width": 35.8, "sensor_height": 23.8})
         self.camera_combo.addItem("Sony APS-C (23.5x15.6mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.6})
 
-        # ZWO ASI cameras
+        # ZWO cameras
         self.camera_combo.addItem("--- ZWO ASI CAMERAS ---", None)
         self.camera_combo.addItem("ASI6200MM Pro (36x24mm)", {"type": "camera", "sensor_width": 36.0, "sensor_height": 24.0})
         self.camera_combo.addItem("ASI2600MM Pro (23.5x15.7mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.7})
@@ -102,6 +102,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self.camera_combo.addItem("ASI183MM Pro (13.2x8.8mm)", {"type": "camera", "sensor_width": 13.2, "sensor_height": 8.8})
         self.camera_combo.addItem("ASI585MC (8.3x6.2mm)", {"type": "camera", "sensor_width": 8.3, "sensor_height": 6.2})
         self.camera_combo.addItem("ASI662MC (7.4x5.6mm) (Seestar S30)", {"type": "camera", "sensor_width": 7.4, "sensor_height": 5.6})
+        self.camera_combo.addItem("IMX585 (11.1x6.3mm) (Seestar S30 Pro)", {"type": "camera", "sensor_width": 11.1, "sensor_height": 6.3})
         self.camera_combo.addItem("ASI385MC (7.7x4.9mm)", {"type": "camera", "sensor_width": 7.7, "sensor_height": 4.9})
         self.camera_combo.addItem("ASI462MC (2.9x2.9mm) (Seestar S50)", {"type": "camera", "sensor_width": 2.9, "sensor_height": 2.9})
         self.camera_combo.addItem("ASI224MC (3.9x2.8mm)", {"type": "camera", "sensor_width": 3.9, "sensor_height": 2.8})
@@ -124,6 +125,15 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self.camera_combo.addItem("--- ATIK CAMERAS ---", None)
         self.camera_combo.addItem("Atik 460EX (36x24mm)", {"type": "camera", "sensor_width": 36.0, "sensor_height": 24.0})
         self.camera_combo.addItem("Atik 383L+ (23.6x15.8mm)", {"type": "camera", "sensor_width": 23.6, "sensor_height": 15.8})
+
+        # Vaonis cameras
+        self.camera_combo.addItem("--- VAONIS CAMERAS ---", None)
+        self.camera_combo.addItem("IMX585 (11.1x6.3mm) (Vaonis Vespera II)", {"type": "camera", "sensor_width": 11.1, "sensor_height": 6.3})
+
+        # Celestron cameras
+        self.camera_combo.addItem("--- CELESTRON CAMERAS ---", None)
+        self.camera_combo.addItem("IMX178 (7.4x4.9mm) (Celestron Origin)", {"type": "camera", "sensor_width": 7.4, "sensor_height": 4.9})
+        self.camera_combo.addItem("IMX678 (7.7x4.3mm) (Celestron Origin Mark II)", {"type": "camera", "sensor_width": 7.7, "sensor_height": 4.3})
 
         self.camera_combo.currentTextChanged.connect(self._on_camera_changed)
 
