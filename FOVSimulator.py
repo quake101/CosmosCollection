@@ -16,6 +16,7 @@ from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS
 from UrlOpener import open_url
+from NINAIntegration import NINAIntegration
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +217,25 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         target_button.setMenu(target_menu)
         target_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         telescope_layout.addWidget(target_button)
+
+        # Add NINA button if integration is enabled
+        if NINAIntegration.is_enabled():
+            nina_menu = QMenu(self)
+
+            framing_action = QAction("Send to Framing Assistant", self)
+            framing_action.triggered.connect(self._send_to_nina)
+            nina_menu.addAction(framing_action)
+
+            slew_action = QAction("Slew to Target", self)
+            slew_action.triggered.connect(self._slew_to_nina_target)
+            nina_menu.addAction(slew_action)
+
+            nina_button = QToolButton()
+            nina_button.setText("NINA")
+            nina_button.setToolTip("Send to NINA")
+            nina_button.setMenu(nina_menu)
+            nina_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            telescope_layout.addWidget(nina_button)
 
         layout.addLayout(telescope_layout)
 
@@ -1791,3 +1811,17 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         except Exception as e:
             logger.error(f"Error opening from target list: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to open target list: {e}")
+
+    def _send_to_nina(self):
+        """Send DSO coordinates to NINA Framing Assistant"""
+        NINAIntegration.send_to_framing_assistant(
+            self.data.get('ra_deg'), self.data.get('dec_deg'),
+            self.data.get('name', 'Unknown'), self
+        )
+
+    def _slew_to_nina_target(self):
+        """Slew mount to the current DSO coordinates via NINA"""
+        NINAIntegration.slew_to_coordinates(
+            self.data.get('ra_deg'), self.data.get('dec_deg'),
+            self.data.get('name', 'Unknown'), self
+        )
