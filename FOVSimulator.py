@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 
 class AladinLiteWindow(WindowPositionMixin, QMainWindow):
     WINDOW_POSITION_KEY = "AladinLite"
+
+    SMART_TELESCOPES = [
+        {'name': 'ZWO Seestar S30',         'aperture': 30,  'focal_length': 150, 'camera_text': 'ASI662MC (7.4x5.6mm) (Seestar S30)',            'smart_telescope': True},
+        {'name': 'ZWO Seestar S30 Pro',     'aperture': 30,  'focal_length': 160, 'camera_text': 'IMX585 (11.1x6.3mm) (Seestar S30 Pro)',         'smart_telescope': True},
+        {'name': 'ZWO Seestar S50',         'aperture': 50,  'focal_length': 250, 'camera_text': 'ASI462MC (2.9x2.9mm) (Seestar S50)',            'smart_telescope': True},
+        {'name': 'Vaonis Vespera II',        'aperture': 50,  'focal_length': 250, 'camera_text': 'IMX585 (11.1x6.3mm) (Vaonis Vespera II)',       'smart_telescope': True},
+        {'name': 'Celestron Origin',         'aperture': 152, 'focal_length': 335, 'camera_text': 'IMX178 (7.4x4.9mm) (Celestron Origin)',         'smart_telescope': True},
+        {'name': 'Celestron Origin Mark II', 'aperture': 152, 'focal_length': 335, 'camera_text': 'IMX678 (7.7x4.3mm) (Celestron Origin Mark II)', 'smart_telescope': True},
+    ]
+
     def __init__(self, data: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"{data['name']} - FOV Simulator - Cosmos Collection")
@@ -56,8 +66,13 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         # Telescope selection
         telescope_label = QLabel("Telescope:")
         self.telescope_combo = QComboBox()
+        self.telescope_combo.setMinimumWidth(280)
         self.telescope_combo.addItem("Default View", None)
         self.telescope_combo.currentTextChanged.connect(self._on_telescope_changed)
+
+        self.show_smart_telescopes = QCheckBox("Show Smart Telescopes")
+        self.show_smart_telescopes.setChecked(False)
+        self.show_smart_telescopes.toggled.connect(self._on_show_smart_telescopes_toggled)
 
         # Load telescopes
         self._load_telescopes()
@@ -169,6 +184,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         # Arrange telescope controls
         telescope_layout.addWidget(telescope_label)
         telescope_layout.addWidget(self.telescope_combo)
+        telescope_layout.addWidget(self.show_smart_telescopes)
         telescope_layout.addWidget(self.show_telescope_fov)
         telescope_layout.addWidget(camera_label)
         telescope_layout.addWidget(self.camera_combo)
@@ -522,8 +538,17 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             # Block signals during loading to prevent save being triggered
             self.telescope_combo.blockSignals(True)
             self.show_telescope_fov.blockSignals(True)
+            self.show_smart_telescopes.blockSignals(True)
             self.camera_combo.blockSignals(True)
             self.barlow_combo.blockSignals(True)
+
+            # Load show smart telescopes checkbox and populate combo if needed
+            # (must happen before telescope name restore so smart entries are in the combo)
+            show_smart = settings.value("show_smart_telescopes", False, type=bool)
+            self.show_smart_telescopes.setChecked(show_smart)
+            if show_smart:
+                self._add_smart_telescopes()
+            logger.debug(f"Restored show smart telescopes: {show_smart}")
 
             # Load telescope selection
             saved_telescope_name = settings.value("telescope_name", None)
@@ -561,6 +586,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             # Unblock signals
             self.telescope_combo.blockSignals(False)
             self.show_telescope_fov.blockSignals(False)
+            self.show_smart_telescopes.blockSignals(False)
             self.camera_combo.blockSignals(False)
             self.barlow_combo.blockSignals(False)
 
@@ -571,6 +597,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             # Make sure to unblock signals even if there's an error
             self.telescope_combo.blockSignals(False)
             self.show_telescope_fov.blockSignals(False)
+            self.show_smart_telescopes.blockSignals(False)
             self.camera_combo.blockSignals(False)
             self.barlow_combo.blockSignals(False)
 
@@ -589,6 +616,9 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             # Save show telescope FOV checkbox
             settings.setValue("show_telescope_fov", self.show_telescope_fov.isChecked())
 
+            # Save show smart telescopes checkbox
+            settings.setValue("show_smart_telescopes", self.show_smart_telescopes.isChecked())
+
             # Save camera/eyepiece selection
             settings.setValue("camera_eyepiece", self.camera_combo.currentText())
 
@@ -600,6 +630,36 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         except Exception as e:
             logger.error(f"Error saving Aladin settings: {str(e)}")
 
+    def _add_smart_telescopes(self):
+        """Append smart telescope entries to the telescope combo box."""
+        self.telescope_combo.addItem("--- SMART TELESCOPES ---", None)
+        for st in self.SMART_TELESCOPES:
+            display = f"{st['name']} ({st['focal_length']}mm f/{st['focal_length']/st['aperture']:.1f})"
+            self.telescope_combo.addItem(display, dict(st))
+
+    def _remove_smart_telescopes(self):
+        """Remove all smart telescope entries (and separator) from the telescope combo box."""
+        i = 0
+        while i < self.telescope_combo.count():
+            text = self.telescope_combo.itemText(i)
+            data = self.telescope_combo.itemData(i)
+            if text == "--- SMART TELESCOPES ---" or (data and data.get('smart_telescope')):
+                self.telescope_combo.removeItem(i)
+            else:
+                i += 1
+
+    def _on_show_smart_telescopes_toggled(self, checked):
+        """Handle Show Smart Telescopes checkbox toggle."""
+        if checked:
+            self._add_smart_telescopes()
+        else:
+            # If a smart telescope is currently selected, reset to Default View first
+            current_data = self.telescope_combo.currentData()
+            if current_data and current_data.get('smart_telescope'):
+                self.telescope_combo.setCurrentIndex(0)
+            self._remove_smart_telescopes()
+        self._save_aladin_settings()
+
     def _on_telescope_changed(self):
         """Handle telescope selection change"""
         current_data = self.telescope_combo.currentData()
@@ -607,8 +667,20 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             self.selected_telescope = current_data
             logger.debug(f"Selected telescope: {current_data['name']} ({current_data['focal_length']}mm)")
 
-            # Auto-select equipment associated with this telescope
-            self._select_telescope_equipment(current_data.get('id'))
+            if current_data.get('smart_telescope'):
+                camera_text = current_data.get('camera_text')
+                if camera_text:
+                    idx = self.camera_combo.findText(camera_text)
+                    if idx >= 0:
+                        self.camera_combo.blockSignals(True)
+                        self.camera_combo.setCurrentIndex(idx)
+                        self.camera_combo.blockSignals(False)
+                self.barlow_combo.blockSignals(True)
+                self.barlow_combo.setCurrentIndex(0)  # "None (1.0x)"
+                self.barlow_combo.blockSignals(False)
+            else:
+                # Auto-select equipment associated with this telescope
+                self._select_telescope_equipment(current_data.get('id'))
         else:
             self.selected_telescope = None
             logger.debug("Selected default view")
