@@ -6,9 +6,11 @@ import threading
 import urllib.parse
 import urllib.request
 from PySide6.QtCore import Qt, QUrl, QTimer, QSettings
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout,
-    QComboBox, QCheckBox, QPushButton, QMessageBox
+    QComboBox, QCheckBox, QPushButton, QMessageBox,
+    QToolButton, QMenu
 )
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
@@ -192,6 +194,29 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         telescope_layout.addWidget(self.barlow_combo)
         telescope_layout.addStretch()
 
+        # Target List button
+        target_menu = QMenu(self)
+
+        self.add_target_action = QAction("Add to Target List", self)
+        self.add_target_action.triggered.connect(self._add_to_target_list)
+        target_menu.addAction(self.add_target_action)
+
+        self.remove_target_action = QAction("Remove from Target List", self)
+        self.remove_target_action.triggered.connect(self._remove_from_target_list)
+        self.remove_target_action.setVisible(False)
+        target_menu.addAction(self.remove_target_action)
+
+        self.open_target_action = QAction("Open in Target List", self)
+        self.open_target_action.triggered.connect(self._open_from_target_list)
+        self.open_target_action.setVisible(False)
+        target_menu.addAction(self.open_target_action)
+
+        target_button = QToolButton()
+        target_button.setText("Target List")
+        target_button.setMenu(target_menu)
+        target_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        telescope_layout.addWidget(target_button)
+
         layout.addLayout(telescope_layout)
 
         # Initialize web view as None initially - we'll create it safely later
@@ -213,6 +238,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self.fov_info_label = QLabel()
         self.fov_info_label.setStyleSheet("font-size: 10pt;")
         bottom_layout.addWidget(self.fov_info_label)
+        bottom_layout.addStretch()
 
         # Add close button
         close_button = QPushButton("Close")
@@ -239,6 +265,9 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
         # Load persistent settings before creating web view
         self._load_aladin_settings()
+
+        # Update target list button state
+        self._update_target_list_button()
 
         # Defer web view creation to avoid initialization crashes
         QTimer.singleShot(100, self._create_web_view_safely)
@@ -1620,3 +1649,145 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             threading.Thread(target=test_connection, daemon=True).start()
         except Exception as e:
             logger.debug(f"Could not perform connectivity test: {e}")
+
+    # ------------------------------------------------------------------
+    # Target List helpers
+    # ------------------------------------------------------------------
+
+    def _check_if_in_target_list(self):
+        """Check if the current DSO is already in the target list."""
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                dso_name = self.data.get('name', '').strip()
+                ra_deg = self.data.get('ra_deg')
+                dec_deg = self.data.get('dec_deg')
+                if not dso_name:
+                    return False
+                cursor.execute(
+                    "SELECT COUNT(*) FROM usertargetlist WHERE UPPER(TRIM(name)) = ?",
+                    (dso_name.upper(),)
+                )
+                if cursor.fetchone()[0] > 0:
+                    return True
+                if ra_deg is not None and dec_deg is not None:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM usertargetlist WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001",
+                        (ra_deg, dec_deg)
+                    )
+                    if cursor.fetchone()[0] > 0:
+                        return True
+                return False
+        except Exception as e:
+            logger.error(f"Error checking target list status: {e}")
+            return False
+
+    def _find_target_list_name(self):
+        """Return the stored target list name for the current DSO, or None."""
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                dso_name = self.data.get('name', '').strip()
+                ra_deg = self.data.get('ra_deg')
+                dec_deg = self.data.get('dec_deg')
+                if not dso_name:
+                    return None
+                cursor.execute(
+                    "SELECT name FROM usertargetlist WHERE UPPER(TRIM(name)) = ? LIMIT 1",
+                    (dso_name.upper(),)
+                )
+                result = cursor.fetchone()
+                if result:
+                    return result[0]
+                if ra_deg is not None and dec_deg is not None:
+                    cursor.execute(
+                        "SELECT name FROM usertargetlist WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001 LIMIT 1",
+                        (ra_deg, dec_deg)
+                    )
+                    result = cursor.fetchone()
+                    if result:
+                        return result[0]
+                return None
+        except Exception as e:
+            logger.error(f"Error finding target list name: {e}")
+            return None
+
+    def _update_target_list_button(self):
+        """Show/hide target list actions based on current list membership."""
+        try:
+            in_list = self._check_if_in_target_list()
+            self.add_target_action.setVisible(not in_list)
+            self.remove_target_action.setVisible(in_list)
+            self.open_target_action.setVisible(in_list)
+        except Exception as e:
+            logger.error(f"Error updating target list button: {e}")
+            self.add_target_action.setVisible(True)
+            self.remove_target_action.setVisible(False)
+            self.open_target_action.setVisible(False)
+
+    def _add_to_target_list(self):
+        """Open the Add Target dialog for the current DSO."""
+        try:
+            from DSOTargetList import AddTargetDialog
+            dialog = AddTargetDialog(dso_data=self.data.copy(), parent=self)
+            if dialog.exec():
+                self._update_target_list_button()
+        except ImportError as e:
+            logger.error(f"Could not import DSOTargetList: {e}")
+            QMessageBox.warning(self, "Import Error", f"Could not load Target List feature: {e}")
+        except Exception as e:
+            logger.error(f"Error adding to target list: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to add to target list: {e}")
+
+    def _remove_from_target_list(self):
+        """Remove the current DSO from the target list after confirmation."""
+        try:
+            dso_name = self.data.get('name', 'this DSO')
+            reply = QMessageBox.question(
+                self, "Remove from Target List",
+                f"Remove '{dso_name}' from the target list?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM usertargetlist WHERE UPPER(TRIM(name)) = ?",
+                    (dso_name.upper(),)
+                )
+                ra_deg = self.data.get('ra_deg')
+                dec_deg = self.data.get('dec_deg')
+                if ra_deg is not None and dec_deg is not None:
+                    cursor.execute(
+                        "DELETE FROM usertargetlist WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001",
+                        (ra_deg, dec_deg)
+                    )
+                conn.commit()
+            self._update_target_list_button()
+            QMessageBox.information(self, "Success", f"'{dso_name}' removed from target list.")
+        except Exception as e:
+            logger.error(f"Error removing from target list: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to remove from target list: {e}")
+
+    def _open_from_target_list(self):
+        """Open the Target List window and highlight the current DSO."""
+        try:
+            target_name = self._find_target_list_name()
+            if not target_name:
+                QMessageBox.warning(self, "Not Found",
+                    f"Could not find '{self.data.get('name', '')}' in your target list.")
+                return
+            from DSOTargetList import DSOTargetListWindow
+            if not hasattr(self, '_target_list_window') or not self._target_list_window.isVisible():
+                self._target_list_window = DSOTargetListWindow()
+            self._target_list_window.show()
+            self._target_list_window.raise_()
+            success = self._target_list_window.open_and_select_target(target_name)
+            if not success:
+                QMessageBox.warning(self, "Not Found",
+                    f"Could not navigate to '{target_name}' in the target list.")
+        except Exception as e:
+            logger.error(f"Error opening from target list: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open target list: {e}")
