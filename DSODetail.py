@@ -625,7 +625,8 @@ class DSODetailWindow(QDialog):
 
     def _setup_ui(self):
         """Set up the UI components - called after window is shown"""
-        from PySide6.QtWidgets import QToolButton
+        from PySide6.QtWidgets import QToolButton, QMenu
+        from PySide6.QtGui import QAction
 
         logger.debug(f"_setup_ui called for {self.data['name']}")
         try:
@@ -689,10 +690,21 @@ class DSODetailWindow(QDialog):
 
             # Add NINA button if integration is enabled
             if NINAIntegration.is_enabled():
+                nina_menu = QMenu(self)
+
+                framing_action = QAction("Send to Framing Assistant", self)
+                framing_action.triggered.connect(self._send_to_nina)
+                nina_menu.addAction(framing_action)
+
+                slew_action = QAction("Slew to Target", self)
+                slew_action.triggered.connect(self._slew_to_nina_target)
+                nina_menu.addAction(slew_action)
+
                 nina_button = QToolButton()
-                nina_button.setText("Send to NINA")
-                nina_button.setToolTip("Send coordinates to NINA Framing Assistant")
-                nina_button.clicked.connect(self._send_to_nina)
+                nina_button.setText("NINA")
+                nina_button.setToolTip("Send to NINA")
+                nina_button.setMenu(nina_menu)
+                nina_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
                 menubar.addWidget(nina_button)
 
             # Create main vertical layout to hold menubar and content
@@ -2208,6 +2220,13 @@ class DSODetailWindow(QDialog):
     def _send_to_nina(self):
         """Send DSO coordinates to NINA Framing Assistant"""
         NINAIntegration.send_to_framing_assistant(
+            self.data.get('ra_deg'), self.data.get('dec_deg'),
+            self.data.get('name', 'Unknown'), self
+        )
+
+    def _slew_to_nina_target(self):
+        """Slew mount to the current DSO coordinates via NINA"""
+        NINAIntegration.slew_to_coordinates(
             self.data.get('ra_deg'), self.data.get('dec_deg'),
             self.data.get('name', 'Unknown'), self
         )
