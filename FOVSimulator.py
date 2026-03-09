@@ -31,6 +31,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         {'name': 'Vaonis Vespera II',        'aperture': 50,  'focal_length': 250, 'camera_text': 'IMX585 (11.1x6.3mm) (Vaonis Vespera II)',       'smart_telescope': True},
         {'name': 'Celestron Origin',         'aperture': 152, 'focal_length': 335, 'camera_text': 'IMX178 (7.4x4.9mm) (Celestron Origin)',         'smart_telescope': True},
         {'name': 'Celestron Origin Mark II', 'aperture': 152, 'focal_length': 335, 'camera_text': 'IMX678 (7.7x4.3mm) (Celestron Origin Mark II)', 'smart_telescope': True},
+        {'name': 'Dwarf 3',                  'aperture': 35,  'focal_length': 150, 'camera_text': 'IMX678 (7.7x4.3mm) (Dwarf 3)',                  'smart_telescope': True},
+        {'name': 'Dwarf Mini',               'aperture': 30,  'focal_length': 150, 'camera_text': 'IMX662 (5.6x3.2mm) (Dwarf Mini)',               'smart_telescope': True},
     ]
 
     def __init__(self, data: dict, parent=None):
