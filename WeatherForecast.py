@@ -1032,8 +1032,10 @@ class HourlyAstroChart(FigureCanvas):
         self.draw_idle()
 
 
-class DayDetailDialog(QDialog):
+class DayDetailDialog(WindowPositionMixin, QDialog):
     """Dialog showing detailed hourly weather data for a day"""
+
+    WINDOW_POSITION_KEY = "DayDetailDialog"
 
     def __init__(self, summary: DailyWeatherSummary, next_day_summary: Optional[DailyWeatherSummary] = None,
                  lat: float = None, lon: float = None, timezone: str = None, parent=None):
@@ -1047,6 +1049,7 @@ class DayDetailDialog(QDialog):
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setModal(False)
         self.resize(1000, 750)
+        self.setup_window_position()
 
         # Get unit preferences
         settings = QSettings("CosmosCollection", "CosmosCollection")
