@@ -12,6 +12,9 @@ from PySide6.QtWidgets import (
     QComboBox, QCheckBox, QPushButton, QMessageBox,
     QToolButton, QMenu
 )
+from astropy import units as u
+from astropy.time import Time
+from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS
@@ -46,6 +49,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self.selected_telescope = None
         self.current_fov = None
         self.current_target = None  # Track current target to preserve user changes
+        self.observer_lat = None
+        self.observer_lon = None
 
         # Calculate default FOV based on object size (in degrees)
         try:
@@ -86,6 +91,10 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self.show_telescope_fov = QCheckBox("Show Telescope FOV")
         self.show_telescope_fov.setChecked(False)
         self.show_telescope_fov.toggled.connect(self._on_show_fov_toggled)
+
+        self.show_horizon = QCheckBox("Virtual Horizon")
+        self.show_horizon.setChecked(False)
+        self.show_horizon.toggled.connect(self._on_show_horizon_toggled)
 
         # Camera/Eyepiece selection (for different FOVs)
         camera_label = QLabel("Camera/Eyepiece:")
@@ -191,6 +200,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         telescope_layout.addWidget(self.telescope_combo)
         telescope_layout.addWidget(self.show_smart_telescopes)
         telescope_layout.addWidget(self.show_telescope_fov)
+        telescope_layout.addWidget(self.show_horizon)
         telescope_layout.addWidget(camera_label)
         telescope_layout.addWidget(self.camera_combo)
         telescope_layout.addWidget(barlow_label)
@@ -592,6 +602,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             self.show_smart_telescopes.blockSignals(True)
             self.camera_combo.blockSignals(True)
             self.barlow_combo.blockSignals(True)
+            self.show_horizon.blockSignals(True)
 
             # Load show smart telescopes checkbox and populate combo if needed
             # (must happen before telescope name restore so smart entries are in the combo)
@@ -634,12 +645,18 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                     self.barlow_combo.setCurrentIndex(index)
                     logger.debug(f"Restored barlow/reducer selection: {saved_barlow_text}")
 
+            # Load virtual horizon checkbox
+            show_horizon = settings.value("show_horizon", False, type=bool)
+            self.show_horizon.setChecked(show_horizon)
+            logger.debug(f"Restored show virtual horizon: {show_horizon}")
+
             # Unblock signals
             self.telescope_combo.blockSignals(False)
             self.show_telescope_fov.blockSignals(False)
             self.show_smart_telescopes.blockSignals(False)
             self.camera_combo.blockSignals(False)
             self.barlow_combo.blockSignals(False)
+            self.show_horizon.blockSignals(False)
 
             logger.debug("Aladin Lite settings loaded successfully")
 
@@ -651,6 +668,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             self.show_smart_telescopes.blockSignals(False)
             self.camera_combo.blockSignals(False)
             self.barlow_combo.blockSignals(False)
+            self.show_horizon.blockSignals(False)
 
     def _save_aladin_settings(self):
         """Save persistent Aladin Lite settings to QSettings"""
@@ -675,6 +693,9 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
             # Save barlow/reducer selection
             settings.setValue("barlow_reducer", self.barlow_combo.currentText())
+
+            # Save virtual horizon checkbox
+            settings.setValue("show_horizon", self.show_horizon.isChecked())
 
             logger.debug("Aladin Lite settings saved successfully")
 
@@ -1475,6 +1496,464 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         # This method is now replaced by _inject_fov_overlay
         return None
 
+    def _load_observer_location(self):
+        """Load observer lat/lon from DB. Returns True on success."""
+        try:
+            with DatabaseManager().get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT location_lat, location_lon FROM usersettings LIMIT 1")
+                row = cursor.fetchone()
+                if row and row[0] is not None and row[1] is not None:
+                    self.observer_lat = float(row[0])
+                    self.observer_lon = float(row[1])
+                    return True
+        except Exception as e:
+            logger.error(f"Error loading observer location: {e}")
+        return False
+
+    def _calculate_horizon_data(self):
+        """Convert horizon from alt-az to RA/Dec using astropy. Returns dict or None."""
+        logger.debug(f"_calculate_horizon_data: lat={self.observer_lat}, lon={self.observer_lon}")
+        try:
+            location = EarthLocation(lat=self.observer_lat * u.deg, lon=self.observer_lon * u.deg, height=250 * u.m)
+            now = Time.now()
+            altaz_frame = AltAz(obstime=now, location=location)
+            logger.debug(f"_calculate_horizon_data: altaz_frame created, time={now}")
+
+            # Sample horizon: alt=0.5° every 5° in azimuth → 72 points
+            horizon_points = []
+            for az_deg in range(0, 360, 5):
+                altaz_coord = SkyCoord(alt=0.5 * u.deg, az=az_deg * u.deg, frame=altaz_frame)
+                radec = altaz_coord.icrs
+                horizon_points.append([float(radec.ra.deg), float(radec.dec.deg)])
+
+            # Cardinal and intercardinal directions at alt=3° for label visibility
+            cardinal_azimuths = {'N': 0, 'NE': 45, 'E': 90, 'SE': 135, 'S': 180, 'SW': 225, 'W': 270, 'NW': 315}
+            cardinals = {}
+            for label, az_deg in cardinal_azimuths.items():
+                altaz_coord = SkyCoord(alt=3.0 * u.deg, az=az_deg * u.deg, frame=altaz_frame)
+                radec = altaz_coord.icrs
+                cardinals[label] = [float(radec.ra.deg), float(radec.dec.deg)]
+
+            # Target alt/az
+            ra = self.data.get('ra_deg', 0)
+            dec = self.data.get('dec_deg', 0)
+            target_altaz = None
+            target_alt = None
+            target_az = None
+            try:
+                target_coord = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame='icrs')
+                target_altaz = target_coord.transform_to(altaz_frame)
+                target_alt = float(target_altaz.alt.deg)
+                target_az = float(target_altaz.az.deg)
+            except Exception:
+                pass
+
+            # Zenith RA/Dec for globe view centering
+            zenith_coord = SkyCoord(alt=90.0 * u.deg, az=0.0 * u.deg, frame=altaz_frame)
+            zenith_radec = zenith_coord.icrs
+            zenith_ra = float(zenith_radec.ra.deg)
+            zenith_dec = float(zenith_radec.dec.deg)
+
+            logger.debug(f"_calculate_horizon_data: {len(horizon_points)} horizon points, target alt={target_alt}, az={target_az}")
+            return {
+                'horizon_points': horizon_points,
+                'cardinals': cardinals,
+                'target_alt': target_alt,
+                'target_az': target_az,
+                'zenith_ra': zenith_ra,
+                'zenith_dec': zenith_dec,
+            }
+        except Exception as e:
+            logger.error(f"Error calculating horizon data: {e}", exc_info=True)
+            return None
+
+    def _inject_horizon_overlay(self):
+        """Inject a virtual horizon overlay into the Aladin Lite view."""
+        logger.debug("_inject_horizon_overlay called")
+        if not self.web_view:
+            logger.warning("_inject_horizon_overlay: web_view is None, skipping")
+            return
+
+        # Inject a placeholder panel immediately so we know JS runs
+        self.web_view.page().runJavaScript("""
+            (function() {
+                var e = document.getElementById('horizon-info-panel');
+                if (e) e.remove();
+                var p = document.createElement('div');
+                p.id = 'horizon-info-panel';
+                p.style.cssText = 'position:fixed;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.85);color:white;padding:10px;border-radius:8px;font-size:12px;z-index:9999;border:2px solid #ffaa00;min-width:160px;';
+                p.innerHTML = '<div style="color:#ffaa00;font-weight:bold;text-align:center;">VIRTUAL HORIZON</div><div>Calculating...</div>';
+                document.body.appendChild(p);
+                console.log('Horizon: placeholder panel injected');
+            })();
+        """)
+
+        horizon_data = self._calculate_horizon_data()
+        if horizon_data is None:
+            logger.error("Failed to calculate horizon data")
+            self.web_view.page().runJavaScript("""
+                var p = document.getElementById('horizon-info-panel');
+                if (p) p.innerHTML = '<div style="color:#ffaa00;font-weight:bold;text-align:center;">VIRTUAL HORIZON</div><div style="color:red;">Calculation failed</div>';
+            """)
+            return
+
+        import json
+        points_json = json.dumps(horizon_data['horizon_points'])
+        cardinals_json = json.dumps(horizon_data['cardinals'])
+        target_alt = horizon_data['target_alt']
+        target_az = horizon_data['target_az']
+        zenith_ra = horizon_data['zenith_ra']
+        zenith_dec = horizon_data['zenith_dec']
+
+        if target_alt is not None and target_az is not None:
+            alt_str = f"{target_alt:.1f}"
+            az_str = f"{target_az:.1f}"
+        else:
+            alt_str = "N/A"
+            az_str = "N/A"
+
+        lat_str = f"{self.observer_lat:.4f}"
+        lon_str = f"{self.observer_lon:.4f}"
+
+        target_alt_js = target_alt if target_alt is not None else 'null'
+        target_az_js = target_az if target_az is not None else 'null'
+        alt_text = f"{target_alt:.1f}" if target_alt is not None else "N/A"
+        az_text = f"{target_az:.1f}" if target_az is not None else "N/A"
+
+        # Step 1: always inject the info panel immediately — no Aladin dependency
+        panel_js = f"""
+        (function() {{
+            var existing = document.getElementById('horizon-info-panel');
+            if (existing) existing.remove();
+            var panel = document.createElement('div');
+            panel.id = 'horizon-info-panel';
+            panel.style.cssText = 'position:fixed;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.85);' +
+                'color:white;padding:10px;border-radius:8px;font-family:"Segoe UI",Arial,sans-serif;' +
+                'font-size:12px;z-index:9999;border:2px solid #ffaa00;min-width:160px;';
+            panel.innerHTML = '<div style="text-align:center;margin-bottom:6px;font-weight:bold;color:#ffaa00;">VIRTUAL HORIZON</div>' +
+                '<div><strong>Alt:</strong> {alt_text}\u00b0</div>' +
+                '<div><strong>Az:</strong> {az_text}\u00b0</div>' +
+                '<div style="font-size:10px;color:#ccc;margin-top:4px;">Lat: {self.observer_lat:.4f}\u00b0  Lon: {self.observer_lon:.4f}\u00b0</div>';
+            document.body.appendChild(panel);
+        }})();
+        """
+        self.web_view.page().runJavaScript(panel_js)
+
+        # Inject edge indicator as a separate call — independent of js_code so it always shows
+        arrow_char = '\u25bc' if (target_alt is None or target_alt >= 0) else '\u25b2'
+        ind_pos = 'bottom:38px' if (target_alt is None or target_alt >= 0) else 'top:10px'
+        indicator_js = f"""
+        (function() {{
+            var ind = document.getElementById('horizon-edge-indicator');
+            if (ind) ind.remove();
+            ind = document.createElement('div');
+            ind.id = 'horizon-edge-indicator';
+            ind.style.cssText = 'position:fixed;{ind_pos};left:0;right:0;text-align:center;' +
+                'color:#ffaa00;font-weight:bold;font-size:13px;z-index:9999;pointer-events:none;' +
+                'font-family:"Segoe UI",Arial,sans-serif;text-shadow:0 0 4px #000,0 0 4px #000;';
+            ind.textContent = '{arrow_char} Horizon (zoom out to see)';
+            document.body.appendChild(ind);
+        }})();
+        """
+        self.web_view.page().runJavaScript(indicator_js)
+
+        # Diagnostic: check page context and iframe structure
+        def _on_horizon_diag(result):
+            logger.debug(f"Horizon JS diagnostic: {result}")
+
+        self.web_view.page().runJavaScript("""
+            (function() {
+                var iframes = document.querySelectorAll('iframe');
+                var iframeInfo = [];
+                for (var i = 0; i < iframes.length; i++) {
+                    var f = iframes[i];
+                    var info = {src: f.src, id: f.id};
+                    try {
+                        var iw = f.contentWindow;
+                        info.aladinInFrame = iw && typeof iw.aladin !== 'undefined' && !!iw.aladin;
+                        info.AInFrame = iw && typeof iw.A !== 'undefined';
+                        info.divInFrame = iw && !!iw.document.querySelector('#aladin-lite-div');
+                    } catch(e) { info.crossOriginErr = e.message; }
+                    iframeInfo.push(info);
+                }
+                return JSON.stringify({
+                    href: window.location.href,
+                    aladinDefined: typeof aladin !== 'undefined' && !!aladin,
+                    ADefined: typeof A !== 'undefined',
+                    aladinDivExists: !!document.querySelector('#aladin-lite-div'),
+                    iframeCount: iframes.length,
+                    iframes: iframeInfo
+                });
+            })();
+        """, _on_horizon_diag)
+
+        # Step 2: canvas-based horizon drawing — uses world2pix, redraws on pan/zoom events
+        js_code = f"""
+        (function() {{
+        try {{
+            // Clean up any previous horizon canvas and timers
+            var existingCanvas = document.getElementById('horizon-overlay-canvas');
+            if (existingCanvas) existingCanvas.remove();
+            document.querySelectorAll('.horizon-cardinal-label').forEach(function(el) {{ el.remove(); }});
+            if (window.horizonRefreshInterval) {{
+                clearInterval(window.horizonRefreshInterval);
+                window.horizonRefreshInterval = null;
+            }}
+
+            var horizonPoints = {points_json};
+            var zenithRa  = {zenith_ra};
+            var zenithDec = {zenith_dec};
+            var cardinals = {cardinals_json};
+            var targetAlt = {target_alt_js};
+
+            var findAladinInstance = function() {{
+                // Direct (HTML-content mode or URL page with global aladin)
+                if (typeof aladin !== 'undefined' && aladin) return aladin;
+                if (typeof window.aladin !== 'undefined' && window.aladin) return window.aladin;
+                if (window.aladinInstance) return window.aladinInstance;
+                var d = document.querySelector('#aladin-lite-div');
+                if (d) {{
+                    if (d._aladin) return d._aladin;
+                    if (d.aladin)  return d.aladin;
+                }}
+                if (typeof A !== 'undefined' && A.aladinInstances && A.aladinInstances.length > 0)
+                    return A.aladinInstances[0];
+                // Search same-origin iframes (Aladin URL page embeds viewer in an iframe)
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {{
+                    try {{
+                        var iw = iframes[i].contentWindow;
+                        if (!iw) continue;
+                        if (iw.aladin) return iw.aladin;
+                        var id = iw.document.querySelector('#aladin-lite-div');
+                        if (id && id._aladin) return id._aladin;
+                        if (iw.A && iw.A.aladinInstances && iw.A.aladinInstances.length > 0)
+                            return iw.A.aladinInstances[0];
+                    }} catch(e) {{ /* cross-origin, skip */ }}
+                }}
+                return null;
+            }};
+
+            // Returns the bounding rect to use for canvas placement.
+            // When Aladin lives in an iframe, use the iframe element's rect.
+            var getAladinRect = function() {{
+                var d = document.querySelector('#aladin-lite-div');
+                if (d) return d.getBoundingClientRect();
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {{
+                    try {{
+                        var iw = iframes[i].contentWindow;
+                        if (iw && (iw.aladin || (iw.A && iw.A.aladinInstances && iw.A.aladinInstances.length))) {{
+                            return iframes[i].getBoundingClientRect();
+                        }}
+                    }} catch(e) {{}}
+                }}
+                return document.body.getBoundingClientRect();
+            }};
+
+            var drawHorizon = function(al) {{
+                var rect = getAladinRect();
+
+                // Create or reuse overlay canvas — always, regardless of world2pix
+                var cv = document.getElementById('horizon-overlay-canvas');
+                if (!cv) {{
+                    cv = document.createElement('canvas');
+                    cv.id = 'horizon-overlay-canvas';
+                    cv.style.cssText = 'position:fixed;pointer-events:none;z-index:9998;';
+                    document.body.appendChild(cv);
+                }}
+                cv.width  = Math.round(rect.width)  || 800;
+                cv.height = Math.round(rect.height) || 600;
+                cv.style.left = rect.left + 'px';
+                cv.style.top  = rect.top  + 'px';
+
+                var ctx = cv.getContext('2d');
+                ctx.clearRect(0, 0, cv.width, cv.height);
+                ctx.strokeStyle = '#ffaa00';
+                ctx.lineWidth = 2;
+                ctx.lineJoin  = 'round';
+
+                var inViewCount = 0;
+
+                // Draw horizon line + cardinal labels only when world2pix is available
+                if (al && typeof al.world2pix === 'function') {{
+                    // Convert all horizon points to canvas pixels
+                    var pxpts = horizonPoints.map(function(pt) {{
+                        try {{ return al.world2pix(pt[0], pt[1]); }} catch(e) {{ return null; }}
+                    }});
+
+                    // Count in-view points
+                    var validPts = 0;
+                    var avgY = 0;
+                    for (var vi = 0; vi < pxpts.length; vi++) {{
+                        var vpx = pxpts[vi];
+                        if (!vpx || isNaN(vpx[0]) || isNaN(vpx[1])) continue;
+                        avgY += vpx[1];
+                        validPts++;
+                        if (vpx[0] >= 0 && vpx[0] <= cv.width && vpx[1] >= 0 && vpx[1] <= cv.height)
+                            inViewCount++;
+                    }}
+
+                    if (inViewCount > 0) {{
+                        // Draw connected segments, breaking at large screen-space jumps
+                        ctx.beginPath();
+                        var penDown = false;
+                        var prevPx = null;
+                        for (var i = 0; i <= horizonPoints.length; i++) {{
+                            var px = pxpts[i % horizonPoints.length];
+                            if (!px || isNaN(px[0]) || isNaN(px[1])) {{ penDown = false; prevPx = null; continue; }}
+                            if (penDown && prevPx &&
+                                (Math.abs(px[0] - prevPx[0]) > cv.width / 2 ||
+                                 Math.abs(px[1] - prevPx[1]) > cv.height / 2)) {{
+                                penDown = false;
+                            }}
+                            if (!penDown) {{ ctx.moveTo(px[0], px[1]); penDown = true; }}
+                            else          {{ ctx.lineTo(px[0], px[1]); }}
+                            prevPx = px;
+                        }}
+                        ctx.stroke();
+                    }}
+
+                    // Cardinal labels — remove stale ones then place updated ones
+                    document.querySelectorAll('.horizon-cardinal-label').forEach(function(el) {{ el.remove(); }});
+                    Object.keys(cardinals).forEach(function(label) {{
+                        try {{
+                            var px = al.world2pix(cardinals[label][0], cardinals[label][1]);
+                            if (px && !isNaN(px[0]) && !isNaN(px[1]) &&
+                                px[0] >= 0 && px[0] <= cv.width && px[1] >= 0 && px[1] <= cv.height) {{
+                                var div = document.createElement('div');
+                                div.className = 'horizon-cardinal-label';
+                                div.textContent = label;
+                                div.style.cssText = 'position:fixed;color:#ffaa00;font-weight:bold;font-size:13px;' +
+                                    'font-family:"Segoe UI",Arial,sans-serif;text-shadow:0 0 4px #000,0 0 4px #000;' +
+                                    'pointer-events:none;z-index:9999;' +
+                                    'left:' + (rect.left + px[0] - 8) + 'px;' +
+                                    'top:'  + (rect.top  + px[1] - 10) + 'px;';
+                                document.body.appendChild(div);
+                            }}
+                        }} catch(e) {{}}
+                    }});
+                }}
+
+                // Show/hide edge indicator div based on whether horizon is in view
+                var ind = document.getElementById('horizon-edge-indicator');
+                if (inViewCount === 0) {{
+                    if (!ind) {{
+                        ind = document.createElement('div');
+                        ind.id = 'horizon-edge-indicator';
+                        document.body.appendChild(ind);
+                    }}
+                    var arrow = (targetAlt === null || targetAlt >= 0) ? '\u25bc' : '\u25b2';
+                    var pos   = (targetAlt === null || targetAlt >= 0) ? 'bottom:38px' : 'top:10px';
+                    ind.style.cssText = 'position:fixed;' + pos + ';left:0;right:0;text-align:center;' +
+                        'color:#ffaa00;font-weight:bold;font-size:13px;z-index:9999;pointer-events:none;' +
+                        'font-family:"Segoe UI",Arial,sans-serif;text-shadow:0 0 4px #000,0 0 4px #000;';
+                    ind.textContent = arrow + ' Horizon (zoom out to see)';
+                }} else if (ind) {{
+                    ind.remove();
+                }}
+            }};
+
+            var startHorizonWhenReady = function(attemptCount) {{
+                attemptCount = attemptCount || 0;
+                var al = findAladinInstance();
+                if (!al) {{
+                    if (attemptCount < 30) {{
+                        setTimeout(function() {{ startHorizonWhenReady(attemptCount + 1); }}, 500);
+                    }} else {{
+                        var p = document.getElementById('horizon-info-panel');
+                        if (p) p.innerHTML += '<div style="color:orange;font-size:10px;margin-top:4px;">Aladin instance not found</div>';
+                    }}
+                    return;
+                }}
+                window.aladinInstance = al;
+
+                // Switch to SIN (orthographic/globe) projection, keep zoom, re-center on target
+                var _rd = null;
+                try {{ _rd = al.getRaDec ? al.getRaDec() : null; }} catch(e) {{}}
+                window.__horizonSavedRa  = _rd ? _rd[0] : null;
+                window.__horizonSavedDec = _rd ? _rd[1] : null;
+                try {{ al.setProjection('SIN'); }} catch(e) {{}}
+                try {{ al.gotoRaDec({self.data.get('ra_deg', 0)}, {self.data.get('dec_deg', 0)}); }} catch(e) {{}}
+
+                drawHorizon(al);
+
+                // Refresh on pan/zoom events; backup timer every 2 s
+                try {{
+                    al.on('positionChanged', function() {{ drawHorizon(al); }});
+                    al.on('zoomChanged',     function() {{ drawHorizon(al); }});
+                }} catch(e) {{ /* event API not available, timer-only fallback */ }}
+                window.horizonRefreshInterval = setInterval(function() {{ drawHorizon(al); }}, 2000);
+            }};
+
+            setTimeout(function() {{ startHorizonWhenReady(0); }}, 1000);
+        }} catch(e) {{
+            window.__horizonJSError = (e.stack || e.message || String(e));
+            var p = document.getElementById('horizon-info-panel');
+            if (p) p.innerHTML += '<div style="color:red;font-size:10px;margin-top:4px;word-break:break-all;">JS Error: ' + (e.message || e) + '</div>';
+        }}
+        }})();
+        """
+        self.web_view.page().runJavaScript(js_code)
+        logger.debug("Horizon overlay injection initiated")
+
+        def _read_js_error(result):
+            if result:
+                logger.error(f"Horizon JS runtime error: {result}")
+        QTimer.singleShot(2000, lambda: self.web_view.page().runJavaScript(
+            "window.__horizonJSError || null", _read_js_error))
+
+    def _remove_horizon_overlay(self):
+        """Remove the virtual horizon overlay from the Aladin Lite view."""
+        if not self.web_view:
+            return
+        js_code = """
+        (function() {
+            var panel = document.getElementById('horizon-info-panel');
+            if (panel) panel.remove();
+            var canvas = document.getElementById('horizon-overlay-canvas');
+            if (canvas) canvas.remove();
+            var ind = document.getElementById('horizon-edge-indicator');
+            if (ind) ind.remove();
+            document.querySelectorAll('.horizon-cardinal-label').forEach(function(el) { el.remove(); });
+            if (window.horizonRefreshInterval) {
+                clearInterval(window.horizonRefreshInterval);
+                window.horizonRefreshInterval = null;
+            }
+            // Restore TAN projection and re-center on original target
+            var al = window.aladinInstance;
+            if (al) {
+                try { al.setProjection('TAN'); } catch(e) {}
+                if (window.__horizonSavedRa !== null && window.__horizonSavedDec !== null) {
+                    try { al.gotoRaDec(window.__horizonSavedRa, window.__horizonSavedDec); } catch(e) {}
+                }
+                setTimeout(function() {
+                    if (window.updateTelescopeFovOverlay) window.updateTelescopeFovOverlay();
+                }, 300);
+            }
+            window.__horizonSavedRa  = null;
+            window.__horizonSavedDec = null;
+        })();
+        """
+        self.web_view.page().runJavaScript(js_code)
+        logger.debug("Horizon overlay removed")
+
+    def _on_show_horizon_toggled(self):
+        """Handle Virtual Horizon checkbox toggle."""
+        self._save_aladin_settings()
+        if self.show_horizon.isChecked():
+            if not self._load_observer_location():
+                QMessageBox.warning(self, "No Location Set",
+                    "Please set your observing location in Settings to use the Virtual Horizon.")
+                self.show_horizon.blockSignals(True)
+                self.show_horizon.setChecked(False)
+                self.show_horizon.blockSignals(False)
+                return
+            self._inject_horizon_overlay()
+        else:
+            self._remove_horizon_overlay()
+
     def _remove_fov_overlay(self):
         """Remove the FOV overlay from the current view"""
         try:
@@ -1564,6 +2043,10 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             # Handle FOV overlay injection if needed
             if self.pending_fov_overlay and self.target_coordinates:
                 self._inject_fov_overlay(True)
+
+            # Re-inject horizon overlay if enabled — delay to let Aladin's A.init.then() resolve
+            if self.show_horizon.isChecked() and (self.observer_lat is not None or self._load_observer_location()):
+                QTimer.singleShot(3000, self._inject_horizon_overlay)
 
     def _check_webgl_support(self):
         """Check if WebGL is available in the browser context"""
