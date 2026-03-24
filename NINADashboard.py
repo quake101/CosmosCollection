@@ -486,6 +486,14 @@ class NINAStatusWorker(QThread):
                             # Only fetch the image when stack count changes (or first time)
                             if current_count != self._last_livestack_count:
                                 self._last_livestack_count = current_count
+                                # Recalculate integration time from full image history
+                                # so mixed-exposure stacks are always accurate
+                                if current_count and actual_target:
+                                    history = NINAIntegration.get_all_image_history(self.host, self.port)
+                                    integration = NINAIntegration.calculate_integration_from_history(
+                                        history, actual_target, int(current_count))
+                                    if integration is not None:
+                                        livestack_status['calculated_integration'] = integration
                                 self.livestack_fetching.emit(0, -1)
                                 livestack_image = NINAIntegration.fetch_livestack_image_data(
                                     self.host, self.port, actual_target, actual_filter,
@@ -1054,7 +1062,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._viewing_history_index = None  # Set when viewing a historical image (not the latest)
         self._current_livestack_pixmap = None  # Store original livestack pixmap
         self._current_liveview_pixmap = None  # Store original liveview pixmap
-        self._sub_exposure_by_target = {}  # {target_name: exposure_time} from image history
+        self._sub_exposure_by_target = {}  # {target_name: latest exposure_time} from image history
+        self._total_integration_by_target = {}  # {target_name: integration seconds from history}
         self._restoring_settings = False  # Guard to prevent re-fetch during settings restore
 
         self._image_fetch_done.connect(self._on_image_fetch_done)
@@ -2663,9 +2672,14 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 info_text = f"{target} - {filter_name}"
                 if stack_count is not None:
                     info_text += f" | Stacks: {stack_count}"
-                    sub_exp = self._sub_exposure_by_target.get(target)
-                    if sub_exp and stack_count:
-                        total_secs = int(stack_count) * sub_exp
+                    # Accumulate integration time based on the delta since last update,
+                    # using the current sub-exposure time for only the new frames.
+                    # This handles mid-session exposure changes correctly.
+                    # Use integration time calculated from full image history in the worker
+                    if 'calculated_integration' in status:
+                        self._total_integration_by_target[target] = status['calculated_integration']
+                    total_secs = self._total_integration_by_target.get(target)
+                    if total_secs:
                         if total_secs >= 3600:
                             h = int(total_secs // 3600)
                             m = int((total_secs % 3600) // 60)
@@ -2686,6 +2700,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.livestack_label.setPixmap(None)
             self._current_livestack_pixmap = None
             self.livestack_info_label.setText("")
+            # Reset integration cache so the next session recalculates from scratch
+            self._total_integration_by_target.clear()
             # Clear comboboxes when not running
             self._updating_livestack_combos = True
             self.livestack_target_combo.clear()
