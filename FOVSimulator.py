@@ -1349,14 +1349,21 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 var existingPanel = document.getElementById('telescope-fov-panel');
 
                 // Get current Aladin FOV dynamically
-                var currentAladinFov = {current_display_fov};  // Fallback value
+                var currentAladinFov = {current_display_fov};  // Fallback (width FOV in degrees)
+                var currentAladinFovH = currentAladinFov;      // Fallback height FOV
 
                 // Try to get actual current FOV from Aladin instance
+                // getFov() returns [widthDeg, heightDeg]
                 try {{
+                    var fovArr = null;
                     if (window.aladinInstance && window.aladinInstance.getFov) {{
-                        currentAladinFov = window.aladinInstance.getFov()[0]; // Get width FOV
+                        fovArr = window.aladinInstance.getFov();
                     }} else if (typeof aladin !== 'undefined' && aladin.getFov) {{
-                        currentAladinFov = aladin.getFov()[0];
+                        fovArr = aladin.getFov();
+                    }}
+                    if (fovArr) {{
+                        currentAladinFov  = fovArr[0];
+                        currentAladinFovH = fovArr[1] || fovArr[0];
                     }}
                 }} catch(e) {{
                     console.log('Could not get dynamic FOV, using fallback:', currentAladinFov);
@@ -1364,15 +1371,16 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
                 var data = window.telescopeFovData;
 
-                // Calculate the size of the overlay as a percentage of the view
-                var overlayWidthPercent = (data.telescopeFovDegrees / currentAladinFov) * 100;
-                var overlayHeightPercent = (data.telescopeFovHeightDegrees / currentAladinFov) * 100;
+                // Width %  = telescope_fov_width  / aladin_width_fov  → % of container width
+                // Height % = telescope_fov_height / aladin_height_fov → % of container height
+                var overlayWidthPercent  = (data.telescopeFovDegrees       / currentAladinFov)  * 100;
+                var overlayHeightPercent = (data.telescopeFovHeightDegrees / currentAladinFovH) * 100;
 
                 // Limit the overlay size to reasonable bounds
                 overlayWidthPercent = Math.max(2, Math.min(95, overlayWidthPercent));
                 overlayHeightPercent = Math.max(2, Math.min(95, overlayHeightPercent));
 
-                console.log('FOV Update: Current Aladin FOV=' + currentAladinFov.toFixed(3) + '°, Telescope FOV=' + data.telescopeFovDegrees.toFixed(3) + '°, Overlay size=' + overlayWidthPercent.toFixed(1) + '%');
+                console.log('FOV Update: Aladin FOV=' + currentAladinFov.toFixed(3) + '°x' + currentAladinFovH.toFixed(3) + '°, Telescope FOV=' + data.telescopeFovDegrees.toFixed(3) + '°x' + data.telescopeFovHeightDegrees.toFixed(3) + '°, Overlay=' + overlayWidthPercent.toFixed(1) + '%x' + overlayHeightPercent.toFixed(1) + '%');
 
                 // Find the Aladin container
                 var aladinContainer = document.querySelector('#aladin-lite-div') || document.querySelector('.aladin-reticleContainer') || document.body;
@@ -1451,7 +1459,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                     <div style="text-align:center;margin-bottom:8px;font-weight:bold;color:${{data.overlayColor}};">🔭 TELESCOPE FOV</div>
                     <div><strong>Size:</strong> ${{data.fovWidthArcmin}}' × ${{data.fovHeightArcmin}}'</div>
                     <div><strong>Setup:</strong> ${{data.fovDetails}}</div>
-                    <div><strong>View:</strong> ${{currentAladinFov.toFixed(2)}}° (${{(currentAladinFov*60).toFixed(0)}}')</div>
+                    <div><strong>View:</strong> ${{currentAladinFov.toFixed(2)}}° × ${{currentAladinFovH.toFixed(2)}}° (${{(currentAladinFov*60).toFixed(0)}}')</div>
                     <div><strong>Scale:</strong> ${{scaleInfo}}</div>
                     <div style="font-size:10px;color:#ccc;margin-top:5px;">Target: RA ${{data.targetRA}}° Dec ${{data.targetDec}}°</div>
                 `;
