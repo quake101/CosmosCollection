@@ -899,6 +899,52 @@ class NINAIntegration:
             return None
 
     @staticmethod
+    def get_all_image_history(host, port):
+        """
+        Get the full image history list from NINA (all LIGHT frames).
+
+        Returns:
+            list: All image history entries, each with ExposureTime, TargetName, etc.
+                  Returns an empty list on failure.
+        """
+        url = f"http://{host}:{port}/v2/api/image-history?all=true&imageType=LIGHT"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                resp = result.get('Response')
+                if isinstance(resp, list):
+                    return resp
+        except Exception as e:
+            logger.debug(f"Error getting all image history: {e}")
+        return []
+
+    @staticmethod
+    def calculate_integration_from_history(history, target, stack_count):
+        """
+        Sum ExposureTime for the most recent stack_count LIGHT frames matching target.
+
+        Args:
+            history: list returned by get_all_image_history
+            target: target name string to filter by
+            stack_count: number of frames in the current stack
+
+        Returns:
+            float total seconds, or None if insufficient data
+        """
+        frames = [
+            img for img in history
+            if img.get('TargetName') == target
+            and isinstance(img.get('ExposureTime'), (int, float))
+            and img['ExposureTime'] > 0
+        ]
+        if not frames:
+            return None
+        # Take the most recent stack_count frames (history is oldest-first)
+        recent = frames[-stack_count:] if len(frames) >= stack_count else frames
+        return sum(img['ExposureTime'] for img in recent)
+
+    @staticmethod
     def get_image_statistics(host, port, index=None):
         """
         Get image history/statistics from NINA using the image-history endpoint.
