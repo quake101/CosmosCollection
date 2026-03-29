@@ -574,6 +574,30 @@ class DSOVisibilityCalculator:
         else:
             return "Night"
 
+    @staticmethod
+    def get_moon_illumination(obs_time):
+        """Return moon illumination fraction 0.0–1.0 at the given astropy Time."""
+        from astropy.coordinates import get_body, get_sun
+        import numpy as np
+        try:
+            sun = get_sun(obs_time)
+            moon = get_body('moon', obs_time)
+            elongation = sun.separation(moon)
+            illumination = (1.0 - np.cos(elongation.rad)) / 2.0
+            return float(np.clip(illumination, 0.0, 1.0))
+        except Exception:
+            return 0.5  # conservative fallback
+
+    @staticmethod
+    def get_moon_separation(dso_coord, obs_time):
+        """Return angular separation in degrees between dso_coord and the moon, or None on failure."""
+        from astropy.coordinates import get_body
+        try:
+            moon = get_body('moon', obs_time)
+            return float(dso_coord.separation(moon).deg)
+        except Exception:
+            return None
+
 
 class MonthlyVisibilityThread(QThread):
     """Thread for calculating visibility hours for all days in a month"""

@@ -546,7 +546,34 @@ class DSOCalculationThread(QThread):
             
             # Sort by combination of altitude and magnitude (lower magnitude is better)
             visible_dsos.sort(key=lambda x: (-x["max_altitude"] + x["dso_info"]["magnitude"]), reverse=False)
-            
+
+            # Moon proximity annotation — runs once after parallel phase completes
+            try:
+                from DSOVisibilityCalculator import DSOVisibilityCalculator as _Calc
+                import pytz as _pytz
+
+                _now = datetime.now(self.local_tz)
+                _midnight_utc = _now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(_pytz.UTC).replace(tzinfo=None)
+                moon_illumination = _Calc.get_moon_illumination(Time(_midnight_utc))
+
+                for dso_data in visible_dsos:
+                    dso_data["moon_illumination"] = moon_illumination
+                    moon_sep = None
+                    try:
+                        coord = dso_data.get("coordinates")
+                        optimal_time = dso_data.get("optimal_time")
+                        if coord is not None and optimal_time is not None:
+                            opt_utc = optimal_time.astimezone(_pytz.UTC).replace(tzinfo=None)
+                            moon_sep = _Calc.get_moon_separation(coord, Time(opt_utc))
+                    except Exception:
+                        pass
+                    dso_data["moon_separation"] = moon_sep  # float degrees or None
+            except Exception as e:
+                print(f"Moon annotation failed: {e}")
+                for dso_data in visible_dsos:
+                    dso_data.setdefault("moon_illumination", 0.5)
+                    dso_data.setdefault("moon_separation", None)
+
             self.result_ready.emit(visible_dsos)
             
         except Exception as e:
@@ -1056,21 +1083,32 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.results_table.setSortingEnabled(False)
 
         # Configure columns based on whether we're using target list
+        moon_illumination = visible_dsos[0].get("moon_illumination", 0.5) if visible_dsos else 0.5
+        moon_col_header = f"Moon ({moon_illumination:.0%} lit)"
+
         if getattr(self, '_using_target_list', False):
+            self.results_table.setColumnCount(10)
+            self.results_table.setHorizontalHeaderLabels([
+                "DSO", "Type", "Constellation", "Magnitude",
+                "Max Alt.", "Best Time", "Direction", "Visible Hours",
+                "Telescope", moon_col_header
+            ])
+            header = self.results_table.horizontalHeader()
+            header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(9, QHeaderView.Interactive)
+            self.results_table.setColumnWidth(9, 90)
+            moon_col = 9
+        else:
             self.results_table.setColumnCount(9)
             self.results_table.setHorizontalHeaderLabels([
                 "DSO", "Type", "Constellation", "Magnitude",
-                "Max Alt.", "Best Time", "Direction", "Visible Hours", "Telescope"
+                "Max Alt.", "Best Time", "Direction", "Visible Hours",
+                moon_col_header
             ])
-            # Configure the new Telescope column
             header = self.results_table.horizontalHeader()
-            header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
-        else:
-            self.results_table.setColumnCount(8)
-            self.results_table.setHorizontalHeaderLabels([
-                "DSO", "Type", "Constellation", "Magnitude",
-                "Max Alt.", "Best Time", "Direction", "Visible Hours"
-            ])
+            header.setSectionResizeMode(8, QHeaderView.Interactive)
+            self.results_table.setColumnWidth(8, 90)
+            moon_col = 8
 
         # Populate table
         self.results_table.setRowCount(len(visible_dsos))
@@ -1137,6 +1175,34 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                 telescope_item = QTableWidgetItem(telescope_name)
                 telescope_item.setTextAlignment(Qt.AlignCenter)
                 self.results_table.setItem(row, 8, telescope_item)
+
+            # Moon separation cell
+            moon_sep = dso_data.get("moon_separation")
+            moon_item = NumericTableWidgetItem()
+            if moon_sep is not None:
+                moon_item.setData(Qt.DisplayRole, f"{moon_sep:.0f}°")
+                moon_item.setData(Qt.UserRole, moon_sep)
+            else:
+                moon_item.setData(Qt.DisplayRole, "N/A")
+                moon_item.setData(Qt.UserRole, -1.0)  # sorts to bottom
+            moon_item.setTextAlignment(Qt.AlignCenter)
+            from PySide6.QtGui import QColor
+            if moon_sep is None:
+                moon_item.setBackground(QColor("#2a2a2a"))
+                moon_item.setForeground(QColor("#888888"))
+            elif moon_sep > 45:
+                moon_item.setBackground(QColor("#1a3a1a"))
+                moon_item.setForeground(QColor("#66cc66"))
+            elif moon_sep > 20:
+                moon_item.setBackground(QColor("#3a3a00"))
+                moon_item.setForeground(QColor("#cccc44"))
+            elif moon_sep > 8:
+                moon_item.setBackground(QColor("#3a1e00"))
+                moon_item.setForeground(QColor("#cc8844"))
+            else:
+                moon_item.setBackground(QColor("#3a0000"))
+                moon_item.setForeground(QColor("#cc4444"))
+            self.results_table.setItem(row, moon_col, moon_item)
 
         # Re-enable sorting
         self.results_table.setSortingEnabled(True)
