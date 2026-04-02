@@ -631,7 +631,7 @@ class DSOTableModel(QAbstractTableModel):
             logger.debug(f"Applying pending sort by column {column}")
             self.sort(column, order)
 
-    def filter_data(self, search_text, selected_catalog=None, show_images_only=False, selected_type=None):
+    def filter_data(self, search_text, selected_catalog=None, show_images_only=False, selected_type=None, show_no_images_only=False):
         """Filter the data based on search text, catalog, image presence, and DSO type"""
         self.layoutAboutToBeChanged.emit()
 
@@ -644,6 +644,7 @@ class DSOTableModel(QAbstractTableModel):
         # Track current search for lazy loading
         self._current_search = search_text or ''
         self._current_show_images_only = show_images_only
+        self._current_show_no_images_only = show_no_images_only
         self._current_selected_type = selected_type
 
         if catalog_changed or type_changed:
@@ -656,7 +657,7 @@ class DSOTableModel(QAbstractTableModel):
             self.layoutChanged.emit()
             return
 
-        if not search_text and not selected_catalog and not show_images_only and not selected_type:
+        if not search_text and not selected_catalog and not show_images_only and not selected_type and not show_no_images_only:
             self.filtered_data = self.dso_data.copy()
         else:
             search_text = search_text.lower() if search_text else ""
@@ -675,6 +676,9 @@ class DSOTableModel(QAbstractTableModel):
                         continue
 
                 if show_images_only and item["image_count"] == 0:
+                    continue
+
+                if show_no_images_only and item["image_count"] > 0:
                     continue
 
                 # Apply search text filter
@@ -858,6 +862,7 @@ class DSOTableModel(QAbstractTableModel):
         has_active_filters = (hasattr(self, '_current_search') and
                             (self._current_search or self.selected_catalog or
                              getattr(self, '_current_show_images_only', False) or
+                             getattr(self, '_current_show_no_images_only', False) or
                              getattr(self, '_current_selected_type', None)))
 
         # If filters are active and we have very few results, keep loading more aggressively
@@ -972,16 +977,20 @@ class DSOTableModel(QAbstractTableModel):
 
             search_text = getattr(self, '_current_search', '').lower() if hasattr(self, '_current_search') else ""
             show_images_only = getattr(self, '_current_show_images_only', False)
+            show_no_images_only = getattr(self, '_current_show_no_images_only', False)
 
             # Notify view that data is about to change
             self.layoutAboutToBeChanged.emit()
 
             # Rebuild filtered data from all loaded data
-            if search_text or show_images_only:
+            if search_text or show_images_only or show_no_images_only:
                 filtered_items = []
                 for item in self.dso_data:
                     # Apply show_images_only filter
                     if show_images_only and item["image_count"] == 0:
+                        continue
+
+                    if show_no_images_only and item["image_count"] > 0:
                         continue
 
                     # Apply search text filter
@@ -1046,16 +1055,20 @@ class DSOTableModel(QAbstractTableModel):
 
             search_text = getattr(self, '_current_search', '').lower() if hasattr(self, '_current_search') else ""
             show_images_only = getattr(self, '_current_show_images_only', False)
+            show_no_images_only = getattr(self, '_current_show_no_images_only', False)
 
             # Notify view that data is about to change
             self.layoutAboutToBeChanged.emit()
 
             # Rebuild filtered data from all loaded data
-            if search_text or show_images_only:
+            if search_text or show_images_only or show_no_images_only:
                 filtered_items = []
                 for item in self.dso_data:
                     # Apply show_images_only filter
                     if show_images_only and item["image_count"] == 0:
+                        continue
+
+                    if show_no_images_only and item["image_count"] > 0:
                         continue
 
                     # Apply search text filter
@@ -1130,8 +1143,8 @@ class DSOTableModel(QAbstractTableModel):
         filtered_len = len(self.filtered_data)
         if (filtered_len < 100 and
             self.load_offset < self.total_count and
-            hasattr(self, '_current_show_images_only') and
-            getattr(self, '_current_show_images_only', False)):
+            (hasattr(self, '_current_show_images_only') and getattr(self, '_current_show_images_only', False) or
+             hasattr(self, '_current_show_no_images_only') and getattr(self, '_current_show_no_images_only', False))):
 
             logger.debug(f"Auto-triggering next load: only {filtered_len} images found, continuing search...")
             # Use a timer to avoid recursive loading
@@ -4723,6 +4736,11 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.highlight_no_images.stateChanged.connect(self._on_highlight_no_images_changed)
         controls_layout.addWidget(self.highlight_no_images)
 
+        # Add show only no images checkbox
+        self.show_no_images_only = QCheckBox("Show Only Objects without Images")
+        self.show_no_images_only.stateChanged.connect(self._on_show_no_images_changed)
+        controls_layout.addWidget(self.show_no_images_only)
+
         # Add clear button
         clear_button = QPushButton("Clear")
         clear_button.clicked.connect(self._clear_filters)
@@ -5097,7 +5115,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self.search_input.text(),
             None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
             self.show_images_only.isChecked(),
-            self._get_selected_type()
+            self._get_selected_type(),
+            self.show_no_images_only.isChecked()
         )
         self._update_status()
 
@@ -5143,6 +5162,18 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 # Normal check with any view position to evaluate all trigger conditions
                 self.model.check_and_load_more_data(0)
 
+    def _on_show_no_images_changed(self, state):
+        """Handle show no images only checkbox state change"""
+        self.model.filter_data(
+            self.search_input.text(),
+            None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
+            self.show_images_only.isChecked(),
+            self._get_selected_type(),
+            self.show_no_images_only.isChecked()
+        )
+        self._update_status()
+        self._check_filter_needs_more_data()
+
     def _on_highlight_no_images_changed(self, state):
         self.model.setHighlightNoImages(state != 0)
 
@@ -5157,12 +5188,14 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.catalog_combo.blockSignals(True)
         self.show_images_only.blockSignals(True)
         self.highlight_no_images.blockSignals(True)
+        self.show_no_images_only.blockSignals(True)
         self.type_combo.blockSignals(True)
 
         self.search_input.clear()
         self.catalog_combo.setCurrentIndex(0)
         self.show_images_only.setChecked(False)
         self.highlight_no_images.setChecked(False)
+        self.show_no_images_only.setChecked(False)
         self.type_combo.setCurrentIndex(0)
 
         # Unblock signals
@@ -5170,11 +5203,12 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.catalog_combo.blockSignals(False)
         self.show_images_only.blockSignals(False)
         self.highlight_no_images.blockSignals(False)
+        self.show_no_images_only.blockSignals(False)
         self.type_combo.blockSignals(False)
 
         logger.debug("Calling filter_data with all filters cleared")
         # Manually trigger filter update once
-        self.model.filter_data("", None, False, None)
+        self.model.filter_data("", None, False, None, False)
 
         # Re-apply default sort after clearing filters
         self.table_view.sortByColumn(0, Qt.AscendingOrder)
@@ -5191,7 +5225,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             text,
             selected_catalog,
             self.show_images_only.isChecked(),
-            self._get_selected_type()
+            self._get_selected_type(),
+            self.show_no_images_only.isChecked()
         )
         self._update_status()
 
@@ -5298,7 +5333,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self.search_input.text(),
             None if catalog == "All Catalogs" else catalog,
             self.show_images_only.isChecked(),
-            self._get_selected_type()
+            self._get_selected_type(),
+            self.show_no_images_only.isChecked()
         )
         self._update_status()
         # Check if we need more data for this filter
@@ -5310,7 +5346,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self.search_input.text(),
             None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
             self.show_images_only.isChecked(),
-            self._get_selected_type()
+            self._get_selected_type(),
+            self.show_no_images_only.isChecked()
         )
         self._update_status()
         # Check if we need more data for this filter
@@ -5848,7 +5885,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 self.search_input.text(),
                 None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
                 self.show_images_only.isChecked(),
-                self._get_selected_type()
+                self._get_selected_type(),
+                self.show_no_images_only.isChecked()
             )
 
             # Update status
