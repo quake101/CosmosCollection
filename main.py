@@ -4624,6 +4624,16 @@ class AboutDialog(QDialog):
             QMessageBox.warning(self, "Error", f"Error checking for updates: {str(e)}")
 
 
+class StayOpenMenu(QMenu):
+    """A QMenu that stays open when checkable actions are clicked."""
+    def mouseReleaseEvent(self, event):
+        action = self.activeAction()
+        if action and action.isCheckable():
+            action.trigger()
+        else:
+            super().mouseReleaseEvent(event)
+
+
 # --- Main App Window ---
 class MainWindow(WindowPositionMixin, QMainWindow):
     WINDOW_POSITION_KEY = "MainWindow"
@@ -4726,20 +4736,24 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         search_layout.addWidget(self.search_input)
         controls_layout.addLayout(search_layout)
 
-        # Add show only images checkbox
-        self.show_images_only = QCheckBox("Show Only Objects with Images")
-        self.show_images_only.stateChanged.connect(self._on_show_images_changed)
-        controls_layout.addWidget(self.show_images_only)
+        # Add Filters dropdown button with checkable actions
+        filters_button = QPushButton("Filters \u25be")
+        filters_menu = StayOpenMenu(self)
 
-        # Add highlight no images checkbox
-        self.highlight_no_images = QCheckBox("Highlight Objects without Images")
-        self.highlight_no_images.stateChanged.connect(self._on_highlight_no_images_changed)
-        controls_layout.addWidget(self.highlight_no_images)
+        self.action_show_images_only = filters_menu.addAction("Show Only Objects with Images")
+        self.action_show_images_only.setCheckable(True)
+        self.action_show_images_only.toggled.connect(self._on_show_images_changed)
 
-        # Add show only no images checkbox
-        self.show_no_images_only = QCheckBox("Show Only Objects without Images")
-        self.show_no_images_only.stateChanged.connect(self._on_show_no_images_changed)
-        controls_layout.addWidget(self.show_no_images_only)
+        self.action_highlight_no_images = filters_menu.addAction("Highlight Objects without Images")
+        self.action_highlight_no_images.setCheckable(True)
+        self.action_highlight_no_images.toggled.connect(self._on_highlight_no_images_changed)
+
+        self.action_show_no_images_only = filters_menu.addAction("Show Only Objects without Images")
+        self.action_show_no_images_only.setCheckable(True)
+        self.action_show_no_images_only.toggled.connect(self._on_show_no_images_changed)
+
+        filters_button.setMenu(filters_menu)
+        controls_layout.addWidget(filters_button)
 
         # Add clear button
         clear_button = QPushButton("Clear")
@@ -5111,12 +5125,19 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _on_show_images_changed(self, state):
         """Handle show images only checkbox state change"""
+        checked = self.action_show_images_only.isChecked()
+        if checked:
+            self.action_show_no_images_only.blockSignals(True)
+            self.action_show_no_images_only.setChecked(False)
+            self.action_show_no_images_only.blockSignals(False)
+        self.action_highlight_no_images.setEnabled(not checked)
+        self.action_show_no_images_only.setEnabled(not checked)
         self.model.filter_data(
             self.search_input.text(),
             None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
-            self.show_images_only.isChecked(),
+            checked,
             self._get_selected_type(),
-            self.show_no_images_only.isChecked()
+            False
         )
         self._update_status()
 
@@ -5164,12 +5185,19 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _on_show_no_images_changed(self, state):
         """Handle show no images only checkbox state change"""
+        checked = self.action_show_no_images_only.isChecked()
+        if checked:
+            self.action_show_images_only.blockSignals(True)
+            self.action_show_images_only.setChecked(False)
+            self.action_show_images_only.blockSignals(False)
+            self.action_highlight_no_images.setEnabled(True)
+        self.action_show_images_only.setEnabled(not checked)
         self.model.filter_data(
             self.search_input.text(),
             None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
-            self.show_images_only.isChecked(),
+            False,
             self._get_selected_type(),
-            self.show_no_images_only.isChecked()
+            checked
         )
         self._update_status()
         self._check_filter_needs_more_data()
@@ -5186,24 +5214,24 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         # Block signals to prevent multiple filter triggers
         self.search_input.blockSignals(True)
         self.catalog_combo.blockSignals(True)
-        self.show_images_only.blockSignals(True)
-        self.highlight_no_images.blockSignals(True)
-        self.show_no_images_only.blockSignals(True)
+        self.action_show_images_only.blockSignals(True)
+        self.action_highlight_no_images.blockSignals(True)
+        self.action_show_no_images_only.blockSignals(True)
         self.type_combo.blockSignals(True)
 
         self.search_input.clear()
         self.catalog_combo.setCurrentIndex(0)
-        self.show_images_only.setChecked(False)
-        self.highlight_no_images.setChecked(False)
-        self.show_no_images_only.setChecked(False)
+        self.action_show_images_only.setChecked(False)
+        self.action_highlight_no_images.setChecked(False)
+        self.action_show_no_images_only.setChecked(False)
         self.type_combo.setCurrentIndex(0)
 
         # Unblock signals
         self.search_input.blockSignals(False)
         self.catalog_combo.blockSignals(False)
-        self.show_images_only.blockSignals(False)
-        self.highlight_no_images.blockSignals(False)
-        self.show_no_images_only.blockSignals(False)
+        self.action_show_images_only.blockSignals(False)
+        self.action_highlight_no_images.blockSignals(False)
+        self.action_show_no_images_only.blockSignals(False)
         self.type_combo.blockSignals(False)
 
         logger.debug("Calling filter_data with all filters cleared")
@@ -5224,9 +5252,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.model.filter_data(
             text,
             selected_catalog,
-            self.show_images_only.isChecked(),
+            self.action_show_images_only.isChecked(),
             self._get_selected_type(),
-            self.show_no_images_only.isChecked()
+            self.action_show_no_images_only.isChecked()
         )
         self._update_status()
 
@@ -5260,7 +5288,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self.model.load_offset >= self.model.total_count and
             self.catalog_combo.currentText() == "All Catalogs" and
             self._get_selected_type() is None and
-            not self.show_images_only.isChecked() and
+            not self.action_show_images_only.isChecked() and
             self._looks_like_object_designation(text)):
 
             # Use a timer to delay the SIMBAD query slightly
@@ -5332,9 +5360,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.model.filter_data(
             self.search_input.text(),
             None if catalog == "All Catalogs" else catalog,
-            self.show_images_only.isChecked(),
+            self.action_show_images_only.isChecked(),
             self._get_selected_type(),
-            self.show_no_images_only.isChecked()
+            self.action_show_no_images_only.isChecked()
         )
         self._update_status()
         # Check if we need more data for this filter
@@ -5345,9 +5373,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.model.filter_data(
             self.search_input.text(),
             None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
-            self.show_images_only.isChecked(),
+            self.action_show_images_only.isChecked(),
             self._get_selected_type(),
-            self.show_no_images_only.isChecked()
+            self.action_show_no_images_only.isChecked()
         )
         self._update_status()
         # Check if we need more data for this filter
@@ -5884,9 +5912,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self.model.filter_data(
                 self.search_input.text(),
                 None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
-                self.show_images_only.isChecked(),
+                self.action_show_images_only.isChecked(),
                 self._get_selected_type(),
-                self.show_no_images_only.isChecked()
+                self.action_show_no_images_only.isChecked()
             )
 
             # Update status
