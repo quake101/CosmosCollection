@@ -1306,6 +1306,14 @@ class VisibilityPlot(FigureCanvas):
         self.clear_cursor_elements()
         self.draw_idle()
 
+    def leaveEvent(self, event):
+        """Hide tooltip when mouse leaves the canvas widget entirely"""
+        super().leaveEvent(event)
+        if hasattr(self, 'qt_tooltip'):
+            self.qt_tooltip.hide()
+        self.last_tooltip_text = None
+        self.last_idx = None
+
     def __del__(self):
         """Destructor - clean up the tooltip widget"""
         try:
@@ -1757,15 +1765,16 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close event - clean up tooltips and threads"""
-        # Hide and clean up the plot widget's tooltip
+        # Immediately destroy tooltip native windows (destroy() is synchronous,
+        # unlike deleteLater() which only schedules deletion for the next event loop
+        # tick — which may not run, leaving floating tooltips visible after close)
         if hasattr(self, 'plot_widget') and hasattr(self.plot_widget, 'qt_tooltip'):
             self.plot_widget.qt_tooltip.hide()
-            self.plot_widget.qt_tooltip.deleteLater()
+            self.plot_widget.qt_tooltip.destroy()
 
-        # Hide and clean up the calendar widget's tooltip
         if hasattr(self, 'calendar') and hasattr(self.calendar, 'tooltip_label'):
             self.calendar.tooltip_label.hide()
-            self.calendar.tooltip_label.deleteLater()
+            self.calendar.tooltip_label.destroy()
 
         # Stop any running calculation threads
         if self.calc_thread and self.calc_thread.isRunning():
