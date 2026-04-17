@@ -1202,6 +1202,23 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             else:
                 moon_item.setBackground(QColor("#3a0000"))
                 moon_item.setForeground(QColor("#cc4444"))
+            if moon_sep is None:
+                moon_item.setToolTip("Moon separation unavailable.")
+            else:
+                if moon_sep > 45:
+                    quality = "Good — minimal moon interference expected."
+                elif moon_sep > 20:
+                    quality = "Moderate — some moon glow may affect faint objects."
+                elif moon_sep > 8:
+                    quality = "Poor — significant moon interference likely."
+                else:
+                    quality = "Very poor — object is very close to the moon."
+                moon_item.setToolTip(
+                    f"Moon Separation: {moon_sep:.1f}°\n"
+                    f"Angular distance between this object and the moon at its best viewing time.\n\n"
+                    f"{quality}\n\n"
+                    f"Color guide:  >45° green  |  20–45° yellow  |  8–20° orange  |  <8° red"
+                )
             self.results_table.setItem(row, moon_col, moon_item)
 
         # Re-enable sorting
