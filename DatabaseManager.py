@@ -195,10 +195,11 @@ class DatabaseManager:
         """Get a database connection with proper error handling"""
         if self._connection is None:
             # Import here to avoid circular imports
-            from ResourceManager import ResourceManager
+            from ResourceManager import ResourceManager, attach_update_catalogs
             db_path = ResourceManager.get_database_path()
             self._connection = sqlite3.connect(str(db_path))
             self._connection.row_factory = sqlite3.Row
+            attach_update_catalogs(self._connection)
             
         try:
             yield self._connection

@@ -281,11 +281,12 @@ class CatalogQueryWorker(QThread):
         # Try local database - create a new connection for this thread
         try:
             import sqlite3
-            from ResourceManager import ResourceManager
+            from ResourceManager import ResourceManager, attach_update_catalogs
             db_path = ResourceManager.get_database_path()
 
             # Create a new connection for this thread (SQLite connections can't be shared)
             conn = sqlite3.connect(str(db_path))
+            attach_update_catalogs(conn)
             try:
                 cursor = conn.cursor()
 

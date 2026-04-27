@@ -398,6 +398,8 @@ class DataLoaderRunnable(QRunnable):
             # Create new SQLite connection in this thread (DatabaseManager is a singleton)
             db_path = ResourceManager.get_database_path()
             conn = sqlite3.connect(str(db_path))
+            from ResourceManager import attach_update_catalogs
+            attach_update_catalogs(conn)
 
             # Ensure created_date column exists (migration for older databases)
             # Do this before setting row_factory

@@ -154,6 +154,13 @@ class ResourceManager:
         """Check if running as a bundle"""
         return self._is_bundled
     
+    def get_update_database_paths(self):
+        """Return all .sqlite files in catalogs/Updates/, sorted."""
+        updates_dir = self.get_resource_path('catalogs', 'Updates')
+        if not updates_dir.is_dir():
+            return []
+        return sorted(updates_dir.glob('*.sqlite'))
+
     @property
     def base_path(self):
         """Get the base application path"""
@@ -162,3 +169,37 @@ class ResourceManager:
 
 # Global instance
 ResourceManager = ResourceManager()
+
+
+def attach_update_catalogs(conn):
+    """ATTACH each update .sqlite and shadow cataloguenr with a TEMP VIEW that unions all sources.
+
+    The TEMP VIEW is session-only — the user's database on disk is never modified.
+    Safe to call even when no update files exist (becomes a no-op).
+    """
+    paths = ResourceManager.get_update_database_paths()
+    if not paths:
+        return
+
+    aliases = []
+    for i, path in enumerate(paths):
+        alias = f"upd_{i}"
+        conn.execute(f"ATTACH DATABASE ? AS {alias}", (str(path),))
+        aliases.append(alias)
+
+    union_parts = (
+        ["SELECT * FROM main.cataloguenr"]
+        + [f"SELECT * FROM {a}.cataloguenr" for a in aliases]
+    )
+    conn.execute(
+        "CREATE TEMP VIEW IF NOT EXISTS cataloguenr AS "
+        + " UNION ALL ".join(union_parts)
+    )
+
+    # Expose update-only tables (name_provenance, attribution) via unified TEMP VIEWs
+    for tbl in ("name_provenance", "attribution"):
+        parts = [f"SELECT * FROM {a}.{tbl}" for a in aliases]
+        conn.execute(
+            f"CREATE TEMP VIEW IF NOT EXISTS {tbl}_all AS "
+            + " UNION ALL ".join(parts)
+        )

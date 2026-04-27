@@ -444,6 +444,67 @@ class DSODetailWindow(QDialog):
         QTimer.singleShot(300, self._load_user_images)
         QTimer.singleShot(400, self._query_emission_data)
 
+    def _get_update_sources_html(self):
+        """Return HTML listing update-database sources that contributed NAME designations to this DSO.
+
+        Returns an empty string when no update databases are loaded or this DSO has no NAME entries.
+        """
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    SELECT d.id FROM dsodetail d
+                    JOIN cataloguenr c ON d.id = c.dsodetailid
+                    WHERE c.catalogue = ? AND c.designation = ?
+                """, (self.data['catalogue'], self.data['id']))
+                row = cursor.fetchone()
+                if not row:
+                    return ""
+                dsodetailid = str(row[0])
+
+                cursor.execute("""
+                    SELECT DISTINCT source FROM name_provenance_all
+                    WHERE dsodetailid = ?
+                """, (dsodetailid,))
+                source_strings = [r[0] for r in cursor.fetchall()]
+                if not source_strings:
+                    return ""
+
+                # Source strings can be combined, e.g. "OpenNGC+Wikidata"
+                labels = set()
+                for s in source_strings:
+                    for part in s.split("+"):
+                        labels.add(part.strip())
+
+                placeholders = ",".join("?" * len(labels))
+                cursor.execute(f"""
+                    SELECT source, key, value FROM attribution_all
+                    WHERE source IN ({placeholders}) AND key IN ('name', 'url', 'license')
+                """, list(labels))
+                attr_rows = cursor.fetchall()
+        except Exception:
+            return ""
+
+        sources = {}
+        for source, key, value in attr_rows:
+            sources.setdefault(source, {})[key] = value
+
+        if not sources:
+            return ""
+
+        parts = []
+        for info in sorted(sources.values(), key=lambda x: x.get('name', '')):
+            name = info.get('name', '')
+            url = info.get('url', '')
+            license_ = info.get('license', '')
+            entry = f'<a href="{url}">{name}</a>' if url else name
+            if license_:
+                entry += f" ({license_})"
+            parts.append(entry)
+
+        return "<br><b>Name Sources:</b> " + " &middot; ".join(parts)
+
     def _format_coordinates(self, ra_deg, dec_deg):
         """Format RA and Dec coordinates efficiently"""
         ra_hours = ra_deg / 15.0
@@ -929,10 +990,14 @@ class DSODetailWindow(QDialog):
                 object_info_text += "None<br>"
 
             object_info_text += "<br><b>Source:</b> N.I.N.A. Database"
+            update_sources = self._get_update_sources_html()
+            if update_sources:
+                object_info_text += update_sources
 
             object_info_label = QLabel(object_info_text)
             object_info_label.setAlignment(Qt.AlignLeft)
             object_info_label.setWordWrap(True)
+            object_info_label.setOpenExternalLinks(True)
             object_info_layout.addWidget(object_info_label)
 
             object_info_groupbox.setLayout(object_info_layout)

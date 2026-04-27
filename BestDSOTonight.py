@@ -285,6 +285,8 @@ class DSOCalculationThread(QThread):
             
             db_path = ResourceManager.get_database_path()
             conn = sqlite3.connect(str(db_path))
+            from ResourceManager import attach_update_catalogs
+            attach_update_catalogs(conn)
             cursor = conn.cursor()
             cursor.execute("SELECT DISTINCT catalogue FROM cataloguenr ORDER BY catalogue")
             catalogs = [row[0] for row in cursor.fetchall()]
@@ -304,7 +306,8 @@ class DSOCalculationThread(QThread):
             db_path = ResourceManager.get_database_path()
             conn = sqlite3.connect(str(db_path))
             conn.row_factory = sqlite3.Row
-
+            from ResourceManager import attach_update_catalogs
+            attach_update_catalogs(conn)
             cursor = conn.cursor()
 
             # Query target list entries with telescope information
@@ -383,9 +386,10 @@ class DSOCalculationThread(QThread):
             db_path = ResourceManager.get_database_path()
             conn = sqlite3.connect(str(db_path))
             conn.row_factory = sqlite3.Row
-            
+            from ResourceManager import attach_update_catalogs
+            attach_update_catalogs(conn)
             cursor = conn.cursor()
-            
+
             # Build the query with catalog filtering if specified
             base_query = """
                 SELECT

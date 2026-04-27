@@ -116,6 +116,8 @@ class InitialDataLoadWorker(QThread):
             db_path = ResourceManager.get_database_path()
             conn = sqlite3.connect(str(db_path))
             conn.row_factory = sqlite3.Row
+            from ResourceManager import attach_update_catalogs
+            attach_update_catalogs(conn)
             cursor = conn.cursor()
 
             # Get list of available catalogs
@@ -222,6 +224,8 @@ class DataLoadWorker(QThread):
 
             conn = sqlite3.connect(str(db_path))
             conn.row_factory = sqlite3.Row
+            from ResourceManager import attach_update_catalogs
+            attach_update_catalogs(conn)
             cursor = conn.cursor()
 
             # Build query with optional catalog and type filters
@@ -763,11 +767,12 @@ class DSOTableModel(QAbstractTableModel):
 
         try:
             import sqlite3
-            from ResourceManager import ResourceManager
+            from ResourceManager import ResourceManager, attach_update_catalogs
 
             # Query the total count for this specific filter
             db_path = ResourceManager.get_database_path()
             conn = sqlite3.connect(str(db_path))
+            attach_update_catalogs(conn)
             cursor = conn.cursor()
 
             # Build count query with filters - must match the data loading query logic
@@ -5796,7 +5801,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 # Insert catalog entries
                 for catalog, designation in catalog_entries:
                     cursor.execute("""
-                        INSERT INTO cataloguenr (dsodetailid, catalogue, designation)
+                        INSERT INTO main.cataloguenr (dsodetailid, catalogue, designation)
                         VALUES (?, ?, ?)
                     """, (dso_id, catalog, designation))
                     logger.debug(f"Inserted catalog entry: {catalog} {designation}")
