@@ -343,6 +343,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             self.web_view.loadStarted.connect(self._on_load_started)
             self.web_view.loadProgress.connect(self._on_load_progress)
             self.web_view.loadFinished.connect(self._on_load_finished)
+            self.web_view.page().renderProcessTerminated.connect(self._on_render_process_terminated)
 
             # Enable developer tools for debugging (optional)
             try:
@@ -2028,6 +2029,38 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         logger.debug(f"Aladin Lite: Load progress {progress}%")
         if self.web_placeholder:
             self.web_placeholder.setText(f"Loading Aladin Lite... {progress}%")
+
+    def _on_render_process_terminated(self, termination_status, exit_code):
+        """Handle GPU/renderer process crash without crashing the whole app"""
+        from PySide6.QtWebEngineCore import QWebEnginePage
+        status_names = {
+            QWebEnginePage.RenderProcessTerminationStatus.NormalTerminationStatus: "Normal",
+            QWebEnginePage.RenderProcessTerminationStatus.AbnormalTerminationStatus: "Abnormal",
+            QWebEnginePage.RenderProcessTerminationStatus.CrashedTerminationStatus: "Crashed",
+            QWebEnginePage.RenderProcessTerminationStatus.KilledTerminationStatus: "Killed",
+        }
+        status_name = status_names.get(termination_status, f"Unknown({termination_status})")
+        logger.error(f"Aladin Lite renderer process terminated: {status_name}, exit code: {exit_code}")
+        self.loading_timeout.stop()
+
+        if self.web_placeholder is None:
+            # Placeholder was already removed; re-create it so we can show the error
+            central_widget = self.centralWidget()
+            if central_widget and central_widget.layout():
+                self.web_placeholder = QLabel("Renderer crashed")
+                central_widget.layout().insertWidget(1, self.web_placeholder)
+
+        if self.web_placeholder:
+            self.web_placeholder.setText(
+                "Aladin Lite renderer crashed (GPU issue)\n\n"
+                "This is usually caused by a GPU driver incompatibility.\n"
+                "Click below to open in your browser instead."
+            )
+            self.web_placeholder.setStyleSheet(
+                f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: 12px; }}"
+            )
+            self.web_placeholder.show()
+        self._add_browser_fallback_button()
 
     def _on_load_finished(self, success):
         """Handle web page load finished"""

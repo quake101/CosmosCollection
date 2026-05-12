@@ -6988,7 +6988,9 @@ if __name__ == "__main__":
 
     # No CLI command - continue with GUI startup
     # Set environment variables for QtWebEngine to enable WebGL
-    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--ignore-gpu-blocklist --enable-webgl --enable-webgl2 --enable-gpu-rasterization'
+    # Note: --disable-software-rasterizer and --use-gl=desktop are intentionally omitted
+    # because they prevent crash recovery and can cause GPU process crashes on some systems.
+    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--ignore-gpu-blocklist --enable-webgl --enable-webgl2 --enable-gpu-rasterization --disable-gpu-sandbox'
 
     # Enable WebGL and hardware acceleration for Qt WebEngine (required for Aladin Lite)
     # MUST be done BEFORE QApplication is created
@@ -6997,8 +6999,7 @@ if __name__ == "__main__":
         '--enable-gpu-rasterization',
         '--enable-webgl',
         '--enable-webgl2',
-        '--disable-software-rasterizer',
-        '--use-gl=desktop',
+        '--disable-gpu-sandbox',
     ]
     # Add WebGL arguments if not already present
     for arg in webgl_args:
