@@ -9,7 +9,7 @@ from typing import List, Optional, Callable
 
 from PySide6.QtCore import QObject, Signal, QSettings
 from PySide6.QtGui import QIcon, QAction
-from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
+from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication, QWidget
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +55,10 @@ class SystemTrayManager(QObject):
             self._tray_icon = QSystemTrayIcon(icon, self)
             self._tray_icon.setToolTip("Cosmos Collection")
 
-            # Create context menu
-            self._menu = QMenu()
+            # Create context menu — must have a QWidget parent so Windows has a
+            # valid HWND when rendering hover highlights while the main window is hidden.
+            parent_widget = self.parent() if isinstance(self.parent(), QWidget) else None
+            self._menu = QMenu(parent_widget)
             self._create_menu()
             self._tray_icon.setContextMenu(self._menu)
 
