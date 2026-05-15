@@ -1,4 +1,5 @@
 import argparse
+import faulthandler
 import logging
 import os
 import sys
@@ -7015,6 +7016,21 @@ if __name__ == "__main__":
         logger.warning("QtWebEngineCore not available - WebGL may not work")
 
     app = QApplication(sys.argv)
+
+    # Always-on crash log: faulthandler writes a native traceback to this file
+    # even when the process is killed by a C-level crash (segfault, access violation).
+    try:
+        _crash_log_dir = ResourceManager.get_data_dir()
+        os.makedirs(_crash_log_dir, exist_ok=True)
+        _crash_log_path = os.path.join(_crash_log_dir, "crash.log")
+        _crash_log_file = open(_crash_log_path, "a", encoding="utf-8")
+        import datetime
+        _crash_log_file.write(f"\n--- session started {datetime.datetime.now().isoformat()} ---\n")
+        _crash_log_file.flush()
+        faulthandler.enable(_crash_log_file)
+        logger.debug(f"Crash log: {_crash_log_path}")
+    except Exception as e:
+        logger.warning(f"Could not enable crash log: {e}")
 
     # Configure file logging if enabled (must be after QApplication for QSettings to work on Windows)
     try:
