@@ -565,64 +565,80 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         
         # Control panel
         control_group = QGroupBox("Target List Management")
-        control_layout = QHBoxLayout()
-        
+        control_layout = QVBoxLayout()
+
+        # Search row
+        search_row = QHBoxLayout()
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("Search name, type, constellation...")
+        self.search_box.setFixedWidth(280)
+        self.search_box.textChanged.connect(self._filter_targets)
+        self.search_box.setClearButtonEnabled(True)
+        search_row.addWidget(QLabel("Search:"))
+        search_row.addWidget(self.search_box)
+        search_row.addStretch()
+        control_layout.addLayout(search_row)
+
+        # Buttons and filter row
+        buttons_row = QHBoxLayout()
+
         # Add target button
         add_target_btn = QPushButton("Add New Target")
         add_target_btn.clicked.connect(self._add_new_target)
-        control_layout.addWidget(add_target_btn)
-        
+        buttons_row.addWidget(add_target_btn)
+
         # Edit target button
         self.edit_target_btn = QPushButton("Edit Selected")
         self.edit_target_btn.clicked.connect(self._edit_selected_target)
         self.edit_target_btn.setEnabled(False)
-        control_layout.addWidget(self.edit_target_btn)
-        
+        buttons_row.addWidget(self.edit_target_btn)
+
         # View details button
         self.view_details_btn = QPushButton("View Details")
         self.view_details_btn.clicked.connect(self._view_target_details)
         self.view_details_btn.setEnabled(False)
         self.view_details_btn.setToolTip("Open detailed view of selected target")
-        control_layout.addWidget(self.view_details_btn)
-        
+        buttons_row.addWidget(self.view_details_btn)
+
         # Remove target button
         self.remove_target_btn = QPushButton("Remove Selected")
         self.remove_target_btn.clicked.connect(self._remove_selected_target)
         self.remove_target_btn.setEnabled(False)
-        control_layout.addWidget(self.remove_target_btn)
-        
+        buttons_row.addWidget(self.remove_target_btn)
+
         # Best DSO Tonight button
         best_tonight_btn = QPushButton("Best DSO Tonight")
         best_tonight_btn.clicked.connect(self._open_best_dso_tonight)
         best_tonight_btn.setToolTip("Open Best DSO Tonight window to find the best objects to observe tonight")
-        control_layout.addWidget(best_tonight_btn)
-        
-        control_layout.addStretch()
-        
+        buttons_row.addWidget(best_tonight_btn)
+
+        buttons_row.addStretch()
+
         # Filter controls
-        control_layout.addWidget(QLabel("Filter by Status:"))
+        buttons_row.addWidget(QLabel("Filter by Status:"))
         self.status_filter = QComboBox()
         self.status_filter.addItems(["All", "Not Observed", "Observed", "Imaged", "Completed"])
         self.status_filter.currentTextChanged.connect(self._filter_targets)
-        control_layout.addWidget(self.status_filter)
-        
-        control_layout.addWidget(QLabel("Filter by Priority:"))
+        buttons_row.addWidget(self.status_filter)
+
+        buttons_row.addWidget(QLabel("Filter by Priority:"))
         self.priority_filter = QComboBox()
         self.priority_filter.addItems(["All", "Low", "Medium", "High", "Urgent"])
         self.priority_filter.currentTextChanged.connect(self._filter_targets)
-        control_layout.addWidget(self.priority_filter)
+        buttons_row.addWidget(self.priority_filter)
 
-        control_layout.addWidget(QLabel("Telescope:"))
+        buttons_row.addWidget(QLabel("Telescope:"))
         self.telescope_filter = QComboBox()
         self._populate_telescope_filter()
         self.telescope_filter.currentIndexChanged.connect(self._filter_targets)
-        control_layout.addWidget(self.telescope_filter)
+        buttons_row.addWidget(self.telescope_filter)
 
         # Refresh button
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self._load_targets)
-        control_layout.addWidget(refresh_btn)
-        
+        buttons_row.addWidget(refresh_btn)
+
+        control_layout.addLayout(buttons_row)
         control_group.setLayout(control_layout)
         main_layout.addWidget(control_group)
         
@@ -1014,6 +1030,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         status_filter = self.status_filter.currentText()
         priority_filter = self.priority_filter.currentText()
         telescope_filter_data = self.telescope_filter.currentData()  # Can be "all", "unassigned", or telescope_id
+        search_text = self.search_box.text().strip().lower()
 
         for row in range(self.targets_table.rowCount()):
             show_row = True
@@ -1040,6 +1057,13 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
                         # Filter by specific telescope ID
                         if telescope_id != telescope_filter_data:
                             show_row = False
+
+            if search_text and show_row:
+                name_text = (self.targets_table.item(row, 0).text() if self.targets_table.item(row, 0) else "").lower()
+                type_text = (self.targets_table.item(row, 1).text() if self.targets_table.item(row, 1) else "").lower()
+                const_text = (self.targets_table.item(row, 2).text() if self.targets_table.item(row, 2) else "").lower()
+                if search_text not in name_text and search_text not in type_text and search_text not in const_text:
+                    show_row = False
 
             self.targets_table.setRowHidden(row, not show_row)
     
