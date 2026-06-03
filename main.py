@@ -6988,16 +6988,17 @@ if __name__ == "__main__":
         sys.exit(0 if cli_result else 1)
 
     # No CLI command - continue with GUI startup
-    # Set environment variables for QtWebEngine to enable WebGL
-    # Note: --disable-software-rasterizer and --use-gl=desktop are intentionally omitted
-    # because they prevent crash recovery and can cause GPU process crashes on some systems.
-    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--ignore-gpu-blocklist --enable-webgl --enable-webgl2 --enable-gpu-rasterization --disable-gpu-sandbox'
+    # Set environment variables for QtWebEngine to enable WebGL.
+    # --ignore-gpu-blocklist and --enable-gpu-rasterization are intentionally omitted:
+    # they force GPU use even on drivers that Chrome's blocklist marks as crash-prone,
+    # causing the GPU process to send SIGABRT to the main process (Fatal Python error: Aborted).
+    # Without those flags, Chromium falls back to SwiftShader software WebGL on bad GPUs,
+    # which still supports Aladin Lite without crashing.
+    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--enable-webgl --enable-webgl2 --disable-gpu-sandbox'
 
-    # Enable WebGL and hardware acceleration for Qt WebEngine (required for Aladin Lite)
-    # MUST be done BEFORE QApplication is created
+    # Enable WebGL for Qt WebEngine (required for Aladin Lite).
+    # MUST be done BEFORE QApplication is created.
     webgl_args = [
-        '--ignore-gpu-blocklist',
-        '--enable-gpu-rasterization',
         '--enable-webgl',
         '--enable-webgl2',
         '--disable-gpu-sandbox',

@@ -328,7 +328,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 # Enable WebGL - critical for Aladin Lite rendering
                 settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
                 settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True)
-                settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessEnabled, True)
+                settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
                 # Enable JavaScript (required for Aladin Lite)
                 settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
                 settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, True)
