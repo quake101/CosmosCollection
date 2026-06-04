@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QLabel, QGroupBox, QMessageBox, QProgressBar, QScrollArea,
     QFrame, QGridLayout, QDialog, QTableWidget, QTableWidgetItem,
-    QHeaderView, QApplication, QSplitter, QCheckBox, QComboBox
+    QHeaderView, QApplication, QSplitter, QCheckBox, QComboBox, QSizePolicy
 )
 from PySide6.QtGui import QColor
 
@@ -1576,6 +1576,8 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         # Status bar
         self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.status_label.setWordWrap(True)
+        self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         main_layout.addWidget(self.status_label)
 
     def _setup_menu_bar(self):
