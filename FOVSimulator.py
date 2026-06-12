@@ -2177,24 +2177,19 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
     def _test_connectivity_async(self):
         """Test connectivity to Aladin Lite server asynchronously"""
-        try:
-            def test_connection():
-                try:
-                    # Disable SSL verification for PyInstaller builds
-                    context = ssl._create_unverified_context() if getattr(sys, 'frozen', False) else None
-                    with urllib.request.urlopen("https://aladin.u-strasbg.fr", timeout=10, context=context) as response:
-                        if response.status == 200:
-                            logger.debug("Aladin server connectivity test successful")
-                        else:
-                            logger.warning(f"Aladin server responded with status {response.status}")
-                except Exception as e:
-                    logger.warning(f"Aladin server connectivity test failed: {e}")
-                    # Don't show error here as it might succeed anyway
+        def test_connection():
+            try:
+                # Use a plain TCP connection instead of urllib/ssl to avoid an
+                # OpenSSL conflict with PySide6.QtNetwork (both link OpenSSL;
+                # using Python's ssl on a background thread alongside Qt's
+                # network stack can trigger an abort() in the C layer).
+                import socket
+                with socket.create_connection(("aladin.u-strasbg.fr", 443), timeout=10):
+                    logger.debug("Aladin server connectivity test successful")
+            except Exception as e:
+                logger.warning(f"Aladin server connectivity test failed: {e}")
 
-            # Run test in background thread
-            threading.Thread(target=test_connection, daemon=True).start()
-        except Exception as e:
-            logger.debug(f"Could not perform connectivity test: {e}")
+        threading.Thread(target=test_connection, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Target List helpers
