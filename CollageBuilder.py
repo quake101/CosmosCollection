@@ -1034,39 +1034,36 @@ class DraggableCell(QWidget):
         drag.setPixmap(pixmap)
         drag.setHotSpot(self.drag_start_position)
 
+        # Save original order so preview and cancellation can restore it
+        self.parent_window._start_drag(self.index)
+
         # Execute the drag
         result = drag.exec(Qt.MoveAction)
 
+        # If the drop was not committed (cancelled or same cell), restore original order
+        if not self.parent_window._drag_committed:
+            self.parent_window._cancel_drag()
+
     def dragEnterEvent(self, event):
-        """Accept drag events from other cells"""
+        """Accept drag events from other cells and show real-time shift preview"""
         if event.mimeData().hasText():
             event.acceptProposedAction()
-            # Visual feedback - highlight the drop target
-            self.setStyleSheet(self.styleSheet() + f"border: 3px solid {COLORS['accent']};")
+            self.parent_window._preview_drag(self.index)
 
     def dragLeaveEvent(self, event):
-        """Remove visual feedback when drag leaves"""
-        # Restore original styling
-        self.parent_window._populate_collage_images()
+        """Keep the preview visible — next dragEnterEvent or cancel will update"""
+        pass
 
     def dropEvent(self, event):
-        """Handle drop event - swap images between cells"""
+        """Handle drop event - insert image at target, shifting others"""
         if event.mimeData().hasText():
-            # Parse source cell information
             source_info = event.mimeData().text().split(',')
             if len(source_info) == 3:
-                source_row = int(source_info[0])
-                source_col = int(source_info[1])
                 source_index = int(source_info[2])
-
-                # Don't do anything if dropping on the same cell
-                if source_index == self.index:
-                    event.acceptProposedAction()
-                    return
-
-                # Swap the images in the parent window's project data
-                self.parent_window._swap_images(source_index, self.index)
-
+                if source_index != self.index:
+                    self.parent_window._commit_drag(source_index, self.index)
+                else:
+                    self.parent_window._cancel_drag()
             event.acceptProposedAction()
 
 # --- Collage Generation Worker Thread ---
@@ -1517,6 +1514,17 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         self.thumbnail_worker = None
         self.thumbnail_labels = {}  # Dictionary to store thumbnail label references
 
+        # Drag state for real-time shift preview
+        self._drag_source_index = None
+        self._drag_original_images = None
+        self._drag_committed = False
+        self._drag_preview_target = None
+
+        # Per-cell widget references for in-place preview updates (no grid rebuild during drag)
+        self._cell_widgets = {}    # cell_index -> DraggableCell
+        self._cell_img_labels = {} # cell_index -> thumbnail QLabel
+        self._cell_dso_labels = {} # cell_index -> DSO name QLabel
+
         # Debug output
         if len(user_images) != len(unique_images):
             logger.debug(f"Removed {len(user_images) - len(unique_images)} duplicate images from user_images list")
@@ -1741,6 +1749,9 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
 
         # Clear thumbnail labels dictionary
         self.thumbnail_labels.clear()
+        self._cell_widgets.clear()
+        self._cell_img_labels.clear()
+        self._cell_dso_labels.clear()
 
         # Clear existing widgets
         for i in reversed(range(self.images_layout.count())):
@@ -1804,9 +1815,10 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                         image_label.setStyleSheet(f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']}; color: {COLORS['text_disabled']}; font-size: 10px;")
                         image_label.setText("Loading...")
 
-                        # Store reference to the label for later thumbnail updates
+                        # Store references for thumbnail updates and in-place drag preview
                         cell_key = f"{row},{col}"
                         self.thumbnail_labels[cell_key] = image_label
+                        self._cell_img_labels[cell_index] = image_label
 
                         cell_layout.addWidget(image_label)
 
@@ -1820,15 +1832,19 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                         dso_label.setWordWrap(True)
                         dso_label.setToolTip(f"DSO: {dso_name}\nFile: {filename}\nPath: {image_path}")
                         cell_layout.addWidget(dso_label)
+                        self._cell_dso_labels[cell_index] = dso_label
 
                         # Add stretch to push DSO name to center of remaining space
                         cell_layout.addStretch(1)
 
                         # Set image data and styling for occupied cells
                         cell_widget.set_image_data(image_data)
+                        border_color = (COLORS['accent']
+                                        if cell_index == self._drag_preview_target
+                                        else COLORS['success'])
                         cell_widget.setStyleSheet(f"""
                             DraggableCell {{
-                                border: 3px solid {COLORS['success']};
+                                border: 3px solid {border_color};
                                 border-radius: 8px;
                                 background-color: {COLORS['background_light']};
                                 margin: 2px;
@@ -1859,8 +1875,9 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                             }}
                         """)
 
-                    # Add cell to grid
+                    # Add cell to grid and store reference for in-place drag preview
                     self.images_layout.addWidget(cell_widget, row, col)
+                    self._cell_widgets[cell_index] = cell_widget
 
         # Start background thumbnail generation for occupied cells
         self._start_thumbnail_generation(collage_images, grid_width, grid_height)
@@ -1908,32 +1925,120 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
             label.setText(error_message.replace(" ", "\n"))  # Add line break for better fit
             label.setStyleSheet(f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']}; color: {COLORS['text_secondary']}; font-size: 10px;")
 
-    def _swap_images(self, source_index, target_index):
-        """Swap images between two grid positions"""
+    def _start_drag(self, source_index):
+        """Save state before a drag operation so preview and cancellation work correctly"""
         if not self.current_project:
             return
-
         project = self.collage_projects[self.current_project]
-        collage_images = project.get('collage_images', [])
+        self._drag_source_index = source_index
+        self._drag_original_images = list(project.get('collage_images', []))
+        self._drag_committed = False
+        self._drag_preview_target = None
 
-        # Extend the list if needed to accommodate the indices
-        max_index = max(source_index, target_index)
-        while len(collage_images) <= max_index:
-            collage_images.append(None)
+    def _preview_drag(self, target_index):
+        """Update cell content in-place to show shift preview without rebuilding the grid.
+        Rebuilding during an active drag destroys the drop-target widget and breaks dropEvent."""
+        if self._drag_source_index is None or self._drag_original_images is None:
+            return
+        if not self.current_project:
+            return
+        project = self.collage_projects[self.current_project]
+        grid_width = project.get('grid_width', 3)
+        grid_height = project.get('grid_height', 3)
+        max_cells = grid_width * grid_height
 
-        # Get the images at both positions (could be None)
-        source_image = collage_images[source_index] if source_index < len(collage_images) else None
-        target_image = collage_images[target_index] if target_index < len(collage_images) else None
+        # Compute preview order: remove from source, insert at target
+        preview = list(self._drag_original_images)
+        if self._drag_source_index < len(preview):
+            item = preview.pop(self._drag_source_index)
+            preview.insert(target_index, item)
 
-        # Swap the images
-        collage_images[source_index] = target_image
-        collage_images[target_index] = source_image
+        self._drag_preview_target = target_index
 
-        # Remove trailing None values to keep the list clean
-        while collage_images and collage_images[-1] is None:
-            collage_images.pop()
+        # Update each existing cell widget in-place
+        for cell_index in range(max_cells):
+            cell_widget = self._cell_widgets.get(cell_index)
+            if cell_widget is None:
+                continue
 
-        # Update the display
+            image_data = preview[cell_index] if cell_index < len(preview) else None
+            cell_widget.set_image_data(image_data)
+            border_color = COLORS['accent'] if cell_index == target_index else COLORS['success']
+
+            if image_data:
+                cell_widget.setStyleSheet(f"""
+                    DraggableCell {{
+                        border: 3px solid {border_color};
+                        border-radius: 8px;
+                        background-color: {COLORS['background_light']};
+                        margin: 2px;
+                    }}
+                """)
+                img_label = self._cell_img_labels.get(cell_index)
+                if img_label:
+                    image_path = image_data.get('image_path', '')
+                    cached = self.thumbnail_cache.get(image_path)
+                    if cached:
+                        img_label.setPixmap(cached)
+                        img_label.setText("")
+                        img_label.setStyleSheet(f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']};")
+                    else:
+                        img_label.clear()
+                        img_label.setText("...")
+                        img_label.setStyleSheet(f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']}; color: {COLORS['text_disabled']}; font-size: 10px;")
+                dso_label = self._cell_dso_labels.get(cell_index)
+                if dso_label:
+                    dso_name = self._get_dso_name_for_image(image_data)
+                    image_path = image_data.get('image_path', '')
+                    filename = os.path.basename(image_path)
+                    dso_label.setText(dso_name)
+                    dso_label.setToolTip(f"DSO: {dso_name}\nFile: {filename}")
+            else:
+                cell_widget.setStyleSheet(f"""
+                    DraggableCell {{
+                        border: 3px dashed {COLORS['border']};
+                        border-radius: 8px;
+                        background-color: {COLORS['background_light']};
+                        margin: 2px;
+                    }}
+                """)
+                img_label = self._cell_img_labels.get(cell_index)
+                if img_label:
+                    img_label.clear()
+                    img_label.setText("")
+                dso_label = self._cell_dso_labels.get(cell_index)
+                if dso_label:
+                    dso_label.setText("")
+
+    def _commit_drag(self, source_index, target_index):
+        """Commit the drag: insert source at target, shifting items between"""
+        self._drag_committed = True
+        if not self.current_project:
+            return
+        project = self.collage_projects[self.current_project]
+        images = (list(self._drag_original_images)
+                  if self._drag_original_images is not None
+                  else list(project.get('collage_images', [])))
+        if source_index < len(images):
+            item = images.pop(source_index)
+            images.insert(target_index, item)
+        while images and images[-1] is None:
+            images.pop()
+        project['collage_images'] = images
+        self._drag_source_index = None
+        self._drag_original_images = None
+        self._drag_preview_target = None
+        self._populate_collage_images()
+
+    def _cancel_drag(self):
+        """Cancel drag and restore the original image order"""
+        if self._drag_original_images is not None and self.current_project:
+            project = self.collage_projects[self.current_project]
+            project['collage_images'] = list(self._drag_original_images)
+        self._drag_source_index = None
+        self._drag_original_images = None
+        self._drag_committed = False
+        self._drag_preview_target = None
         self._populate_collage_images()
 
     def _on_images_reordered(self, reordered_images):
