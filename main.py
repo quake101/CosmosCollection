@@ -26,6 +26,16 @@ if getattr(sys, 'frozen', False):
     except Exception as e:
         print(f"Warning: Could not configure SSL certificates: {e}")
 
+# The embedded Chromium (QtWebEngine) renderer was terminating (exit code 18) before it could
+# render Aladin Lite. This is a sandbox initialization failure, not the GPU blocklist issue it
+# was previously assumed to be: --disable-gpu-sandbox alone did not stop the crash, but
+# --no-sandbox does, and it also restores full hardware-accelerated WebGL (verified against real
+# rendering, not just "page loaded"). The disabled sandbox only applies to Aladin Lite's fixed,
+# non-user-supplied aladin.u-strasbg.fr URL.
+# NOTE: this must stay the only place QTWEBENGINE_CHROMIUM_FLAGS is set — a later
+# assignment near QApplication startup used to clobber this and re-enable the crash-prone path.
+os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--no-sandbox'
+
 # Core PySide6 imports (always needed)
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings, Slot
 from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush, QAction
@@ -6988,25 +6998,7 @@ if __name__ == "__main__":
         sys.exit(0 if cli_result else 1)
 
     # No CLI command - continue with GUI startup
-    # Set environment variables for QtWebEngine to enable WebGL.
-    # --ignore-gpu-blocklist and --enable-gpu-rasterization are intentionally omitted:
-    # they force GPU use even on drivers that Chrome's blocklist marks as crash-prone,
-    # causing the GPU process to send SIGABRT to the main process (Fatal Python error: Aborted).
-    # Without those flags, Chromium falls back to SwiftShader software WebGL on bad GPUs,
-    # which still supports Aladin Lite without crashing.
-    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--enable-webgl --enable-webgl2 --disable-gpu-sandbox'
-
-    # Enable WebGL for Qt WebEngine (required for Aladin Lite).
-    # MUST be done BEFORE QApplication is created.
-    webgl_args = [
-        '--enable-webgl',
-        '--enable-webgl2',
-        '--disable-gpu-sandbox',
-    ]
-    # Add WebGL arguments if not already present
-    for arg in webgl_args:
-        if arg not in sys.argv:
-            sys.argv.append(arg)
+    # (QTWEBENGINE_CHROMIUM_FLAGS is already set at module load time, above.)
 
     # Initialize QtWebEngine BEFORE QApplication to ensure WebGL settings are applied
     try:

@@ -289,6 +289,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self.pending_fov_overlay = None
         self.target_coordinates = None
         self.fallback_button = None  # Track fallback button to avoid duplicates
+        self._renderer_crashed = False  # Set by _on_render_process_terminated; suppresses the generic load-failed message
 
         # Add loading timeout
         self.loading_timeout = QTimer()
@@ -366,27 +367,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 logger.debug(f"Could not enable developer tools: {e}")
                 # Continue without developer tools
 
-            # Replace the placeholder with the actual web view
-            central_widget = self.centralWidget()
-            if central_widget and central_widget.layout() and self.web_placeholder:
-                layout = central_widget.layout()
-                # Find the placeholder in the layout and replace it
-                for i in range(layout.count()):
-                    item = layout.itemAt(i)
-                    if item and item.widget() == self.web_placeholder:
-                        # Remove placeholder
-                        layout.removeWidget(self.web_placeholder)
-                        self.web_placeholder.hide()
-                        self.web_placeholder.deleteLater()
-                        self.web_placeholder = None
-
-                        # Add web view in the same position
-                        layout.insertWidget(i, self.web_view)
-                        self.web_view.show()
-                        logger.debug("Replaced placeholder with web view in layout")
-                        break
-
-            # Now that web view is created, load Aladin
+            # Load Aladin — placeholder stays visible until _on_load_finished swaps it out
             self._update_aladin_view(preserve_target=False)
             logger.debug("Web view created successfully")
 
@@ -1469,27 +1450,50 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
             // Initial overlay creation
             setTimeout(function() {{
+                // Aladin computes its width/height FOV from the container size at the moment
+                // it finishes loading, which is stale if the widget gets resized afterward
+                // (e.g. the placeholder-to-webview swap on load finish). It does not recompute
+                // on its own, so re-apply the current width FOV to force a resync — this does
+                // not change the visible zoom, it just makes Aladin recalculate the height FOV
+                // against the container's real, current aspect ratio.
+                try {{
+                    var resyncInst = (window.aladinInstance && window.aladinInstance.getFov) ? window.aladinInstance
+                        : (typeof aladin !== 'undefined' && aladin.getFov) ? aladin : null;
+                    if (resyncInst && resyncInst.setFov) {{
+                        resyncInst.setFov(resyncInst.getFov()[0]);
+                    }}
+                }} catch(e) {{
+                    console.log('Could not resync Aladin FOV:', e);
+                }}
+
                 window.updateTelescopeFovOverlay();
 
-                // Set up zoom change detection
+                // Set up zoom/resize change detection
                 var lastFov = null;
+                var lastFovH = null;
                 setInterval(function() {{
                     try {{
-                        var currentFov = null;
+                        var currentFov = null, currentFovH = null;
                         if (window.aladinInstance && window.aladinInstance.getFov) {{
-                            currentFov = window.aladinInstance.getFov()[0];
+                            var f = window.aladinInstance.getFov();
+                            currentFov = f[0]; currentFovH = f[1];
                         }} else if (typeof aladin !== 'undefined' && aladin.getFov) {{
-                            currentFov = aladin.getFov()[0];
+                            var f = aladin.getFov();
+                            currentFov = f[0]; currentFovH = f[1];
                         }}
 
-                        if (currentFov && Math.abs(currentFov - lastFov) > 0.001) {{
+                        // Compare both axes — a container resize can change the height FOV
+                        // while leaving the width FOV untouched (or vice versa).
+                        if (currentFov !== null &&
+                            (Math.abs(currentFov - lastFov) > 0.001 || Math.abs(currentFovH - lastFovH) > 0.001)) {{
                             lastFov = currentFov;
+                            lastFovH = currentFovH;
                             window.updateTelescopeFovOverlay();
                         }}
                     }} catch(e) {{
                         // Silently ignore errors in polling
                     }}
-                }}, 500); // Check every 500ms for zoom changes
+                }}, 500); // Check every 500ms for zoom/resize changes
 
                 console.log('Dynamic FOV overlay system initialized');
             }}, 1500);
@@ -2019,6 +2023,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
     def _on_load_started(self):
         """Handle web page load started"""
         logger.debug("Aladin Lite: Load started")
+        self._renderer_crashed = False
         if self.web_placeholder:
             self.web_placeholder.setText("Loading Aladin Lite...")
         # Start timeout timer (30 seconds)
@@ -2027,7 +2032,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
     def _on_load_progress(self, progress):
         """Handle web page load progress"""
         logger.debug(f"Aladin Lite: Load progress {progress}%")
-        if self.web_placeholder:
+        # Chromium still reports load progress after a renderer crash; don't stomp the crash message.
+        if self.web_placeholder and not self._renderer_crashed:
             self.web_placeholder.setText(f"Loading Aladin Lite... {progress}%")
 
     def _on_render_process_terminated(self, termination_status, exit_code):
@@ -2042,6 +2048,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         status_name = status_names.get(termination_status, f"Unknown({termination_status})")
         logger.error(f"Aladin Lite renderer process terminated: {status_name}, exit code: {exit_code}")
         self.loading_timeout.stop()
+        self._renderer_crashed = True
 
         if self.web_placeholder is None:
             # Placeholder was already removed; re-create it so we can show the error
@@ -2061,6 +2068,12 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             )
             self.web_placeholder.show()
         self._add_browser_fallback_button()
+        # Stop any in-progress load to break the automatic crash-and-retry cycle
+        try:
+            if self.web_view:
+                self.web_view.stop()
+        except Exception:
+            pass
 
     def _on_load_finished(self, success):
         """Handle web page load finished"""
@@ -2069,7 +2082,9 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
         if not success:
             logger.error("Failed to load Aladin Lite")
-            if self.web_placeholder:
+            # If the renderer already crashed, _on_render_process_terminated set a more
+            # accurate message — don't stomp it with the generic network-error text.
+            if self.web_placeholder and not self._renderer_crashed:
                 self.web_placeholder.setText("Failed to load Aladin Lite\nCheck your internet connection\n\nClick below to open in browser instead.")
                 self.web_placeholder.setStyleSheet(f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: 12px; }}")
             self._add_browser_fallback_button()
