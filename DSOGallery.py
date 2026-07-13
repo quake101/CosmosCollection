@@ -416,23 +416,14 @@ class DataLoaderRunnable(QRunnable):
             try:
                 cursor = conn.cursor()
 
-                # Optimized query - single pass with LEFT JOIN instead of correlated subqueries
+                # One row per image (not per DSO) so every attached image gets its own card
                 query = """
-                WITH PreferredImages AS (
-                    SELECT
-                        dsodetailid,
-                        image_path,
-                        equipment,
-                        is_favorite,
-                        created_date,
-                        ROW_NUMBER() OVER (PARTITION BY dsodetailid ORDER BY is_favorite DESC, id ASC) as rn
-                    FROM userimages
-                )
-                SELECT DISTINCT
+                SELECT
                     d.id as dsodetailid,
-                    pi.image_path,
-                    pi.equipment,
-                    pi.is_favorite,
+                    ui.id as imageid,
+                    ui.image_path,
+                    ui.equipment,
+                    ui.is_favorite,
                     d.dsotype,
                     d.constellation,
                     GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', '
@@ -443,14 +434,14 @@ class DataLoaderRunnable(QRunnable):
                                 WHEN 'IC' THEN 3
                                 ELSE 4
                             END, c.designation) as name,
-                    pi.created_date,
+                    ui.created_date,
                     d.ra,
                     d.dec
-                FROM dsodetail d
+                FROM userimages ui
+                INNER JOIN dsodetail d ON d.id = ui.dsodetailid
                 INNER JOIN cataloguenr c ON d.id = c.dsodetailid
-                LEFT JOIN PreferredImages pi ON d.id = pi.dsodetailid AND pi.rn = 1
-                WHERE pi.image_path IS NOT NULL
-                GROUP BY d.id
+                WHERE ui.image_path IS NOT NULL AND ui.image_path != ''
+                GROUP BY ui.id
                 ORDER BY name
                 """
 
@@ -462,16 +453,17 @@ class DataLoaderRunnable(QRunnable):
                 for row in rows:
                     item = {
                         'dsodetailid': row[0],
-                        'image_path': row[1],
-                        'equipment': row[2] or '',
-                        'is_favorite': row[3],
-                        'dsotype': row[4] or '',
-                        'constellation': row[5] or '',
-                        'name': row[6] or 'Unknown',
-                        'friendly_type': self._get_friendly_type_name(row[4] or ''),
-                        'created_date': row[7] or '',
-                        'ra_deg': row[8],
-                        'dec_deg': row[9]
+                        'imageid': row[1],
+                        'image_path': row[2],
+                        'equipment': row[3] or '',
+                        'is_favorite': row[4],
+                        'dsotype': row[5] or '',
+                        'constellation': row[6] or '',
+                        'name': row[7] or 'Unknown',
+                        'friendly_type': self._get_friendly_type_name(row[5] or ''),
+                        'created_date': row[8] or '',
+                        'ra_deg': row[9],
+                        'dec_deg': row[10]
                     }
                     items.append(item)
 
@@ -714,12 +706,14 @@ class GalleryCard(QFrame):
         Initialize gallery card
 
         Args:
-            item_data (dict): Dictionary containing DSO data
+            item_data (dict): Dictionary describing a single image (one DSO can
+                have multiple images, and therefore multiple cards)
                 - dsodetailid: DSO ID
+                - imageid: userimages.id for this specific image
                 - name: DSO name
                 - dsotype: DSO type code
-                - image_path: Path to favorite image
-                - equipment: Equipment used
+                - image_path: Path to this image
+                - equipment: Equipment used for this image
             thumbnail_size (int): Size of thumbnail in pixels (default 150)
         """
         super().__init__(parent)
@@ -761,6 +755,16 @@ class GalleryCard(QFrame):
         type_label.setStyleSheet(f"font-size: 10px; color: {COLORS['text_secondary']};")
         type_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(type_label)
+
+        # Tooltip with per-image details, since a DSO with multiple images
+        # will have multiple cards that otherwise look identical
+        equipment = self.item_data.get('equipment', '').strip()
+        tooltip_lines = [self.item_data.get('name', 'Unknown')]
+        if equipment:
+            tooltip_lines.append(f"Equipment: {equipment}")
+        if self.item_data.get('is_favorite'):
+            tooltip_lines.append("Favorite image")
+        self.setToolTip('\n'.join(tooltip_lines))
 
         # Card styling - card width is thumbnail size + padding (20px for margins and borders)
         card_width = self.thumbnail_size + 20
@@ -1028,7 +1032,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         # Update status
         count = len(self.all_items)
-        self.status_label.setText(f"Loaded {count} DSO{'s' if count != 1 else ''} with images")
+        self.status_label.setText(f"Loaded {count} image{'s' if count != 1 else ''}")
 
         # Populate grid if window is already shown
         if not self._initial_load_pending:
@@ -1118,7 +1122,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                 loading_label.setStyleSheet("font-size: 14px; color: #cccccc; padding: 50px;")
             elif len(self.all_items) == 0:
                 # Data loaded but database has no images
-                loading_label = QLabel("No DSO images in your database.\n\nAdd images to DSO objects to see them here.")
+                loading_label = QLabel("No images in your database.\n\nAdd images to DSO objects to see them here.")
                 loading_label.setStyleSheet("font-size: 14px; color: #888888; padding: 50px;")
             else:
                 # Data loaded but no matches for current filters
@@ -1128,7 +1132,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self.grid_layout.addWidget(loading_label, 0, 0)
 
             if self.all_items:
-                self.status_label.setText(f"Showing 0 of {len(self.all_items)} DSOs")
+                self.status_label.setText(f"Showing 0 of {len(self.all_items)} images")
 
             # Re-enable updates
             self.grid_container.setUpdatesEnabled(True)
@@ -1186,9 +1190,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         # Update status immediately
         if showing == total:
-            self.status_label.setText(f"Loading {total} DSO{'s' if total != 1 else ''}...")
+            self.status_label.setText(f"Loading {total} image{'s' if total != 1 else ''}...")
         else:
-            self.status_label.setText(f"Loading {showing} of {total} DSOs...")
+            self.status_label.setText(f"Loading {showing} of {total} images...")
 
         # Create cards in batches to keep UI responsive
         self._create_cards_batch(0, cols)
@@ -1239,9 +1243,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             showing = len(self.filtered_items)
             total = len(self.all_items)
             if showing == total:
-                self.status_label.setText(f"Showing all {total} DSO{'s' if total != 1 else ''}")
+                self.status_label.setText(f"Showing all {total} image{'s' if total != 1 else ''}")
             else:
-                self.status_label.setText(f"Showing {showing} of {total} DSOs")
+                self.status_label.setText(f"Showing {showing} of {total} images")
 
             # Load thumbnails in background
             self._load_thumbnails()
