@@ -34,7 +34,16 @@ if getattr(sys, 'frozen', False):
 # non-user-supplied aladin.u-strasbg.fr URL.
 # NOTE: this must stay the only place QTWEBENGINE_CHROMIUM_FLAGS is set — a later
 # assignment near QApplication startup used to clobber this and re-enable the crash-prone path.
-os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--no-sandbox'
+#
+# --enable-logging/--log-file: app.exec() has crashed (SIGABRT) with no Python-level cause and no
+# Windows "Application Error" event, which points to a Chromium-internal CHECK()/fatal-assertion
+# failure (likely GPU/WebGL, given it happened while Aladin Lite was actively rendering) rather
+# than memory corruption. Chromium prints the fatal message to its own log right before abort()-ing;
+# without this flag that message is lost, leaving faulthandler's single app.exec() frame as the
+# only clue. This captures it to chromium_debug.log next to crash.log for the next occurrence.
+from ResourceManager import ResourceManager as _ResourceManager
+_chromium_log_path = os.path.join(str(_ResourceManager.get_data_dir()), 'chromium_debug.log')
+os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = f'--no-sandbox --enable-logging --log-file={_chromium_log_path}'
 
 # Core PySide6 imports (always needed)
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings, Slot

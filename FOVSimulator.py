@@ -1165,12 +1165,19 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                     lineWidth: 3
                 }});
                 aladinInstance.addOverlay(overlay);
-                overlay.addShape(A.circle({ra}, {dec}, {overlay_radius:.6f}));
+                overlay.addFootprints(A.circle({ra}, {dec}, {overlay_radius:.6f}));
                 console.log('FOV Overlay Debug: Circle overlay added at RA={ra}, Dec={dec}, radius={overlay_radius:.6f}°');
             """
         else:
             half_width = telescope_fov_width_deg / 2.0
             half_height = telescope_fov_height_deg / 2.0
+            # RA is a coordinate angle, not a true angular separation — at declination
+            # dec, one degree of RA only spans cos(dec) degrees on the sky. Without this
+            # correction the rectangle's true angular width shrinks as |dec| grows and no
+            # longer matches the telescope's actual field of view.
+            cos_dec = math.cos(math.radians(dec))
+            cos_dec = cos_dec if abs(cos_dec) > 1e-6 else (1e-6 if cos_dec >= 0 else -1e-6)
+            half_width_ra = half_width / cos_dec
             overlay_creation = f"""
                 var overlay = A.graphicOverlay({{
                     color: '{overlay_color}',
@@ -1179,12 +1186,12 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 aladinInstance.addOverlay(overlay);
 
                 var poly = A.polygon([
-                    [{ra - half_width:.6f}, {dec - half_height:.6f}],
-                    [{ra + half_width:.6f}, {dec - half_height:.6f}],
-                    [{ra + half_width:.6f}, {dec + half_height:.6f}],
-                    [{ra - half_width:.6f}, {dec + half_height:.6f}]
+                    [{ra - half_width_ra:.6f}, {dec - half_height:.6f}],
+                    [{ra + half_width_ra:.6f}, {dec - half_height:.6f}],
+                    [{ra + half_width_ra:.6f}, {dec + half_height:.6f}],
+                    [{ra - half_width_ra:.6f}, {dec + half_height:.6f}]
                 ]);
-                overlay.addShape(poly);
+                overlay.addFootprints(poly);
                 console.log('FOV Overlay Debug: Rectangle overlay added at RA={ra}, Dec={dec}, size={half_width*2:.6f}°x{half_height*2:.6f}°');
             """
 
@@ -1201,6 +1208,18 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                     try {{
                         console.log('FOV Overlay Debug: Creating overlay...');
 
+                        // Clear any previously injected overlay/info panel before adding
+                        // the new one — otherwise switching telescope/equipment while the
+                        // same target is loaded stacks a new shape on top of the old one.
+                        if (window.telescopeFovOverlay) {{
+                            try {{ window.telescopeFovOverlay.removeAll(); }} catch(e) {{}}
+                            window.telescopeFovOverlay = null;
+                        }}
+                        if (window.telescopeFovInfoDiv) {{
+                            try {{ window.telescopeFovInfoDiv.remove(); }} catch(e) {{}}
+                            window.telescopeFovInfoDiv = null;
+                        }}
+
                         {overlay_creation}
 
                         // Add info overlay
@@ -1208,6 +1227,9 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                         infoDiv.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(0,0,0,0.8);color:white;padding:10px;border-radius:5px;font-family:Arial;font-size:12px;z-index:1000;';
                         infoDiv.innerHTML = '<strong>Telescope FOV:</strong> {fov_data["width_arcmin"]:.1f}\\' × {fov_data["height_arcmin"]:.1f}\\'<br><strong>Type:</strong> {fov_data["details"]}';
                         document.body.appendChild(infoDiv);
+
+                        window.telescopeFovOverlay = overlay;
+                        window.telescopeFovInfoDiv = infoDiv;
 
                         console.log('FOV Overlay Debug: Overlay and info panel added successfully!');
                         return true;
@@ -1303,206 +1325,10 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             setTimeout(function() {{ addOverlayWhenReady(0); }}, 1000);
         """
 
-        # First try the complex Aladin API approach
         self.web_view.page().runJavaScript(setup_code)
         self.web_view.page().runJavaScript(js_code)
 
-        # Also add a dynamically scaling HTML overlay
-        # Get the current display FOV
-        current_display_fov = self.current_fov
-
-        simple_overlay_js = f"""
-            // Global variables for the overlay system
-            window.telescopeFovData = {{
-                telescopeFovDegrees: {telescope_fov_width_deg:.6f},
-                telescopeFovHeightDegrees: {telescope_fov_height_deg:.6f},
-                overlayColor: '{overlay_color}',
-                overlayShape: '{overlay_shape}',
-                fovDetails: '{fov_data["details"]}',
-                fovWidthArcmin: {fov_data["width_arcmin"]:.1f},
-                fovHeightArcmin: {fov_data["height_arcmin"]:.1f},
-                targetRA: {ra:.3f},
-                targetDec: {dec:.3f}
-            }};
-
-            // Function to update overlay scale based on current Aladin FOV
-            window.updateTelescopeFovOverlay = function() {{
-                var existingIndicator = document.getElementById('telescope-fov-indicator');
-                var existingPanel = document.getElementById('telescope-fov-panel');
-
-                // Get current Aladin FOV dynamically
-                var currentAladinFov = {current_display_fov};  // Fallback (width FOV in degrees)
-                var currentAladinFovH = currentAladinFov;      // Fallback height FOV
-
-                // Try to get actual current FOV from Aladin instance
-                // getFov() returns [widthDeg, heightDeg]
-                try {{
-                    var fovArr = null;
-                    if (window.aladinInstance && window.aladinInstance.getFov) {{
-                        fovArr = window.aladinInstance.getFov();
-                    }} else if (typeof aladin !== 'undefined' && aladin.getFov) {{
-                        fovArr = aladin.getFov();
-                    }}
-                    if (fovArr) {{
-                        currentAladinFov  = fovArr[0];
-                        currentAladinFovH = fovArr[1] || fovArr[0];
-                    }}
-                }} catch(e) {{
-                    console.log('Could not get dynamic FOV, using fallback:', currentAladinFov);
-                }}
-
-                var data = window.telescopeFovData;
-
-                // Width %  = telescope_fov_width  / aladin_width_fov  → % of container width
-                // Height % = telescope_fov_height / aladin_height_fov → % of container height
-                var overlayWidthPercent  = (data.telescopeFovDegrees       / currentAladinFov)  * 100;
-                var overlayHeightPercent = (data.telescopeFovHeightDegrees / currentAladinFovH) * 100;
-
-                // Limit the overlay size to reasonable bounds
-                overlayWidthPercent = Math.max(2, Math.min(95, overlayWidthPercent));
-                overlayHeightPercent = Math.max(2, Math.min(95, overlayHeightPercent));
-
-                console.log('FOV Update: Aladin FOV=' + currentAladinFov.toFixed(3) + '°x' + currentAladinFovH.toFixed(3) + '°, Telescope FOV=' + data.telescopeFovDegrees.toFixed(3) + '°x' + data.telescopeFovHeightDegrees.toFixed(3) + '°, Overlay=' + overlayWidthPercent.toFixed(1) + '%x' + overlayHeightPercent.toFixed(1) + '%');
-
-                // Find the Aladin container
-                var aladinContainer = document.querySelector('#aladin-lite-div') || document.querySelector('.aladin-reticleContainer') || document.body;
-
-                // Remove existing elements
-                if (existingIndicator) existingIndicator.remove();
-                if (existingPanel) existingPanel.remove();
-
-                // Create new telescope FOV indicator
-                var fovIndicator = document.createElement('div');
-                fovIndicator.id = 'telescope-fov-indicator';
-                fovIndicator.style.cssText = `
-                    position: absolute;
-                    left: 50%;
-                    top: 50%;
-                    width: ${{overlayWidthPercent}}%;
-                    height: ${{overlayHeightPercent}}%;
-                    border: 3px solid ${{data.overlayColor}};
-                    border-radius: {50 if overlay_shape == 'circle' else 0}%;
-                    background: transparent;
-                    transform: translate(-50%, -50%);
-                    pointer-events: none;
-                    z-index: 1000;
-                    box-shadow: 0 0 10px rgba(0,0,0,0.8);
-                    transition: all 0.3s ease;
-                `;
-
-                // Position relative to Aladin container
-                if (aladinContainer !== document.body) {{
-                    aladinContainer.style.position = 'relative';
-                    aladinContainer.appendChild(fovIndicator);
-                }} else {{
-                    fovIndicator.style.position = 'fixed';
-                    document.body.appendChild(fovIndicator);
-                }}
-
-                // Add crosshair at center
-                var crosshair = document.createElement('div');
-                crosshair.style.cssText = `
-                    position: absolute;
-                    left: 50%;
-                    top: 50%;
-                    width: 20px;
-                    height: 20px;
-                    transform: translate(-50%, -50%);
-                    pointer-events: none;
-                    z-index: 1001;
-                `;
-                crosshair.innerHTML = `
-                    <div style="position:absolute;left:50%;top:0;width:1px;height:100%;background:${{data.overlayColor}};transform:translateX(-50%);"></div>
-                    <div style="position:absolute;top:50%;left:0;height:1px;width:100%;background:${{data.overlayColor}};transform:translateY(-50%);"></div>
-                `;
-                fovIndicator.appendChild(crosshair);
-
-                // Update info panel
-                var scaleInfo = data.telescopeFovDegrees < currentAladinFov ? '📏 TO SCALE' : '⚠️ FOV larger than view';
-
-                var infoPanel = document.createElement('div');
-                infoPanel.id = 'telescope-fov-panel';
-                infoPanel.style.cssText = `
-                    position: fixed;
-                    top: 10px;
-                    right: 10px;
-                    background: rgba(0,0,0,0.9);
-                    color: white;
-                    padding: 12px;
-                    border-radius: 8px;
-                    font-family: 'Segoe UI', Arial, sans-serif;
-                    font-size: 12px;
-                    z-index: 1001;
-                    border: 2px solid ${{data.overlayColor}};
-                    min-width: 200px;
-                `;
-
-                infoPanel.innerHTML = `
-                    <div style="text-align:center;margin-bottom:8px;font-weight:bold;color:${{data.overlayColor}};">🔭 TELESCOPE FOV</div>
-                    <div><strong>Size:</strong> ${{data.fovWidthArcmin}}' × ${{data.fovHeightArcmin}}'</div>
-                    <div><strong>Setup:</strong> ${{data.fovDetails}}</div>
-                    <div><strong>View:</strong> ${{currentAladinFov.toFixed(2)}}° × ${{currentAladinFovH.toFixed(2)}}° (${{(currentAladinFov*60).toFixed(0)}}')</div>
-                    <div><strong>Scale:</strong> ${{scaleInfo}}</div>
-                    <div style="font-size:10px;color:#ccc;margin-top:5px;">Target: RA ${{data.targetRA}}° Dec ${{data.targetDec}}°</div>
-                `;
-                document.body.appendChild(infoPanel);
-            }};
-
-            // Initial overlay creation
-            setTimeout(function() {{
-                // Aladin computes its width/height FOV from the container size at the moment
-                // it finishes loading, which is stale if the widget gets resized afterward
-                // (e.g. the placeholder-to-webview swap on load finish). It does not recompute
-                // on its own, so re-apply the current width FOV to force a resync — this does
-                // not change the visible zoom, it just makes Aladin recalculate the height FOV
-                // against the container's real, current aspect ratio.
-                try {{
-                    var resyncInst = (window.aladinInstance && window.aladinInstance.getFov) ? window.aladinInstance
-                        : (typeof aladin !== 'undefined' && aladin.getFov) ? aladin : null;
-                    if (resyncInst && resyncInst.setFov) {{
-                        resyncInst.setFov(resyncInst.getFov()[0]);
-                    }}
-                }} catch(e) {{
-                    console.log('Could not resync Aladin FOV:', e);
-                }}
-
-                window.updateTelescopeFovOverlay();
-
-                // Set up zoom/resize change detection
-                var lastFov = null;
-                var lastFovH = null;
-                setInterval(function() {{
-                    try {{
-                        var currentFov = null, currentFovH = null;
-                        if (window.aladinInstance && window.aladinInstance.getFov) {{
-                            var f = window.aladinInstance.getFov();
-                            currentFov = f[0]; currentFovH = f[1];
-                        }} else if (typeof aladin !== 'undefined' && aladin.getFov) {{
-                            var f = aladin.getFov();
-                            currentFov = f[0]; currentFovH = f[1];
-                        }}
-
-                        // Compare both axes — a container resize can change the height FOV
-                        // while leaving the width FOV untouched (or vice versa).
-                        if (currentFov !== null &&
-                            (Math.abs(currentFov - lastFov) > 0.001 || Math.abs(currentFovH - lastFovH) > 0.001)) {{
-                            lastFov = currentFov;
-                            lastFovH = currentFovH;
-                            window.updateTelescopeFovOverlay();
-                        }}
-                    }} catch(e) {{
-                        // Silently ignore errors in polling
-                    }}
-                }}, 500); // Check every 500ms for zoom/resize changes
-
-                console.log('Dynamic FOV overlay system initialized');
-            }}, 1500);
-        """
-
-        # Inject both approaches
-        self.web_view.page().runJavaScript(simple_overlay_js)
-
-        logger.debug("JavaScript FOV overlay injection completed (with simple fallback)")
+        logger.debug("JavaScript FOV overlay injection completed")
 
     def _generate_fov_overlay_script(self, telescope_fov_data):
         """Generate JavaScript for FOV overlay (legacy method)"""
@@ -1971,14 +1797,14 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         """Remove the FOV overlay from the current view"""
         try:
             remove_js = """
-                // Remove existing FOV overlay elements
-                var existingOverlay = document.querySelector('.telescope-fov-overlay');
-                if (existingOverlay) {
-                    existingOverlay.remove();
+                // Remove the native Aladin overlay shape and its info panel
+                if (window.telescopeFovOverlay) {
+                    try { window.telescopeFovOverlay.removeAll(); } catch(e) {}
+                    window.telescopeFovOverlay = null;
                 }
-                var existingInfo = document.querySelector('.telescope-fov-info');
-                if (existingInfo) {
-                    existingInfo.remove();
+                if (window.telescopeFovInfoDiv) {
+                    try { window.telescopeFovInfoDiv.remove(); } catch(e) {}
+                    window.telescopeFovInfoDiv = null;
                 }
                 console.log('FOV overlay removed');
             """
