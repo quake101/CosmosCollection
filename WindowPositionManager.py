@@ -44,8 +44,7 @@ class WindowPositionManager:
 
         # Try to restore saved geometry first
         geometry = settings.value(f"{window_key}/geometry")
-        if geometry:
-            window.restoreGeometry(geometry)
+        if geometry and window.restoreGeometry(geometry):
             return True
 
         # Fallback: Try to restore position and size separately
