@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS
-from TimeFormatHelper import format_time
+from TimeFormatHelper import format_time, format_datetime
 from NINAIntegration import NINAIntegration
 
 class NumericTableWidgetItem(QTableWidgetItem):
@@ -633,6 +633,29 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self.use_target_list_checkbox.setChecked(True)
             # Use QTimer to trigger calculation after UI is fully initialized
             QTimer.singleShot(100, self.calculate_best_dsos)
+        elif self._should_auto_calculate():
+            # Auto Calculate is enabled, and either no results are showing yet
+            # (always true for a freshly opened window) or the last
+            # calculation wasn't done today
+            QTimer.singleShot(100, self.calculate_best_dsos)
+
+    def _needs_auto_calculate(self):
+        """Return True if Auto Calculate should run because the last calculation
+        wasn't performed today (or has never been performed)."""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        last_calculated_date = settings.value("BestDSOTonight/last_calculated_date", "", type=str)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        return last_calculated_date != today_str
+
+    def _should_auto_calculate(self):
+        """Return True if the Auto Calculate checkbox is checked and a
+        calculation is warranted: either no results are currently displayed
+        or the last calculation wasn't done today."""
+        if not self.auto_calculate_checkbox.isChecked():
+            return False
+        if self.results_table.rowCount() == 0:
+            return True
+        return self._needs_auto_calculate()
 
     def init_ui(self):
         """Initialize the user interface"""
@@ -759,6 +782,23 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         if saved_use_target_list:
             self.use_target_list_checkbox.setChecked(True)
         action_layout.addWidget(self.use_target_list_checkbox)
+
+        # Auto Calculate checkbox
+        self.auto_calculate_checkbox = QCheckBox("Auto Calculate")
+        self.auto_calculate_checkbox.setToolTip(
+            "Automatically calculate best DSOs using the settings above.\n\n"
+            "Runs automatically when:\n"
+            "• This window is opened and no results are shown yet\n"
+            "• This window is opened and the last calculation wasn't done today\n"
+            "• You check this box while no results are currently shown\n\n"
+            "Uses whichever settings are currently set (including Use My\n"
+            "Target List, if enabled)."
+        )
+        self.auto_calculate_checkbox.toggled.connect(self._on_auto_calculate_checkbox_changed)
+        saved_auto_calculate = settings.value("BestDSOTonight/auto_calculate", False, type=bool)
+        if saved_auto_calculate:
+            self.auto_calculate_checkbox.setChecked(True)
+        action_layout.addWidget(self.auto_calculate_checkbox)
 
         # Horizontal layout to hold both groups side by side
         groups_layout = QHBoxLayout()
@@ -996,6 +1036,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         """Save settings and window position when closing"""
         settings = QSettings("CosmosCollection", "CosmosCollection")
         settings.setValue("BestDSOTonight/use_target_list", self.use_target_list_checkbox.isChecked())
+        settings.setValue("BestDSOTonight/auto_calculate", self.auto_calculate_checkbox.isChecked())
         super().closeEvent(event)
 
     def _on_target_list_checkbox_changed(self, checked):
@@ -1013,6 +1054,23 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         # The global stylesheet's :disabled state will automatically
         # grey out the disabled widgets
+
+    def _on_auto_calculate_checkbox_changed(self, checked):
+        """Handle Auto Calculate checkbox state change.
+
+        If Auto Calculate is being turned on and there are no results
+        currently displayed, trigger a calculation right away.
+        """
+        if not checked:
+            return
+
+        # Guard against firing before the UI (results_table) is fully built,
+        # e.g. when the checkbox state is restored from settings during init.
+        if not hasattr(self, 'results_table'):
+            return
+
+        if self._should_auto_calculate():
+            self.calculate_best_dsos()
 
     def calculate_best_dsos(self):
         """Start the calculation of best DSOs for tonight"""
@@ -1074,13 +1132,21 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.calculate_btn.setEnabled(True)
         self.calculate_btn.setText("Calculate Best DSOs Tonight")
 
+        now = datetime.now()
+        last_calculated = format_datetime(now)
+
+        # Persist the date of this calculation so Auto Calculate knows not to
+        # re-run again today
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue("BestDSOTonight/last_calculated_date", now.strftime("%Y-%m-%d"))
+
         if not visible_dsos:
-            self.status_label.setText("No DSOs meet the visibility criteria for tonight")
+            self.status_label.setText(f"No DSOs meet the visibility criteria for tonight. Last calculated: {last_calculated}")
             self.status_label.setStyleSheet("")  # Reset to default color
             self.results_table.setRowCount(0)
             return
 
-        self.status_label.setText(f"Found {len(visible_dsos)} visible DSOs for tonight")
+        self.status_label.setText(f"Found {len(visible_dsos)} visible DSOs for tonight. Last calculated: {last_calculated}")
         self.status_label.setStyleSheet("")  # Reset to default color
         
         # Disable sorting temporarily while populating
