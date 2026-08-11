@@ -32,6 +32,31 @@ from Theme import COLORS
 from TimeFormatHelper import format_time, format_datetime
 from NINAIntegration import NINAIntegration
 
+
+def _get_available_catalogs():
+    """Get list of available catalogs from database.
+
+    Standalone helper (no location/timezone lookup) so callers that only
+    need the catalog list - e.g. populating the catalog dropdown - don't
+    have to pay for building a full DSOVisibilityCalculator.
+    """
+    try:
+        from ResourceManager import ResourceManager, attach_update_catalogs
+        import sqlite3
+
+        db_path = ResourceManager.get_database_path()
+        conn = sqlite3.connect(str(db_path))
+        attach_update_catalogs(conn)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT catalogue FROM cataloguenr ORDER BY catalogue")
+        catalogs = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return catalogs
+    except Exception as e:
+        print(f"Error getting catalogs: {e}")
+        return []
+
+
 class NumericTableWidgetItem(QTableWidgetItem):
     """Custom QTableWidgetItem that sorts by numeric value stored in UserRole"""
     def __lt__(self, other):
@@ -279,22 +304,7 @@ class DSOCalculationThread(QThread):
 
     def get_available_catalogs(self):
         """Get list of available catalogs from database"""
-        try:
-            from ResourceManager import ResourceManager
-            import sqlite3
-            
-            db_path = ResourceManager.get_database_path()
-            conn = sqlite3.connect(str(db_path))
-            from ResourceManager import attach_update_catalogs
-            attach_update_catalogs(conn)
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT catalogue FROM cataloguenr ORDER BY catalogue")
-            catalogs = [row[0] for row in cursor.fetchall()]
-            conn.close()
-            return catalogs
-        except Exception as e:
-            print(f"Error getting catalogs: {e}")
-            return []
+        return _get_available_catalogs()
 
     def load_dsos_from_target_list(self):
         """Load DSOs from the user's target list"""
@@ -584,6 +594,108 @@ class DSOCalculationThread(QThread):
             self.error_occurred.emit(f"Calculation error: {str(e)}")
 
 
+def _compute_twilight_times():
+    """
+    Calculate astronomical twilight start and end times for tonight.
+    Returns (start_hour, duration_hours) based on when sun altitude < -12 degrees.
+    Falls back to (18, 12) if calculation fails.
+    """
+    try:
+        # Get observer location from database. This runs inside a QThread, so
+        # (like the other thread bodies in this file) it opens its own fresh
+        # sqlite3 connection here rather than going through the DatabaseManager
+        # singleton, whose cached connection is bound to whichever thread
+        # first created it and can't be reused from a different thread.
+        import sqlite3
+        from ResourceManager import ResourceManager
+
+        db_path = ResourceManager.get_database_path()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
+            location_row = cursor.fetchone()
+            if not location_row:
+                cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+                location_row = cursor.fetchone()
+        finally:
+            conn.close()
+
+        if not location_row or None in location_row:
+            # No location configured, use default
+            return (18, 12)
+
+        lat, lon, tz_str = location_row
+
+        # Set up observer location
+        observer_location = EarthLocation(lat=lat*u.deg, lon=lon*u.deg)
+        local_tz = pytz.timezone(tz_str)
+
+        # Create 24-hour time range starting at noon today (to capture both twilights)
+        now = datetime.now(local_tz)
+        noon_today = now.replace(hour=12, minute=0, second=0, microsecond=0)
+        noon_utc = Time(noon_today.astimezone(pytz.UTC).replace(tzinfo=None))
+
+        # Calculate sun position every 15 minutes for 24 hours
+        time_range = noon_utc + np.linspace(0, 24, 96) * u.hour
+        altaz_frame = AltAz(obstime=time_range, location=observer_location)
+        sun = get_sun(time_range)
+        sun_altaz = sun.transform_to(altaz_frame)
+
+        # Find when sun is below -12 degrees (astronomical twilight)
+        dark_periods = sun_altaz.alt.deg < -12
+
+        if not np.any(dark_periods):
+            # No dark period (e.g., polar day) - use default
+            return (18, 12)
+
+        # Find first dark period start (evening twilight)
+        dark_indices = np.where(dark_periods)[0]
+        first_dark_idx = dark_indices[0]
+        last_dark_idx = dark_indices[-1]
+
+        # Convert indices to times
+        evening_twilight = time_range[first_dark_idx]
+        morning_twilight = time_range[last_dark_idx]
+
+        # Convert to local time
+        evening_local = evening_twilight.to_datetime(timezone=pytz.UTC).astimezone(local_tz)
+        morning_local = morning_twilight.to_datetime(timezone=pytz.UTC).astimezone(local_tz)
+
+        # Extract start hour (round to nearest hour)
+        start_hour = evening_local.hour
+
+        # Calculate duration (handle day crossing)
+        duration_td = morning_local - evening_local
+        duration_hours = int(duration_td.total_seconds() / 3600)
+
+        # Ensure reasonable values
+        if duration_hours < 1:
+            duration_hours = 12
+        elif duration_hours > 24:
+            duration_hours = 12
+
+        return (start_hour, duration_hours)
+
+    except Exception as e:
+        # If anything fails, use default values
+        print(f"Error calculating twilight times: {e}")
+        return (18, 12)
+
+
+class TwilightCalculationThread(QThread):
+    """
+    Background thread that computes tonight's astronomical twilight window
+    (start hour + duration) so the main window never blocks the GUI thread
+    on this astropy calculation (which can also trigger an IERS data fetch).
+    """
+    result_ready = Signal(int, int)  # start_hour, duration_hours
+
+    def run(self):
+        start_hour, duration_hours = _compute_twilight_times()
+        self.result_ready.emit(start_hour, duration_hours)
+
+
 class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
     """Main window for Best DSO Tonight calculator"""
     WINDOW_POSITION_KEY = "BestDSOTonight"
@@ -597,6 +709,8 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.setup_window_position()
 
         self.calc_thread = None
+        self.twilight_thread = None
+        self._twilight_calc_date = None  # date (YYYY-MM-DD) the twilight window was last computed
         self.available_catalogs = []
         self.visible_dsos_data = []  # Store DSO data for detail window
         self.init_ui()
@@ -607,22 +721,21 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         QTimer.singleShot(0, self._complete_initialization)
 
     def _complete_initialization(self):
-        """Complete initialization after UI is shown - calculates twilight times"""
-        # Update status to show what's happening
-        # This may trigger IERS data download on first run
+        """Complete initialization after UI is shown - kicks off the twilight
+        calculation in a background thread so the window stays responsive
+        (this astropy calculation can also trigger an IERS data fetch)."""
         self.status_label.setText("Loading astronomical ephemeris data...")
         self.status_label.setStyleSheet(f"color: {COLORS['info']};")
-        QApplication.processEvents()  # Force UI update
 
-        try:
-            # Calculate twilight times (may trigger IERS data download)
-            start_hour, duration = self.calculate_twilight_times()
-            self.start_hour_spin.setValue(start_hour)
-            self.duration_hours_spin.setValue(duration)
-        except Exception as e:
-            # If calculation fails, use defaults but don't crash
-            self.start_hour_spin.setValue(18)
-            self.duration_hours_spin.setValue(12)
+        self.twilight_thread = TwilightCalculationThread()
+        self.twilight_thread.result_ready.connect(self._on_twilight_calculated)
+        self.twilight_thread.start()
+
+    def _on_twilight_calculated(self, start_hour, duration_hours):
+        """Apply the computed twilight window and finish initialization."""
+        self.start_hour_spin.setValue(start_hour)
+        self.duration_hours_spin.setValue(duration_hours)
+        self._twilight_calc_date = datetime.now().strftime("%Y-%m-%d")
 
         # Update status to ready
         self.status_label.setText("Ready to calculate best DSOs for tonight")
@@ -638,6 +751,23 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             # (always true for a freshly opened window) or the last
             # calculation wasn't done today
             QTimer.singleShot(100, self.calculate_best_dsos)
+
+    def refresh_twilight_if_stale(self):
+        """Recompute the twilight-based start hour/duration defaults if they
+        were last computed on a previous calendar day. Called when a
+        previously-built window instance is reopened, since twilight times
+        (and possibly the observer's location/timezone) can change day to day.
+        No-op if already refreshed today or a refresh is already in flight.
+        """
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if self._twilight_calc_date == today_str:
+            return
+        if self.twilight_thread and self.twilight_thread.isRunning():
+            return
+
+        self.twilight_thread = TwilightCalculationThread()
+        self.twilight_thread.result_ready.connect(self._on_twilight_calculated)
+        self.twilight_thread.start()
 
     def _needs_auto_calculate(self):
         """Return True if Auto Calculate should run because the last calculation
@@ -916,90 +1046,13 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self.location_label.setText("Error loading location")
             self.calculate_btn.setEnabled(False)
 
-    def calculate_twilight_times(self):
-        """
-        Calculate astronomical twilight start and end times for tonight.
-        Returns (start_hour, duration_hours) based on when sun altitude < -12 degrees.
-        Falls back to (18, 12) if calculation fails.
-        """
-        try:
-            # Get observer location from database
-            db_manager = DatabaseManager()
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
-                location_row = cursor.fetchone()
-                if not location_row:
-                    cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-                    location_row = cursor.fetchone()
-
-                if not location_row or None in location_row:
-                    # No location configured, use default
-                    return (18, 12)
-
-                lat, lon, tz_str = location_row
-
-            # Set up observer location
-            observer_location = EarthLocation(lat=lat*u.deg, lon=lon*u.deg)
-            local_tz = pytz.timezone(tz_str)
-
-            # Create 24-hour time range starting at noon today (to capture both twilights)
-            now = datetime.now(local_tz)
-            noon_today = now.replace(hour=12, minute=0, second=0, microsecond=0)
-            noon_utc = Time(noon_today.astimezone(pytz.UTC).replace(tzinfo=None))
-
-            # Calculate sun position every 15 minutes for 24 hours
-            time_range = noon_utc + np.linspace(0, 24, 96) * u.hour
-            altaz_frame = AltAz(obstime=time_range, location=observer_location)
-            sun = get_sun(time_range)
-            sun_altaz = sun.transform_to(altaz_frame)
-
-            # Find when sun is below -12 degrees (astronomical twilight)
-            dark_periods = sun_altaz.alt.deg < -12
-
-            if not np.any(dark_periods):
-                # No dark period (e.g., polar day) - use default
-                return (18, 12)
-
-            # Find first dark period start (evening twilight)
-            dark_indices = np.where(dark_periods)[0]
-            first_dark_idx = dark_indices[0]
-            last_dark_idx = dark_indices[-1]
-
-            # Convert indices to times
-            evening_twilight = time_range[first_dark_idx]
-            morning_twilight = time_range[last_dark_idx]
-
-            # Convert to local time
-            evening_local = evening_twilight.to_datetime(timezone=pytz.UTC).astimezone(local_tz)
-            morning_local = morning_twilight.to_datetime(timezone=pytz.UTC).astimezone(local_tz)
-
-            # Extract start hour (round to nearest hour)
-            start_hour = evening_local.hour
-
-            # Calculate duration (handle day crossing)
-            duration_td = morning_local - evening_local
-            duration_hours = int(duration_td.total_seconds() / 3600)
-
-            # Ensure reasonable values
-            if duration_hours < 1:
-                duration_hours = 12
-            elif duration_hours > 24:
-                duration_hours = 12
-
-            return (start_hour, duration_hours)
-
-        except Exception as e:
-            # If anything fails, use default values
-            print(f"Error calculating twilight times: {e}")
-            return (18, 12)
-
     def load_catalog_options(self):
         """Load available catalogs from database"""
         try:
-            # Create a temporary calculation thread to get catalogs
-            temp_thread = DSOCalculationThread()
-            self.available_catalogs = temp_thread.get_available_catalogs()
+            # Query catalogs directly - avoids building a full
+            # DSOCalculationThread/DSOVisibilityCalculator (and the location/
+            # timezone DB round trips that come with it) just for this list.
+            self.available_catalogs = _get_available_catalogs()
         except Exception as e:
             print(f"Error loading catalogs: {e}")
             self.available_catalogs = ["M", "NGC", "IC"]  # Fallback default catalogs

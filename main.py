@@ -5186,8 +5186,25 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Show the Best DSO Tonight window"""
         try:
             from BestDSOTonight import BestDSOTonightWindow
-            if not hasattr(self, 'best_dso_window') or not self.best_dso_window.isVisible():
+            # Reuse the existing window (even if it was closed/hidden) rather than
+            # rebuilding it from scratch each time - reconstruction re-runs the
+            # catalog load and twilight calculation, which is expensive.
+            needs_new = not hasattr(self, 'best_dso_window') or self.best_dso_window is None
+            if not needs_new:
+                try:
+                    self.best_dso_window.isVisible()  # touch to detect a deleted C++ object
+                except RuntimeError:
+                    needs_new = True
+            if needs_new:
                 self.best_dso_window = BestDSOTonightWindow()
+            else:
+                # Location/timezone may have changed in settings since the window
+                # was last shown - refresh the displayed label (cheap single query).
+                # Calculation results are always re-read from the DB fresh regardless.
+                self.best_dso_window.load_location_info()
+                # Refresh the twilight-based time defaults if they're from a
+                # previous day (also re-reads location/timezone from the DB).
+                self.best_dso_window.refresh_twilight_if_stale()
             self.best_dso_window.show()
             self.best_dso_window.raise_()
             self.best_dso_window.activateWindow()
