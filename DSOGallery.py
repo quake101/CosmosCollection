@@ -862,6 +862,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         thread_count = settings.value("max_threads", default_threads, type=int)
         self.thread_pool.setMaxThreadCount(thread_count)
         self.thumbnail_signals = ThumbnailSignals()
+        self._thumbnail_signals_connected = False
         self.cancelled_flag = [False]  # Mutable flag for cancellation
 
         # Thumbnail loading progress tracking
@@ -887,6 +888,13 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         # Flag to track if resize is in progress
         self.resize_in_progress = False
+
+        # Count of outstanding QApplication.setOverrideCursor(WaitCursor) pushes
+        # that still need a matching restoreOverrideCursor(). A plain boolean
+        # can't survive overlapping triggers (e.g. typing quickly in the search
+        # box while a previous grid populate is still batching in), so we use
+        # a counter instead to keep every push paired with exactly one pop.
+        self._pending_wait_cursors = 0
 
         # Lazy loading tracking
         self.thumbnail_loaded_indices = set()  # Track which card indices have been queued
@@ -1096,6 +1104,17 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         return columns
 
+    def _push_wait_cursor(self):
+        """Push a WaitCursor and track it so it's always paired with a restore."""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._pending_wait_cursors += 1
+
+    def _pop_wait_cursor(self):
+        """Restore a previously pushed WaitCursor, if one is still outstanding."""
+        if self._pending_wait_cursors > 0:
+            QApplication.restoreOverrideCursor()
+            self._pending_wait_cursors -= 1
+
     def _populate_grid(self):
         """Populate grid with gallery cards"""
         # Close any existing progress dialog
@@ -1148,11 +1167,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Show wait cursor during loading if many items
         showing = len(self.filtered_items)
         total = len(self.all_items)
-        if showing > 50:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            self._loading_cursor_active = True
-        else:
-            self._loading_cursor_active = False
+        cursor_pushed = showing > 50
+        if cursor_pushed:
+            self._push_wait_cursor()
 
         # Set up progress tracking for thumbnail loading
         self.thumbnails_to_load = showing
@@ -1195,9 +1212,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self.status_label.setText(f"Loading {showing} of {total} images...")
 
         # Create cards in batches to keep UI responsive
-        self._create_cards_batch(0, cols)
+        self._create_cards_batch(0, cols, cursor_pushed=cursor_pushed)
 
-    def _create_cards_batch(self, start_idx, cols, batch_size=15):
+    def _create_cards_batch(self, start_idx, cols, batch_size=15, cursor_pushed=False):
         """Create a batch of gallery cards to keep UI responsive"""
         end_idx = min(start_idx + batch_size, len(self.filtered_items))
 
@@ -1225,7 +1242,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # If there are more cards to create, schedule next batch
         # Use QTimer.singleShot(0, ...) to allow UI events to process between batches
         if end_idx < len(self.filtered_items):
-            QTimer.singleShot(0, lambda: self._create_cards_batch(end_idx, cols, batch_size))
+            QTimer.singleShot(0, lambda: self._create_cards_batch(end_idx, cols, batch_size, cursor_pushed))
         else:
             # All cards created - finalize grid layout
             self.grid_layout.setRowStretch(len(self.filtered_items) // cols + 1, 1)
@@ -1234,10 +1251,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             # Re-enable updates now that grid is built
             self.grid_container.setUpdatesEnabled(True)
 
-            # Restore cursor if we set it
-            if hasattr(self, '_loading_cursor_active') and self._loading_cursor_active:
-                QApplication.restoreOverrideCursor()
-                self._loading_cursor_active = False
+            # Restore cursor if this batch chain pushed one
+            if cursor_pushed:
+                self._pop_wait_cursor()
 
             # Update status
             showing = len(self.filtered_items)
@@ -1260,19 +1276,17 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Reset tracking for new grid
         self.thumbnail_loaded_indices.clear()
 
-        # Connect signals (disconnect first to avoid duplicates)
-        try:
+        # Connect signals (disconnect first to avoid duplicates). Only attempt
+        # disconnect if we know we're connected - PySide6 emits a
+        # RuntimeWarning (not a catchable exception) when disconnecting a
+        # signal with no matching connection, so a try/except can't suppress it.
+        if self._thumbnail_signals_connected:
             self.thumbnail_signals.thumbnail_ready.disconnect(self._on_thumbnail_ready)
-        except (TypeError, RuntimeError):
-            pass  # Not connected yet
-
-        try:
             self.thumbnail_signals.thumbnail_error.disconnect(self._on_thumbnail_error)
-        except (TypeError, RuntimeError):
-            pass  # Not connected yet
 
         self.thumbnail_signals.thumbnail_ready.connect(self._on_thumbnail_ready)
         self.thumbnail_signals.thumbnail_error.connect(self._on_thumbnail_error)
+        self._thumbnail_signals_connected = True
 
         # Load visible thumbnails first (priority)
         self._load_visible_thumbnails()
@@ -1866,7 +1880,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self.resize_in_progress = True
 
             # Show visual feedback - change cursor and status
-            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self._push_wait_cursor()
             old_status = self.status_label.text()
             self.status_label.setText("Reorganizing gallery layout...")
             self.status_label.setStyleSheet("padding: 5px; color: #ffcc00;")
@@ -1888,7 +1902,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.status_label.setStyleSheet("padding: 5px;")
         self.resize_in_progress = False
         # Restore normal cursor
-        QApplication.restoreOverrideCursor()
+        self._pop_wait_cursor()
 
     def resizeEvent(self, event):
         """Handle window resize - defer grid recalculation"""
@@ -1941,13 +1955,10 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close - cleanup thread pool and cursor"""
-        # Restore cursor if it was changed during resize
-        if self.resize_in_progress:
-            QApplication.restoreOverrideCursor()
-
-        # Restore cursor if it was changed during loading
-        if hasattr(self, '_loading_cursor_active') and self._loading_cursor_active:
-            QApplication.restoreOverrideCursor()
+        # Restore any WaitCursor pushes that never got matched with a restore
+        # (e.g. window closed while a grid populate or resize was still in flight)
+        while self._pending_wait_cursors > 0:
+            self._pop_wait_cursor()
 
         # Cancel all pending thumbnail tasks
         self.cancelled_flag[0] = True
