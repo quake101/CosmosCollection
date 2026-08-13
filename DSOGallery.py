@@ -841,6 +841,14 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             'sort': 'Name (A-Z)'
         }
 
+        # Restore previously used search/filter selections
+        filter_settings = QSettings("CosmosCollection", "CosmosCollection")
+        self.current_filters['search'] = filter_settings.value("gallery_filter_search", '', type=str)
+        self.current_filters['catalog'] = filter_settings.value("gallery_filter_catalog", 'All', type=str)
+        self.current_filters['type'] = filter_settings.value("gallery_filter_type", 'All', type=str)
+        self.current_filters['equipment'] = filter_settings.value("gallery_filter_equipment", 'All', type=str)
+        self.current_filters['sort'] = filter_settings.value("gallery_filter_sort", 'Name (A-Z)', type=str)
+
         # Thumbnail size options: Small (100), Medium (150), Large (200), Extra Large (250)
         self.thumbnail_size_options = {
             'Small': 100,
@@ -939,6 +947,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         filters_layout.addWidget(QLabel("Search:"))
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search DSO name...")
+        self.search_input.setText(self.current_filters['search'])
         self.search_input.textChanged.connect(lambda: self.search_timer.start(300))
         filters_layout.addWidget(self.search_input)
 
@@ -946,6 +955,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         filters_layout.addWidget(QLabel("Catalog:"))
         self.catalog_combo = QComboBox()
         self.catalog_combo.addItems(["All", "M", "NGC", "IC", "Sh2", "B", "Cr", "Mel"])
+        if self.current_filters['catalog'] in [self.catalog_combo.itemText(i) for i in range(self.catalog_combo.count())]:
+            self.catalog_combo.setCurrentText(self.current_filters['catalog'])
         self.catalog_combo.currentTextChanged.connect(self._on_filter_changed)
         filters_layout.addWidget(self.catalog_combo)
 
@@ -972,6 +983,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["Name (A-Z)", "Name (Z-A)", "Date Added (Newest)", "Date Added (Oldest)", "Type", "Constellation"])
         self.sort_combo.setMinimumWidth(130)
+        if self.current_filters['sort'] in [self.sort_combo.itemText(i) for i in range(self.sort_combo.count())]:
+            self.sort_combo.setCurrentText(self.current_filters['sort'])
         self.sort_combo.currentTextChanged.connect(self._on_sort_changed)
         filters_layout.addWidget(self.sort_combo)
 
@@ -1031,12 +1044,14 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     def _on_data_loaded(self, items):
         """Handle data loaded from background thread"""
         self.all_items = items
-        self.filtered_items = self.all_items.copy()
         self.data_loaded = True  # Mark data as loaded
 
-        # Populate filter dropdowns
+        # Populate filter dropdowns (restores saved type/equipment selection if still valid)
         self._populate_type_filter()
         self._populate_equipment_filter()
+
+        # Apply restored search/filter/sort state now that data and options are available
+        self._filter_and_sort_items()
 
         # Update status
         count = len(self.all_items)
@@ -1060,10 +1075,19 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                 types.add(item['friendly_type'])
 
         # Sort and add to combo box
+        self.type_combo.blockSignals(True)
         self.type_combo.clear()
         self.type_combo.addItem("All")
         for dso_type in sorted(types):
             self.type_combo.addItem(dso_type)
+
+        # Restore saved filter selection if it still exists among the options
+        saved_type = self.current_filters.get('type', 'All')
+        if saved_type in [self.type_combo.itemText(i) for i in range(self.type_combo.count())]:
+            self.type_combo.setCurrentText(saved_type)
+        else:
+            self.current_filters['type'] = 'All'
+        self.type_combo.blockSignals(False)
 
         # Ensure dropdown view is wide enough to show full text
         self.type_combo.view().setMinimumWidth(self.type_combo.minimumSizeHint().width())
@@ -1077,10 +1101,19 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                 equipment_set.add(item['equipment'].strip())
 
         # Sort and add to combo box
+        self.equipment_combo.blockSignals(True)
         self.equipment_combo.clear()
         self.equipment_combo.addItem("All")
         for equipment in sorted(equipment_set):
             self.equipment_combo.addItem(equipment)
+
+        # Restore saved filter selection if it still exists among the options
+        saved_equipment = self.current_filters.get('equipment', 'All')
+        if saved_equipment in [self.equipment_combo.itemText(i) for i in range(self.equipment_combo.count())]:
+            self.equipment_combo.setCurrentText(saved_equipment)
+        else:
+            self.current_filters['equipment'] = 'All'
+        self.equipment_combo.blockSignals(False)
 
         # Ensure dropdown view is wide enough to show full text
         self.equipment_combo.view().setMinimumWidth(self.equipment_combo.minimumSizeHint().width())
@@ -1730,14 +1763,27 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.current_filters['equipment'] = self.equipment_combo.currentText()
         self.current_filters['sort'] = self.sort_combo.currentText()
 
-        # Filter items
-        self.filtered_items = [item for item in self.all_items if self._matches_filters(item)]
+        # Persist filter/search state so it's remembered next time the gallery opens
+        self._save_filter_settings()
 
-        # Apply sorting
-        self._sort_items()
+        self._filter_and_sort_items()
 
         # Refresh grid
         self._populate_grid()
+
+    def _save_filter_settings(self):
+        """Persist current search/filter/sort state to settings"""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue("gallery_filter_search", self.current_filters['search'])
+        settings.setValue("gallery_filter_catalog", self.current_filters['catalog'])
+        settings.setValue("gallery_filter_type", self.current_filters['type'])
+        settings.setValue("gallery_filter_equipment", self.current_filters['equipment'])
+        settings.setValue("gallery_filter_sort", self.current_filters['sort'])
+
+    def _filter_and_sort_items(self):
+        """Filter and sort all_items into filtered_items based on current_filters"""
+        self.filtered_items = [item for item in self.all_items if self._matches_filters(item)]
+        self._sort_items()
 
     def _on_sort_changed(self):
         """Handle sort dropdown change"""
