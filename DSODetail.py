@@ -395,6 +395,7 @@ class DSODetailWindow(QDialog):
         self.setWindowModality(Qt.NonModal)
         self.resize(1000, 800)
         WindowPositionManager.restore_window_position(self, "ObjectDetail")
+        self.setAcceptDrops(True)
 
         self.data = data
         self.current_image_path = None
@@ -1285,15 +1286,21 @@ class DSODetailWindow(QDialog):
             logger.error(f"Error saving image information: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to save image information: {str(e)}")
 
-    def _add_user_image(self):
-        """Add a user image for the object and all its designations"""
+    def _add_user_image(self, file_name=None):
+        """Add a user image for the object and all its designations.
+
+        Args:
+            file_name: Pre-selected image path (e.g. from drag-and-drop). If not
+                given, prompts the user with a file picker.
+        """
         # Get the image file
-        file_name, _ = QFileDialog.getOpenFileName(
-            self,
-            f"Select Image for {self.data['name']}",
-            os.path.expanduser("~"),  # Start in user's home directory
-            "Image Files (*.png *.jpg *.jpeg *.tif *.tiff *.fits *.fit *.fts);;Regular Images (*.png *.jpg *.jpeg *.tif *.tiff);;FITS Files (*.fits *.fit *.fts);;All Files (*)"
-        )
+        if not file_name:
+            file_name, _ = QFileDialog.getOpenFileName(
+                self,
+                f"Select Image for {self.data['name']}",
+                os.path.expanduser("~"),  # Start in user's home directory
+                "Image Files (*.png *.jpg *.jpeg *.tif *.tiff *.fits *.fit *.fts);;Regular Images (*.png *.jpg *.jpeg *.tif *.tiff);;FITS Files (*.fits *.fit *.fts);;All Files (*)"
+            )
 
         if file_name:
             try:
@@ -1371,8 +1378,17 @@ class DSODetailWindow(QDialog):
 
                         # Emit signal to notify that an image was added
                         self.image_added.emit()
+
+                        QMessageBox.information(
+                            self, "Image Added",
+                            f"{os.path.basename(file_name)} was successfully added to {self.data['name']}."
+                        )
                     else:
                         logger.error(f"Could not find dsodetailid for {self.data['name']}")
+                        QMessageBox.critical(
+                            self, "Error",
+                            f"Could not add image: no database entry was found for {self.data['name']}."
+                        )
 
             except Exception as e:
                 logger.error(f"Error adding user image: {str(e)}", exc_info=True)
@@ -2404,3 +2420,26 @@ class DSODetailWindow(QDialog):
         """Save window position when closing"""
         WindowPositionManager.save_window_position(self, "ObjectDetail")
         event.accept()
+
+    def dragEnterEvent(self, event):
+        """Accept drag if it is a single supported image file"""
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if len(urls) == 1 and urls[0].isLocalFile():
+                from DSOGallery import SUPPORTED_IMAGE_EXTENSIONS
+                ext = os.path.splitext(urls[0].toLocalFile())[1].lower()
+                if ext in SUPPORTED_IMAGE_EXTENSIONS:
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):
+        """Add the dropped file as a new image for this object"""
+        from DSOGallery import SUPPORTED_IMAGE_EXTENSIONS
+        urls = event.mimeData().urls()
+        if urls and urls[0].isLocalFile():
+            file_path = urls[0].toLocalFile()
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in SUPPORTED_IMAGE_EXTENSIONS:
+                event.acceptProposedAction()
+                self._add_user_image(file_path)
