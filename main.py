@@ -4821,6 +4821,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.resize(1200, 800)
         self.setWindowFlags(Qt.Window)
         self.setup_window_position()
+        self.setAcceptDrops(True)
         self.db_manager = DatabaseManager()
         self._showed_dso_data = None
         self._cached_catalogs = None
@@ -6406,6 +6407,70 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                         # Use a timer to allow the minimize animation to complete
                         QTimer.singleShot(100, self._minimize_to_tray)
         super().changeEvent(event)
+
+    def dragEnterEvent(self, event):
+        """Accept drag if it is a single supported image file"""
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if len(urls) == 1 and urls[0].isLocalFile():
+                from DSOGallery import SUPPORTED_IMAGE_EXTENSIONS
+                ext = os.path.splitext(urls[0].toLocalFile())[1].lower()
+                if ext in SUPPORTED_IMAGE_EXTENSIONS:
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):
+        """Open the Add Image dialog with the dropped file pre-filled"""
+        from DSOGallery import SUPPORTED_IMAGE_EXTENSIONS
+        urls = event.mimeData().urls()
+        if urls and urls[0].isLocalFile():
+            file_path = urls[0].toLocalFile()
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in SUPPORTED_IMAGE_EXTENSIONS:
+                event.acceptProposedAction()
+                self._show_add_image_dialog(file_path)
+
+    def _show_add_image_dialog(self, file_path=None):
+        """Show dialog to add a new image to a DSO"""
+        try:
+            from DSOGallery import AddImageDialog
+        except ImportError as e:
+            QMessageBox.warning(self, "Import Error", f"Could not load the Add Image dialog: {e}")
+            return
+
+        dialog = AddImageDialog(self)
+        if file_path:
+            dialog.set_file_path(file_path)
+        if dialog.exec() == QDialog.Accepted:
+            self._add_image_to_database(dialog.get_image_data())
+
+    def _add_image_to_database(self, image_data):
+        """Add an image to the database and refresh the DSO list"""
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO userimages (
+                        dsodetailid, image_path, integration_time,
+                        equipment, date_taken, notes, created_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                """, (
+                    image_data['dsodetailid'],
+                    image_data['image_path'],
+                    image_data['integration_time'],
+                    image_data['equipment'],
+                    image_data['date_taken'],
+                    image_data['notes']
+                ))
+                conn.commit()
+
+            QMessageBox.information(self, "Image Added", "Image successfully added to database.")
+            self._refresh_data()
+
+        except Exception as e:
+            logger.error(f"Error adding image to database: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to add image to database:\n{str(e)}")
 
     def _setup_system_tray_if_enabled(self):
         """Initialize system tray if the setting is enabled"""

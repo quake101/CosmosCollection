@@ -6,13 +6,16 @@ Displays all DSO objects with images in a responsive grid gallery format
 
 import sys
 import os
+import re
+from datetime import datetime
 from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QGroupBox,
                                QMessageBox, QScrollArea, QComboBox, QLineEdit,
                                QFrame, QGridLayout, QMenu, QApplication,
                                QDialog, QFileDialog, QFormLayout, QDialogButtonBox,
-                               QCompleter, QSlider, QProgressDialog)
+                               QCompleter, QSlider, QProgressDialog, QPlainTextEdit,
+                               QSizePolicy)
 from PySide6.QtCore import QSettings
 from PySide6.QtGui import QPixmap, QImage
 
@@ -20,6 +23,9 @@ from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS
 import numpy as np
+
+# Image extensions supported for DSO images throughout the gallery
+SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.fits', '.fit', '.fts'}
 
 
 class ThumbnailCache:
@@ -479,6 +485,78 @@ class DataLoaderRunnable(QRunnable):
             self.signals.load_error.emit(str(e))
 
 
+def _load_preview_pixmap(image_path, max_dim=200):
+    """Load a small preview pixmap for an image path, including FITS files.
+
+    Returns None if the file can't be read/decoded (e.g. unsupported format).
+    """
+    if not image_path or not os.path.exists(image_path):
+        return None
+
+    _, ext = os.path.splitext(image_path.lower())
+    pixmap = None
+
+    if ext in ('.fits', '.fit', '.fts'):
+        try:
+            from astropy.io import fits
+            from astropy.visualization import simple_norm
+
+            with fits.open(image_path) as hdul:
+                image_data = None
+                for hdu in hdul:
+                    if hdu.data is not None and len(hdu.data.shape) >= 2:
+                        image_data = hdu.data
+                        break
+                if image_data is None:
+                    return None
+
+                if len(image_data.shape) == 3 and image_data.shape[0] == 3:
+                    image_data = np.transpose(image_data, (1, 2, 0))
+                elif len(image_data.shape) == 3 and image_data.shape[2] != 3:
+                    image_data = image_data[0]
+                elif len(image_data.shape) == 4:
+                    image_data = image_data[0, 0]
+
+                image_data = np.nan_to_num(image_data, nan=0.0, posinf=0.0, neginf=0.0)
+                is_rgb = len(image_data.shape) == 3 and image_data.shape[2] == 3
+
+                def _normalize(channel):
+                    try:
+                        norm = simple_norm(channel, stretch='linear', percent=99.5)
+                        return norm(channel)
+                    except Exception:
+                        lo, hi = np.percentile(channel, [0.5, 99.5])
+                        return (channel - lo) / (hi - lo) if hi > lo else channel
+
+                if is_rgb:
+                    normalized = np.zeros_like(image_data, dtype=float)
+                    for c in range(3):
+                        normalized[:, :, c] = _normalize(image_data[:, :, c])
+                    rgb = (np.clip(normalized, 0, 1) * 255).astype(np.uint8)
+                    if not rgb.flags['C_CONTIGUOUS']:
+                        rgb = np.ascontiguousarray(rgb)
+                    h, w, c = rgb.shape
+                    qimage = QImage(rgb.data, w, h, w * c, QImage.Format_RGB888)
+                else:
+                    normalized = np.clip(_normalize(image_data), 0, 1)
+                    img8 = (normalized * 255).astype(np.uint8)
+                    if not img8.flags['C_CONTIGUOUS']:
+                        img8 = np.ascontiguousarray(img8)
+                    h, w = img8.shape
+                    qimage = QImage(img8.data, w, h, w, QImage.Format_Grayscale8)
+
+                pixmap = QPixmap.fromImage(qimage.copy())
+        except Exception:
+            return None
+    else:
+        pixmap = QPixmap(image_path)
+
+    if pixmap is None or pixmap.isNull():
+        return None
+
+    return pixmap.scaled(max_dim, max_dim, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
 class AddImageDialog(WindowPositionMixin, QDialog):
     """Dialog for adding a new image to a DSO"""
 
@@ -487,81 +565,172 @@ class AddImageDialog(WindowPositionMixin, QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add Image to DSO")
-        self.setMinimumWidth(250)
         self.selected_file = None
-        self.dso_data = []  # List of (dsodetailid, name) tuples
+        self.dso_data = []  # List of (dsodetailid, name) tuples, index-aligned with dso_combo
+        self._dso_auto_selected = False
 
+        self.setAcceptDrops(True)
         self._init_ui()
         self._load_dso_list()
         self._load_equipment_list()
+        self._update_preview()
         self.setup_window_position()
 
     def _init_ui(self):
         """Create the dialog UI"""
         layout = QVBoxLayout(self)
-        layout.setSpacing(15)
+        layout.setSpacing(12)
 
         # Instructions
         instructions = QLabel("Select an image file and choose which DSO to attach it to.")
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
 
-        # Form layout for inputs
-        form_layout = QFormLayout()
-        form_layout.setSpacing(10)
+        # --- Image preview / drop zone + DSO selection -----------------
+        top_row = QHBoxLayout()
+        top_row.setSpacing(12)
 
-        # Image file selection
+        # Grows with the dialog (both wider and taller) so enlarging the
+        # window makes the thumbnail bigger instead of the text fields;
+        # the loaded source pixmap is re-scaled to fit on every resize.
+        self._preview_source_pixmap = None
+        self.preview_label = QLabel()
+        self.preview_label.setMinimumSize(150, 150)
+        self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setCursor(Qt.PointingHandCursor)
+        self.preview_label.setToolTip("Click to browse, or drag & drop an image onto this dialog")
+        self.preview_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {COLORS['background_light']};
+                border: 2px dashed {COLORS['border_light']};
+                border-radius: 6px;
+                color: {COLORS['text_secondary']};
+                font-size: 9pt;
+                padding: 6px;
+            }}
+        """)
+        self.preview_label.mousePressEvent = lambda event: self._browse_file()
+        top_row.addWidget(self.preview_label, 1)
+
+        # Fields column stays at its natural width (stretch 0) so extra
+        # horizontal space is given to the preview above instead.
+        right_col = QVBoxLayout()
+        right_col.setSpacing(6)
+
         file_layout = QHBoxLayout()
         self.file_path_edit = QLineEdit()
         self.file_path_edit.setPlaceholderText("No file selected...")
         self.file_path_edit.setReadOnly(True)
+        self.file_path_edit.setMinimumWidth(200)
+        self.file_path_edit.setMaximumWidth(260)
         file_layout.addWidget(self.file_path_edit)
 
         browse_btn = QPushButton("Browse...")
         browse_btn.clicked.connect(self._browse_file)
         file_layout.addWidget(browse_btn)
-        form_layout.addRow("Image File:", file_layout)
+        right_col.addLayout(file_layout)
+
+        dso_label = QLabel("Attach to DSO:")
+        right_col.addWidget(dso_label)
 
         # DSO selection with search
         self.dso_combo = QComboBox()
         self.dso_combo.setEditable(True)
         self.dso_combo.setInsertPolicy(QComboBox.NoInsert)
         self.dso_combo.lineEdit().setPlaceholderText("Search for DSO...")
-        self.dso_combo.setMinimumWidth(300)
-        form_layout.addRow("Attach to DSO:", self.dso_combo)
+        # Keep the closed combo box narrow regardless of how long individual
+        # DSO entries are (some objects have many catalogue designations);
+        # the popup list itself is widened separately so full names stay readable.
+        self.dso_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.dso_combo.setMinimumContentsLength(20)
+        self.dso_combo.setMinimumWidth(200)
+        self.dso_combo.setMaximumWidth(260)
+        self.dso_combo.view().setMinimumWidth(380)
+        self.dso_combo.activated.connect(self._on_dso_manually_changed)
+        right_col.addWidget(self.dso_combo)
 
-        # Optional metadata fields
+        self.detected_label = QLabel("")
+        self.detected_label.setStyleSheet(f"color: {COLORS['info']}; font-size: 9pt;")
+        self.detected_label.setWordWrap(True)
+        self.detected_label.setMaximumWidth(260)
+        self.detected_label.hide()
+        right_col.addWidget(self.detected_label)
+        right_col.addStretch()
+
+        top_row.addLayout(right_col)
+        # Give the image/DSO row the extra vertical space on a taller resize
+        # too, so the preview grows in both directions.
+        layout.addLayout(top_row, 1)
+
+        # --- Optional capture details -----------------------------------
+        # Capped to a fixed max width so resizing the dialog doesn't stretch
+        # these fields - all the extra space goes to the preview instead.
+        FIELD_MAX_WIDTH = 260
+
+        form_layout = QFormLayout()
+        form_layout.setSpacing(10)
+
         self.telescope_combo = QComboBox()
         self.telescope_combo.setEditable(True)
         self.telescope_combo.setInsertPolicy(QComboBox.NoInsert)
         self.telescope_combo.lineEdit().setPlaceholderText("e.g., 8\" SCT")
+        self.telescope_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.telescope_combo.setMinimumContentsLength(18)
+        self.telescope_combo.setMaximumWidth(FIELD_MAX_WIDTH)
         form_layout.addRow("Telescope:", self.telescope_combo)
 
         self.camera_combo = QComboBox()
         self.camera_combo.setEditable(True)
         self.camera_combo.setInsertPolicy(QComboBox.NoInsert)
         self.camera_combo.lineEdit().setPlaceholderText("e.g., ASI294MC Pro")
+        self.camera_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.camera_combo.setMinimumContentsLength(18)
+        self.camera_combo.setMaximumWidth(FIELD_MAX_WIDTH)
         form_layout.addRow("Camera:", self.camera_combo)
 
         self.integration_edit = QLineEdit()
         self.integration_edit.setPlaceholderText("e.g., 2h 30m")
+        self.integration_edit.setMaximumWidth(FIELD_MAX_WIDTH)
         form_layout.addRow("Integration Time:", self.integration_edit)
 
+        date_layout = QHBoxLayout()
         self.date_edit = QLineEdit()
         self.date_edit.setPlaceholderText("e.g., 2024-01-15")
-        form_layout.addRow("Date Taken:", self.date_edit)
+        self.date_edit.setMaximumWidth(FIELD_MAX_WIDTH - 70)
+        date_layout.addWidget(self.date_edit)
+        today_btn = QPushButton("Today")
+        today_btn.setToolTip("Fill in today's date")
+        today_btn.clicked.connect(self._fill_today_date)
+        date_layout.addWidget(today_btn)
+        date_layout.addStretch()
+        form_layout.addRow("Date Taken:", date_layout)
 
-        self.notes_edit = QLineEdit()
+        self.notes_edit = QPlainTextEdit()
         self.notes_edit.setPlaceholderText("Optional notes about this image")
+        self.notes_edit.setMaximumHeight(60)
+        self.notes_edit.setMaximumWidth(FIELD_MAX_WIDTH)
         form_layout.addRow("Notes:", self.notes_edit)
 
         layout.addLayout(form_layout)
+
+        # Inline validation feedback (shown instead of popping a dialog
+        # for every missing field)
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+        self.status_label.setWordWrap(True)
+        self.status_label.hide()
+        layout.addWidget(self.status_label)
 
         # Dialog buttons
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self._validate_and_accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
+
+        self.setMinimumWidth(460)
+        self.resize(460, self.sizeHint().height())
 
     def _load_dso_list(self):
         """Load all DSOs from database for the combo box"""
@@ -658,28 +827,143 @@ class AddImageDialog(WindowPositionMixin, QDialog):
             "All Files (*.*)"
         )
         if file_name:
-            self.selected_file = file_name
-            self.file_path_edit.setText(file_name)
+            self.set_file_path(file_name)
 
     def set_file_path(self, path):
-        """Pre-populate the file path (e.g. from drag-and-drop)"""
+        """Set the selected file path, refresh the preview and try to auto-detect the DSO"""
         self.selected_file = path
         self.file_path_edit.setText(path)
+        self._clear_error(self.file_path_edit)
+        self._update_preview()
+        self._try_auto_detect_dso()
+
+    def _update_preview(self):
+        """(Re)load the preview source for the selected file and render it at the
+        preview box's current size. Loaded once per file at a resolution large
+        enough to still look sharp when the dialog is enlarged."""
+        self._preview_source_pixmap = (
+            _load_preview_pixmap(self.selected_file, max_dim=600) if self.selected_file else None
+        )
+        self._render_preview()
+
+    def _render_preview(self):
+        """Scale the cached preview source to fit the preview box's current size"""
+        if self._preview_source_pixmap:
+            scaled = self._preview_source_pixmap.scaled(
+                self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.preview_label.setPixmap(scaled)
+        elif self.selected_file:
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("Preview not\navailable")
+        else:
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("Drag && drop\nan image here\nor click to browse")
+
+    def resizeEvent(self, event):
+        """Re-scale the preview thumbnail to fill the enlarged/shrunk preview box"""
+        super().resizeEvent(event)
+        self._render_preview()
+
+    def _guess_dso_index_from_filename(self, file_path):
+        """Look for a DSO catalogue designation (e.g. 'M31', 'NGC 7000') embedded in the filename"""
+        # Keep hyphens (but drop other punctuation/whitespace) so distinct
+        # designations that only differ by a hyphen - e.g. Messier "M 16"
+        # vs. Minkowski "M 1-6" - don't collapse into the same "M16" string
+        # and get confused for one another.
+        basename = os.path.splitext(os.path.basename(file_path))[0]
+        base_norm = re.sub(r'[^A-Z0-9-]', '', basename.upper())
+        if not base_norm:
+            return None
+
+        best_index = None
+        best_len = 0
+        for index, (dsodetailid, name) in enumerate(self.dso_data):
+            for designation in name.split(','):
+                d_norm = re.sub(r'[^A-Z0-9-]', '', designation.upper())
+                if len(d_norm) >= 2 and len(d_norm) > best_len and d_norm in base_norm:
+                    best_index = index
+                    best_len = len(d_norm)
+        return best_index
+
+    def _try_auto_detect_dso(self):
+        """Auto-select the DSO combo if the filename clearly names one, without
+        overriding a selection the user made themselves"""
+        if not self.selected_file or (self.dso_combo.currentIndex() >= 0 and not self._dso_auto_selected):
+            return
+
+        index = self._guess_dso_index_from_filename(self.selected_file)
+        if index is not None:
+            self.dso_combo.setCurrentIndex(index)
+            self._dso_auto_selected = True
+            self.detected_label.setText("Auto-detected from filename — please verify this is correct.")
+            self.detected_label.show()
+        elif self._dso_auto_selected:
+            self.dso_combo.setCurrentIndex(-1)
+            self.dso_combo.lineEdit().clear()
+            self._dso_auto_selected = False
+            self.detected_label.hide()
+
+    def _on_dso_manually_changed(self, index):
+        """User picked a DSO themselves; stop treating the selection as a guess"""
+        self._dso_auto_selected = False
+        self.detected_label.hide()
+        self._clear_error(self.dso_combo)
+
+    def _fill_today_date(self):
+        """Fill the date field with today's date"""
+        self.date_edit.setText(datetime.now().strftime('%Y-%m-%d'))
+
+    def _mark_error(self, widget):
+        widget.setStyleSheet(f"border: 1px solid {COLORS['error']};")
+
+    def _clear_error(self, widget):
+        widget.setStyleSheet("")
+
+    def dragEnterEvent(self, event):
+        """Accept drag if it is a single supported image file"""
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if len(urls) == 1 and urls[0].isLocalFile():
+                ext = os.path.splitext(urls[0].toLocalFile())[1].lower()
+                if ext in SUPPORTED_IMAGE_EXTENSIONS:
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):
+        """Set the dropped file as the selected image"""
+        urls = event.mimeData().urls()
+        if urls and urls[0].isLocalFile():
+            file_path = urls[0].toLocalFile()
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in SUPPORTED_IMAGE_EXTENSIONS:
+                event.acceptProposedAction()
+                self.set_file_path(file_path)
 
     def _validate_and_accept(self):
-        """Validate inputs before accepting"""
-        if not self.selected_file:
-            QMessageBox.warning(self, "Missing Image", "Please select an image file.")
-            return
+        """Validate inputs before accepting, showing inline feedback instead of popups"""
+        errors = []
+        self._clear_error(self.file_path_edit)
+        self._clear_error(self.dso_combo)
 
-        if not os.path.exists(self.selected_file):
-            QMessageBox.warning(self, "File Not Found", "The selected image file does not exist.")
-            return
+        if not self.selected_file:
+            errors.append("Select an image file.")
+            self._mark_error(self.file_path_edit)
+        elif not os.path.exists(self.selected_file):
+            errors.append("The selected image file no longer exists.")
+            self._mark_error(self.file_path_edit)
 
         if self.dso_combo.currentIndex() < 0:
-            QMessageBox.warning(self, "No DSO Selected", "Please select a DSO to attach the image to.")
+            errors.append("Choose which DSO to attach the image to.")
+            self._mark_error(self.dso_combo)
+
+        if errors:
+            self.status_label.setText("  •  ".join(errors))
+            self.status_label.show()
             return
 
+        self.status_label.hide()
         self.accept()
 
     def get_image_data(self):
@@ -691,7 +975,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
                                                      self.camera_combo.currentText().strip()])),
             'integration_time': self.integration_edit.text().strip(),
             'date_taken': self.date_edit.text().strip(),
-            'notes': self.notes_edit.text().strip()
+            'notes': self.notes_edit.toPlainText().strip()
         }
 
 
@@ -818,7 +1102,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     """Main window for DSO Image Gallery"""
 
     WINDOW_POSITION_KEY = "DSOGallery"
-    _SUPPORTED_DROP_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.fits', '.fit', '.fts'}
+    _SUPPORTED_DROP_EXTENSIONS = SUPPORTED_IMAGE_EXTENSIONS
 
     def __init__(self):
         """Initialize DSO Image Gallery window"""
