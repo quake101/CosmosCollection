@@ -9,7 +9,7 @@ import logging
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import matplotlib
 matplotlib.use('QtAgg')
@@ -50,6 +50,51 @@ logger = logging.getLogger(__name__)
 CACHE_MAX_AGE_MINUTES = 15
 
 
+def _get_openweather_signature() -> Tuple[bool, str]:
+    """Return (enabled, api_key) reflecting the current OpenWeather integration
+    settings. Used to detect when cached weather data was fetched under a
+    different OpenWeather configuration (e.g. the user just enabled the
+    integration and added an API key) so a stale cache doesn't hide the change."""
+    settings = QSettings("CosmosCollection", "CosmosCollection")
+    enabled = settings.value("openweather_integration_enabled", False, type=bool)
+    api_key = settings.value("openweather_api_key", "", type=str)
+    return (enabled, api_key)
+
+
+def test_openweather_key(api_key: str, timeout: int = 10) -> Tuple[bool, str]:
+    """Test whether an OpenWeather API key is valid via a lightweight current-weather
+    request. Used by the Settings dialog's "Test API Key" button.
+
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return False, "Please enter an API key first."
+
+    try:
+        # Any fixed coordinates work here - we only care whether the key is accepted.
+        url = f"https://api.openweathermap.org/data/2.5/weather?lat=51.5074&lon=-0.1278&appid={api_key}"
+        verify = not getattr(sys, 'frozen', False)
+        response = requests.get(url, timeout=timeout, verify=verify)
+
+        if response.status_code == 401:
+            return False, (
+                "Invalid API key. Please double-check your key.\n\n"
+                "Note: newly created OpenWeather keys can take a few minutes to activate."
+            )
+        response.raise_for_status()
+        response.json()  # confirm the response is valid JSON
+        return True, "Connection successful! Your OpenWeather API key is valid."
+
+    except requests.exceptions.Timeout:
+        return False, "Connection timed out. Please check your network connection."
+    except requests.exceptions.RequestException as e:
+        return False, f"Connection failed: {str(e)}"
+    except Exception as e:
+        return False, f"Error testing API key: {str(e)}"
+
+
 class WeatherCache:
     """Simple cache for weather data to reduce API calls"""
     _instance = None
@@ -60,6 +105,7 @@ class WeatherCache:
             cls._instance._data = None
             cls._instance._timestamp = None
             cls._instance._location = None
+            cls._instance._openweather_signature = None
             cls._instance._update_callbacks = []
         return cls._instance
 
@@ -82,6 +128,13 @@ class WeatherCache:
             logger.debug(f"Weather cache miss: data is {age.seconds // 60} minutes old")
             return None
 
+        # Check if OpenWeather integration settings changed since this data was
+        # fetched (e.g. user just enabled it / added an API key) - if so, the
+        # cached data doesn't reflect the current configuration, so treat it as stale.
+        if self._openweather_signature != _get_openweather_signature():
+            logger.debug("Weather cache miss: OpenWeather integration settings changed")
+            return None
+
         logger.debug(f"Weather cache hit: data is {age.seconds // 60} minutes old")
         return self._data
 
@@ -90,6 +143,7 @@ class WeatherCache:
         self._data = data
         self._timestamp = datetime.now()
         self._location = (lat, lon)
+        self._openweather_signature = _get_openweather_signature()
         logger.debug("Weather data cached")
 
         # Notify all registered callbacks
@@ -117,6 +171,7 @@ class WeatherCache:
         self._data = None
         self._timestamp = None
         self._location = None
+        self._openweather_signature = None
 
     def add_update_callback(self, callback):
         """Register a callback to be called when weather data is updated.
@@ -162,6 +217,7 @@ class HourlyWeatherData:
     wind_gusts: float = 0.0  # km/h — peak gust in the hour
     visibility: Optional[float] = None  # meters
     surface_pressure: Optional[float] = None  # hPa
+    openweather_blended: bool = False  # True if this hour was averaged with OpenWeather data
 
 
 @dataclass
@@ -185,6 +241,7 @@ class DailyWeatherSummary:
     moon_phase: Optional[MoonPhaseData] = None
     dark_hours_start: Optional[datetime] = None  # First dark hour (sun_alt < -12°)
     dark_hours_end: Optional[datetime] = None  # Last dark hour (sun_alt < -12°)
+    openweather_blended: bool = False  # True if any hour this day was blended with OpenWeather data
 
 
 class WeatherWorker(QThread):
@@ -198,6 +255,10 @@ class WeatherWorker(QThread):
         self.lat = lat
         self.lon = lon
         self.timezone = timezone
+        # Set by _fetch_openweather_data() when OpenWeather is enabled but a fetch
+        # attempt fails (bad key, network error, etc.) - None otherwise, including
+        # when the integration is simply disabled/unconfigured (not an error).
+        self.openweather_error: Optional[str] = None
 
     def run(self):
         """Fetch weather data from Open-Meteo API"""
@@ -223,8 +284,13 @@ class WeatherWorker(QThread):
 
             data = response.json()
 
+            # Optionally supplement with OpenWeather data (opt-in, requires API key).
+            # Returns None if disabled/unconfigured/unavailable, in which case the
+            # forecast falls back to Open-Meteo data only, exactly as before.
+            openweather_data = self._fetch_openweather_data()
+
             self.progress.emit("Processing weather data...")
-            daily_summaries = self._process_weather_data(data)
+            daily_summaries = self._process_weather_data(data, openweather_data)
 
             self.weather_loaded.emit(daily_summaries)
 
@@ -234,33 +300,144 @@ class WeatherWorker(QThread):
             logger.error(f"Error fetching weather data: {str(e)}", exc_info=True)
             self.error_occurred.emit(f"Error: {str(e)}")
 
-    def _process_weather_data(self, data: Dict[str, Any]) -> List[DailyWeatherSummary]:
-        """Process raw API data into daily summaries"""
+    def _fetch_openweather_data(self) -> Optional[Dict[datetime, Dict[str, Optional[float]]]]:
+        """Fetch supplemental forecast data from OpenWeather's free 5 day / 3 hour
+        forecast API, if the integration is enabled and an API key is configured.
+
+        Returns a dict keyed by forecast timestamp -> field values, or None if the
+        integration is disabled/unconfigured (not an error - self.openweather_error
+        stays None) or the request fails for any reason such as a bad key, network
+        error, or rate limit (self.openweather_error is set to a short reason so
+        callers can surface it, e.g. in the Weather Forecast window's status line).
+        Either way, callers should treat None as "no supplemental data available"
+        and fall back to Open-Meteo-only data.
+        """
+        self.openweather_error = None
+        try:
+            enabled, api_key = _get_openweather_signature()
+            if not enabled or not api_key:
+                return None
+
+            url = (
+                f"https://api.openweathermap.org/data/2.5/forecast?"
+                f"lat={self.lat}&lon={self.lon}&units=metric&appid={api_key}"
+            )
+            verify = not getattr(sys, 'frozen', False)
+            response = requests.get(url, timeout=20, verify=verify)
+
+            if response.status_code == 401:
+                self.openweather_error = "invalid API key"
+                logger.warning("OpenWeather fetch failed: invalid API key")
+                return None
+
+            response.raise_for_status()
+            data = response.json()
+
+            result: Dict[datetime, Dict[str, Optional[float]]] = {}
+            for entry in data.get("list", []):
+                dt = datetime.fromtimestamp(entry["dt"])
+                main = entry.get("main", {})
+                wind = entry.get("wind", {})
+                wind_speed = wind.get("speed")
+                wind_gust = wind.get("gust")
+                pop = entry.get("pop")
+                result[dt] = {
+                    "cloud_cover": entry.get("clouds", {}).get("all"),
+                    "temperature": main.get("temp"),
+                    "humidity": main.get("humidity"),
+                    "surface_pressure": main.get("pressure"),
+                    "wind_speed": wind_speed * 3.6 if wind_speed is not None else None,  # m/s -> km/h
+                    "wind_gusts": wind_gust * 3.6 if wind_gust is not None else None,  # m/s -> km/h
+                    "precipitation_probability": pop * 100 if pop is not None else None,
+                    "visibility": entry.get("visibility"),
+                }
+            return result
+
+        except requests.exceptions.Timeout:
+            self.openweather_error = "request timed out"
+            logger.warning("OpenWeather fetch failed: timed out")
+            return None
+        except requests.exceptions.RequestException as e:
+            self.openweather_error = "network error"
+            logger.warning(f"OpenWeather fetch failed: network error: {e}")
+            return None
+        except Exception as e:
+            self.openweather_error = "unexpected error"
+            logger.warning(f"OpenWeather fetch failed, continuing with Open-Meteo only: {e}")
+            return None
+
+    def _process_weather_data(
+        self,
+        data: Dict[str, Any],
+        openweather_data: Optional[Dict[datetime, Dict[str, Optional[float]]]] = None
+    ) -> List[DailyWeatherSummary]:
+        """Process raw API data into daily summaries, optionally blending in
+        supplemental OpenWeather data (simple average per overlapping field)."""
         hourly = data.get("hourly", {})
         times = hourly.get("time", [])
 
         if not times:
             return []
 
+        def blend(om_value, ow_match: Optional[Dict[str, Optional[float]]], field: str):
+            """Average an Open-Meteo value with the matching OpenWeather value,
+            if one was found for this hour and the field is present."""
+            if ow_match is None:
+                return om_value, False
+            ow_value = ow_match.get(field)
+            if ow_value is None:
+                return om_value, False
+            return (om_value + ow_value) / 2, True
+
+        def find_openweather_match(dt: datetime, tolerance_minutes: int = 90):
+            """Find the nearest OpenWeather 3-hour forecast entry to an Open-Meteo
+            hourly timestamp, within a tolerance window."""
+            if not openweather_data:
+                return None
+            best_match = None
+            best_diff = None
+            for ow_dt, values in openweather_data.items():
+                diff = abs((ow_dt - dt).total_seconds())
+                if diff <= tolerance_minutes * 60 and (best_diff is None or diff < best_diff):
+                    best_match = values
+                    best_diff = diff
+            return best_match
+
         # Parse hourly data
         hourly_records: List[HourlyWeatherData] = []
         for i, time_str in enumerate(times):
             try:
                 dt = datetime.fromisoformat(time_str)
+                ow_match = find_openweather_match(dt)
+
+                cloud_cover, blended_1 = blend(hourly.get("cloud_cover", [0] * len(times))[i] or 0, ow_match, "cloud_cover")
+                temperature, blended_2 = blend(hourly.get("temperature_2m", [0] * len(times))[i] or 0, ow_match, "temperature")
+                humidity, blended_3 = blend(hourly.get("relative_humidity_2m", [0] * len(times))[i] or 0, ow_match, "humidity")
+                wind_speed, blended_4 = blend(hourly.get("wind_speed_10m", [0] * len(times))[i] or 0, ow_match, "wind_speed")
+                wind_gusts, blended_5 = blend(hourly.get("wind_gusts_10m", [0] * len(times))[i] or 0, ow_match, "wind_gusts")
+                precip_prob, blended_6 = blend(
+                    hourly.get("precipitation_probability", [0] * len(times))[i] or 0, ow_match, "precipitation_probability"
+                )
+                visibility_om = hourly.get("visibility", [None] * len(times))[i]
+                visibility, blended_7 = blend(visibility_om or 0, ow_match, "visibility") if visibility_om is not None else (visibility_om, False)
+                pressure_om = hourly.get("surface_pressure", [None] * len(times))[i]
+                surface_pressure, blended_8 = blend(pressure_om or 0, ow_match, "surface_pressure") if pressure_om is not None else (pressure_om, False)
+
                 hourly_records.append(HourlyWeatherData(
                     time=dt,
-                    cloud_cover=hourly.get("cloud_cover", [0] * len(times))[i] or 0,
+                    cloud_cover=cloud_cover,
                     cloud_cover_low=hourly.get("cloud_cover_low", [0] * len(times))[i] or 0,
                     cloud_cover_mid=hourly.get("cloud_cover_mid", [0] * len(times))[i] or 0,
                     cloud_cover_high=hourly.get("cloud_cover_high", [0] * len(times))[i] or 0,
-                    temperature=hourly.get("temperature_2m", [0] * len(times))[i] or 0,
+                    temperature=temperature,
                     dew_point=hourly.get("dew_point_2m", [0] * len(times))[i] or 0,
-                    humidity=hourly.get("relative_humidity_2m", [0] * len(times))[i] or 0,
-                    wind_speed=hourly.get("wind_speed_10m", [0] * len(times))[i] or 0,
-                    precipitation_probability=hourly.get("precipitation_probability", [0] * len(times))[i] or 0,
-                    wind_gusts=hourly.get("wind_gusts_10m", [0] * len(times))[i] or 0,
-                    visibility=hourly.get("visibility", [None] * len(times))[i],
-                    surface_pressure=hourly.get("surface_pressure", [None] * len(times))[i]
+                    humidity=humidity,
+                    wind_speed=wind_speed,
+                    precipitation_probability=precip_prob,
+                    wind_gusts=wind_gusts,
+                    visibility=visibility,
+                    surface_pressure=surface_pressure,
+                    openweather_blended=any([blended_1, blended_2, blended_3, blended_4, blended_5, blended_6, blended_7, blended_8])
                 ))
             except (ValueError, IndexError) as e:
                 logger.warning(f"Error parsing hourly data at index {i}: {e}")
@@ -371,7 +548,8 @@ class WeatherWorker(QThread):
                 seeing_estimate=seeing,
                 moon_phase=moon_phase,
                 dark_hours_start=dark_start,
-                dark_hours_end=dark_end
+                dark_hours_end=dark_end,
+                openweather_blended=any(h.openweather_blended for h in hours)
             )
             daily_summaries.append(summary)
 
@@ -1542,16 +1720,17 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         scroll_area.setWidget(self.cards_widget)
         overview_layout.addWidget(scroll_area)
 
-        # Help text with attribution
-        help_text = QLabel(
+        # Help text with attribution (text updated in _on_weather_loaded to
+        # reflect whether OpenWeather data was blended in)
+        self.attribution_label = QLabel(
             'Double-click a day card for detailed hourly forecast. '
             'Weather data provided by <a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a>.'
         )
-        help_text.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
-        help_text.setAlignment(Qt.AlignCenter)
-        help_text.setOpenExternalLinks(False)
-        help_text.linkActivated.connect(lambda url: open_url(url))
-        overview_layout.addWidget(help_text)
+        self.attribution_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        self.attribution_label.setAlignment(Qt.AlignCenter)
+        self.attribution_label.setOpenExternalLinks(False)
+        self.attribution_label.linkActivated.connect(lambda url: open_url(url))
+        overview_layout.addWidget(self.attribution_label)
 
         main_layout.addWidget(overview_group, 1)  # Give stretch factor to expand
 
@@ -1707,6 +1886,19 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.daily_summaries = summaries
 
+        # Reflect whether OpenWeather data was successfully blended into this forecast
+        if any(s.openweather_blended for s in summaries):
+            self.attribution_label.setText(
+                'Double-click a day card for detailed hourly forecast. '
+                'Weather data blended from <a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a> '
+                'and <a href="https://openweathermap.org/" style="color: #6ea8fe;">OpenWeather</a>.'
+            )
+        else:
+            self.attribution_label.setText(
+                'Double-click a day card for detailed hourly forecast. '
+                'Weather data provided by <a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a>.'
+            )
+
         # Store in cache if this is fresh data
         if not from_cache and self.lat is not None and self.lon is not None:
             cache = WeatherCache()
@@ -1732,6 +1924,14 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
 
         self.cards_layout.addStretch()
 
+        # Note when OpenWeather was enabled but this fetch attempt failed, so a
+        # broken integration (bad key, network issue, etc.) is never silent.
+        # Only meaningful right after a fresh fetch - a cache hit didn't attempt
+        # a new OpenWeather call, so there's nothing new to report.
+        openweather_note = ""
+        if not from_cache and self.worker is not None and getattr(self.worker, "openweather_error", None):
+            openweather_note = f" | OpenWeather unavailable ({self.worker.openweather_error}) - using Open-Meteo only"
+
         # Update status
         if from_cache:
             cache = WeatherCache()
@@ -1741,12 +1941,14 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
             now = datetime.now()
             status_text = f"Last updated: {format_datetime(now)}"
 
+        status_text += openweather_note
+
         # Append next refresh time if auto-refresh is enabled
         if self.next_refresh_time is not None:
             status_text += f" | Next refresh: {format_time(self.next_refresh_time)}"
 
         self.status_label.setText(status_text)
-        self.status_label.setStyleSheet("")
+        self.status_label.setStyleSheet(f"color: {COLORS['warning']};" if openweather_note else "")
 
     def _on_error(self, error_message: str):
         """Handle errors from worker"""

@@ -1506,8 +1506,8 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings - Cosmos Collection")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setModal(True)
-        self.resize(700, 450)
-        
+        self.resize(750, 500)
+
         self.db_manager = DatabaseManager()
         self._setup_ui()
         self._load_current_settings()
@@ -1792,74 +1792,43 @@ class SettingsDialog(QDialog):
         perf_settings_layout.addWidget(cache_help)
 
         app_settings_layout.addWidget(perf_settings_group)
+        app_settings_layout.addStretch()
 
-        # Plate Solving Settings group
-        plate_solve_group = QGroupBox("Plate Solving Settings")
-        plate_solve_layout = QVBoxLayout(plate_solve_group)
+        # Integrations tab: list of integrations on the left, that integration's
+        # settings on the right (QStackedWidget swapped via list selection).
+        from PySide6.QtWidgets import QStackedWidget
 
-        # ASTAP path setting
-        astap_layout = QHBoxLayout()
-        astap_label = QLabel("ASTAP Path:")
-        astap_label.setMinimumWidth(120)
-        self.astap_path_input = QLineEdit()
-        self.astap_path_input.setPlaceholderText("Path to astap_cli executable (auto-detected if empty)")
-        astap_browse_btn = QPushButton("Browse...")
-        astap_browse_btn.setFixedWidth(80)
-        astap_browse_btn.clicked.connect(self._browse_astap_path)
-        astap_layout.addWidget(astap_label)
-        astap_layout.addWidget(self.astap_path_input)
-        astap_layout.addWidget(astap_browse_btn)
-        plate_solve_layout.addLayout(astap_layout)
+        integrations_tab = QWidget()
+        integrations_layout = QHBoxLayout(integrations_tab)
 
-        # ASTAP help text
-        astap_help = QLabel(
-            "ASTAP is a free, fast local plate solver. Download from: "
-            "<a href='https://www.hnsky.org/astap.htm' style='color: #0078d7;'>hnsky.org/astap.htm</a><br>"
-            "Point to <b>astap_cli.exe</b> (command-line version), not astap.exe (GUI). "
-            "Leave empty to auto-detect."
-        )
-        astap_help.setOpenExternalLinks(True)
-        astap_help.setWordWrap(True)
-        astap_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        astap_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
-        plate_solve_layout.addWidget(astap_help)
+        # --- Left: list of integrations ---
+        integrations_left_panel = QWidget()
+        integrations_left_layout = QVBoxLayout(integrations_left_panel)
+        integrations_left_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Astrometry.net API key setting
-        api_key_layout = QHBoxLayout()
-        api_key_label = QLabel("Astrometry.net API Key:")
-        api_key_label.setMinimumWidth(120)
-        self.astrometry_api_key_input = QLineEdit()
-        self.astrometry_api_key_input.setPlaceholderText("Required for online plate solving")
-        self.astrometry_api_key_input.setEchoMode(QLineEdit.Password)
-        show_key_btn = QPushButton("Show")
-        show_key_btn.setFixedWidth(50)
-        show_key_btn.setCheckable(True)
-        show_key_btn.clicked.connect(lambda checked: self.astrometry_api_key_input.setEchoMode(
-            QLineEdit.Normal if checked else QLineEdit.Password
-        ))
-        api_key_layout.addWidget(api_key_label)
-        api_key_layout.addWidget(self.astrometry_api_key_input)
-        api_key_layout.addWidget(show_key_btn)
-        plate_solve_layout.addLayout(api_key_layout)
+        integrations_label = QLabel("Integrations:")
+        integrations_label.setStyleSheet("font-weight: bold;")
+        integrations_left_layout.addWidget(integrations_label)
 
-        # API key help text
-        api_key_help = QLabel(
-            "Get a free API key: Register at "
-            "<a href='https://nova.astrometry.net/' style='color: #0078d7;'>nova.astrometry.net</a>, "
-            "then find your key in My Account > API.<br>"
-            "An API key is required for online plate solving (used when ASTAP fails or is unavailable)."
-        )
-        api_key_help.setOpenExternalLinks(True)
-        api_key_help.setWordWrap(True)
-        api_key_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        api_key_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
-        plate_solve_layout.addWidget(api_key_help)
+        self.integrations_list = QListWidget()
+        self.integrations_list.setMinimumWidth(180)
+        self.integrations_list.addItems(["NINA", "ASTAP", "Astrometry.net", "OpenWeather"])
+        integrations_left_layout.addWidget(self.integrations_list)
+        integrations_layout.addWidget(integrations_left_panel)
 
-        app_settings_layout.addWidget(plate_solve_group)
+        # --- Right: stacked settings pages, one per integration ---
+        self.integrations_stack = QStackedWidget()
+        integrations_layout.addWidget(self.integrations_stack, stretch=1)
 
-        # NINA Integration group
-        nina_group = QGroupBox("NINA Integration")
-        nina_layout = QVBoxLayout(nina_group)
+        self.integrations_list.currentRowChanged.connect(self.integrations_stack.setCurrentIndex)
+
+        # NINA page
+        nina_page = QWidget()
+        nina_layout = QVBoxLayout(nina_page)
+
+        nina_title = QLabel("NINA Integration")
+        nina_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        nina_layout.addWidget(nina_title)
 
         # Enable checkbox
         self.nina_enabled_checkbox = QCheckBox("Enable NINA Integration")
@@ -1919,8 +1888,153 @@ class SettingsDialog(QDialog):
         nina_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; }}")
         nina_layout.addWidget(nina_help)
 
-        app_settings_layout.addWidget(nina_group)
-        app_settings_layout.addStretch()
+        nina_layout.addStretch()
+        self.integrations_stack.addWidget(nina_page)
+
+        # ASTAP page
+        astap_page = QWidget()
+        astap_page_layout = QVBoxLayout(astap_page)
+
+        astap_title = QLabel("ASTAP")
+        astap_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        astap_page_layout.addWidget(astap_title)
+
+        # ASTAP path setting
+        astap_layout = QHBoxLayout()
+        astap_label = QLabel("ASTAP Path:")
+        astap_label.setMinimumWidth(120)
+        self.astap_path_input = QLineEdit()
+        self.astap_path_input.setPlaceholderText("Path to astap_cli executable (auto-detected if empty)")
+        astap_browse_btn = QPushButton("Browse...")
+        astap_browse_btn.setFixedWidth(80)
+        astap_browse_btn.clicked.connect(self._browse_astap_path)
+        astap_layout.addWidget(astap_label)
+        astap_layout.addWidget(self.astap_path_input)
+        astap_layout.addWidget(astap_browse_btn)
+        astap_page_layout.addLayout(astap_layout)
+
+        # ASTAP help text
+        astap_help = QLabel(
+            "ASTAP is a free, fast local plate solver. Download from: "
+            "<a href='https://www.hnsky.org/astap.htm' style='color: #0078d7;'>hnsky.org/astap.htm</a><br>"
+            "Point to <b>astap_cli.exe</b> (command-line version), not astap.exe (GUI). "
+            "Leave empty to auto-detect."
+        )
+        astap_help.setOpenExternalLinks(True)
+        astap_help.setWordWrap(True)
+        astap_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        astap_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        astap_page_layout.addWidget(astap_help)
+
+        astap_page_layout.addStretch()
+        self.integrations_stack.addWidget(astap_page)
+
+        # Astrometry.net page
+        astrometry_page = QWidget()
+        astrometry_page_layout = QVBoxLayout(astrometry_page)
+
+        astrometry_title = QLabel("Astrometry.net")
+        astrometry_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        astrometry_page_layout.addWidget(astrometry_title)
+
+        # Astrometry.net API key setting
+        api_key_layout = QHBoxLayout()
+        api_key_label = QLabel("API Key:")
+        api_key_label.setMinimumWidth(120)
+        self.astrometry_api_key_input = QLineEdit()
+        self.astrometry_api_key_input.setPlaceholderText("Required for online plate solving")
+        self.astrometry_api_key_input.setEchoMode(QLineEdit.Password)
+        show_key_btn = QPushButton("Show")
+        show_key_btn.setFixedWidth(50)
+        show_key_btn.setCheckable(True)
+        show_key_btn.clicked.connect(lambda checked: self.astrometry_api_key_input.setEchoMode(
+            QLineEdit.Normal if checked else QLineEdit.Password
+        ))
+        api_key_layout.addWidget(api_key_label)
+        api_key_layout.addWidget(self.astrometry_api_key_input)
+        api_key_layout.addWidget(show_key_btn)
+        astrometry_page_layout.addLayout(api_key_layout)
+
+        # API key help text
+        api_key_help = QLabel(
+            "Get a free API key: Register at "
+            "<a href='https://nova.astrometry.net/' style='color: #0078d7;'>nova.astrometry.net</a>, "
+            "then find your key in My Account > API.<br>"
+            "An API key is required for online plate solving (used when ASTAP fails or is unavailable)."
+        )
+        api_key_help.setOpenExternalLinks(True)
+        api_key_help.setWordWrap(True)
+        api_key_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        api_key_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        astrometry_page_layout.addWidget(api_key_help)
+
+        astrometry_page_layout.addStretch()
+        self.integrations_stack.addWidget(astrometry_page)
+
+        # OpenWeather page
+        openweather_page = QWidget()
+        openweather_page_layout = QVBoxLayout(openweather_page)
+
+        openweather_title = QLabel("OpenWeather")
+        openweather_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        openweather_page_layout.addWidget(openweather_title)
+
+        # Enable checkbox
+        self.openweather_enabled_checkbox = QCheckBox("Enable OpenWeather Integration")
+        self.openweather_enabled_checkbox.setToolTip(
+            "When enabled (and an API key is provided below), OpenWeather forecast\n"
+            "data is blended with Open-Meteo data to improve forecast accuracy."
+        )
+        openweather_page_layout.addWidget(self.openweather_enabled_checkbox)
+
+        # OpenWeather API key setting
+        openweather_key_layout = QHBoxLayout()
+        openweather_key_label = QLabel("API Key:")
+        openweather_key_label.setMinimumWidth(120)
+        self.openweather_api_key_input = QLineEdit()
+        self.openweather_api_key_input.setPlaceholderText("Required to enable this integration")
+        self.openweather_api_key_input.setEchoMode(QLineEdit.Password)
+        openweather_show_key_btn = QPushButton("Show")
+        openweather_show_key_btn.setFixedWidth(50)
+        openweather_show_key_btn.setCheckable(True)
+        openweather_show_key_btn.clicked.connect(lambda checked: self.openweather_api_key_input.setEchoMode(
+            QLineEdit.Normal if checked else QLineEdit.Password
+        ))
+        openweather_key_layout.addWidget(openweather_key_label)
+        openweather_key_layout.addWidget(self.openweather_api_key_input)
+        openweather_key_layout.addWidget(openweather_show_key_btn)
+        openweather_page_layout.addLayout(openweather_key_layout)
+
+        # Test API key button
+        openweather_test_layout = QHBoxLayout()
+        openweather_test_spacer = QLabel("")
+        openweather_test_spacer.setMinimumWidth(120)
+        self.openweather_test_btn = QPushButton("Test API Key")
+        self.openweather_test_btn.setToolTip("Verify the entered OpenWeather API key is valid")
+        self.openweather_test_btn.clicked.connect(self._test_openweather_key)
+        openweather_test_layout.addWidget(openweather_test_spacer)
+        openweather_test_layout.addWidget(self.openweather_test_btn)
+        openweather_test_layout.addStretch()
+        openweather_page_layout.addLayout(openweather_test_layout)
+
+        # OpenWeather help text
+        openweather_help = QLabel(
+            "Get a free API key: Register at "
+            "<a href='https://openweathermap.org/api' style='color: #0078d7;'>openweathermap.org/api</a>, "
+            "then find your key under My API Keys.<br>"
+            "When enabled, OpenWeather's forecast is averaged with Open-Meteo's data "
+            "(cloud cover, temperature, humidity, wind, precipitation chance) to reduce single-source forecast bias."
+        )
+        openweather_help.setOpenExternalLinks(True)
+        openweather_help.setWordWrap(True)
+        openweather_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        openweather_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        openweather_page_layout.addWidget(openweather_help)
+
+        openweather_page_layout.addStretch()
+        self.integrations_stack.addWidget(openweather_page)
+
+        self.integrations_list.setCurrentRow(0)
 
         # Backup/Restore tab
         backup_restore_tab = QWidget()
@@ -1979,6 +2093,7 @@ class SettingsDialog(QDialog):
 
         # Add tabs
         tab_widget.addTab(app_settings_scroll, "Application Settings")
+        tab_widget.addTab(integrations_tab, "Integrations")
         tab_widget.addTab(location_tab, "Location Manager")
         tab_widget.addTab(backup_restore_tab, "Backup && Restore")
 
@@ -2069,6 +2184,12 @@ class SettingsDialog(QDialog):
             self.nina_ip_input.setText(nina_ip)
             nina_port = settings.value("nina_api_port", 1888, type=int)
             self.nina_port_spinbox.setValue(nina_port)
+
+            # Load OpenWeather settings
+            openweather_enabled = settings.value("openweather_integration_enabled", False, type=bool)
+            self.openweather_enabled_checkbox.setChecked(openweather_enabled)
+            openweather_api_key = settings.value("openweather_api_key", "", type=str)
+            self.openweather_api_key_input.setText(openweather_api_key)
 
         except Exception as e:
             logger.error(f"Error loading settings: {str(e)}")
@@ -2302,6 +2423,10 @@ class SettingsDialog(QDialog):
             settings.setValue("nina_api_host", self.nina_ip_input.text().strip() or "localhost")
             settings.setValue("nina_api_port", self.nina_port_spinbox.value())
 
+            # Save OpenWeather settings
+            settings.setValue("openweather_integration_enabled", self.openweather_enabled_checkbox.isChecked())
+            settings.setValue("openweather_api_key", self.openweather_api_key_input.text().strip())
+
             self.accept()
 
         except Exception as e:
@@ -2390,6 +2515,27 @@ class SettingsDialog(QDialog):
         finally:
             self.nina_test_btn.setEnabled(True)
             self.nina_test_btn.setText("Test Connection")
+
+    def _test_openweather_key(self):
+        """Test that the entered OpenWeather API key is valid"""
+        api_key = self.openweather_api_key_input.text().strip()
+
+        try:
+            self.openweather_test_btn.setEnabled(False)
+            self.openweather_test_btn.setText("Testing...")
+            QApplication.processEvents()
+
+            from WeatherForecast import test_openweather_key
+            success, message = test_openweather_key(api_key)
+
+            if success:
+                QMessageBox.information(self, "Connection Successful", message)
+            else:
+                QMessageBox.warning(self, "Connection Failed", message)
+
+        finally:
+            self.openweather_test_btn.setEnabled(True)
+            self.openweather_test_btn.setText("Test API Key")
 
     def _perform_backup(self):
         """Perform a backup of all user data to a JSON file"""
