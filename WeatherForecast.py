@@ -1088,11 +1088,14 @@ class HourlyAstroChart(FigureCanvas):
         self.ax.axhline(y=40, color=COLORS['warning'], linestyle='--', alpha=0.5, linewidth=1)
 
         if is_midnight_view:
+            # "Tonight" starts on the evening date, even though the view stretches into the next morning
+            night_date_str = self.hourly_data[0].time.strftime('%b %d')
             self.ax.set_xlabel('Time (Evening → Morning)', color=COLORS['text'], fontsize=9)
-            self.ax.set_title('Tonight\'s Astrophotography Conditions', color=COLORS['text'], fontsize=10, fontweight='bold')
+            self.ax.set_title(f'Astrophotography Conditions - Night of {night_date_str}', color=COLORS['text'], fontsize=10, fontweight='bold')
         else:
+            day_date_str = self.hourly_data[0].time.strftime('%b %d') if self.hourly_data else ''
             self.ax.set_xlabel('Hour of Day', color=COLORS['text'], fontsize=9)
-            self.ax.set_title('Hourly Astrophotography Conditions', color=COLORS['text'], fontsize=10, fontweight='bold')
+            self.ax.set_title(f'Hourly Astrophotography Conditions - {day_date_str}', color=COLORS['text'], fontsize=10, fontweight='bold')
 
         # Style the chart
         self.ax.set_xlim(-0.5, num_hours - 0.5)
