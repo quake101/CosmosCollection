@@ -1955,6 +1955,18 @@ class SettingsDialog(QDialog):
         api_key_layout.addWidget(show_key_btn)
         astrometry_page_layout.addLayout(api_key_layout)
 
+        # Test API key button
+        astrometry_test_layout = QHBoxLayout()
+        astrometry_test_spacer = QLabel("")
+        astrometry_test_spacer.setMinimumWidth(120)
+        self.astrometry_test_btn = QPushButton("Test API Key")
+        self.astrometry_test_btn.setToolTip("Verify the entered Astrometry.net API key is valid")
+        self.astrometry_test_btn.clicked.connect(self._test_astrometry_key)
+        astrometry_test_layout.addWidget(astrometry_test_spacer)
+        astrometry_test_layout.addWidget(self.astrometry_test_btn)
+        astrometry_test_layout.addStretch()
+        astrometry_page_layout.addLayout(astrometry_test_layout)
+
         # API key help text
         api_key_help = QLabel(
             "Get a free API key: Register at "
@@ -2515,6 +2527,27 @@ class SettingsDialog(QDialog):
         finally:
             self.nina_test_btn.setEnabled(True)
             self.nina_test_btn.setText("Test Connection")
+
+    def _test_astrometry_key(self):
+        """Test that the entered Astrometry.net API key is valid"""
+        api_key = self.astrometry_api_key_input.text().strip()
+
+        try:
+            self.astrometry_test_btn.setEnabled(False)
+            self.astrometry_test_btn.setText("Testing...")
+            QApplication.processEvents()
+
+            from PlateSolver import test_astrometry_key
+            success, message = test_astrometry_key(api_key)
+
+            if success:
+                QMessageBox.information(self, "Connection Successful", message)
+            else:
+                QMessageBox.warning(self, "Connection Failed", message)
+
+        finally:
+            self.astrometry_test_btn.setEnabled(True)
+            self.astrometry_test_btn.setText("Test API Key")
 
     def _test_openweather_key(self):
         """Test that the entered OpenWeather API key is valid"""

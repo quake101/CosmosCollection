@@ -19,6 +19,49 @@ from PySide6.QtCore import QObject, Signal, QThread
 logger = logging.getLogger(__name__)
 
 
+def test_astrometry_key(api_key: str, timeout: int = 30) -> Tuple[bool, str]:
+    """Test whether an Astrometry.net API key is valid via the login endpoint.
+    Used by the Settings dialog's "Test API Key" button.
+
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    import requests
+
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return False, "Please enter an API key first."
+
+    try:
+        login_url = PlateSolver.ASTROMETRY_NET_API_URL + "login"
+        response = requests.post(login_url, data={
+            'request-json': json.dumps({"apikey": api_key})
+        }, timeout=timeout)
+
+        try:
+            login_data = response.json()
+        except Exception:
+            return False, f"Failed to parse response: {response.text[:200]}"
+
+        if login_data.get('status') != 'success':
+            error_msg = login_data.get('errormessage', 'Unknown error')
+            if 'apikey' in error_msg.lower():
+                return False, "Invalid API key. Please double-check your key."
+            return False, f"Astrometry.net login failed: {error_msg}"
+
+        if not login_data.get('session'):
+            return False, f"No session key in login response: {login_data}"
+
+        return True, "Connection successful! Your Astrometry.net API key is valid."
+
+    except requests.exceptions.Timeout:
+        return False, "Connection timed out. Please check your network connection."
+    except requests.exceptions.RequestException as e:
+        return False, f"Connection failed: {str(e)}"
+    except Exception as e:
+        return False, f"Error testing API key: {str(e)}"
+
+
 class PlateSolveResult:
     """Container for plate solve results"""
 
