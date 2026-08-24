@@ -52,6 +52,21 @@ jobs:
       run: |
         pyinstaller CosmosCollection.spec
 
+    - name: Build updater helper with PyInstaller
+      run: |
+        pyinstaller updater/cosmos_updater.spec
+
+    - name: Bundle updater helper into distribution (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        Copy-Item dist/CosmosCollectionUpdater.exe dist/CosmosCollection/CosmosCollectionUpdater.exe
+
+    - name: Bundle updater helper into distribution (Linux/macOS)
+      if: matrix.os != 'windows-latest'
+      run: |
+        cp dist/CosmosCollectionUpdater dist/CosmosCollection/CosmosCollectionUpdater
+        chmod +x dist/CosmosCollection/CosmosCollectionUpdater
+
     - name: Create distribution zip (Windows)
       if: matrix.os == 'windows-latest'
       run: |
@@ -64,17 +79,34 @@ jobs:
         zip -r ../CosmosCollection-${{ matrix.platform }}.zip .
         cd ../..
 
+    - name: Generate checksum (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        $hash = (Get-FileHash -Algorithm SHA256 dist/CosmosCollection-${{ matrix.platform }}.zip).Hash.ToLower()
+        "$hash  CosmosCollection-${{ matrix.platform }}.zip" | Out-File -Encoding ascii -NoNewline dist/CosmosCollection-${{ matrix.platform }}.zip.sha256
+
+    - name: Generate checksum (Linux/macOS)
+      if: matrix.os != 'windows-latest'
+      run: |
+        cd dist
+        sha256sum CosmosCollection-${{ matrix.platform }}.zip > CosmosCollection-${{ matrix.platform }}.zip.sha256
+        cd ..
+
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: CosmosCollection-${{ matrix.platform }}
-        path: dist/CosmosCollection-${{ matrix.platform }}.zip
+        path: |
+          dist/CosmosCollection-${{ matrix.platform }}.zip
+          dist/CosmosCollection-${{ matrix.platform }}.zip.sha256
 
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
-        files: dist/CosmosCollection-${{ matrix.platform }}.zip
+        files: |
+          dist/CosmosCollection-${{ matrix.platform }}.zip
+          dist/CosmosCollection-${{ matrix.platform }}.zip.sha256
         draft: false
         prerelease: false
         generate_release_notes: true

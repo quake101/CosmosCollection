@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
     QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout, QSpinBox, QFileDialog, QSizePolicy,
     QListWidget, QListWidgetItem, QCompleter, QSplitter, QSystemTrayIcon,
-    QTableWidget, QTableWidgetItem
+    QTableWidget, QTableWidgetItem, QProgressDialog
 )
 
 # Local imports (always needed)
@@ -4842,6 +4842,131 @@ class BulkAddToTargetDialog(QDialog):
 
 
 # --- About Dialog ---
+def _get_quit_callback(widget):
+    """Walk up the widget's parent chain looking for MainWindow's
+    _quit_application (which stops timers/tray/db cleanly before quitting).
+    Falls back to a bare QApplication.quit if it can't be found - e.g. an
+    update offered before MainWindow exists."""
+    while widget is not None:
+        if hasattr(widget, '_quit_application'):
+            return widget._quit_application
+        widget = widget.parent() if hasattr(widget, 'parent') else None
+    return QApplication.instance().quit
+
+
+def offer_update_and_apply(parent, version_info):
+    """Shared 'update is available' flow used by the About dialog's Check
+    for Updates button, the silent startup check, and the tray check.
+
+    On a packaged build for a platform we publish a release for, offers to
+    download, verify, and install the update in place, then restart. In
+    every other case (source/dev runs, unsupported OS, or a release missing
+    the matching asset), falls back to the original "visit the download
+    page" behavior.
+    """
+    from AppUpdater import update_manager
+    from version import version_manager
+    from UrlOpener import open_url
+
+    github_url = version_info.get('github_url')
+
+    if not update_manager.is_supported():
+        msg = QMessageBox(parent)
+        msg.setWindowTitle("Update Available")
+        msg.setText("A new version is available!")
+        msg.setInformativeText(
+            f"Current version: {version_info['local_version']}\n"
+            f"Latest version: {version_info['github_version']}\n\n"
+            f"Would you like to visit the download page?"
+        )
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.Yes)
+        if msg.exec() == QMessageBox.Yes and github_url:
+            open_url(github_url)
+        return
+
+    release_data = version_manager.get_github_latest_release() or {}
+    zip_asset, sha256_asset, asset_error = update_manager.get_pending_asset(release_data)
+
+    msg = QMessageBox(parent)
+    msg.setWindowTitle("Update Available")
+    msg.setText("A new version is available!")
+    info_text = (
+        f"Current version: {version_info['local_version']}\n"
+        f"Latest version: {version_info['github_version']}"
+    )
+    if asset_error:
+        info_text += f"\n\n{asset_error}"
+    msg.setInformativeText(info_text)
+
+    install_button = None
+    if not asset_error:
+        install_button = msg.addButton("Download && Install", QMessageBox.AcceptRole)
+    notes_button = msg.addButton("Release Notes", QMessageBox.HelpRole)
+    msg.addButton("Later", QMessageBox.RejectRole)
+    msg.setDefaultButton(install_button or notes_button)
+    msg.exec()
+
+    clicked = msg.clickedButton()
+    if clicked == notes_button:
+        if github_url:
+            open_url(github_url)
+    elif install_button is not None and clicked == install_button:
+        _download_and_install_update(parent, zip_asset, sha256_asset, version_info)
+
+
+def _download_and_install_update(parent, zip_asset, sha256_asset, version_info):
+    """Downloads (with a progress dialog), verifies, and applies the update,
+    then restarts the app. Any failure is reported and simply leaves the
+    running app untouched - nothing here modifies the install directory
+    directly (that only happens in the separate updater helper process)."""
+    from AppUpdater import update_manager, UpdateError
+
+    progress = QProgressDialog("Downloading update...", "Cancel", 0, 100, parent)
+    progress.setWindowTitle("Updating Cosmos Collection")
+    progress.setWindowModality(Qt.WindowModal)
+    progress.setMinimumDuration(0)
+    progress.setAutoClose(False)
+    progress.setAutoReset(False)
+
+    quit_callback = _get_quit_callback(parent)
+
+    def on_progress(done, total):
+        mb_done = done / (1024 * 1024)
+        if total > 0:
+            progress.setMaximum(total)
+            progress.setValue(done)
+            progress.setLabelText(f"Downloading update... {mb_done:.1f} / {total / (1024 * 1024):.1f} MB")
+        else:
+            progress.setMaximum(0)  # indeterminate
+            progress.setLabelText(f"Downloading update... {mb_done:.1f} MB")
+
+    def on_error(message):
+        progress.close()
+        QMessageBox.warning(parent, "Update Failed", f"Could not download the update:\n\n{message}")
+
+    def on_ready(zip_path):
+        progress.setLabelText("Installing update...")
+        progress.setMaximum(0)
+        try:
+            update_manager.apply_update(zip_path)
+        except UpdateError as e:
+            progress.close()
+            QMessageBox.warning(parent, "Update Failed", f"Could not install the update:\n\n{e}")
+            return
+        progress.close()
+        QMessageBox.information(
+            parent, "Update Ready",
+            f"Cosmos Collection {version_info['github_version']} has been downloaded.\n"
+            f"The application will now restart to finish installing it."
+        )
+        quit_callback()
+
+    worker = update_manager.start_download(zip_asset, sha256_asset, on_progress, on_error, on_ready)
+    progress.canceled.connect(worker.cancel)
+    progress.show()
+
+
 class AboutDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4933,8 +5058,6 @@ class AboutDialog(QDialog):
         try:
             from version import version_manager
             from PySide6.QtWidgets import QMessageBox
-            from PySide6.QtCore import QUrl
-            from UrlOpener import open_url
 
             # Force refresh the GitHub release info
             version_manager._cached_release_info = None
@@ -4946,19 +5069,7 @@ class AboutDialog(QDialog):
                 return
 
             if version_info['update_available']:
-                msg = QMessageBox()
-                msg.setWindowTitle("Update Available")
-                msg.setText(f"A new version is available!")
-                msg.setInformativeText(
-                    f"Current version: {version_info['local_version']}\n"
-                    f"Latest version: {version_info['github_version']}\n\n"
-                    f"Would you like to visit the download page?"
-                )
-                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-                msg.setDefaultButton(QMessageBox.Yes)
-
-                if msg.exec() == QMessageBox.Yes and version_info['github_url']:
-                    open_url(version_info['github_url'])
+                offer_update_and_apply(self, version_info)
             else:
                 QMessageBox.information(self, "No Updates",
                     f"You are running the latest version ({version_info['local_version']}).")
@@ -5866,6 +5977,15 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _check_updates_on_startup(self):
         """Silently check for updates on startup if enabled in settings"""
         try:
+            # Surface a prior failed/incomplete update once, regardless of
+            # whether startup checking is enabled - this reports on an
+            # action the user already took, not a new check.
+            from AppUpdater import update_manager
+            failure_message = update_manager.check_previous_update_failure()
+            if failure_message:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Update Did Not Complete", failure_message)
+
             # Check if the setting is enabled
             settings = QSettings("CosmosCollection", "CosmosCollection")
             check_updates = settings.value("check_updates_on_startup", True, type=bool)
@@ -5877,8 +5997,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             logger.debug("Checking for updates on startup")
 
             from version import version_manager
-            from PySide6.QtWidgets import QMessageBox
-            from UrlOpener import open_url
 
             # Get version info
             version_info = version_manager.get_version_info()
@@ -5886,19 +6004,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             # Only show message if update is available
             if version_info.get('github_available') and version_info.get('update_available'):
                 logger.info(f"Update available: {version_info.get('github_version')}")
-                msg = QMessageBox()
-                msg.setWindowTitle("Update Available")
-                msg.setText(f"A new version is available!")
-                msg.setInformativeText(
-                    f"Current version: {version_info['local_version']}\n"
-                    f"Latest version: {version_info['github_version']}\n\n"
-                    f"Would you like to visit the download page?"
-                )
-                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-                msg.setDefaultButton(QMessageBox.Yes)
-
-                if msg.exec() == QMessageBox.Yes and version_info.get('github_url'):
-                    open_url(version_info['github_url'])
+                offer_update_and_apply(self, version_info)
             else:
                 logger.debug("No updates available or unable to check")
 
@@ -6807,9 +6913,18 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                     self._tray_manager._tray_icon.showMessage(
                         "Update Available",
                         f"Cosmos Collection {version_info['github_version']} is available.\n"
-                        f"You are running {version_info['local_version']}.",
+                        f"Click here to download and install it.",
                         QSystemTrayIcon.Information,
                         10000  # Show for 10 seconds
+                    )
+                    # Re-wire the click handler on every check so it always
+                    # offers to update using this check's version info.
+                    try:
+                        self._tray_manager._tray_icon.messageClicked.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass  # nothing was connected yet
+                    self._tray_manager._tray_icon.messageClicked.connect(
+                        lambda vi=version_info: offer_update_and_apply(self, vi)
                     )
             else:
                 logger.debug("Tray update check: no updates available")
