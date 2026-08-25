@@ -5,10 +5,11 @@ Provides system tray icon with mini weather forecast and quick actions
 """
 
 import logging
+import sys
 from typing import List, Optional, Callable
 
 from PySide6.QtCore import QObject, Signal, QSettings
-from PySide6.QtGui import QIcon, QAction
+from PySide6.QtGui import QIcon, QAction, QCursor
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication, QWidget
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,19 @@ class SystemTrayManager(QObject):
             parent_widget = self.parent() if isinstance(self.parent(), QWidget) else None
             self._menu = QMenu(parent_widget)
             self._create_menu()
-            self._tray_icon.setContextMenu(self._menu)
+
+            # Deliberately NOT calling setContextMenu(): when the main window is
+            # hidden there is no foreground window, and Windows' menu-tracking
+            # then misreads the still-logically-down right mouse button as a
+            # click on whatever item the cursor first touches while moving into
+            # the menu — items fire on hover instead of on click. We pop the
+            # menu ourselves in _on_tray_activated() so we can call
+            # SetForegroundWindow first, which is Microsoft's documented fix
+            # for tray-icon context menus (see Shell_NotifyIcon/TrackPopupMenu
+            # remarks). This does not show/restore any window — it only hands
+            # our process the OS input-focus context a normal foreground app
+            # would already have, exactly like Explorer does for its own tray
+            # icons on every right-click.
 
             # Connect signals
             self._tray_icon.activated.connect(self._on_tray_activated)
@@ -206,6 +219,28 @@ class SystemTrayManager(QObject):
         logger.debug(f"Tray icon activated with reason: {reason}")
         if reason == QSystemTrayIcon.DoubleClick:
             self.restore_requested.emit()
+        elif reason == QSystemTrayIcon.Context:
+            self._popup_menu()
+
+    def _popup_menu(self):
+        """
+        Show the right-click menu, taking the OS foreground-window handoff
+        first so Windows' menu tracking works correctly when no app window
+        is currently visible/active. This does not show or restore any
+        window — see the comment in setup() for why it's needed.
+        """
+        if not self._menu:
+            return
+
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hwnd = int(self._menu.winId())
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception as e:
+                logger.debug(f"SetForegroundWindow before tray menu popup failed: {e}")
+
+        self._menu.popup(QCursor.pos())
 
     def _on_show_clicked(self):
         """Handle Show action clicked"""
