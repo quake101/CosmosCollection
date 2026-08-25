@@ -166,6 +166,22 @@ class ResourceManager:
         """Get the base application path"""
         return self._base_path
 
+    @property
+    def install_dir(self):
+        """Top-level directory containing the app executable.
+
+        NOT the same as base_path in a PyInstaller onedir build: PyInstaller
+        sets sys._MEIPASS for onedir builds too (pointing at the internal
+        resources folder, e.g. "_internal", not the folder the .exe sits
+        in), so base_path resolves one level too deep for anything that
+        needs the real install root - such as the updater, which must mirror
+        a downloaded release onto the whole install directory (exe +
+        _internal), not nest it inside _internal.
+        """
+        if getattr(sys, 'frozen', False):
+            return Path(sys.executable).parent
+        return self._base_path
+
 
 # Global instance
 ResourceManager = ResourceManager()

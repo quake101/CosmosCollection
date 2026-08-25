@@ -230,7 +230,7 @@ class UpdateManager:
         if not updater_path.exists():
             # Fall back to the currently-installed updater if the new
             # release's zip didn't include one for some reason.
-            fallback = ResourceManager.base_path / updater_name
+            fallback = ResourceManager.install_dir / updater_name
             if fallback.exists():
                 updater_path = fallback
             else:
@@ -243,7 +243,7 @@ class UpdateManager:
             except OSError:
                 pass
 
-        install_dir = ResourceManager.base_path
+        install_dir = ResourceManager.install_dir
         relaunch_path = sys.executable
         log_path = self.updates_dir / 'update_log.txt'
 
