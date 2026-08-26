@@ -54,7 +54,7 @@ jobs:
 
     - name: Build updater helper with PyInstaller
       run: |
-        pyinstaller updater/cosmos_updater.spec
+        pyinstaller updater/CosmosUpdater.spec
 
     - name: Bundle updater helper into distribution (Windows)
       if: matrix.os == 'windows-latest'

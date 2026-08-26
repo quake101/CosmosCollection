@@ -5,7 +5,7 @@ Download-and-apply update support for Cosmos Collection.
 Downloads the platform-matching release zip from GitHub, verifies it against
 the release's published SHA256 checksum, extracts it to a staging
 directory, then hands off to the standalone CosmosCollectionUpdater helper
-(see updater/cosmos_updater.py) to swap the install directory and relaunch
+(see updater/CosmosUpdater.py) to swap the install directory and relaunch
 the app. A running onedir build can't overwrite its own executable/DLLs, so
 the actual file swap always happens in that separate process, after this
 one has quit.

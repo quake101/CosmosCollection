@@ -9,9 +9,13 @@ a staging directory, then launches this helper and quits. This helper waits
 for the main app's process to fully exit, mirrors the staged files over the
 install directory, relaunches the app, and cleans up after itself.
 
-Stdlib-only by design so it stays small and dependency-free when compiled by
-PyInstaller - it must be able to run standalone even while the main app's
-own bundled libraries are mid-replacement.
+The actual wait/copy/relaunch logic (_run_update below) is stdlib-only by
+design, so the update itself can never be blocked by a GUI problem - it must
+be able to run standalone even while the main app's own bundled libraries
+are mid-replacement. main() additionally shows a PySide6 progress dialog
+(see CosmosUpdaterWorker.py) reporting each stage, imported lazily and
+wrapped so any failure to create it just falls back to running the update
+headless.
 
 Usage:
     CosmosCollectionUpdater --pid <main_app_pid> --staged-dir <path>
@@ -140,27 +144,27 @@ def _write_failure_marker(log_path, install_dir, staged_dir, error):
         pass
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Cosmos Collection updater")
-    parser.add_argument("--pid", type=int, required=True)
-    parser.add_argument("--staged-dir", required=True)
-    parser.add_argument("--install-dir", required=True)
-    parser.add_argument("--relaunch", required=True)
-    parser.add_argument("--log", default=None)
-    parser.add_argument(
-        "--cleanup", action="append", default=[],
-        help="Extra file/dir to delete after a successful update (repeatable)",
-    )
-    args = parser.parse_args()
+def _run_update(args, status_cb):
+    """Runs the wait/copy/relaunch steps, reporting each stage through
+    status_cb(text) (in addition to the log file) so a progress dialog can
+    show live status. Returns the process exit code; failures are reported
+    rather than raised so the caller can still relaunch the (possibly old)
+    app either way, matching the original behavior."""
 
-    _log(args.log, f"Updater starting, waiting for pid {args.pid} to exit")
+    def _report(text):
+        _log(args.log, text)
+        status_cb(text)
+
+    _report("Waiting for Cosmos Collection to close...")
     _wait_for_pid_exit(args.pid, timeout=60)
     time.sleep(1.0)  # grace period for Windows to release file handles
 
     try:
+        _report("Copying updated files...")
         _mirror_sync(args.staged_dir, args.install_dir, args.log)
         _log(args.log, "Mirror sync complete")
     except Exception as e:
+        _report(f"Update failed: {e}")
         _log(args.log, f"ERROR: update failed during file sync: {e}")
         _write_failure_marker(args.log, args.install_dir, args.staged_dir, e)
         # Try to relaunch the (old, possibly partially-updated) app anyway so
@@ -172,6 +176,7 @@ def main():
         return 1
 
     try:
+        _report("Restarting Cosmos Collection...")
         subprocess.Popen([args.relaunch], cwd=args.install_dir, close_fds=True)
         _log(args.log, f"Relaunched {args.relaunch}")
     except OSError as e:
@@ -189,6 +194,31 @@ def main():
 
     _log(args.log, "Update applied successfully")
     return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Cosmos Collection updater")
+    parser.add_argument("--pid", type=int, required=True)
+    parser.add_argument("--staged-dir", required=True)
+    parser.add_argument("--install-dir", required=True)
+    parser.add_argument("--relaunch", required=True)
+    parser.add_argument("--log", default=None)
+    parser.add_argument(
+        "--cleanup", action="append", default=[],
+        help="Extra file/dir to delete after a successful update (repeatable)",
+    )
+    args = parser.parse_args()
+
+    _log(args.log, f"Updater starting, waiting for pid {args.pid} to exit")
+
+    try:
+        from CosmosUpdaterWorker import run_with_progress
+        return run_with_progress(lambda status_cb: _run_update(args, status_cb))
+    except Exception as e:
+        # A GUI problem (missing display, Qt failure, etc.) must never block
+        # the actual update - fall back to running it headless.
+        _log(args.log, f"WARN: progress dialog unavailable, continuing headless: {e}")
+        return _run_update(args, lambda _text: None)
 
 
 if __name__ == "__main__":
