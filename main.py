@@ -4912,10 +4912,10 @@ def offer_update_and_apply(parent, version_info):
         if github_url:
             open_url(github_url)
     elif install_button is not None and clicked == install_button:
-        _download_and_install_update(parent, zip_asset, sha256_asset, version_info)
+        _download_and_install_update(parent, zip_asset, sha256_asset)
 
 
-def _download_and_install_update(parent, zip_asset, sha256_asset, version_info):
+def _download_and_install_update(parent, zip_asset, sha256_asset):
     """Downloads (with a progress dialog), verifies, and applies the update,
     then restarts the app. Any failure is reported and simply leaves the
     running app untouched - nothing here modifies the install directory
@@ -4955,11 +4955,13 @@ def _download_and_install_update(parent, zip_asset, sha256_asset, version_info):
             QMessageBox.warning(parent, "Update Failed", f"Could not install the update:\n\n{e}")
             return
         progress.close()
-        QMessageBox.information(
-            parent, "Update Ready",
-            f"Cosmos Collection {version_info['github_version']} has been downloaded.\n"
-            f"The application will now restart to finish installing it."
-        )
+        # No "Update Ready" confirmation here - apply_update() has already
+        # launched the standalone updater helper, which is now waiting for
+        # this process to exit before it can proceed. A blocking dialog at
+        # this point would just sit there until the user notices and
+        # dismisses it, making the update look hung. The helper's own
+        # progress dialog (CosmosUpdaterWorker.py) picks up from here to
+        # narrate the rest of the restart.
         quit_callback()
 
     worker = update_manager.start_download(zip_asset, sha256_asset, on_progress, on_error, on_ready)
