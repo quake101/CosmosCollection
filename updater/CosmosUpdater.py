@@ -21,10 +21,16 @@ Usage:
     CosmosCollectionUpdater --pid <main_app_pid> --staged-dir <path>
         --install-dir <path> --relaunch <path_to_exe>
         [--log <path>] [--cleanup <path> ...]
+
+This is a windowed (console=False) build with no visible stdout/stderr, so
+running it directly with no/bad arguments or --help shows a message box
+with the usage text above instead of printing it (see
+_show_standalone_help).
 """
 
 import argparse
 import ctypes
+import io
 import os
 import shutil
 import subprocess
@@ -196,18 +202,81 @@ def _run_update(args, status_cb):
     return 0
 
 
+def _show_standalone_help(usage_text):
+    """Show argparse's usage/help text in a message box.
+
+    This is a windowed (console=False) build, so PyInstaller sets
+    sys.stdout/sys.stderr to None - argparse's normal print-and-exit for
+    --help or missing/bad arguments would otherwise crash silently the
+    moment it tries to write, leaving someone who double-clicks the exe
+    directly with no explanation at all. A QMessageBox works regardless,
+    since it doesn't depend on either stream."""
+    try:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        app = QApplication.instance() or QApplication(sys.argv)
+        box = QMessageBox()
+        box.setWindowTitle("Cosmos Collection Updater")
+        box.setIcon(QMessageBox.Information)
+        box.setText(
+            "This is an internal helper that Cosmos Collection launches "
+            "automatically to apply an update. It isn't meant to be run "
+            "directly."
+        )
+        box.setDetailedText(usage_text)
+        box.exec()
+    except Exception:
+        pass  # Qt unavailable - nothing more we can do in a windowed build
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Cosmos Collection updater")
-    parser.add_argument("--pid", type=int, required=True)
-    parser.add_argument("--staged-dir", required=True)
-    parser.add_argument("--install-dir", required=True)
-    parser.add_argument("--relaunch", required=True)
-    parser.add_argument("--log", default=None)
+    parser = argparse.ArgumentParser(
+        prog="CosmosCollectionUpdater",
+        description=(
+            "Cosmos Collection's standalone update helper. Cosmos Collection "
+            "launches this automatically after downloading an update - it "
+            "isn't meant to be run directly."
+        ),
+    )
+    parser.add_argument(
+        "--pid", type=int, required=True,
+        help="Process ID of the running Cosmos Collection instance to wait for",
+    )
+    parser.add_argument(
+        "--staged-dir", required=True,
+        help="Directory holding the already-extracted update to copy into place",
+    )
+    parser.add_argument(
+        "--install-dir", required=True,
+        help="Cosmos Collection installation directory to update",
+    )
+    parser.add_argument(
+        "--relaunch", required=True,
+        help="Executable to relaunch once the update has been applied",
+    )
+    parser.add_argument(
+        "--log", default=None,
+        help="Optional log file to append progress/status to",
+    )
     parser.add_argument(
         "--cleanup", action="append", default=[],
         help="Extra file/dir to delete after a successful update (repeatable)",
     )
-    args = parser.parse_args()
+
+    # argparse writes --help/usage-error text to sys.stdout/sys.stderr,
+    # which are None in this windowed build - substitute an in-memory
+    # buffer so that write succeeds and we can show its contents in a
+    # dialog, instead of the write itself crashing the process first.
+    captured = io.StringIO()
+    if sys.stdout is None:
+        sys.stdout = captured
+    if sys.stderr is None:
+        sys.stderr = captured
+
+    try:
+        args = parser.parse_args()
+    except SystemExit as e:
+        _show_standalone_help(captured.getvalue().strip() or parser.format_help())
+        return e.code if isinstance(e.code, int) else 2
 
     _log(args.log, f"Updater starting, waiting for pid {args.pid} to exit")
 
