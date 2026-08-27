@@ -5287,6 +5287,10 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         # Check for updates on startup if enabled
         QTimer.singleShot(2000, self._check_updates_on_startup)
 
+        # Clean up leftover staged-update directories from past failed or
+        # interrupted updates, off the UI thread
+        QTimer.singleShot(3000, self._cleanup_stale_updates)
+
         # Initialize system tray if enabled
         self._tray_manager: Optional[SystemTrayManager] = None
         self._setup_system_tray_if_enabled()
@@ -5975,6 +5979,17 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 self.model.load_more_data()
             else:
                 logger.info(f"All {self.model.total_count} objects already loaded")
+
+    def _cleanup_stale_updates(self):
+        """Kick off background cleanup of leftover updates\\staged-* dirs
+        from past failed/interrupted updates. Runs on its own thread since
+        it does filesystem work, and is unconditional (unlike the update
+        check itself) since it's just housekeeping."""
+        try:
+            from AppUpdater import update_manager
+            update_manager.cleanup_stale_staged_dirs_async()
+        except Exception as e:
+            logger.debug(f"Could not start staged-update cleanup: {e}")
 
     def _check_updates_on_startup(self):
         """Silently check for updates on startup if enabled in settings"""

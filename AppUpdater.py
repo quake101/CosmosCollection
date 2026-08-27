@@ -21,6 +21,8 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -283,6 +285,49 @@ class UpdateManager:
         except OSError:
             pass
         return message
+
+    def cleanup_stale_staged_dirs(self, min_age_seconds: int = 300) -> int:
+        """Remove leftover staged-<pid> directories from updates that never
+        cleaned up after themselves. On success the updater helper deletes
+        its own staged directory before relaunching (see
+        CosmosUpdater._run_update); one still present means that run
+        crashed, was killed, or failed and left it behind for diagnostics -
+        which, if surfaced at all, was already reported once via
+        check_previous_update_failure(). Directories modified more
+        recently than min_age_seconds are left alone in case an update is
+        genuinely still in progress. Returns the number removed. Safe to
+        call from a background thread."""
+        removed = 0
+        if not self.updates_dir.is_dir():
+            return removed
+        now = time.time()
+        for entry in self.updates_dir.iterdir():
+            if not entry.is_dir() or not entry.name.startswith('staged-'):
+                continue
+            try:
+                age = now - entry.stat().st_mtime
+            except OSError:
+                continue
+            if age < min_age_seconds:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            if entry.exists():
+                logger.warning(f"Could not fully remove stale staged update directory: {entry}")
+            else:
+                removed += 1
+                logger.info(f"Removed stale staged update directory: {entry}")
+        return removed
+
+    def cleanup_stale_staged_dirs_async(self, min_age_seconds: int = 300) -> None:
+        """Run cleanup_stale_staged_dirs() on a background daemon thread so
+        the caller (typically app startup) never blocks on filesystem
+        work."""
+        threading.Thread(
+            target=self.cleanup_stale_staged_dirs,
+            args=(min_age_seconds,),
+            daemon=True,
+            name="StagedUpdateCleanup",
+        ).start()
 
 
 # Global instance for easy access, mirroring version.py's version_manager
