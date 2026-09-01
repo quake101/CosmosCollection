@@ -5,6 +5,7 @@ Displays astrophotography-relevant weather data from Open-Meteo API
 """
 
 import sys
+import time
 import logging
 
 from dataclasses import dataclass
@@ -279,10 +280,29 @@ class WeatherWorker(QThread):
             verify = not getattr(sys, 'frozen', False)
 
             self.progress.emit("Downloading weather forecast data...")
-            response = requests.get(url, timeout=30, verify=verify)
-            response.raise_for_status()
 
-            data = response.json()
+            # Open-Meteo occasionally returns a 200 with an empty/invalid body
+            # (transient upstream hiccup). Retry once before giving up, since
+            # a fresh request a moment later typically succeeds.
+            max_attempts = 2
+            data = None
+            for attempt in range(1, max_attempts + 1):
+                response = requests.get(url, timeout=30, verify=verify)
+                response.raise_for_status()
+                try:
+                    data = response.json()
+                    break
+                except ValueError:
+                    body_preview = response.text[:200] if response.text else "<empty>"
+                    logger.warning(
+                        f"Open-Meteo returned an unparseable response on attempt "
+                        f"{attempt}/{max_attempts} (status {response.status_code}): {body_preview!r}"
+                    )
+                    if attempt == max_attempts:
+                        raise ValueError(
+                            "Open-Meteo returned an invalid response. Please try refreshing again."
+                        )
+                    time.sleep(1)
 
             # Optionally supplement with OpenWeather data (opt-in, requires API key).
             # Returns None if disabled/unconfigured/unavailable, in which case the
@@ -323,15 +343,34 @@ class WeatherWorker(QThread):
                 f"lat={self.lat}&lon={self.lon}&units=metric&appid={api_key}"
             )
             verify = not getattr(sys, 'frozen', False)
-            response = requests.get(url, timeout=20, verify=verify)
 
-            if response.status_code == 401:
-                self.openweather_error = "invalid API key"
-                logger.warning("OpenWeather fetch failed: invalid API key")
-                return None
+            # OpenWeather, like Open-Meteo, occasionally returns a 200 with an
+            # empty/invalid body (transient upstream hiccup). Retry once before
+            # giving up, since a fresh request a moment later typically succeeds.
+            max_attempts = 2
+            data = None
+            for attempt in range(1, max_attempts + 1):
+                response = requests.get(url, timeout=20, verify=verify)
 
-            response.raise_for_status()
-            data = response.json()
+                if response.status_code == 401:
+                    self.openweather_error = "invalid API key"
+                    logger.warning("OpenWeather fetch failed: invalid API key")
+                    return None
+
+                response.raise_for_status()
+                try:
+                    data = response.json()
+                    break
+                except ValueError:
+                    body_preview = response.text[:200] if response.text else "<empty>"
+                    logger.warning(
+                        f"OpenWeather returned an unparseable response on attempt "
+                        f"{attempt}/{max_attempts} (status {response.status_code}): {body_preview!r}"
+                    )
+                    if attempt == max_attempts:
+                        self.openweather_error = "invalid response"
+                        return None
+                    time.sleep(1)
 
             result: Dict[datetime, Dict[str, Optional[float]]] = {}
             for entry in data.get("list", []):
