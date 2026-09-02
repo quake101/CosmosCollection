@@ -48,10 +48,20 @@ if getattr(sys, 'frozen', False):
 # "Select Location from Map" (Leaflet) dialog. This forces Chromium to composite the final frame
 # on the CPU instead of the GPU, which works around that corruption. It does not disable WebGL
 # itself (still GPU-rendered, just software-composited afterward), so Aladin Lite keeps working.
+#
+# --disable-gpu-rasterization --disable-zero-copy: on native Wayland sessions (CachyOS's default),
+# --disable-gpu-compositing alone turned the corruption into a solid black map instead of fixing
+# it. That's a known Chromium/Wayland/Mesa combination: with compositing forced onto the CPU but
+# tile rasterization and zero-copy GPU->CPU tile transport left on, the compositor can't read the
+# GPU-rasterized tiles back into CPU memory and silently paints black instead of falling back.
+# Disabling rasterization and zero-copy too keeps the whole raster+composite pipeline on the CPU
+# so there's no GPU-to-CPU handoff left to fail. Still doesn't touch WebGL, so Aladin Lite is
+# unaffected.
 from ResourceManager import ResourceManager as _ResourceManager
 _chromium_log_path = os.path.join(str(_ResourceManager.get_data_dir()), 'chromium_debug.log')
 os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
-    f'--no-sandbox --disable-gpu-compositing --enable-logging --log-file={_chromium_log_path}'
+    f'--no-sandbox --disable-gpu-compositing --disable-gpu-rasterization --disable-zero-copy '
+    f'--enable-logging --log-file={_chromium_log_path}'
 )
 
 # Core PySide6 imports (always needed)
