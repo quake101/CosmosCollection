@@ -41,9 +41,18 @@ if getattr(sys, 'frozen', False):
 # than memory corruption. Chromium prints the fatal message to its own log right before abort()-ing;
 # without this flag that message is lost, leaving faulthandler's single app.exec() frame as the
 # only clue. This captures it to chromium_debug.log next to crash.log for the next occurrence.
+#
+# --disable-gpu-compositing: on Linux, bleeding-edge Mesa builds (e.g. rolling-release distros
+# like CachyOS) have shipped GPU tile-rasterization/compositor bugs that render QtWebEngine
+# content as blocky, wrong-colored garbage instead of the actual page -- reported here on the
+# "Select Location from Map" (Leaflet) dialog. This forces Chromium to composite the final frame
+# on the CPU instead of the GPU, which works around that corruption. It does not disable WebGL
+# itself (still GPU-rendered, just software-composited afterward), so Aladin Lite keeps working.
 from ResourceManager import ResourceManager as _ResourceManager
 _chromium_log_path = os.path.join(str(_ResourceManager.get_data_dir()), 'chromium_debug.log')
-os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = f'--no-sandbox --enable-logging --log-file={_chromium_log_path}'
+os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
+    f'--no-sandbox --disable-gpu-compositing --enable-logging --log-file={_chromium_log_path}'
+)
 
 # Core PySide6 imports (always needed)
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings, Slot
