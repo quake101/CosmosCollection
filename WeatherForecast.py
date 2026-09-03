@@ -613,6 +613,14 @@ def calculate_astro_score(cloud_cover: float, humidity: float, wind_speed: float
     - >40 km/h gusts: max score 35 (severe — tracking essentially impossible)
     - >25 km/h gusts: max score 60 (moderate — long exposures degraded)
 
+    Score caps based on precipitation probability (rain can cut a session short):
+    - >50% chance: max score 40 (high risk of disruption)
+    - >30% chance: max score 60 (moderate risk of disruption)
+
+    Score caps based on humidity (dew/fogging risk on optics):
+    - >90% humidity: max score 50 (severe dew/fog risk)
+    - >80% humidity: max score 70 (elevated dew/fog risk)
+
     Base scoring weights:
     - Cloud cover (40%): lower is better
     - Transparency/Visibility (15%): higher is better (affects deep sky objects)
@@ -700,6 +708,20 @@ def calculate_astro_score(cloud_cover: float, humidity: float, wind_speed: float
         total_score = min(total_score, 35)  # Severe gusts — tracking essentially impossible
     elif wind_gusts > 25:
         total_score = min(total_score, 60)  # Moderate gusts — long exposures degraded
+
+    # Apply precipitation caps — meaningful rain risk should hard-limit the score
+    # since a session can be cut short or ruined regardless of sky clarity elsewhere
+    if precip_prob > 50:
+        total_score = min(total_score, 40)  # High rain risk — session likely disrupted
+    elif precip_prob > 30:
+        total_score = min(total_score, 60)  # Moderate rain risk — plan for interruptions
+
+    # Apply humidity caps — near-saturation humidity brings dew/fogging risk
+    # that degrades a session regardless of sky clarity
+    if humidity > 90:
+        total_score = min(total_score, 50)  # Severe dew/fog risk
+    elif humidity > 80:
+        total_score = min(total_score, 70)  # Elevated dew/fog risk
 
     return int(min(100, max(0, total_score)))
 
