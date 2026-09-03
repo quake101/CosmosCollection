@@ -618,8 +618,8 @@ def calculate_astro_score(cloud_cover: float, humidity: float, wind_speed: float
     - >30% chance: max score 60 (moderate risk of disruption)
 
     Score caps based on humidity (dew/fogging risk on optics):
-    - >90% humidity: max score 50 (severe dew/fog risk)
-    - >80% humidity: max score 70 (elevated dew/fog risk)
+    - >90% humidity: max score 40 (severe dew/fog risk)
+    - >80% humidity: max score 60 (elevated dew/fog risk)
 
     Base scoring weights:
     - Cloud cover (40%): lower is better
@@ -719,9 +719,9 @@ def calculate_astro_score(cloud_cover: float, humidity: float, wind_speed: float
     # Apply humidity caps — near-saturation humidity brings dew/fogging risk
     # that degrades a session regardless of sky clarity
     if humidity > 90:
-        total_score = min(total_score, 50)  # Severe dew/fog risk
+        total_score = min(total_score, 40)  # Severe dew/fog risk
     elif humidity > 80:
-        total_score = min(total_score, 70)  # Elevated dew/fog risk
+        total_score = min(total_score, 60)  # Elevated dew/fog risk
 
     return int(min(100, max(0, total_score)))
 
