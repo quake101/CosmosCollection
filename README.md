@@ -84,6 +84,19 @@ sudo pacman -S xcb-util-cursor
 
 This is a one-time system setup required for Qt 6.5+ applications.
 
+**CachyOS / Arch Linux — QtWebEngine features (Map Picker, FOV Simulator):**
+
+The Location Manager's map picker and the FOV Simulator both use QtWebEngine, whose bundled binary is linked against an older `libxml2.so.2`. Rolling-release distros like CachyOS ship a newer `libxml2` that only provides `libxml2.so.16`, so these features fail to open with an error like:
+
+```
+ERROR:__main__:QtWebEngine not available: libxml2.so.2: cannot open shared object file: No such file or directory
+```
+
+Fix by installing the legacy compatibility package:
+```bash
+sudo pacman -S libxml2-legacy
+```
+
 ### Building from Source
 
 If you prefer to build from source:
@@ -96,7 +109,11 @@ If you prefer to build from source:
 
 #### Installation
 
-1. Clone or download the CosmosCollection project
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/quake101/CosmosCollection.git
+   cd CosmosCollection
+   ```
 2. Install dependencies:
    ```
    pip install -r requirements.txt
@@ -105,6 +122,16 @@ If you prefer to build from source:
    ```
    python main.py
    ```
+
+**CachyOS / Arch Linux — Python version:**
+
+CachyOS is rolling-release and typically ships the newest Python (e.g. 3.14) before pinned dependencies like `PySide6==6.9.0` and `numpy==2.2.5` publish wheels for it, causing `pip install -r requirements.txt` to fail with "No matching distribution found" or a build error. Use [uv](https://github.com/astral-sh/uv) to get a compatible Python (3.12) for the virtual environment instead:
+
+```bash
+uv python install 3.12
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+```
 
 ## Usage
 
