@@ -7532,6 +7532,28 @@ if __name__ == "__main__":
     # Apply global dark theme
     apply_theme(app)
 
+    # Pre-warm astropy/erfa/numpy on the main thread, before any background thread (weather
+    # fetch, DSO visibility calc, ...) gets a chance to trigger the same first-time lazy
+    # imports/C-extension dispatch setup concurrently. A rare native crash (Fatal Python
+    # error: Illegal instruction, mid garbage-collection) has been observed at more than one
+    # such first-call site -- astropy.units.cds's first import during an IERS table parse,
+    # and separately astropy.time.Time._apply/replicate inside get_sun() -- both only ever
+    # seen inside the background WeatherForecast thread. Rather than chase each first-call
+    # site individually, exercise the actual functions that thread runs (with throwaway data)
+    # here, single-threaded, before any worker thread has started, so whatever one-time
+    # native setup they trigger happens in a context that reproducibly hasn't crashed.
+    try:
+        from astropy.utils.iers import IERS_Auto
+        IERS_Auto.open()
+        from WeatherForecast import calculate_sun_altitudes, calculate_moon_phase
+        import datetime as _dt
+        _now = _dt.datetime.utcnow()
+        calculate_sun_altitudes(0.0, 0.0, [_now])
+        calculate_moon_phase(_now)
+        logger.debug("Pre-warmed astropy/erfa machinery")
+    except Exception as e:
+        logger.warning(f"Could not pre-warm astropy machinery (will retry lazily later): {e}")
+
     # Initialize database manager and get data
     db_manager = DatabaseManager()
 
