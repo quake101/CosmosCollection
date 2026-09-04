@@ -2943,6 +2943,7 @@ class MapLocationPickerDialog(QDialog):
         self.web_view = None
         self.bridge = None
         self.channel = None
+        self._renderer_crashed = False  # Set by _on_render_process_terminated; suppresses the generic load-failed message
 
         self._setup_ui()
 
@@ -3297,6 +3298,11 @@ class MapLocationPickerDialog(QDialog):
             # Add load finished handler to check if everything loaded
             self.web_view.loadFinished.connect(self._on_map_loaded)
 
+            # Catch GPU/renderer process crashes (see FOVSimulator's AladinLiteWindow for the
+            # same pattern) so a crash shows a clear message instead of a silently dead dialog.
+            self._renderer_crashed = False
+            self.web_view.page().renderProcessTerminated.connect(self._on_render_process_terminated)
+
             # Add web view to map container
             self.map_layout.addWidget(self.web_view)
 
@@ -3337,7 +3343,32 @@ class MapLocationPickerDialog(QDialog):
             # Check bridge status after a delay (give it time to initialize)
             QTimer.singleShot(2000, self._check_bridge_status)
         else:
-            logger.error("Map page failed to load")
+            # If the renderer already crashed, _on_render_process_terminated has already shown
+            # a more accurate message -- don't stomp it with the generic one.
+            if not self._renderer_crashed:
+                logger.error("Map page failed to load")
+                QMessageBox.warning(self, "Map Failed to Load",
+                    "The map failed to load, possibly due to a network issue.\n\n"
+                    "You can still enter coordinates manually.")
+                self.reject()
+
+    def _on_render_process_terminated(self, termination_status, exit_code):
+        """Handle GPU/renderer process crash without crashing the whole app or leaving a dead dialog"""
+        from PySide6.QtWebEngineCore import QWebEnginePage
+        status_names = {
+            QWebEnginePage.RenderProcessTerminationStatus.NormalTerminationStatus: "Normal",
+            QWebEnginePage.RenderProcessTerminationStatus.AbnormalTerminationStatus: "Abnormal",
+            QWebEnginePage.RenderProcessTerminationStatus.CrashedTerminationStatus: "Crashed",
+            QWebEnginePage.RenderProcessTerminationStatus.KilledTerminationStatus: "Killed",
+        }
+        status_name = status_names.get(termination_status, f"Unknown({termination_status})")
+        logger.error(f"Map picker renderer process terminated: {status_name}, exit code: {exit_code}")
+        self._renderer_crashed = True
+
+        QMessageBox.warning(self, "Map Renderer Crashed",
+            "The map's renderer process crashed (usually a GPU driver issue).\n\n"
+            "You can still enter coordinates manually.")
+        self.reject()
 
     def _check_bridge_status(self):
         """Check if the JavaScript bridge is ready"""
