@@ -3354,6 +3354,10 @@ class MapLocationPickerDialog(QDialog):
 
     def _on_render_process_terminated(self, termination_status, exit_code):
         """Handle GPU/renderer process crash without crashing the whole app or leaving a dead dialog"""
+        if self._renderer_crashed:
+            # Chromium can fire this signal again (e.g. an automatic reload attempt) before
+            # reject() below has actually torn the dialog down. Only handle the first one.
+            return
         from PySide6.QtWebEngineCore import QWebEnginePage
         status_names = {
             QWebEnginePage.RenderProcessTerminationStatus.NormalTerminationStatus: "Normal",
@@ -7473,6 +7477,15 @@ if __name__ == "__main__":
         _crash_log_file.write(f"\n--- session started {datetime.datetime.now().isoformat()} ---\n")
         _crash_log_file.flush()
         faulthandler.enable(_crash_log_file)
+        # faulthandler.enable() only registers SIGSEGV/SIGFPE/SIGABRT/SIGBUS/SIGILL by default --
+        # it misses SIGTRAP, which is how e.g. a hardened-glibc/OpenBLAS/Chromium-GPU-process
+        # trap can take the whole process down. Register it too so that shows up here instead
+        # of vanishing with nothing but a "session started" line.
+        try:
+            import signal
+            faulthandler.register(signal.SIGTRAP, file=_crash_log_file, all_threads=True)
+        except Exception as e:
+            logger.debug(f"Could not register SIGTRAP handler: {e}")
         logger.debug(f"Crash log: {_crash_log_path}")
     except Exception as e:
         logger.warning(f"Could not enable crash log: {e}")
