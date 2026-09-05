@@ -285,6 +285,20 @@ class UpdateManager:
             )
         else:
             popen_kwargs['start_new_session'] = True
+            # On a systemd-managed desktop (KDE/GNOME both do this), this
+            # app's own launch is tracked as a per-launch systemd unit with
+            # KillMode=control-group. The instant this process exits (which
+            # the caller does immediately after apply_update() returns),
+            # systemd tears down that unit's whole cgroup -- and this
+            # helper, just spawned, can still be sitting in it: setsid
+            # (start_new_session) moves it to a new *session*, not a new
+            # *cgroup*, so it offers no protection here. Escape into an
+            # independent systemd scope when possible so the helper (and
+            # the app it later relaunches, see updater/CosmosUpdater.py's
+            # _relaunch_app) can't be caught by that teardown.
+            systemd_run = shutil.which('systemd-run')
+            if systemd_run:
+                args = [systemd_run, '--user', '--scope', '--quiet', '--collect', '--'] + args
 
         subprocess.Popen(args, **popen_kwargs)
         logger.info(f"Launched updater helper: {updater_path}")

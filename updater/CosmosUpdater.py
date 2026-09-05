@@ -154,6 +154,72 @@ def _mirror_sync(src_dir, dst_dir, log_path):
                 shutil.rmtree(os.path.join(root, name), ignore_errors=True)
 
 
+def _popen_relaunch(args):
+    """Launch args.relaunch, escaping any systemd unit/cgroup this helper
+    process might itself be a member of, when possible (see
+    _relaunch_app's docstring for why that matters)."""
+    cmd = [args.relaunch]
+    if sys.platform != "win32":
+        systemd_run = shutil.which("systemd-run")
+        if systemd_run:
+            # --scope adopts this exact command into a brand-new,
+            # independent transient unit instead of leaving it in whatever
+            # cgroup this helper inherited. --collect cleans that unit up
+            # once it exits instead of leaving a "failed"/"exited" unit
+            # behind forever (as the app's own KDE/GNOME-created units do).
+            cmd = [systemd_run, '--user', '--scope', '--quiet', '--collect', '--'] + cmd
+    return subprocess.Popen(cmd, cwd=args.install_dir, close_fds=True)
+
+
+def _relaunch_app(args, log_path, attempts=2, settle=1.5, healthcheck=0.75):
+    """Launch args.relaunch and confirm it's actually still running a beat
+    later, retrying once if not. Returns True if the app appears to have
+    started successfully.
+
+    A bare Popen() only raises when execve() itself fails outright (bad
+    path, missing +x) - it says nothing about what happens a moment later.
+    On a systemd-managed desktop (KDE and GNOME both do this), launching
+    this app wraps it in its own per-launch systemd scope/service with
+    KillMode=control-group. The instant that unit's tracked process exits
+    - which is exactly what just happened, since that's the whole reason
+    this updater is running - systemd tears down its entire cgroup. This
+    helper, and the app it's about to relaunch, can still be sitting in
+    that very cgroup at that moment: start_new_session (setsid) moves a
+    process to a new *session*, not a new *cgroup*, so it does nothing to
+    protect against this. The result is exactly what was observed in the
+    wild: Popen() reports success (the exec did succeed), the log says
+    "Relaunched ...", and the process is killed a moment later - before it
+    can render anything or write so much as its first log line - so
+    nothing else ever shows it failed either. Confirming the process is
+    still alive a fraction of a second later, and retrying after a short
+    settle delay if it isn't, turns that silent lie into an honest,
+    self-healing result.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            proc = _popen_relaunch(args)
+        except OSError as e:
+            _log(log_path, f"ERROR: could not relaunch app (attempt {attempt}/{attempts}): {e}")
+            time.sleep(settle)
+            continue
+
+        time.sleep(healthcheck)
+        exit_code = proc.poll()
+        if exit_code is None:
+            _log(log_path, f"Relaunched {args.relaunch} (pid {proc.pid})")
+            return True
+
+        _log(
+            log_path,
+            f"WARN: relaunched process exited immediately (code {exit_code}) "
+            f"on attempt {attempt}/{attempts}"
+        )
+        time.sleep(settle)
+
+    _log(log_path, f"ERROR: app did not stay running after {attempts} relaunch attempts")
+    return False
+
+
 def _write_failure_marker(log_path, install_dir, staged_dir, error):
     marker_dir = os.path.dirname(log_path) if log_path else install_dir
     marker = os.path.join(marker_dir, "update_failed.txt")
@@ -193,18 +259,12 @@ def _run_update(args, status_cb):
         _write_failure_marker(args.log, args.install_dir, args.staged_dir, e)
         # Try to relaunch the (old, possibly partially-updated) app anyway so
         # the user isn't left with nothing running.
-        try:
-            subprocess.Popen([args.relaunch], cwd=args.install_dir, close_fds=True)
-        except OSError:
-            pass
+        _relaunch_app(args, args.log)
         return 1
 
-    try:
-        _report("Restarting Cosmos Collection...")
-        subprocess.Popen([args.relaunch], cwd=args.install_dir, close_fds=True)
-        _log(args.log, f"Relaunched {args.relaunch}")
-    except OSError as e:
-        _log(args.log, f"ERROR: could not relaunch app: {e}")
+    _report("Restarting Cosmos Collection...")
+    if not _relaunch_app(args, args.log):
+        _report("Cosmos Collection did not restart - please launch it manually.")
 
     shutil.rmtree(args.staged_dir, ignore_errors=True)
     for path in args.cleanup:
