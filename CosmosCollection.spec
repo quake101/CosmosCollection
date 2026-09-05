@@ -62,29 +62,71 @@ a = Analysis(
 )
 
 if sys.platform.startswith('linux'):
-    # These are Linux desktop/OS-integration libraries (GTK, NSS, cairo, fontconfig,
-    # freetype, OpenSSL, D-Bus, CUPS, avahi, ...) that PyInstaller's dependency walker
-    # bundles from whatever happens to be installed on the BUILD machine, because Qt
-    # WebEngine's Chromium dlopens many of them optionally. Bundling a snapshot from one
+    # These are base Linux/X11/desktop-integration libraries (GTK, NSS, cairo,
+    # fontconfig, freetype, OpenSSL, libstdc++, X11/xcb, GBM, zlib, SQLite, Kerberos,
+    # ...) that PyInstaller's dependency walker bundles from whatever happens to be
+    # installed on the BUILD machine, because Qt WebEngine's Chromium dynamically
+    # depends on (or optionally dlopens) many of them. Bundling a snapshot from one
     # machine (e.g. GitHub Actions' Ubuntu runner) and running it on another (e.g.
     # CachyOS) reproducibly crashed the WebEngine renderer process (map picker, FOV
     # Simulator - "renderer process terminated ... exit code: 1002", no import-time
     # error, only at first render) even though the actual Qt/Chromium binaries were
-    # byte-identical between the working and broken builds. These libraries are
-    # near-universally present on any Linux desktop capable of running a Qt GUI at all,
-    # so excluding them here and letting normal dynamic linking find the target
+    # byte-identical between the working and broken builds -- confirmed by diffing a
+    # working build against a crashing one built from the exact same source: only
+    # these ~95 base-OS libraries actually differed in content. Excluding a narrower
+    # first attempt (just GTK/NSS) did not fully fix it, so this list was widened to
+    # every base-OS library the diff turned up (libstdc++.so.6 and libgcc_s.so.1 -
+    # an ABI mismatch there against a Chromium built on a different toolchain baseline
+    # is the single most likely culprit of the two attempts). All of these are
+    # near-universally present on any Linux desktop capable of running a Qt GUI at
+    # all, so excluding them here and letting normal dynamic linking find the target
     # machine's own copies is safer than freezing in whatever CI happened to have.
-    # Confirmed fix: stripping exactly this set from a broken build made the crash go
-    # away; the same build with them present crashed 5/5 runs.
+    # Every prefix below is anchored with the literal '.so' that starts a soname's
+    # version suffix (e.g. 'libfreetype.so', not just 'libfreetype'). Several packages
+    # -- Pillow in particular -- vendor their OWN private, auditwheel-renamed copies of
+    # some of these same library families as e.g. 'libfreetype-5d47eaee.so.6.20.2', and
+    # an earlier unanchored version of this list matched those too (basename.startswith
+    # doesn't care about the '-hash' in between), silently deleting Pillow's own
+    # required copies and breaking image loading. The '.so' anchor makes that
+    # impossible: a hash-suffixed name never has '.so' immediately after the family
+    # name, only after '-<hash>'.
     _EXCLUDED_SYSTEM_LIB_PREFIXES = (
-        'libgtk-3', 'libgdk-3', 'libatk-1.0', 'libatk-bridge-2.0', 'libatspi',
-        'libcairo', 'libpango', 'libnss3', 'libnssutil3', 'libnspr4', 'libnssckbi',
-        'libfreebl3', 'libfreeblpriv3', 'libfontconfig', 'libfreetype',
-        'libglib-2.0', 'libgobject-2.0', 'libgio-2.0', 'libgmodule-2.0',
-        'libgthread-2.0', 'libgdk_pixbuf-2.0', 'libharfbuzz', 'libgraphite2',
-        'libfribidi', 'libdatrie', 'libthai', 'libcrypto.so', 'libssl.so',
-        'libp11-kit', 'libgnutls', 'libavahi-client', 'libavahi-common',
-        'libcups', 'libdbus-1', 'libepoxy', 'libexpat', 'libffi',
+        # GTK/GLib/accessibility/theming (optional dlopen targets for native dialogs)
+        'libgtk-3.so', 'libgdk-3.so', 'libgdk_pixbuf-2.0.so', 'libatk-1.0.so',
+        'libatk-bridge-2.0.so', 'libatspi.so', 'libglib-2.0.so', 'libgobject-2.0.so',
+        'libgio-2.0.so', 'libgmodule-2.0.so', 'libgthread-2.0.so',
+        # Font/text shaping/rendering
+        'libcairo.so', 'libcairo-gobject.so', 'libpango-1.0.so', 'libpangocairo-1.0.so',
+        'libpangoft2-1.0.so', 'libfontconfig.so', 'libfreetype.so', 'libharfbuzz.so',
+        'libgraphite2.so', 'libfribidi.so', 'libdatrie.so', 'libthai.so', 'libpixman-1.so',
+        # NSS/crypto/TLS
+        'libnss3.so', 'libnssutil3.so', 'libnspr4.so', 'libnssckbi.so', 'libfreebl3.so',
+        'libfreeblpriv3.so', 'libsoftokn3.so', 'libsmime3.so', 'libplc4.so', 'libplds4.so',
+        'libcrypto.so', 'libssl.so', 'libp11-kit.so', 'libgnutls.so', 'libtasn1.so',
+        'libunistring.so', 'libidn2.so', 'libgmp.so',
+        # C/C++ runtime and low-level base libs - an ABI mismatch here (Chromium built
+        # against a different toolchain baseline than the bundled copy) is the prime
+        # suspect for a hard renderer crash with no Python-level error
+        'libstdc++.so', 'libgcc_s.so', 'libatomic.so',
+        # Compression / misc data formats
+        'libz.so', 'libzstd.so', 'libbz2.so', 'liblzma.so', 'libpng16.so', 'libpcre2-8.so',
+        'libbrotlicommon.so', 'libbrotlidec.so',
+        # X11/xcb/GPU-buffer (Chromium's Linux windowing + GPU compositing path)
+        'libX11.so', 'libX11-xcb.so', 'libXau.so', 'libXcomposite.so', 'libXcursor.so',
+        'libXdamage.so', 'libXdmcp.so', 'libXext.so', 'libXfixes.so', 'libXinerama.so',
+        'libXi.so', 'libXrandr.so', 'libXrender.so', 'libXtst.so',
+        'libxcb-glx.so', 'libxcb-randr.so', 'libxcb-render.so', 'libxcb-shm.so',
+        'libxcb-sync.so', 'libxcb-xfixes.so',
+        'libxkbcommon.so', 'libxkbfile.so', 'libxshmfence.so', 'libgbm.so',
+        # D-Bus/system/session integration
+        'libdbus-1.so', 'libepoxy.so', 'libexpat.so', 'libffi.so', 'libavahi-client.so',
+        'libavahi-common.so', 'libcups.so', 'libsystemd.so', 'libmount.so', 'libblkid.so',
+        'libcom_err.so', 'libasound.so',
+        # Kerberos/GSSAPI (pulled in transitively via requests/keyring's optional auth backends)
+        'libgssapi_krb5.so', 'libk5crypto.so', 'libkrb5support.so', 'libkrb5.so',
+        'libkeyutils.so',
+        # XML/misc
+        'libxml2.so', 'libxslt.so', 'libsqlite3.so',
     )
     a.binaries = [
         b for b in a.binaries

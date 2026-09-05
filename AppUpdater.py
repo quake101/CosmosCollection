@@ -222,6 +222,25 @@ class UpdateManager:
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 zf.extractall(staged_dir)
+                # zipfile.extractall() does NOT restore Unix permission bits, even though
+                # our release zips (built with `zip -r` on Linux/macOS) correctly store
+                # them in each entry's external_attr -- this is a long-standing stdlib
+                # limitation, not something specific to this archive. Left unfixed, every
+                # extracted file -- including the CosmosCollection/-CLI executables and the
+                # updater helper -- comes out as plain 0644, and the later copy into the
+                # install dir (shutil.copy2, which DOES preserve the mode it's given)
+                # faithfully carries that non-executable mode forward, so the app fails to
+                # relaunch after an update with a Permission denied error. Restore the
+                # stored mode ourselves for Unix-created entries.
+                if platform.system() != 'Windows':
+                    for info in zf.infolist():
+                        if info.create_system == 3 and not info.filename.endswith('/'):  # 3 = Unix
+                            mode = (info.external_attr >> 16) & 0o777
+                            if mode:
+                                try:
+                                    os.chmod(staged_dir / info.filename, mode)
+                                except OSError:
+                                    pass
         except Exception as e:
             shutil.rmtree(staged_dir, ignore_errors=True)
             raise UpdateError(f"Could not extract the update archive: {e}")
