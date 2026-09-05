@@ -28,7 +28,13 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.11'
+        # 3.11 made PyInstaller 6.12.0's Qt-collection hook duplicate the entire Qt6 module
+        # set at the top level of _internal/ (in addition to the correct nested copies under
+        # PySide6/Qt/lib/). That stray copy sits on LD_LIBRARY_PATH for the whole process
+        # tree, including the QtWebEngineProcess child, and reproducibly crashed it (map
+        # picker / FOV Simulator renderer process, exit code 1002) on Linux. 3.12 does not
+        # have this problem -- confirmed by rebuilding locally with both versions.
+        python-version: '3.12'
 
     - name: Install dependencies
       run: |
