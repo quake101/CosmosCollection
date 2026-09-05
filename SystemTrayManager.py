@@ -62,30 +62,38 @@ class SystemTrayManager(QObject):
             self._menu = QMenu(parent_widget)
             self._create_menu()
 
-            # On Windows, deliberately NOT calling setContextMenu(): when the
-            # main window is hidden there is no foreground window, and
-            # Windows' menu-tracking then misreads the still-logically-down
-            # right mouse button as a click on whatever item the cursor first
-            # touches while moving into the menu — items fire on hover instead
-            # of on click. We pop the menu ourselves in _on_tray_activated()
-            # so we can call SetForegroundWindow first, which is Microsoft's
-            # documented fix for tray-icon context menus (see
-            # Shell_NotifyIcon/TrackPopupMenu remarks). This does not
+            # On Windows and macOS, deliberately NOT calling setContextMenu():
+            # when the main window is hidden there is no foreground window,
+            # and Windows' menu-tracking then misreads the still-logically-
+            # down right mouse button as a click on whatever item the cursor
+            # first touches while moving into the menu — items fire on hover
+            # instead of on click. We pop the menu ourselves in
+            # _on_tray_activated() so we can call SetForegroundWindow first,
+            # which is Microsoft's documented fix for tray-icon context menus
+            # (see Shell_NotifyIcon/TrackPopupMenu remarks). This does not
             # show/restore any window — it only hands our process the OS
             # input-focus context a normal foreground app would already have,
             # exactly like Explorer does for its own tray icons on every
-            # right-click.
+            # right-click. macOS is fine with the same manual approach (its
+            # global cursor position is always queryable), and it's also the
+            # only way to keep macOS's DoubleClick activation working: per
+            # Qt's own docs, a double click is only ever emitted there if no
+            # context menu is set on the icon.
             #
-            # On Linux/macOS we do use setContextMenu(), letting the platform
-            # (e.g. the desktop environment's StatusNotifierItem handling)
-            # position and show the menu natively above the tray icon.
-            # Manually popping up at QCursor.pos() instead is unreliable
-            # there — under Wayland compositors in particular (common on
-            # distros like CachyOS running KDE Plasma or Hyprland), the
-            # global cursor position isn't reliably queryable, which is why
-            # the menu could show up centered on screen instead of above the
-            # icon.
-            if sys.platform != "win32":
+            # On Linux we do use setContextMenu(), letting the desktop
+            # environment's StatusNotifierItem handling position and show
+            # the menu natively above the tray icon. Manually popping up at
+            # QCursor.pos() instead is unreliable there — under Wayland
+            # compositors in particular (common on distros like CachyOS
+            # running KDE Plasma or Hyprland), the global cursor position
+            # isn't reliably queryable, which is why the menu could show up
+            # centered on screen instead of above the icon. The tradeoff:
+            # once a context menu is attached this way, most Linux tray
+            # hosts stop reporting a right-click "Context" activation to us
+            # at all (they show the menu themselves) and also stop
+            # synthesizing a "DoubleClick" reason for left-clicks — see the
+            # Trigger handling in _on_tray_activated().
+            if sys.platform == "linux":
                 self._tray_icon.setContextMenu(self._menu)
 
             # Connect signals
@@ -232,10 +240,21 @@ class SystemTrayManager(QObject):
         logger.debug(f"Tray icon activated with reason: {reason}")
         if reason == QSystemTrayIcon.DoubleClick:
             self.restore_requested.emit()
-        elif reason == QSystemTrayIcon.Context and sys.platform == "win32":
-            # On other platforms the menu is already attached via
-            # setContextMenu() in setup(), and the platform/desktop
-            # environment shows it itself, positioned above the tray icon.
+        elif reason == QSystemTrayIcon.Trigger and sys.platform == "linux":
+            # Linux tray hosts (StatusNotifierItem-based, e.g. KDE Plasma,
+            # Hyprland/waybar) only ever report a single left-click as
+            # "Trigger" — there's no native double-click concept — and once
+            # a context menu is attached (see setup()) most of them stop
+            # synthesizing a separate DoubleClick reason entirely, so
+            # DoubleClick alone would never fire here. Restore on a single
+            # left click instead, which also matches the click-to-toggle
+            # convention most Linux tray apps use (Windows is the odd one
+            # out with its double-click convention).
+            self.restore_requested.emit()
+        elif reason == QSystemTrayIcon.Context and sys.platform != "linux":
+            # On Linux the menu is already attached via setContextMenu() in
+            # setup(), and the desktop environment shows it itself,
+            # positioned above the tray icon.
             self._popup_menu()
 
     def _popup_menu(self):
@@ -245,9 +264,9 @@ class SystemTrayManager(QObject):
         is currently visible/active. This does not show or restore any
         window — see the comment in setup() for why it's needed.
 
-        Windows-only: other platforms rely on setContextMenu() instead (see
-        setup()), since QCursor.pos() isn't a reliable menu-anchor position
-        everywhere else (notably under Wayland).
+        Used on Windows and macOS only: Linux relies on setContextMenu()
+        instead (see setup()), since QCursor.pos() isn't a reliable
+        menu-anchor position there (notably under Wayland).
         """
         if not self._menu:
             return
