@@ -62,18 +62,31 @@ class SystemTrayManager(QObject):
             self._menu = QMenu(parent_widget)
             self._create_menu()
 
-            # Deliberately NOT calling setContextMenu(): when the main window is
-            # hidden there is no foreground window, and Windows' menu-tracking
-            # then misreads the still-logically-down right mouse button as a
-            # click on whatever item the cursor first touches while moving into
-            # the menu — items fire on hover instead of on click. We pop the
-            # menu ourselves in _on_tray_activated() so we can call
-            # SetForegroundWindow first, which is Microsoft's documented fix
-            # for tray-icon context menus (see Shell_NotifyIcon/TrackPopupMenu
-            # remarks). This does not show/restore any window — it only hands
-            # our process the OS input-focus context a normal foreground app
-            # would already have, exactly like Explorer does for its own tray
-            # icons on every right-click.
+            # On Windows, deliberately NOT calling setContextMenu(): when the
+            # main window is hidden there is no foreground window, and
+            # Windows' menu-tracking then misreads the still-logically-down
+            # right mouse button as a click on whatever item the cursor first
+            # touches while moving into the menu — items fire on hover instead
+            # of on click. We pop the menu ourselves in _on_tray_activated()
+            # so we can call SetForegroundWindow first, which is Microsoft's
+            # documented fix for tray-icon context menus (see
+            # Shell_NotifyIcon/TrackPopupMenu remarks). This does not
+            # show/restore any window — it only hands our process the OS
+            # input-focus context a normal foreground app would already have,
+            # exactly like Explorer does for its own tray icons on every
+            # right-click.
+            #
+            # On Linux/macOS we do use setContextMenu(), letting the platform
+            # (e.g. the desktop environment's StatusNotifierItem handling)
+            # position and show the menu natively above the tray icon.
+            # Manually popping up at QCursor.pos() instead is unreliable
+            # there — under Wayland compositors in particular (common on
+            # distros like CachyOS running KDE Plasma or Hyprland), the
+            # global cursor position isn't reliably queryable, which is why
+            # the menu could show up centered on screen instead of above the
+            # icon.
+            if sys.platform != "win32":
+                self._tray_icon.setContextMenu(self._menu)
 
             # Connect signals
             self._tray_icon.activated.connect(self._on_tray_activated)
@@ -219,7 +232,10 @@ class SystemTrayManager(QObject):
         logger.debug(f"Tray icon activated with reason: {reason}")
         if reason == QSystemTrayIcon.DoubleClick:
             self.restore_requested.emit()
-        elif reason == QSystemTrayIcon.Context:
+        elif reason == QSystemTrayIcon.Context and sys.platform == "win32":
+            # On other platforms the menu is already attached via
+            # setContextMenu() in setup(), and the platform/desktop
+            # environment shows it itself, positioned above the tray icon.
             self._popup_menu()
 
     def _popup_menu(self):
@@ -228,17 +244,20 @@ class SystemTrayManager(QObject):
         first so Windows' menu tracking works correctly when no app window
         is currently visible/active. This does not show or restore any
         window — see the comment in setup() for why it's needed.
+
+        Windows-only: other platforms rely on setContextMenu() instead (see
+        setup()), since QCursor.pos() isn't a reliable menu-anchor position
+        everywhere else (notably under Wayland).
         """
         if not self._menu:
             return
 
-        if sys.platform == "win32":
-            try:
-                import ctypes
-                hwnd = int(self._menu.winId())
-                ctypes.windll.user32.SetForegroundWindow(hwnd)
-            except Exception as e:
-                logger.debug(f"SetForegroundWindow before tray menu popup failed: {e}")
+        try:
+            import ctypes
+            hwnd = int(self._menu.winId())
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception as e:
+            logger.debug(f"SetForegroundWindow before tray menu popup failed: {e}")
 
         self._menu.popup(QCursor.pos())
 
