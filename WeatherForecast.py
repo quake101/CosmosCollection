@@ -311,25 +311,30 @@ class WeatherWorker(QThread):
             openweather_data = self._fetch_openweather_data()
 
             self.progress.emit("Processing weather data...")
-            # Disable the cyclic GC around this call. A native crash (Fatal Python error:
-            # Illegal instruction) has recurred here at several unrelated first-call sites
-            # (astropy.units.cds import, Time.replicate, an ecliptic frame transform,
-            # numpy arrayprint/__str__, pytz.timezone's os.environ lookup) -- the one
-            # constant every time is "Garbage-collecting" at the top of the trace, in this
-            # thread. That points at a GC pass landing mid-call while some C extension has
-            # left transient state a GC traversal isn't safe to observe, not at any one of
-            # those libraries specifically. gc.disable()/enable() is process-wide, not
-            # thread-local, but this call is quick and runs once per weather refresh, so
+            # Disable the cyclic GC from here through the weather_loaded emit below. A
+            # native crash (Fatal Python error: Illegal instruction) has recurred at
+            # several unrelated first-call sites inside _process_weather_data (astropy
+            # units.cds import, Time.replicate, an ecliptic frame transform, numpy
+            # arrayprint/__str__, pytz.timezone's os.environ lookup) -- the one constant
+            # every time is "Garbage-collecting" at the top of the trace, in this thread.
+            # That points at a GC pass landing while some C extension has left transient
+            # state a GC traversal isn't safe to observe, not at any one of those
+            # libraries specifically. Re-enabling gc immediately after
+            # _process_weather_data returned (right before this comment used to sit)
+            # wasn't enough -- the crash recurred one line later, right after
+            # gc.enable(), inside weather_loaded.emit() itself (cross-thread signal
+            # delivery allocates too). So the disabled window now extends through the
+            # emit call as well. gc.disable()/enable() is process-wide, not thread-local,
+            # but this whole stretch is quick and runs once per weather refresh, so
             # briefly deferring collection elsewhere is a small price for not crashing.
             gc_was_enabled = gc.isenabled()
             gc.disable()
             try:
                 daily_summaries = self._process_weather_data(data, openweather_data)
+                self.weather_loaded.emit(daily_summaries)
             finally:
                 if gc_was_enabled:
                     gc.enable()
-
-            self.weather_loaded.emit(daily_summaries)
 
         except requests.exceptions.RequestException as e:
             self.error_occurred.emit(f"Network error: {str(e)}")

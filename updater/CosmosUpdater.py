@@ -96,6 +96,19 @@ def _retry(func, attempts=10, delay=0.5):
     raise last_err
 
 
+# Top-level app executables that must be able to run via execve() after an update.
+# shutil.copy2() below preserves whatever mode the staged source file already has,
+# which is normally correct -- except the *main app's* own extraction step
+# (AppUpdater.py, a separate, older copy of the code doing the staging) has at times
+# shipped with a bug where Python's zipfile.extractall() silently drops the Unix
+# executable bit on every extracted file. This helper can't assume the app that
+# staged the files it's copying already has that fixed: an old, buggy app version is
+# exactly the one that needs an update most. So explicitly re-assert +x on these by
+# name rather than trusting the source mode -- that makes the fix self-healing on the
+# very next update for every user, regardless of which app version initiated it.
+_EXECUTABLE_NAMES = {'CosmosCollection', 'CosmosCollection-CLI', 'CosmosCollectionUpdater'}
+
+
 def _mirror_sync(src_dir, dst_dir, log_path):
     """Make dst_dir's contents match src_dir's: copy every file from
     src_dir into dst_dir (overwriting), then delete anything in dst_dir
@@ -119,6 +132,11 @@ def _mirror_sync(src_dir, dst_dir, log_path):
             src_file = os.path.join(root, name)
             dst_file = os.path.join(dst_root, name)
             _retry(lambda sf=src_file, df=dst_file: shutil.copy2(sf, df))
+            if sys.platform != "win32" and rel == "." and name in _EXECUTABLE_NAMES:
+                try:
+                    os.chmod(dst_file, 0o755)
+                except OSError as e:
+                    _log(log_path, f"WARN: could not set executable bit on {dst_file}: {e}")
 
     # Remove files/dirs present in dst_dir but no longer in src_dir
     for root, dirs, files in os.walk(dst_dir, topdown=False):
