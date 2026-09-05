@@ -2424,9 +2424,20 @@ class SettingsDialog(QDialog):
 
     def _open_log_folder(self):
         """Open the folder where log files are stored"""
-        from PySide6.QtGui import QDesktopServices
+        # Route through UrlOpener instead of calling QDesktopServices directly:
+        # on Linux (e.g. CachyOS), QDesktopServices.openUrl() shells out to
+        # xdg-open, and in a PyInstaller-frozen build that subprocess inherits
+        # our bundled LD_LIBRARY_PATH, which makes it fail to launch the file
+        # manager. UrlOpener retries with gio/xdg-open under a cleaned
+        # environment first (same fix already used for opening web links).
+        from UrlOpener import open_url
         log_dir = ResourceManager.get_data_dir()
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_dir)))
+        if not open_url(QUrl.fromLocalFile(str(log_dir))):
+            logger.warning(f"Failed to open log folder: {log_dir}")
+            QMessageBox.warning(
+                self, "Open Log Folder",
+                f"Could not open the log folder automatically.\n\nLocation:\n{log_dir}"
+            )
 
     def _save_settings(self):
         """Save application settings (QSettings only - locations are saved separately)"""
