@@ -3,9 +3,11 @@ import faulthandler
 import logging
 import os
 import sys
+import threading
 import urllib.request
 import urllib.error
 import json
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from typing import Optional, Dict
 
 # Configure SSL certificates BEFORE any network imports (CRITICAL for PyInstaller)
@@ -2103,10 +2105,11 @@ class SettingsDialog(QDialog):
         restore_group_layout = QVBoxLayout(restore_group)
 
         restore_description = QLabel(
-            "Restore your user data from a previously created backup file.\n\n"
+            "Restore your user data from a previously created backup file.<br><br>"
             "<b>Warning:</b> Restoring will replace your current data with the backup data. "
             "It is recommended to create a backup of your current data first."
         )
+        restore_description.setTextFormat(Qt.RichText)
         restore_description.setWordWrap(True)
         restore_description.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         restore_group_layout.addWidget(restore_description)
@@ -2892,9 +2895,412 @@ class SettingsDialog(QDialog):
             )
             logger.info(f"Backup restored successfully from {file_path}")
 
+            # Check that every restored image still points at a real file on disk.
+            # A backup made on another machine (or a moved/renamed image folder) can
+            # leave userimages.image_path pointing nowhere; give the user a chance to
+            # fix that right away instead of discovering broken thumbnails later.
+            invalid_images = self._find_invalid_images()
+            if invalid_images:
+                fixup_dialog = RestoreImageFixupDialog(invalid_images, self.db_manager, self)
+                fixup_dialog.exec()
+
         except Exception as e:
             logger.error(f"Error restoring backup: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Restore Error", f"Failed to restore backup: {str(e)}")
+
+    def _find_invalid_images(self):
+        """Return restored userimages rows whose image_path no longer exists on disk.
+
+        Each entry is a dict: {'id': userimage id, 'path': last known path, 'name': DSO name}.
+        """
+        invalid = []
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT ui.id, ui.image_path,
+                           COALESCE(GROUP_CONCAT(DISTINCT c.catalogue || ' ' || c.designation), 'Unknown') AS name
+                    FROM userimages ui
+                    LEFT JOIN dsodetail d ON d.id = ui.dsodetailid
+                    LEFT JOIN cataloguenr c ON c.dsodetailid = d.id
+                    WHERE ui.image_path IS NOT NULL AND ui.image_path != ''
+                    GROUP BY ui.id
+                """)
+                rows = cursor.fetchall()
+            for row_id, path, name in rows:
+                if not os.path.exists(path):
+                    invalid.append({'id': row_id, 'path': path, 'name': name})
+        except Exception as e:
+            logger.error(f"Error checking restored image paths: {str(e)}", exc_info=True)
+        return invalid
+
+
+# --- Folder Scan Worker (for restore image fixup) ---
+class FolderScanWorker(QThread):
+    """Recursively walks a folder tree in the background, indexing files by lowercase basename.
+
+    Each directory is scanned as its own task on a thread pool, so many directories are
+    listed concurrently instead of one os.walk() step at a time. This mainly pays off on
+    network shares or spinning disks where each directory listing has real latency; the
+    threads release the GIL while blocked on that I/O, so they run in parallel."""
+
+    progress = Signal(int)  # number of files scanned so far
+    finished_scan = Signal(dict)  # {lowercase basename: [full paths]}
+
+    def __init__(self, root_folder, parent=None, max_workers=None):
+        super().__init__(parent)
+        self.root_folder = root_folder
+        self.max_workers = max_workers or max(1, (os.cpu_count() or 4) - 2)
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    def _scan_one_dir(self, path):
+        """List a single directory (non-recursive). Returns (files, subdirs)."""
+        files, subdirs = [], []
+        if self._cancel_event.is_set():
+            return files, subdirs
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    if self._cancel_event.is_set():
+                        break
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            subdirs.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            files.append(entry.path)
+                    except OSError:
+                        continue  # e.g. broken symlink/permission race - skip that entry
+        except OSError as e:
+            logger.error(f"Error scanning directory {path}: {str(e)}")
+        return files, subdirs
+
+    def run(self):
+        basename_map = {}
+        lock = threading.Lock()
+        count = 0
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                pending = {executor.submit(self._scan_one_dir, self.root_folder)}
+                while pending and not self._cancel_event.is_set():
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        files, subdirs = future.result()
+                        with lock:
+                            for file_path in files:
+                                key = os.path.basename(file_path).lower()
+                                basename_map.setdefault(key, []).append(file_path)
+                            count += len(files)
+                        if not self._cancel_event.is_set():
+                            for subdir in subdirs:
+                                pending.add(executor.submit(self._scan_one_dir, subdir))
+                    self.progress.emit(count)
+        except Exception as e:
+            logger.error(f"Error scanning folder {self.root_folder}: {str(e)}", exc_info=True)
+        self.progress.emit(count)
+        self.finished_scan.emit(basename_map)
+
+
+# --- Scan Match Confirmation Dialog (for restore image fixup) ---
+class ScanMatchConfirmationDialog(QDialog):
+    """Lets the user review and approve filename matches found by a folder scan before anything is written"""
+
+    def __init__(self, proposals, db_manager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Confirm Matched Images")
+        self.setModal(True)
+        self.resize(800, 400)
+
+        self.proposals = proposals  # list of {'id', 'name', 'old_path', 'new_path'}
+        self.db_manager = db_manager
+        self.applied = []  # proposals actually written to the database
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        count = len(self.proposals)
+        info_label = QLabel(
+            f"Found {count} possible match{'es' if count != 1 else ''} by filename. "
+            "These are only suggestions — review the paths below and uncheck anything "
+            "that doesn't look right before applying."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        self.table = QTableWidget(count, 4)
+        self.table.setHorizontalHeaderLabels(["Use", "DSO", "Missing Path", "Found Match"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.setColumnWidth(0, 50)
+        self.table.setColumnWidth(1, 150)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+
+        for row, proposal in enumerate(self.proposals):
+            use_item = QTableWidgetItem()
+            use_item.setFlags((use_item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
+            use_item.setCheckState(Qt.Checked)
+            self.table.setItem(row, 0, use_item)
+
+            for col, value in enumerate(
+                (proposal['name'], proposal['old_path'], proposal['new_path']), start=1
+            ):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(row, col, item)
+
+        # Size the path columns to fit their (typically long) contents; still
+        # draggable afterward since the header stays in Interactive mode.
+        self.table.resizeColumnToContents(2)
+        self.table.resizeColumnToContents(3)
+
+        layout.addWidget(self.table)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        apply_btn = QPushButton("Apply Selected")
+        apply_btn.setDefault(True)
+        apply_btn.clicked.connect(self._apply)
+        btn_layout.addWidget(apply_btn)
+
+        layout.addLayout(btn_layout)
+
+    def _apply(self):
+        checked_proposals = [
+            proposal for row, proposal in enumerate(self.proposals)
+            if self.table.item(row, 0).checkState() == Qt.Checked
+        ]
+
+        if not checked_proposals:
+            QMessageBox.information(self, "Nothing Selected", "Select at least one match to apply, or Cancel.")
+            return
+
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                for proposal in checked_proposals:
+                    cursor.execute(
+                        "UPDATE userimages SET image_path = ? WHERE id = ?",
+                        (proposal['new_path'], proposal['id'])
+                    )
+                conn.commit()
+            self.applied = checked_proposals
+            self.accept()
+        except Exception as e:
+            logger.error(f"Error applying scanned image matches: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to update image paths: {str(e)}")
+
+
+# --- Restore Image Fixup Dialog ---
+class RestoreImageFixupDialog(QDialog):
+    """Lets the user resolve restored images whose files could not be found on disk,
+    either by locating each file manually or by scanning a folder tree for filename matches"""
+
+    def __init__(self, invalid_images, db_manager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Locate Missing Images")
+        self.setModal(True)
+        self.resize(750, 450)
+
+        self.db_manager = db_manager
+        # Each entry: {'id', 'path', 'name', 'fixed', 'note', 'scan_folder'}
+        self.images = [
+            {**img, 'fixed': False, 'note': '', 'scan_folder': None}
+            for img in invalid_images
+        ]
+        self._scan_worker = None
+        self._progress_dialog = None
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        self.header_label = QLabel()
+        self.header_label.setWordWrap(True)
+        layout.addWidget(self.header_label)
+
+        self.table = QTableWidget(len(self.images), 4)
+        self.table.setHorizontalHeaderLabels(["Status", "DSO", "Last Known Path", "Action"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.setColumnWidth(0, 110)
+        self.table.setColumnWidth(1, 150)
+        self.table.setColumnWidth(2, 320)
+        self.table.setColumnWidth(3, 100)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+
+        for row, image in enumerate(self.images):
+            self.table.setItem(row, 1, self._readonly_item(image['name']))
+            locate_btn = QPushButton("Locate...")
+            locate_btn.clicked.connect(lambda _checked=False, r=row: self._locate_single(r))
+            self.table.setCellWidget(row, 3, locate_btn)
+            self._refresh_row(row)
+
+        layout.addWidget(self.table)
+
+        btn_layout = QHBoxLayout()
+        scan_btn = QPushButton("Scan Folder (and Subfolders)...")
+        scan_btn.clicked.connect(self._scan_folder)
+        btn_layout.addWidget(scan_btn)
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        self._update_header()
+
+    @staticmethod
+    def _readonly_item(text):
+        item = QTableWidgetItem(text)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        return item
+
+    def _refresh_row(self, row):
+        image = self.images[row]
+        if image['fixed']:
+            status_text = "✅ Fixed"
+        elif image['note']:
+            status_text = "⚠ " + image['note']
+        else:
+            status_text = "⚠ Missing"
+        self.table.setItem(row, 0, self._readonly_item(status_text))
+        self.table.setItem(row, 2, self._readonly_item(image['path']))
+
+        locate_btn = self.table.cellWidget(row, 3)
+        if locate_btn is not None:
+            locate_btn.setText("Change..." if image['fixed'] else "Locate...")
+
+    def _update_header(self):
+        total = len(self.images)
+        remaining = sum(1 for img in self.images if not img['fixed'])
+        fixed = total - remaining
+        if remaining == 0:
+            self.header_label.setText(
+                f"All {total} restored image{'s' if total != 1 else ''} have been located. You can close this window."
+            )
+        else:
+            self.header_label.setText(
+                f"{fixed} of {total} restored image{'s' if total != 1 else ''} located so far. "
+                f"{remaining} still missing. Locate them individually, or scan a folder to find matches automatically."
+            )
+
+    def _apply_fix(self, row, new_path, write_db=True):
+        image = self.images[row]
+        if write_db:
+            try:
+                with self.db_manager.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE userimages SET image_path = ? WHERE id = ?",
+                        (new_path, image['id'])
+                    )
+                    conn.commit()
+            except Exception as e:
+                logger.error(f"Error updating image path: {str(e)}", exc_info=True)
+                QMessageBox.critical(self, "Error", f"Failed to update image path: {str(e)}")
+                return
+        image['path'] = new_path
+        image['fixed'] = True
+        image['note'] = ''
+        self._refresh_row(row)
+        self._update_header()
+
+    def _locate_single(self, row):
+        image = self.images[row]
+        start_dir = image['scan_folder'] or ''
+        if not start_dir:
+            last_known_dir = os.path.dirname(image['path'])
+            start_dir = last_known_dir if os.path.isdir(last_known_dir) else ''
+
+        try:
+            from DSOGallery import SUPPORTED_IMAGE_EXTENSIONS
+            ext_filter = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_IMAGE_EXTENSIONS))
+            name_filter = f"Image Files ({ext_filter});;All Files (*.*)"
+        except ImportError:
+            name_filter = "All Files (*.*)"
+
+        new_path, _ = QFileDialog.getOpenFileName(
+            self, f"Locate Image for {image['name']}", start_dir, name_filter
+        )
+        if new_path:
+            self._apply_fix(row, new_path)
+
+    def _scan_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Scan")
+        if not folder:
+            return
+
+        self._progress_dialog = QProgressDialog("Scanning folder for images...", "Cancel", 0, 0, self)
+        self._progress_dialog.setWindowTitle("Scanning")
+        self._progress_dialog.setWindowModality(Qt.WindowModal)
+        self._progress_dialog.setMinimumDuration(0)
+        self._progress_dialog.setAutoClose(False)
+        self._progress_dialog.setAutoReset(False)
+
+        # Match the user's configured worker-thread count (Settings > max_threads),
+        # the same setting used for parallel data loading elsewhere in the app.
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        default_threads = max(1, (os.cpu_count() or 4) - 2)
+        max_threads = max(1, min(settings.value("max_threads", default_threads, type=int), 128))
+
+        self._scan_worker = FolderScanWorker(folder, max_workers=max_threads)
+        self._scan_worker.progress.connect(
+            lambda count: self._progress_dialog.setLabelText(f"Scanning folder for images...\n{count} files scanned")
+        )
+        self._scan_worker.finished_scan.connect(lambda basename_map: self._on_scan_finished(folder, basename_map))
+        self._progress_dialog.canceled.connect(self._scan_worker.cancel)
+
+        self._scan_worker.start()
+        self._progress_dialog.show()
+
+    def _on_scan_finished(self, folder, basename_map):
+        if self._progress_dialog is not None:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+
+        proposals = []
+        for row, image in enumerate(self.images):
+            if image['fixed']:
+                continue
+            candidates = basename_map.get(os.path.basename(image['path']).lower(), [])
+            if len(candidates) == 1:
+                proposals.append({
+                    'row': row,
+                    'id': image['id'],
+                    'name': image['name'],
+                    'old_path': image['path'],
+                    'new_path': candidates[0],
+                })
+            elif len(candidates) > 1:
+                image['note'] = 'Multiple matches found - locate manually'
+                image['scan_folder'] = folder
+                self._refresh_row(row)
+
+        if not proposals:
+            QMessageBox.information(
+                self, "No Matches Found",
+                "No filenames in the selected folder (or its subfolders) matched the missing images."
+            )
+            return
+
+        confirm_dialog = ScanMatchConfirmationDialog(proposals, self.db_manager, self)
+        if confirm_dialog.exec() == QDialog.Accepted:
+            applied_ids = {applied['id'] for applied in confirm_dialog.applied}
+            for proposal in proposals:
+                if proposal['id'] in applied_ids:
+                    self._apply_fix(proposal['row'], proposal['new_path'], write_db=False)
 
 
 # --- Map Location Picker Dialog ---
