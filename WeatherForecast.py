@@ -77,8 +77,9 @@ def test_openweather_key(api_key: str, timeout: int = 10) -> Tuple[bool, str]:
     try:
         # Any fixed coordinates work here - we only care whether the key is accepted.
         url = f"https://api.openweathermap.org/data/2.5/weather?lat=51.5074&lon=-0.1278&appid={api_key}"
-        verify = not getattr(sys, 'frozen', False)
-        response = requests.get(url, timeout=timeout, verify=verify)
+        # See the comment on the Open-Meteo request in WeatherWorker.run() -- verification
+        # is left on its default (True) deliberately.
+        response = requests.get(url, timeout=timeout)
 
         if response.status_code == 401:
             return False, (
@@ -277,9 +278,17 @@ class WeatherWorker(QThread):
                 f"forecast_days=7&timezone=auto"
             )
 
-            # Handle SSL for PyInstaller frozen builds
-            verify = not getattr(sys, 'frozen', False)
-
+            # Cert verification is left on its default (True) here and everywhere else in
+            # this file. main.py points SSL_CERT_FILE/REQUESTS_CA_BUNDLE at the bundled
+            # certifi CA file before any network imports, so requests picks that up as an
+            # explicit ca_certs path in both dev and frozen builds. A previous "verify =
+            # not frozen" workaround here disabled verification in frozen builds without
+            # even avoiding this call path: urllib3 still calls SSLContext.load_default_certs()
+            # whenever no explicit ca_certs/ca_cert_dir/ca_cert_data was given, regardless of
+            # verify=True/False, and that's exactly where a "Fatal Python error: Illegal
+            # instruction" crash (in ssl.py load_default_certs, native/unrecoverable) hit
+            # this thread in the field. Passing an explicit ca_certs path (via verify=True
+            # + the env vars above) skips load_default_certs() entirely.
             self.progress.emit("Downloading weather forecast data...")
 
             # Open-Meteo occasionally returns a 200 with an empty/invalid body
@@ -288,7 +297,7 @@ class WeatherWorker(QThread):
             max_attempts = 2
             data = None
             for attempt in range(1, max_attempts + 1):
-                response = requests.get(url, timeout=30, verify=verify)
+                response = requests.get(url, timeout=30)
                 response.raise_for_status()
                 try:
                     data = response.json()
@@ -364,15 +373,15 @@ class WeatherWorker(QThread):
                 f"https://api.openweathermap.org/data/2.5/forecast?"
                 f"lat={self.lat}&lon={self.lon}&units=metric&appid={api_key}"
             )
-            verify = not getattr(sys, 'frozen', False)
-
+            # See the comment on the Open-Meteo request in run() -- verification is left
+            # on its default (True) deliberately.
             # OpenWeather, like Open-Meteo, occasionally returns a 200 with an
             # empty/invalid body (transient upstream hiccup). Retry once before
             # giving up, since a fresh request a moment later typically succeeds.
             max_attempts = 2
             data = None
             for attempt in range(1, max_attempts + 1):
-                response = requests.get(url, timeout=20, verify=verify)
+                response = requests.get(url, timeout=20)
 
                 if response.status_code == 401:
                     self.openweather_error = "invalid API key"

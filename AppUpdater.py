@@ -94,13 +94,12 @@ class DownloadWorker(QThread):
             self.dest_dir.mkdir(parents=True, exist_ok=True)
             zip_path = self.dest_dir / self.zip_asset['name']
 
-            # Disable SSL verification for PyInstaller builds, matching the
-            # pattern used elsewhere in this codebase (version.py,
-            # WeatherForecast.py) to work around bundled-cert issues.
-            verify_ssl = not getattr(sys, 'frozen', False)
-
-            expected_sha256 = self._fetch_expected_sha256(verify_ssl)
-            self._download(self.zip_asset['browser_download_url'], zip_path, verify_ssl)
+            # Verification is left on its default (True) deliberately -- see the comment
+            # on the Open-Meteo request in WeatherForecast.WeatherWorker.run() for why a
+            # frozen-only "don't verify" workaround was removed here. It matters more here
+            # than anywhere else in this codebase: this downloads and installs an update.
+            expected_sha256 = self._fetch_expected_sha256()
+            self._download(self.zip_asset['browser_download_url'], zip_path)
 
             if self._cancelled:
                 return
@@ -118,19 +117,19 @@ class DownloadWorker(QThread):
             logger.error(f"Update download failed: {e}")
             self.error_occurred.emit(str(e))
 
-    def _fetch_expected_sha256(self, verify_ssl: bool) -> Optional[str]:
+    def _fetch_expected_sha256(self) -> Optional[str]:
         if not self.sha256_asset:
             return None
         response = requests.get(
-            self.sha256_asset['browser_download_url'], timeout=15, verify=verify_ssl
+            self.sha256_asset['browser_download_url'], timeout=15
         )
         response.raise_for_status()
         # Checksum files are conventionally "<hash>  <filename>" or just "<hash>"
         text = response.text.strip()
         return text.split()[0].lower() if text else None
 
-    def _download(self, url: str, dest: Path, verify_ssl: bool):
-        response = requests.get(url, stream=True, timeout=30, verify=verify_ssl)
+    def _download(self, url: str, dest: Path):
+        response = requests.get(url, stream=True, timeout=30)
         response.raise_for_status()
         total = int(response.headers.get('Content-Length', 0)) or self.zip_asset.get('size', 0)
         downloaded = 0
