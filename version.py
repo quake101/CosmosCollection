@@ -166,10 +166,10 @@ class VersionManager:
                 'User-Agent': 'CosmosCollection'
             }
 
-            # Disable SSL verification for PyInstaller builds
-            import sys
-            verify_ssl = not getattr(sys, 'frozen', False)
-            response = requests.get(url, headers=headers, timeout=10, verify=verify_ssl)
+            # Verification is left on its default (True) deliberately -- see the comment
+            # on the Open-Meteo request in WeatherForecast.WeatherWorker.run() for why a
+            # frozen-only "don't verify" workaround was removed here.
+            response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
 
             release_data = response.json()
