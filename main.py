@@ -2661,12 +2661,12 @@ class SettingsDialog(QDialog):
                 except Exception:
                     pass  # Table might not exist
 
-                # Backup telescopeequipment (links equipment to telescopes)
+                # Backup telescope_equipment (links equipment to telescopes)
                 try:
-                    cursor.execute("SELECT * FROM telescopeequipment")
+                    cursor.execute("SELECT * FROM telescope_equipment")
                     columns = [description[0] for description in cursor.description]
                     rows = cursor.fetchall()
-                    backup_data['tables']['telescopeequipment'] = {
+                    backup_data['tables']['telescope_equipment'] = {
                         'columns': columns,
                         'rows': [list(row) for row in rows]
                     }
@@ -2822,15 +2822,15 @@ class SettingsDialog(QDialog):
                     except Exception:
                         pass  # Table might not exist
 
-                # Restore telescopeequipment (links equipment to telescopes)
-                if 'telescopeequipment' in backup_data['tables']:
+                # Restore telescope_equipment (links equipment to telescopes)
+                if 'telescope_equipment' in backup_data['tables']:
                     try:
-                        cursor.execute("DELETE FROM telescopeequipment")
-                        table_data = backup_data['tables']['telescopeequipment']
+                        cursor.execute("DELETE FROM telescope_equipment")
+                        table_data = backup_data['tables']['telescope_equipment']
                         columns = table_data['columns']
                         for row in table_data['rows']:
                             placeholders = ', '.join(['?' for _ in columns])
-                            cursor.execute(f"INSERT INTO telescopeequipment ({', '.join(columns)}) VALUES ({placeholders})", row)
+                            cursor.execute(f"INSERT INTO telescope_equipment ({', '.join(columns)}) VALUES ({placeholders})", row)
                     except Exception:
                         pass  # Table might not exist
 
