@@ -1833,7 +1833,7 @@ class SettingsDialog(QDialog):
 
         self.integrations_list = QListWidget()
         self.integrations_list.setMinimumWidth(180)
-        self.integrations_list.addItems(["NINA", "ASTAP", "Astrometry.net", "OpenWeather"])
+        self.integrations_list.addItems(["NINA", "ASTAP", "Astrometry.net", "OpenWeather", "VisualCrossing", "WeatherAPI"])
         integrations_left_layout.addWidget(self.integrations_list)
         integrations_layout.addWidget(integrations_left_panel)
 
@@ -2067,6 +2067,136 @@ class SettingsDialog(QDialog):
         openweather_page_layout.addStretch()
         self.integrations_stack.addWidget(openweather_page)
 
+        # VisualCrossing page
+        visualcrossing_page = QWidget()
+        visualcrossing_page_layout = QVBoxLayout(visualcrossing_page)
+
+        visualcrossing_title = QLabel("VisualCrossing")
+        visualcrossing_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        visualcrossing_page_layout.addWidget(visualcrossing_title)
+
+        # Enable checkbox
+        self.visualcrossing_enabled_checkbox = QCheckBox("Enable VisualCrossing Integration")
+        self.visualcrossing_enabled_checkbox.setToolTip(
+            "When enabled (and an API key is provided below), VisualCrossing forecast\n"
+            "data is blended with Open-Meteo (and OpenWeather, if also enabled) data\n"
+            "to improve forecast accuracy."
+        )
+        visualcrossing_page_layout.addWidget(self.visualcrossing_enabled_checkbox)
+
+        # VisualCrossing API key setting
+        visualcrossing_key_layout = QHBoxLayout()
+        visualcrossing_key_label = QLabel("API Key:")
+        visualcrossing_key_label.setMinimumWidth(120)
+        self.visualcrossing_api_key_input = QLineEdit()
+        self.visualcrossing_api_key_input.setPlaceholderText("Required to enable this integration")
+        self.visualcrossing_api_key_input.setEchoMode(QLineEdit.Password)
+        visualcrossing_show_key_btn = QPushButton("Show")
+        visualcrossing_show_key_btn.setFixedWidth(50)
+        visualcrossing_show_key_btn.setCheckable(True)
+        visualcrossing_show_key_btn.clicked.connect(lambda checked: self.visualcrossing_api_key_input.setEchoMode(
+            QLineEdit.Normal if checked else QLineEdit.Password
+        ))
+        visualcrossing_key_layout.addWidget(visualcrossing_key_label)
+        visualcrossing_key_layout.addWidget(self.visualcrossing_api_key_input)
+        visualcrossing_key_layout.addWidget(visualcrossing_show_key_btn)
+        visualcrossing_page_layout.addLayout(visualcrossing_key_layout)
+
+        # Test API key button
+        visualcrossing_test_layout = QHBoxLayout()
+        visualcrossing_test_spacer = QLabel("")
+        visualcrossing_test_spacer.setMinimumWidth(120)
+        self.visualcrossing_test_btn = QPushButton("Test API Key")
+        self.visualcrossing_test_btn.setToolTip("Verify the entered VisualCrossing API key is valid")
+        self.visualcrossing_test_btn.clicked.connect(self._test_visualcrossing_key)
+        visualcrossing_test_layout.addWidget(visualcrossing_test_spacer)
+        visualcrossing_test_layout.addWidget(self.visualcrossing_test_btn)
+        visualcrossing_test_layout.addStretch()
+        visualcrossing_page_layout.addLayout(visualcrossing_test_layout)
+
+        # VisualCrossing help text
+        visualcrossing_help = QLabel(
+            "Get a free API key: Register at "
+            "<a href='https://www.visualcrossing.com/sign-up' style='color: #0078d7;'>visualcrossing.com/sign-up</a>, "
+            "then find your key on your Account page.<br>"
+            "When enabled, VisualCrossing's forecast is averaged with Open-Meteo's data "
+            "(cloud cover, temperature, humidity, wind, precipitation chance) to reduce single-source forecast bias. "
+            "The free tier has a daily record budget, so avoid refreshing excessively."
+        )
+        visualcrossing_help.setOpenExternalLinks(True)
+        visualcrossing_help.setWordWrap(True)
+        visualcrossing_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        visualcrossing_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        visualcrossing_page_layout.addWidget(visualcrossing_help)
+
+        visualcrossing_page_layout.addStretch()
+        self.integrations_stack.addWidget(visualcrossing_page)
+
+        # WeatherAPI page
+        weatherapi_page = QWidget()
+        weatherapi_page_layout = QVBoxLayout(weatherapi_page)
+
+        weatherapi_title = QLabel("WeatherAPI")
+        weatherapi_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        weatherapi_page_layout.addWidget(weatherapi_title)
+
+        # Enable checkbox
+        self.weatherapi_enabled_checkbox = QCheckBox("Enable WeatherAPI Integration")
+        self.weatherapi_enabled_checkbox.setToolTip(
+            "When enabled (and an API key is provided below), WeatherAPI forecast\n"
+            "data is blended with Open-Meteo (and OpenWeather/VisualCrossing, if also\n"
+            "enabled) data to improve forecast accuracy."
+        )
+        weatherapi_page_layout.addWidget(self.weatherapi_enabled_checkbox)
+
+        # WeatherAPI API key setting
+        weatherapi_key_layout = QHBoxLayout()
+        weatherapi_key_label = QLabel("API Key:")
+        weatherapi_key_label.setMinimumWidth(120)
+        self.weatherapi_api_key_input = QLineEdit()
+        self.weatherapi_api_key_input.setPlaceholderText("Required to enable this integration")
+        self.weatherapi_api_key_input.setEchoMode(QLineEdit.Password)
+        weatherapi_show_key_btn = QPushButton("Show")
+        weatherapi_show_key_btn.setFixedWidth(50)
+        weatherapi_show_key_btn.setCheckable(True)
+        weatherapi_show_key_btn.clicked.connect(lambda checked: self.weatherapi_api_key_input.setEchoMode(
+            QLineEdit.Normal if checked else QLineEdit.Password
+        ))
+        weatherapi_key_layout.addWidget(weatherapi_key_label)
+        weatherapi_key_layout.addWidget(self.weatherapi_api_key_input)
+        weatherapi_key_layout.addWidget(weatherapi_show_key_btn)
+        weatherapi_page_layout.addLayout(weatherapi_key_layout)
+
+        # Test API key button
+        weatherapi_test_layout = QHBoxLayout()
+        weatherapi_test_spacer = QLabel("")
+        weatherapi_test_spacer.setMinimumWidth(120)
+        self.weatherapi_test_btn = QPushButton("Test API Key")
+        self.weatherapi_test_btn.setToolTip("Verify the entered WeatherAPI API key is valid")
+        self.weatherapi_test_btn.clicked.connect(self._test_weatherapi_key)
+        weatherapi_test_layout.addWidget(weatherapi_test_spacer)
+        weatherapi_test_layout.addWidget(self.weatherapi_test_btn)
+        weatherapi_test_layout.addStretch()
+        weatherapi_page_layout.addLayout(weatherapi_test_layout)
+
+        # WeatherAPI help text
+        weatherapi_help = QLabel(
+            "Get a free API key: Register at "
+            "<a href='https://www.weatherapi.com/signup.aspx' style='color: #0078d7;'>weatherapi.com/signup.aspx</a>, "
+            "then find your key on your Account page.<br>"
+            "When enabled, WeatherAPI's forecast is averaged with Open-Meteo's data "
+            "(cloud cover, temperature, humidity, wind, precipitation chance) to reduce single-source forecast bias. "
+            "The free tier is limited to a 3-day forecast."
+        )
+        weatherapi_help.setOpenExternalLinks(True)
+        weatherapi_help.setWordWrap(True)
+        weatherapi_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        weatherapi_help.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        weatherapi_page_layout.addWidget(weatherapi_help)
+
+        weatherapi_page_layout.addStretch()
+        self.integrations_stack.addWidget(weatherapi_page)
+
         self.integrations_list.setCurrentRow(0)
 
         # Backup/Restore tab
@@ -2224,6 +2354,18 @@ class SettingsDialog(QDialog):
             self.openweather_enabled_checkbox.setChecked(openweather_enabled)
             openweather_api_key = settings.value("openweather_api_key", "", type=str)
             self.openweather_api_key_input.setText(openweather_api_key)
+
+            # Load VisualCrossing settings
+            visualcrossing_enabled = settings.value("visualcrossing_integration_enabled", False, type=bool)
+            self.visualcrossing_enabled_checkbox.setChecked(visualcrossing_enabled)
+            visualcrossing_api_key = settings.value("visualcrossing_api_key", "", type=str)
+            self.visualcrossing_api_key_input.setText(visualcrossing_api_key)
+
+            # Load WeatherAPI settings
+            weatherapi_enabled = settings.value("weatherapi_integration_enabled", False, type=bool)
+            self.weatherapi_enabled_checkbox.setChecked(weatherapi_enabled)
+            weatherapi_api_key = settings.value("weatherapi_api_key", "", type=str)
+            self.weatherapi_api_key_input.setText(weatherapi_api_key)
 
         except Exception as e:
             logger.error(f"Error loading settings: {str(e)}")
@@ -2472,6 +2614,14 @@ class SettingsDialog(QDialog):
             settings.setValue("openweather_integration_enabled", self.openweather_enabled_checkbox.isChecked())
             settings.setValue("openweather_api_key", self.openweather_api_key_input.text().strip())
 
+            # Save VisualCrossing settings
+            settings.setValue("visualcrossing_integration_enabled", self.visualcrossing_enabled_checkbox.isChecked())
+            settings.setValue("visualcrossing_api_key", self.visualcrossing_api_key_input.text().strip())
+
+            # Save WeatherAPI settings
+            settings.setValue("weatherapi_integration_enabled", self.weatherapi_enabled_checkbox.isChecked())
+            settings.setValue("weatherapi_api_key", self.weatherapi_api_key_input.text().strip())
+
             self.accept()
 
         except Exception as e:
@@ -2602,6 +2752,48 @@ class SettingsDialog(QDialog):
         finally:
             self.openweather_test_btn.setEnabled(True)
             self.openweather_test_btn.setText("Test API Key")
+
+    def _test_visualcrossing_key(self):
+        """Test that the entered VisualCrossing API key is valid"""
+        api_key = self.visualcrossing_api_key_input.text().strip()
+
+        try:
+            self.visualcrossing_test_btn.setEnabled(False)
+            self.visualcrossing_test_btn.setText("Testing...")
+            QApplication.processEvents()
+
+            from WeatherForecast import test_visualcrossing_key
+            success, message = test_visualcrossing_key(api_key)
+
+            if success:
+                QMessageBox.information(self, "Connection Successful", message)
+            else:
+                QMessageBox.warning(self, "Connection Failed", message)
+
+        finally:
+            self.visualcrossing_test_btn.setEnabled(True)
+            self.visualcrossing_test_btn.setText("Test API Key")
+
+    def _test_weatherapi_key(self):
+        """Test that the entered WeatherAPI API key is valid"""
+        api_key = self.weatherapi_api_key_input.text().strip()
+
+        try:
+            self.weatherapi_test_btn.setEnabled(False)
+            self.weatherapi_test_btn.setText("Testing...")
+            QApplication.processEvents()
+
+            from WeatherForecast import test_weatherapi_key
+            success, message = test_weatherapi_key(api_key)
+
+            if success:
+                QMessageBox.information(self, "Connection Successful", message)
+            else:
+                QMessageBox.warning(self, "Connection Failed", message)
+
+        finally:
+            self.weatherapi_test_btn.setEnabled(True)
+            self.weatherapi_test_btn.setText("Test API Key")
 
     def _perform_backup(self):
         """Perform a backup of all user data to a JSON file"""

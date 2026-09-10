@@ -63,6 +63,28 @@ def _get_openweather_signature() -> Tuple[bool, str]:
     return (enabled, api_key)
 
 
+def _get_visualcrossing_signature() -> Tuple[bool, str]:
+    """Return (enabled, api_key) reflecting the current VisualCrossing integration
+    settings. Used to detect when cached weather data was fetched under a
+    different VisualCrossing configuration (e.g. the user just enabled the
+    integration and added an API key) so a stale cache doesn't hide the change."""
+    settings = QSettings("CosmosCollection", "CosmosCollection")
+    enabled = settings.value("visualcrossing_integration_enabled", False, type=bool)
+    api_key = settings.value("visualcrossing_api_key", "", type=str)
+    return (enabled, api_key)
+
+
+def _get_weatherapi_signature() -> Tuple[bool, str]:
+    """Return (enabled, api_key) reflecting the current WeatherAPI.com integration
+    settings. Used to detect when cached weather data was fetched under a
+    different WeatherAPI configuration (e.g. the user just enabled the
+    integration and added an API key) so a stale cache doesn't hide the change."""
+    settings = QSettings("CosmosCollection", "CosmosCollection")
+    enabled = settings.value("weatherapi_integration_enabled", False, type=bool)
+    api_key = settings.value("weatherapi_api_key", "", type=str)
+    return (enabled, api_key)
+
+
 def test_openweather_key(api_key: str, timeout: int = 10) -> Tuple[bool, str]:
     """Test whether an OpenWeather API key is valid via a lightweight current-weather
     request. Used by the Settings dialog's "Test API Key" button.
@@ -98,6 +120,98 @@ def test_openweather_key(api_key: str, timeout: int = 10) -> Tuple[bool, str]:
         return False, f"Error testing API key: {str(e)}"
 
 
+def test_visualcrossing_key(api_key: str, timeout: int = 10) -> Tuple[bool, str]:
+    """Test whether a VisualCrossing API key is valid via a lightweight current-conditions
+    request. Used by the Settings dialog's "Test API Key" button.
+
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return False, "Please enter an API key first."
+
+    try:
+        # Any fixed coordinates work here - we only care whether the key is accepted.
+        # include=current keeps this to the smallest possible record cost against the
+        # free tier's daily budget (a "today"/hours request would cost ~24 records).
+        url = (
+            "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/"
+            f"timeline/51.5074,-0.1278/today?unitGroup=metric&include=current&key={api_key}&contentType=json"
+        )
+        # See the comment on the Open-Meteo request in WeatherWorker.run() -- verification
+        # is left on its default (True) deliberately.
+        response = requests.get(url, timeout=timeout)
+
+        # VisualCrossing returns a plain-text error body (not JSON) on failure, and an
+        # invalid/unauthorized key has been observed as either 401 or 400 depending on
+        # the failure reason, so treat any non-2xx as a failed key check rather than
+        # only checking for one specific status code.
+        if not response.ok:
+            body_preview = (response.text or "").strip()[:200]
+            if response.status_code in (401, 403) or "key" in body_preview.lower():
+                return False, (
+                    "Invalid API key. Please double-check your key.\n\n"
+                    "Note: newly created VisualCrossing keys can take a few minutes to activate."
+                )
+            return False, f"Connection failed: {response.status_code} {body_preview}"
+
+        response.json()  # confirm the response is valid JSON
+        return True, "Connection successful! Your VisualCrossing API key is valid."
+
+    except requests.exceptions.Timeout:
+        return False, "Connection timed out. Please check your network connection."
+    except requests.exceptions.RequestException as e:
+        return False, f"Connection failed: {str(e)}"
+    except Exception as e:
+        return False, f"Error testing API key: {str(e)}"
+
+
+def test_weatherapi_key(api_key: str, timeout: int = 10) -> Tuple[bool, str]:
+    """Test whether a WeatherAPI.com API key is valid via a lightweight current-conditions
+    request. Used by the Settings dialog's "Test API Key" button.
+
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return False, "Please enter an API key first."
+
+    try:
+        # Any fixed coordinates work here - we only care whether the key is accepted.
+        url = f"https://api.weatherapi.com/v1/current.json?key={api_key}&q=51.5074,-0.1278"
+        # See the comment on the Open-Meteo request in WeatherWorker.run() -- verification
+        # is left on its default (True) deliberately.
+        response = requests.get(url, timeout=timeout)
+
+        if not response.ok:
+            # WeatherAPI returns a JSON body of the form {"error": {"code": ..., "message": ...}}
+            # on failure. Error code 2006 is specifically an invalid key; other 4xx codes
+            # (missing key, quota exceeded, disabled key, etc.) are reported as-is.
+            error_message = None
+            try:
+                error_message = response.json().get("error", {}).get("message")
+            except ValueError:
+                pass
+            if response.status_code == 401 or "invalid" in (error_message or "").lower():
+                return False, (
+                    "Invalid API key. Please double-check your key.\n\n"
+                    "Note: newly created WeatherAPI keys can take a few minutes to activate."
+                )
+            return False, f"Connection failed: {error_message or f'HTTP {response.status_code}'}"
+
+        response.json()  # confirm the response is valid JSON
+        return True, "Connection successful! Your WeatherAPI API key is valid."
+
+    except requests.exceptions.Timeout:
+        return False, "Connection timed out. Please check your network connection."
+    except requests.exceptions.RequestException as e:
+        return False, f"Connection failed: {str(e)}"
+    except Exception as e:
+        return False, f"Error testing API key: {str(e)}"
+
+
 class WeatherCache:
     """Simple cache for weather data to reduce API calls"""
     _instance = None
@@ -109,6 +223,8 @@ class WeatherCache:
             cls._instance._timestamp = None
             cls._instance._location = None
             cls._instance._openweather_signature = None
+            cls._instance._visualcrossing_signature = None
+            cls._instance._weatherapi_signature = None
             cls._instance._update_callbacks = []
         return cls._instance
 
@@ -131,11 +247,17 @@ class WeatherCache:
             logger.debug(f"Weather cache miss: data is {age.seconds // 60} minutes old")
             return None
 
-        # Check if OpenWeather integration settings changed since this data was
-        # fetched (e.g. user just enabled it / added an API key) - if so, the
+        # Check if any optional integration's settings changed since this data was
+        # fetched (e.g. user just enabled one / added an API key) - if so, the
         # cached data doesn't reflect the current configuration, so treat it as stale.
         if self._openweather_signature != _get_openweather_signature():
             logger.debug("Weather cache miss: OpenWeather integration settings changed")
+            return None
+        if self._visualcrossing_signature != _get_visualcrossing_signature():
+            logger.debug("Weather cache miss: VisualCrossing integration settings changed")
+            return None
+        if self._weatherapi_signature != _get_weatherapi_signature():
+            logger.debug("Weather cache miss: WeatherAPI integration settings changed")
             return None
 
         logger.debug(f"Weather cache hit: data is {age.seconds // 60} minutes old")
@@ -147,6 +269,8 @@ class WeatherCache:
         self._timestamp = datetime.now()
         self._location = (lat, lon)
         self._openweather_signature = _get_openweather_signature()
+        self._visualcrossing_signature = _get_visualcrossing_signature()
+        self._weatherapi_signature = _get_weatherapi_signature()
         logger.debug("Weather data cached")
 
         # Notify all registered callbacks
@@ -175,6 +299,8 @@ class WeatherCache:
         self._timestamp = None
         self._location = None
         self._openweather_signature = None
+        self._visualcrossing_signature = None
+        self._weatherapi_signature = None
 
     def add_update_callback(self, callback):
         """Register a callback to be called when weather data is updated.
@@ -221,6 +347,8 @@ class HourlyWeatherData:
     visibility: Optional[float] = None  # meters
     surface_pressure: Optional[float] = None  # hPa
     openweather_blended: bool = False  # True if this hour was averaged with OpenWeather data
+    visualcrossing_blended: bool = False  # True if this hour was averaged with VisualCrossing data
+    weatherapi_blended: bool = False  # True if this hour was averaged with WeatherAPI data
 
 
 @dataclass
@@ -245,6 +373,8 @@ class DailyWeatherSummary:
     dark_hours_start: Optional[datetime] = None  # First dark hour (sun_alt < -12°)
     dark_hours_end: Optional[datetime] = None  # Last dark hour (sun_alt < -12°)
     openweather_blended: bool = False  # True if any hour this day was blended with OpenWeather data
+    visualcrossing_blended: bool = False  # True if any hour this day was blended with VisualCrossing data
+    weatherapi_blended: bool = False  # True if any hour this day was blended with WeatherAPI data
 
 
 class WeatherWorker(QThread):
@@ -258,10 +388,13 @@ class WeatherWorker(QThread):
         self.lat = lat
         self.lon = lon
         self.timezone = timezone
-        # Set by _fetch_openweather_data() when OpenWeather is enabled but a fetch
-        # attempt fails (bad key, network error, etc.) - None otherwise, including
-        # when the integration is simply disabled/unconfigured (not an error).
+        # Set by _fetch_openweather_data() / _fetch_visualcrossing_data() / _fetch_weatherapi_data()
+        # when that integration is enabled but a fetch attempt fails (bad key, network
+        # error, etc.) - None otherwise, including when the integration is simply
+        # disabled/unconfigured (not an error).
         self.openweather_error: Optional[str] = None
+        self.visualcrossing_error: Optional[str] = None
+        self.weatherapi_error: Optional[str] = None
 
     def run(self):
         """Fetch weather data from Open-Meteo API"""
@@ -314,10 +447,14 @@ class WeatherWorker(QThread):
                         )
                     time.sleep(1)
 
-            # Optionally supplement with OpenWeather data (opt-in, requires API key).
-            # Returns None if disabled/unconfigured/unavailable, in which case the
-            # forecast falls back to Open-Meteo data only, exactly as before.
+            # Optionally supplement with OpenWeather, VisualCrossing, and/or WeatherAPI
+            # data (all opt-in, requires an API key each). Each returns None if
+            # disabled/unconfigured/unavailable, in which case that source simply
+            # doesn't contribute to the blend below - Open-Meteo data is always the
+            # baseline.
             openweather_data = self._fetch_openweather_data()
+            visualcrossing_data = self._fetch_visualcrossing_data()
+            weatherapi_data = self._fetch_weatherapi_data()
 
             self.progress.emit("Processing weather data...")
             # Disable the cyclic GC from here through the weather_loaded emit below. A
@@ -339,7 +476,7 @@ class WeatherWorker(QThread):
             gc_was_enabled = gc.isenabled()
             gc.disable()
             try:
-                daily_summaries = self._process_weather_data(data, openweather_data)
+                daily_summaries = self._process_weather_data(data, openweather_data, visualcrossing_data, weatherapi_data)
                 self.weather_loaded.emit(daily_summaries)
             finally:
                 if gc_was_enabled:
@@ -436,38 +573,262 @@ class WeatherWorker(QThread):
             logger.warning(f"OpenWeather fetch failed, continuing with Open-Meteo only: {e}")
             return None
 
+    def _fetch_visualcrossing_data(self) -> Optional[Dict[datetime, Dict[str, Optional[float]]]]:
+        """Fetch supplemental forecast data from VisualCrossing's Timeline Weather API,
+        if the integration is enabled and an API key is configured.
+
+        Returns a dict keyed by forecast timestamp -> field values, or None if the
+        integration is disabled/unconfigured (not an error - self.visualcrossing_error
+        stays None) or the request fails for any reason such as a bad key, network
+        error, or exhausted daily quota (self.visualcrossing_error is set to a short
+        reason so callers can surface it, e.g. in the Weather Forecast window's status
+        line). Either way, callers should treat None as "no supplemental data available"
+        and fall back to whatever other source(s) are available.
+        """
+        self.visualcrossing_error = None
+        try:
+            enabled, api_key = _get_visualcrossing_signature()
+            if not enabled or not api_key:
+                return None
+
+            # next7days matches Open-Meteo's forecast_days=7 window above. elements=
+            # restricts the response to only the fields we actually use, keeping the
+            # payload (and the free tier's daily record budget) small.
+            url = (
+                "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/"
+                f"timeline/{self.lat},{self.lon}/next7days?"
+                f"unitGroup=metric&include=hours&"
+                f"elements=datetimeEpoch,cloudcover,temp,humidity,windspeed,windgust,"
+                f"precipprob,visibility,pressure&"
+                f"key={api_key}&contentType=json"
+            )
+            # See the comment on the Open-Meteo request in run() -- verification is left
+            # on its default (True) deliberately.
+            # VisualCrossing, like Open-Meteo, occasionally returns a 200 with an
+            # empty/invalid body (transient upstream hiccup). Retry once before
+            # giving up, since a fresh request a moment later typically succeeds.
+            max_attempts = 2
+            data = None
+            for attempt in range(1, max_attempts + 1):
+                response = requests.get(url, timeout=20)
+
+                if not response.ok:
+                    # VisualCrossing returns a plain-text error body (not JSON) on
+                    # failure. An invalid/unauthorized key has been observed as either
+                    # 401 or 400 depending on the failure reason.
+                    body_preview = (response.text or "").strip()[:200]
+                    if response.status_code in (401, 403) or "key" in body_preview.lower():
+                        self.visualcrossing_error = "invalid API key"
+                        logger.warning("VisualCrossing fetch failed: invalid API key")
+                    elif response.status_code == 429:
+                        self.visualcrossing_error = "daily quota exceeded"
+                        logger.warning("VisualCrossing fetch failed: daily quota exceeded")
+                    else:
+                        self.visualcrossing_error = f"HTTP {response.status_code}"
+                        logger.warning(f"VisualCrossing fetch failed: {response.status_code}: {body_preview!r}")
+                    return None
+
+                try:
+                    data = response.json()
+                    break
+                except ValueError:
+                    body_preview = response.text[:200] if response.text else "<empty>"
+                    logger.warning(
+                        f"VisualCrossing returned an unparseable response on attempt "
+                        f"{attempt}/{max_attempts} (status {response.status_code}): {body_preview!r}"
+                    )
+                    if attempt == max_attempts:
+                        self.visualcrossing_error = "invalid response"
+                        return None
+                    time.sleep(1)
+
+            result: Dict[datetime, Dict[str, Optional[float]]] = {}
+            for day in data.get("days", []):
+                for entry in day.get("hours", []):
+                    epoch = entry.get("datetimeEpoch")
+                    if epoch is None:
+                        continue
+                    dt = datetime.fromtimestamp(epoch)
+                    visibility_km = entry.get("visibility")
+                    result[dt] = {
+                        "cloud_cover": entry.get("cloudcover"),
+                        "temperature": entry.get("temp"),
+                        "humidity": entry.get("humidity"),
+                        "surface_pressure": entry.get("pressure"),
+                        "wind_speed": entry.get("windspeed"),  # already km/h (unitGroup=metric)
+                        "wind_gusts": entry.get("windgust"),  # already km/h
+                        "precipitation_probability": entry.get("precipprob"),  # already 0-100
+                        "visibility": visibility_km * 1000 if visibility_km is not None else None,  # km -> m
+                    }
+            return result
+
+        except requests.exceptions.Timeout:
+            self.visualcrossing_error = "request timed out"
+            logger.warning("VisualCrossing fetch failed: timed out")
+            return None
+        except requests.exceptions.RequestException as e:
+            self.visualcrossing_error = "network error"
+            logger.warning(f"VisualCrossing fetch failed: network error: {e}")
+            return None
+        except Exception as e:
+            self.visualcrossing_error = "unexpected error"
+            logger.warning(f"VisualCrossing fetch failed, continuing without it: {e}")
+            return None
+
+    def _fetch_weatherapi_data(self) -> Optional[Dict[datetime, Dict[str, Optional[float]]]]:
+        """Fetch supplemental forecast data from WeatherAPI.com's Forecast API, if the
+        integration is enabled and an API key is configured.
+
+        Returns a dict keyed by forecast timestamp -> field values, or None if the
+        integration is disabled/unconfigured (not an error - self.weatherapi_error
+        stays None) or the request fails for any reason such as a bad key, network
+        error, or exceeded quota (self.weatherapi_error is set to a short reason so
+        callers can surface it, e.g. in the Weather Forecast window's status line).
+        Either way, callers should treat None as "no supplemental data available"
+        and fall back to whatever other source(s) are available.
+        """
+        self.weatherapi_error = None
+        try:
+            enabled, api_key = _get_weatherapi_signature()
+            if not enabled or not api_key:
+                return None
+
+            # days=7 matches Open-Meteo's forecast_days=7 window above. WeatherAPI's
+            # free tier is limited to a 3-day forecast; it silently returns however
+            # many days the key's plan allows rather than erroring, so a free-tier key
+            # here simply yields fewer hours to blend for the later days (handled
+            # gracefully below via find_nearest_match's tolerance window).
+            url = (
+                f"https://api.weatherapi.com/v1/forecast.json?"
+                f"key={api_key}&q={self.lat},{self.lon}&days=7&aqi=no&alerts=no"
+            )
+            # See the comment on the Open-Meteo request in run() -- verification is left
+            # on its default (True) deliberately.
+            # WeatherAPI, like Open-Meteo, occasionally returns a 200 with an
+            # empty/invalid body (transient upstream hiccup). Retry once before
+            # giving up, since a fresh request a moment later typically succeeds.
+            max_attempts = 2
+            data = None
+            for attempt in range(1, max_attempts + 1):
+                response = requests.get(url, timeout=20)
+
+                if not response.ok:
+                    # WeatherAPI returns a JSON body of the form
+                    # {"error": {"code": ..., "message": ...}} on failure.
+                    error_message = None
+                    try:
+                        error_message = response.json().get("error", {}).get("message")
+                    except ValueError:
+                        pass
+                    if response.status_code == 401 or "invalid" in (error_message or "").lower():
+                        self.weatherapi_error = "invalid API key"
+                        logger.warning("WeatherAPI fetch failed: invalid API key")
+                    elif response.status_code == 403:
+                        self.weatherapi_error = error_message or "quota exceeded"
+                        logger.warning(f"WeatherAPI fetch failed: {self.weatherapi_error}")
+                    else:
+                        self.weatherapi_error = error_message or f"HTTP {response.status_code}"
+                        logger.warning(f"WeatherAPI fetch failed: {self.weatherapi_error}")
+                    return None
+
+                try:
+                    data = response.json()
+                    break
+                except ValueError:
+                    body_preview = response.text[:200] if response.text else "<empty>"
+                    logger.warning(
+                        f"WeatherAPI returned an unparseable response on attempt "
+                        f"{attempt}/{max_attempts} (status {response.status_code}): {body_preview!r}"
+                    )
+                    if attempt == max_attempts:
+                        self.weatherapi_error = "invalid response"
+                        return None
+                    time.sleep(1)
+
+            result: Dict[datetime, Dict[str, Optional[float]]] = {}
+            for day in data.get("forecast", {}).get("forecastday", []):
+                for entry in day.get("hour", []):
+                    epoch = entry.get("time_epoch")
+                    if epoch is None:
+                        continue
+                    dt = datetime.fromtimestamp(epoch)
+                    visibility_km = entry.get("vis_km")
+                    chance_of_rain = entry.get("chance_of_rain")
+                    chance_of_snow = entry.get("chance_of_snow")
+                    if chance_of_rain is None and chance_of_snow is None:
+                        precip_prob = None
+                    else:
+                        precip_prob = max(chance_of_rain or 0, chance_of_snow or 0)
+                    result[dt] = {
+                        "cloud_cover": entry.get("cloud"),
+                        "temperature": entry.get("temp_c"),
+                        "humidity": entry.get("humidity"),
+                        "surface_pressure": entry.get("pressure_mb"),
+                        "wind_speed": entry.get("wind_kph"),  # already km/h
+                        "wind_gusts": entry.get("gust_kph"),  # already km/h
+                        "precipitation_probability": precip_prob,
+                        "visibility": visibility_km * 1000 if visibility_km is not None else None,  # km -> m
+                    }
+            return result
+
+        except requests.exceptions.Timeout:
+            self.weatherapi_error = "request timed out"
+            logger.warning("WeatherAPI fetch failed: timed out")
+            return None
+        except requests.exceptions.RequestException as e:
+            self.weatherapi_error = "network error"
+            logger.warning(f"WeatherAPI fetch failed: network error: {e}")
+            return None
+        except Exception as e:
+            self.weatherapi_error = "unexpected error"
+            logger.warning(f"WeatherAPI fetch failed, continuing without it: {e}")
+            return None
+
     def _process_weather_data(
         self,
         data: Dict[str, Any],
-        openweather_data: Optional[Dict[datetime, Dict[str, Optional[float]]]] = None
+        openweather_data: Optional[Dict[datetime, Dict[str, Optional[float]]]] = None,
+        visualcrossing_data: Optional[Dict[datetime, Dict[str, Optional[float]]]] = None,
+        weatherapi_data: Optional[Dict[datetime, Dict[str, Optional[float]]]] = None
     ) -> List[DailyWeatherSummary]:
         """Process raw API data into daily summaries, optionally blending in
-        supplemental OpenWeather data (simple average per overlapping field)."""
+        supplemental OpenWeather, VisualCrossing, and/or WeatherAPI data (simple
+        average across whichever of Open-Meteo/OpenWeather/VisualCrossing/WeatherAPI
+        have a value for a given field/hour)."""
         hourly = data.get("hourly", {})
         times = hourly.get("time", [])
 
         if not times:
             return []
 
-        def blend(om_value, ow_match: Optional[Dict[str, Optional[float]]], field: str):
-            """Average an Open-Meteo value with the matching OpenWeather value,
-            if one was found for this hour and the field is present."""
-            if ow_match is None:
-                return om_value, False
-            ow_value = ow_match.get(field)
-            if ow_value is None:
-                return om_value, False
-            return (om_value + ow_value) / 2, True
+        def blend(om_value, field: str, *source_matches: Tuple[str, Optional[Dict[str, Optional[float]]]]):
+            """Average an Open-Meteo value with the matching value from whichever
+            supplemental sources have a value for this field/hour. Returns
+            (value, {names of sources that contributed})."""
+            values = [om_value]
+            contributors = set()
+            for source_name, match in source_matches:
+                if match is None:
+                    continue
+                source_value = match.get(field)
+                if source_value is None:
+                    continue
+                values.append(source_value)
+                contributors.add(source_name)
+            if not contributors:
+                return om_value, contributors
+            return sum(values) / len(values), contributors
 
-        def find_openweather_match(dt: datetime, tolerance_minutes: int = 90):
-            """Find the nearest OpenWeather 3-hour forecast entry to an Open-Meteo
+        def find_nearest_match(source_data: Optional[Dict[datetime, Dict[str, Optional[float]]]],
+                               dt: datetime, tolerance_minutes: int):
+            """Find the nearest supplemental-source forecast entry to an Open-Meteo
             hourly timestamp, within a tolerance window."""
-            if not openweather_data:
+            if not source_data:
                 return None
             best_match = None
             best_diff = None
-            for ow_dt, values in openweather_data.items():
-                diff = abs((ow_dt - dt).total_seconds())
+            for source_dt, values in source_data.items():
+                diff = abs((source_dt - dt).total_seconds())
                 if diff <= tolerance_minutes * 60 and (best_diff is None or diff < best_diff):
                     best_match = values
                     best_diff = diff
@@ -478,20 +839,29 @@ class WeatherWorker(QThread):
         for i, time_str in enumerate(times):
             try:
                 dt = datetime.fromisoformat(time_str)
-                ow_match = find_openweather_match(dt)
+                # OpenWeather's free tier is only 3-hourly, so it needs a wide
+                # tolerance to find a nearby entry. VisualCrossing and WeatherAPI are
+                # hourly (like Open-Meteo), so a tight tolerance is enough for a
+                # precise match.
+                ow_match = find_nearest_match(openweather_data, dt, tolerance_minutes=90)
+                vc_match = find_nearest_match(visualcrossing_data, dt, tolerance_minutes=5)
+                wa_match = find_nearest_match(weatherapi_data, dt, tolerance_minutes=5)
+                sources = (("openweather", ow_match), ("visualcrossing", vc_match), ("weatherapi", wa_match))
 
-                cloud_cover, blended_1 = blend(hourly.get("cloud_cover", [0] * len(times))[i] or 0, ow_match, "cloud_cover")
-                temperature, blended_2 = blend(hourly.get("temperature_2m", [0] * len(times))[i] or 0, ow_match, "temperature")
-                humidity, blended_3 = blend(hourly.get("relative_humidity_2m", [0] * len(times))[i] or 0, ow_match, "humidity")
-                wind_speed, blended_4 = blend(hourly.get("wind_speed_10m", [0] * len(times))[i] or 0, ow_match, "wind_speed")
-                wind_gusts, blended_5 = blend(hourly.get("wind_gusts_10m", [0] * len(times))[i] or 0, ow_match, "wind_gusts")
-                precip_prob, blended_6 = blend(
-                    hourly.get("precipitation_probability", [0] * len(times))[i] or 0, ow_match, "precipitation_probability"
+                cloud_cover, c1 = blend(hourly.get("cloud_cover", [0] * len(times))[i] or 0, "cloud_cover", *sources)
+                temperature, c2 = blend(hourly.get("temperature_2m", [0] * len(times))[i] or 0, "temperature", *sources)
+                humidity, c3 = blend(hourly.get("relative_humidity_2m", [0] * len(times))[i] or 0, "humidity", *sources)
+                wind_speed, c4 = blend(hourly.get("wind_speed_10m", [0] * len(times))[i] or 0, "wind_speed", *sources)
+                wind_gusts, c5 = blend(hourly.get("wind_gusts_10m", [0] * len(times))[i] or 0, "wind_gusts", *sources)
+                precip_prob, c6 = blend(
+                    hourly.get("precipitation_probability", [0] * len(times))[i] or 0, "precipitation_probability", *sources
                 )
                 visibility_om = hourly.get("visibility", [None] * len(times))[i]
-                visibility, blended_7 = blend(visibility_om or 0, ow_match, "visibility") if visibility_om is not None else (visibility_om, False)
+                visibility, c7 = blend(visibility_om or 0, "visibility", *sources) if visibility_om is not None else (visibility_om, set())
                 pressure_om = hourly.get("surface_pressure", [None] * len(times))[i]
-                surface_pressure, blended_8 = blend(pressure_om or 0, ow_match, "surface_pressure") if pressure_om is not None else (pressure_om, False)
+                surface_pressure, c8 = blend(pressure_om or 0, "surface_pressure", *sources) if pressure_om is not None else (pressure_om, set())
+
+                contributors = c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8
 
                 hourly_records.append(HourlyWeatherData(
                     time=dt,
@@ -507,7 +877,9 @@ class WeatherWorker(QThread):
                     wind_gusts=wind_gusts,
                     visibility=visibility,
                     surface_pressure=surface_pressure,
-                    openweather_blended=any([blended_1, blended_2, blended_3, blended_4, blended_5, blended_6, blended_7, blended_8])
+                    openweather_blended="openweather" in contributors,
+                    visualcrossing_blended="visualcrossing" in contributors,
+                    weatherapi_blended="weatherapi" in contributors
                 ))
             except (ValueError, IndexError) as e:
                 logger.warning(f"Error parsing hourly data at index {i}: {e}")
@@ -619,7 +991,9 @@ class WeatherWorker(QThread):
                 moon_phase=moon_phase,
                 dark_hours_start=dark_start,
                 dark_hours_end=dark_end,
-                openweather_blended=any(h.openweather_blended for h in hours)
+                openweather_blended=any(h.openweather_blended for h in hours),
+                visualcrossing_blended=any(h.visualcrossing_blended for h in hours),
+                weatherapi_blended=any(h.weatherapi_blended for h in hours)
             )
             daily_summaries.append(summary)
 
@@ -1816,7 +2190,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         overview_layout.addWidget(scroll_area)
 
         # Help text with attribution (text updated in _on_weather_loaded to
-        # reflect whether OpenWeather data was blended in)
+        # reflect whether OpenWeather, VisualCrossing, and/or WeatherAPI data was blended in)
         self.attribution_label = QLabel(
             'Double-click a day card for detailed hourly forecast. '
             'Weather data provided by <a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a>.'
@@ -1981,17 +2355,30 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.daily_summaries = summaries
 
-        # Reflect whether OpenWeather data was successfully blended into this forecast
+        # Reflect which supplemental source(s), if any, were successfully blended
+        # into this forecast.
+        sources = ['<a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a>']
         if any(s.openweather_blended for s in summaries):
+            sources.append('<a href="https://openweathermap.org/" style="color: #6ea8fe;">OpenWeather</a>')
+        if any(s.visualcrossing_blended for s in summaries):
+            sources.append('<a href="https://www.visualcrossing.com/" style="color: #6ea8fe;">VisualCrossing</a>')
+        if any(s.weatherapi_blended for s in summaries):
+            sources.append('<a href="https://www.weatherapi.com/" style="color: #6ea8fe;">WeatherAPI</a>')
+
+        if len(sources) == 1:
             self.attribution_label.setText(
                 'Double-click a day card for detailed hourly forecast. '
-                'Weather data blended from <a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a> '
-                'and <a href="https://openweathermap.org/" style="color: #6ea8fe;">OpenWeather</a>.'
+                f'Weather data provided by {sources[0]}.'
             )
         else:
+            # "A and B" for two sources, "A, B, and C" (and so on) for more
+            source_list = (
+                f"{sources[0]} and {sources[1]}" if len(sources) == 2
+                else f"{', '.join(sources[:-1])}, and {sources[-1]}"
+            )
             self.attribution_label.setText(
                 'Double-click a day card for detailed hourly forecast. '
-                'Weather data provided by <a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a>.'
+                f'Weather data blended from {source_list}.'
             )
 
         # Store in cache if this is fresh data
@@ -2019,13 +2406,19 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
 
         self.cards_layout.addStretch()
 
-        # Note when OpenWeather was enabled but this fetch attempt failed, so a
-        # broken integration (bad key, network issue, etc.) is never silent.
-        # Only meaningful right after a fresh fetch - a cache hit didn't attempt
-        # a new OpenWeather call, so there's nothing new to report.
-        openweather_note = ""
-        if not from_cache and self.worker is not None and getattr(self.worker, "openweather_error", None):
-            openweather_note = f" | OpenWeather unavailable ({self.worker.openweather_error}) - using Open-Meteo only"
+        # Note when an enabled optional integration failed on this fetch attempt, so
+        # a broken integration (bad key, network issue, etc.) is never silent. Only
+        # meaningful right after a fresh fetch - a cache hit didn't attempt new
+        # OpenWeather/VisualCrossing/WeatherAPI calls, so there's nothing new to report.
+        integration_notes = []
+        if not from_cache and self.worker is not None:
+            if getattr(self.worker, "openweather_error", None):
+                integration_notes.append(f"OpenWeather unavailable ({self.worker.openweather_error})")
+            if getattr(self.worker, "visualcrossing_error", None):
+                integration_notes.append(f"VisualCrossing unavailable ({self.worker.visualcrossing_error})")
+            if getattr(self.worker, "weatherapi_error", None):
+                integration_notes.append(f"WeatherAPI unavailable ({self.worker.weatherapi_error})")
+        integration_note = f" | {'; '.join(integration_notes)} - using remaining source(s) only" if integration_notes else ""
 
         # Update status
         if from_cache:
@@ -2036,14 +2429,14 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
             now = datetime.now()
             status_text = f"Last updated: {format_datetime(now)}"
 
-        status_text += openweather_note
+        status_text += integration_note
 
         # Append next refresh time if auto-refresh is enabled
         if self.next_refresh_time is not None:
             status_text += f" | Next refresh: {format_time(self.next_refresh_time)}"
 
         self.status_label.setText(status_text)
-        self.status_label.setStyleSheet(f"color: {COLORS['warning']};" if openweather_note else "")
+        self.status_label.setStyleSheet(f"color: {COLORS['warning']};" if integration_note else "")
 
     def _on_error(self, error_message: str):
         """Handle errors from worker"""
