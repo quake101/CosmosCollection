@@ -8,7 +8,7 @@ import logging
 import sys
 from typing import List, Optional, Callable
 
-from PySide6.QtCore import QObject, Signal, QSettings
+from PySide6.QtCore import QObject, Signal, QSettings, QTimer
 from PySide6.QtGui import QIcon, QAction, QCursor
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication, QWidget
 
@@ -255,7 +255,20 @@ class SystemTrayManager(QObject):
             # On Linux the menu is already attached via setContextMenu() in
             # setup(), and the desktop environment shows it itself,
             # positioned above the tray icon.
-            self._popup_menu()
+            #
+            # Defer the popup to the next event-loop iteration rather than
+            # calling it synchronously from here. Windows still considers
+            # the right mouse button logically down while this handler
+            # runs, and since the tray icon sits near the bottom of the
+            # screen, Qt flips the menu to appear above the cursor —
+            # putting the last item (Quit) directly under it. Popping the
+            # menu up immediately means the button-up from the very click
+            # that opened the menu lands on that item and fires it, with
+            # no further input from the user. Deferring with
+            # QTimer.singleShot(0, ...) lets that button-up finish being
+            # processed first, so the menu only starts tracking clicks
+            # that happen after it's actually on screen.
+            QTimer.singleShot(0, self._popup_menu)
 
     def _popup_menu(self):
         """
