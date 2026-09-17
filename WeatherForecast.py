@@ -395,13 +395,87 @@ class WeatherWorker(QThread):
         self.openweather_error: Optional[str] = None
         self.visualcrossing_error: Optional[str] = None
         self.weatherapi_error: Optional[str] = None
+        # Set if the primary Open-Meteo fetch itself fails (network error, invalid
+        # response, etc.). Unlike the three above, Open-Meteo failing doesn't stop
+        # the fetch - the other enabled sources are still tried, and if any of them
+        # succeeded, one gets promoted to the baseline hourly grid (see
+        # _process_weather_data / baseline_source) instead of leaving the forecast
+        # blank just because Open-Meteo was unreachable.
+        self.openmeteo_error: Optional[str] = None
+        self.baseline_source: str = "openmeteo"
 
     def run(self):
-        """Fetch weather data from Open-Meteo API"""
+        """Fetch weather data from Open-Meteo API, falling back to whichever other
+        enabled source(s) are reachable if Open-Meteo itself fails - one source
+        failing (bad DNS, network outage, etc.) should never blank out the whole
+        forecast when another enabled source could still serve it."""
+        data = self._fetch_openmeteo_data()
+
+        try:
+            # Optionally supplement with OpenWeather, VisualCrossing, and/or WeatherAPI
+            # data (all opt-in, requires an API key each). Each returns None if
+            # disabled/unconfigured/unavailable. These are always attempted regardless
+            # of whether the Open-Meteo fetch above succeeded - if it didn't, the best
+            # of these gets promoted to the baseline hourly grid instead of merely
+            # being blended into it (see _process_weather_data / baseline_source).
+            openweather_data = self._fetch_openweather_data()
+            visualcrossing_data = self._fetch_visualcrossing_data()
+            weatherapi_data = self._fetch_weatherapi_data()
+
+            if data is None and not (openweather_data or visualcrossing_data or weatherapi_data):
+                self.error_occurred.emit(
+                    f"Open-Meteo unavailable ({self.openmeteo_error}) and no other "
+                    "weather source is enabled or reachable."
+                )
+                return
+
+            self.progress.emit("Processing weather data...")
+            # Disable the cyclic GC from here through the weather_loaded emit below. A
+            # native crash (Fatal Python error: Illegal instruction) has recurred at
+            # several unrelated first-call sites inside _process_weather_data (astropy
+            # units.cds import, Time.replicate, an ecliptic frame transform, numpy
+            # arrayprint/__str__, pytz.timezone's os.environ lookup) -- the one constant
+            # every time is "Garbage-collecting" at the top of the trace, in this thread.
+            # That points at a GC pass landing while some C extension has left transient
+            # state a GC traversal isn't safe to observe, not at any one of those
+            # libraries specifically. Re-enabling gc immediately after
+            # _process_weather_data returned (right before this comment used to sit)
+            # wasn't enough -- the crash recurred one line later, right after
+            # gc.enable(), inside weather_loaded.emit() itself (cross-thread signal
+            # delivery allocates too). So the disabled window now extends through the
+            # emit call as well. gc.disable()/enable() is process-wide, not thread-local,
+            # but this whole stretch is quick and runs once per weather refresh, so
+            # briefly deferring collection elsewhere is a small price for not crashing.
+            gc_was_enabled = gc.isenabled()
+            gc.disable()
+            try:
+                daily_summaries = self._process_weather_data(data, openweather_data, visualcrossing_data, weatherapi_data)
+                if not daily_summaries:
+                    self.error_occurred.emit(
+                        f"Open-Meteo unavailable ({self.openmeteo_error}) and no other "
+                        "weather source returned usable forecast data."
+                    )
+                    return
+                self.weather_loaded.emit(daily_summaries)
+            finally:
+                if gc_was_enabled:
+                    gc.enable()
+
+        except requests.exceptions.RequestException as e:
+            self.error_occurred.emit(f"Network error: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error fetching weather data: {str(e)}", exc_info=True)
+            self.error_occurred.emit(f"Error: {str(e)}")
+
+    def _fetch_openmeteo_data(self) -> Optional[Dict[str, Any]]:
+        """Fetch the primary Open-Meteo forecast. Returns None (and sets
+        self.openmeteo_error to a short reason) on any failure instead of raising,
+        so a failed Open-Meteo fetch doesn't prevent run() from still trying the
+        other enabled sources."""
+        self.openmeteo_error = None
         try:
             self.progress.emit("Connecting to Open-Meteo API...")
 
-            # Build API URL
             url = (
                 f"https://api.open-meteo.com/v1/forecast?"
                 f"latitude={self.lat}&longitude={self.lon}&"
@@ -428,13 +502,11 @@ class WeatherWorker(QThread):
             # (transient upstream hiccup). Retry once before giving up, since
             # a fresh request a moment later typically succeeds.
             max_attempts = 2
-            data = None
             for attempt in range(1, max_attempts + 1):
                 response = requests.get(url, timeout=30)
                 response.raise_for_status()
                 try:
-                    data = response.json()
-                    break
+                    return response.json()
                 except ValueError:
                     body_preview = response.text[:200] if response.text else "<empty>"
                     logger.warning(
@@ -442,51 +514,20 @@ class WeatherWorker(QThread):
                         f"{attempt}/{max_attempts} (status {response.status_code}): {body_preview!r}"
                     )
                     if attempt == max_attempts:
-                        raise ValueError(
-                            "Open-Meteo returned an invalid response. Please try refreshing again."
-                        )
+                        self.openmeteo_error = "invalid response"
+                        return None
                     time.sleep(1)
 
-            # Optionally supplement with OpenWeather, VisualCrossing, and/or WeatherAPI
-            # data (all opt-in, requires an API key each). Each returns None if
-            # disabled/unconfigured/unavailable, in which case that source simply
-            # doesn't contribute to the blend below - Open-Meteo data is always the
-            # baseline.
-            openweather_data = self._fetch_openweather_data()
-            visualcrossing_data = self._fetch_visualcrossing_data()
-            weatherapi_data = self._fetch_weatherapi_data()
-
-            self.progress.emit("Processing weather data...")
-            # Disable the cyclic GC from here through the weather_loaded emit below. A
-            # native crash (Fatal Python error: Illegal instruction) has recurred at
-            # several unrelated first-call sites inside _process_weather_data (astropy
-            # units.cds import, Time.replicate, an ecliptic frame transform, numpy
-            # arrayprint/__str__, pytz.timezone's os.environ lookup) -- the one constant
-            # every time is "Garbage-collecting" at the top of the trace, in this thread.
-            # That points at a GC pass landing while some C extension has left transient
-            # state a GC traversal isn't safe to observe, not at any one of those
-            # libraries specifically. Re-enabling gc immediately after
-            # _process_weather_data returned (right before this comment used to sit)
-            # wasn't enough -- the crash recurred one line later, right after
-            # gc.enable(), inside weather_loaded.emit() itself (cross-thread signal
-            # delivery allocates too). So the disabled window now extends through the
-            # emit call as well. gc.disable()/enable() is process-wide, not thread-local,
-            # but this whole stretch is quick and runs once per weather refresh, so
-            # briefly deferring collection elsewhere is a small price for not crashing.
-            gc_was_enabled = gc.isenabled()
-            gc.disable()
-            try:
-                daily_summaries = self._process_weather_data(data, openweather_data, visualcrossing_data, weatherapi_data)
-                self.weather_loaded.emit(daily_summaries)
-            finally:
-                if gc_was_enabled:
-                    gc.enable()
-
+        except requests.exceptions.Timeout:
+            self.openmeteo_error = "request timed out"
+            logger.warning("Open-Meteo fetch failed: timed out, continuing with remaining source(s)")
         except requests.exceptions.RequestException as e:
-            self.error_occurred.emit(f"Network error: {str(e)}")
+            self.openmeteo_error = "network error"
+            logger.warning(f"Open-Meteo fetch failed, continuing with remaining source(s): {e}")
         except Exception as e:
-            logger.error(f"Error fetching weather data: {str(e)}", exc_info=True)
-            self.error_occurred.emit(f"Error: {str(e)}")
+            self.openmeteo_error = "unexpected error"
+            logger.warning(f"Open-Meteo fetch failed, continuing with remaining source(s): {e}")
+        return None
 
     def _fetch_openweather_data(self) -> Optional[Dict[datetime, Dict[str, Optional[float]]]]:
         """Fetch supplemental forecast data from OpenWeather's free 5 day / 3 hour
@@ -786,7 +827,7 @@ class WeatherWorker(QThread):
 
     def _process_weather_data(
         self,
-        data: Dict[str, Any],
+        data: Optional[Dict[str, Any]],
         openweather_data: Optional[Dict[datetime, Dict[str, Optional[float]]]] = None,
         visualcrossing_data: Optional[Dict[datetime, Dict[str, Optional[float]]]] = None,
         weatherapi_data: Optional[Dict[datetime, Dict[str, Optional[float]]]] = None
@@ -794,9 +835,50 @@ class WeatherWorker(QThread):
         """Process raw API data into daily summaries, optionally blending in
         supplemental OpenWeather, VisualCrossing, and/or WeatherAPI data (simple
         average across whichever of Open-Meteo/OpenWeather/VisualCrossing/WeatherAPI
-        have a value for a given field/hour)."""
-        hourly = data.get("hourly", {})
+        have a value for a given field/hour). data may be None if the Open-Meteo
+        fetch failed - in that case, the best available supplemental source is
+        promoted to the baseline hourly grid instead (see self.baseline_source)."""
+        hourly = data.get("hourly", {}) if data else {}
         times = hourly.get("time", [])
+
+        self.baseline_source = "openmeteo"
+        if not times:
+            # Open-Meteo is unavailable (or returned no hours) - promote the best
+            # remaining enabled source to the baseline grid rather than blending it
+            # into an empty one, so a single failed API doesn't blank the forecast.
+            # VisualCrossing/WeatherAPI are hourly (like Open-Meteo); OpenWeather's
+            # free tier is only 3-hourly, so it's used only as a last resort.
+            for name, source in (("visualcrossing", visualcrossing_data),
+                                  ("weatherapi", weatherapi_data),
+                                  ("openweather", openweather_data)):
+                if not source:
+                    continue
+                sorted_dts = sorted(source.keys())
+                times = [dt.isoformat() for dt in sorted_dts]
+                hourly = {
+                    "time": times,
+                    "cloud_cover": [source[dt].get("cloud_cover") for dt in sorted_dts],
+                    "temperature_2m": [source[dt].get("temperature") for dt in sorted_dts],
+                    "relative_humidity_2m": [source[dt].get("humidity") for dt in sorted_dts],
+                    "wind_speed_10m": [source[dt].get("wind_speed") for dt in sorted_dts],
+                    "wind_gusts_10m": [source[dt].get("wind_gusts") for dt in sorted_dts],
+                    "precipitation_probability": [source[dt].get("precipitation_probability") for dt in sorted_dts],
+                    "visibility": [source[dt].get("visibility") for dt in sorted_dts],
+                    "surface_pressure": [source[dt].get("surface_pressure") for dt in sorted_dts],
+                    # cloud_cover_low/mid/high and dew_point have no equivalent in the
+                    # other APIs and are left out here - they default to 0 below via
+                    # the existing hourly.get(..., [0] * len(times)) fallback.
+                }
+                self.baseline_source = name
+                # This source is now the baseline itself, not a supplemental match -
+                # clear it so it isn't blended against its own values below.
+                if name == "visualcrossing":
+                    visualcrossing_data = None
+                elif name == "weatherapi":
+                    weatherapi_data = None
+                elif name == "openweather":
+                    openweather_data = None
+                break
 
         if not times:
             return []
@@ -2355,15 +2437,26 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.daily_summaries = summaries
 
-        # Reflect which supplemental source(s), if any, were successfully blended
-        # into this forecast.
-        sources = ['<a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a>']
-        if any(s.openweather_blended for s in summaries):
-            sources.append('<a href="https://openweathermap.org/" style="color: #6ea8fe;">OpenWeather</a>')
-        if any(s.visualcrossing_blended for s in summaries):
-            sources.append('<a href="https://www.visualcrossing.com/" style="color: #6ea8fe;">VisualCrossing</a>')
-        if any(s.weatherapi_blended for s in summaries):
-            sources.append('<a href="https://www.weatherapi.com/" style="color: #6ea8fe;">WeatherAPI</a>')
+        # Reflect the actual baseline source (normally Open-Meteo, but a
+        # supplemental source if Open-Meteo itself failed on this fetch - see
+        # WeatherWorker.baseline_source) plus which other source(s), if any, were
+        # blended into it.
+        source_links = {
+            "openmeteo": '<a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a>',
+            "openweather": '<a href="https://openweathermap.org/" style="color: #6ea8fe;">OpenWeather</a>',
+            "visualcrossing": '<a href="https://www.visualcrossing.com/" style="color: #6ea8fe;">VisualCrossing</a>',
+            "weatherapi": '<a href="https://www.weatherapi.com/" style="color: #6ea8fe;">WeatherAPI</a>',
+        }
+        baseline_source = "openmeteo"
+        if not from_cache and self.worker is not None:
+            baseline_source = getattr(self.worker, "baseline_source", "openmeteo")
+        sources = [source_links[baseline_source]]
+        if baseline_source != "openweather" and any(s.openweather_blended for s in summaries):
+            sources.append(source_links["openweather"])
+        if baseline_source != "visualcrossing" and any(s.visualcrossing_blended for s in summaries):
+            sources.append(source_links["visualcrossing"])
+        if baseline_source != "weatherapi" and any(s.weatherapi_blended for s in summaries):
+            sources.append(source_links["weatherapi"])
 
         if len(sources) == 1:
             self.attribution_label.setText(
@@ -2412,6 +2505,8 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         # OpenWeather/VisualCrossing/WeatherAPI calls, so there's nothing new to report.
         integration_notes = []
         if not from_cache and self.worker is not None:
+            if getattr(self.worker, "openmeteo_error", None):
+                integration_notes.append(f"Open-Meteo unavailable ({self.worker.openmeteo_error})")
             if getattr(self.worker, "openweather_error", None):
                 integration_notes.append(f"OpenWeather unavailable ({self.worker.openweather_error})")
             if getattr(self.worker, "visualcrossing_error", None):
