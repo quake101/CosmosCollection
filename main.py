@@ -89,6 +89,7 @@ from DSODetail import DSODetailWindow
 from FOVSimulator import AladinLiteWindow
 from NINAIntegration import NINAIntegration
 from SystemTrayManager import SystemTrayManager
+from StartupLoadingDialog import StartupLoadingDialog
 
 # Import astroquery at module level so PyInstaller detects it
 try:
@@ -5998,6 +5999,12 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         weather_action.triggered.connect(self._show_weather_forecast)
         toolbar.addAction(weather_action)
 
+        # Session Manager action
+        session_manager_action = QAction("Session Manager", self)
+        session_manager_action.setToolTip("Plan future observing sessions and log past ones")
+        session_manager_action.triggered.connect(self._show_session_manager)
+        toolbar.addAction(session_manager_action)
+
         # NINA Dashboard action (only visible if NINA integration is enabled)
         self.nina_dashboard_action = QAction("NINA Dashboard", self)
         self.nina_dashboard_action.setToolTip("View real-time NINA status, imaging, and guiding")
@@ -6186,6 +6193,20 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             QMessageBox.warning(self, "Import Error", f"Could not load Target List: {e}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not open Target List: {e}")
+
+    def _show_session_manager(self):
+        """Show the Session Manager window"""
+        try:
+            from SessionManager import SessionManagerWindow
+            if not hasattr(self, 'session_manager_window') or not self.session_manager_window.isVisible():
+                self.session_manager_window = SessionManagerWindow()
+            self.session_manager_window.show()
+            self.session_manager_window.raise_()
+            self.session_manager_window.activateWindow()
+        except ImportError as e:
+            QMessageBox.warning(self, "Import Error", f"Could not load Session Manager: {e}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not open Session Manager: {e}")
 
     def _show_collage_builder(self):
         """Show the Collage Builder window"""
@@ -8075,6 +8096,20 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
 
+    # Set application icon
+    icon_path = os.path.join(APP_DIR, 'images', 'CosmosCollection.png')
+    app_icon = QIcon(icon_path)
+    app.setWindowIcon(app_icon)
+
+    # Apply global dark theme before any UI paints
+    apply_theme(app)
+
+    # Show a loading dialog immediately so the user gets feedback instead of
+    # a blank screen during the pre-warm/database-load gap below.
+    splash = StartupLoadingDialog()
+    splash.show()
+    QApplication.processEvents()
+
     # Always-on crash log: faulthandler writes a native traceback to this file
     # even when the process is killed by a C-level crash (segfault, access violation).
     try:
@@ -8133,13 +8168,8 @@ if __name__ == "__main__":
         logger.debug("Global WebEngine profile configured with WebGL support")
     except Exception as e:
         logger.warning(f"Could not configure global WebEngine profile: {e}")
-    # Set application icon
-    icon_path = os.path.join(APP_DIR, 'images', 'CosmosCollection.png')
-    app_icon = QIcon(icon_path)
-    app.setWindowIcon(app_icon)
 
-    # Apply global dark theme
-    apply_theme(app)
+    splash.set_status("Preparing astronomy engine...")
 
     # Pre-warm astropy/erfa/numpy on the main thread, before any background thread (weather
     # fetch, DSO visibility calc, ...) gets a chance to trigger the same first-time lazy
@@ -8159,9 +8189,27 @@ if __name__ == "__main__":
         _now = _dt.datetime.utcnow()
         calculate_sun_altitudes(0.0, 0.0, [_now])
         calculate_moon_phase(_now)
+
+        # Also pre-warm DSOVisibilityCalculator (Best DSO Tonight, DSO Visibility
+        # Calculator, Session Manager). It pulls in matplotlib (backend init, font
+        # cache) on top of the astropy/erfa cost above, and exercises the same
+        # ICRS<->AltAz transform graph via a different call path - importing and
+        # exercising it here, in this same single-threaded pre-warm block, means
+        # that cost (observed at ~8s cold) is paid once at startup instead of
+        # freezing whichever of those windows the user happens to open first.
+        from DSOVisibilityCalculator import DSOVisibilityCalculator
+        from astropy.coordinates import SkyCoord
+        import astropy.units as _u
+        _calc = DSOVisibilityCalculator(location_lat=0.0, location_lon=0.0, timezone="UTC")
+        _calc.calculate_visibility_for_coordinates(
+            SkyCoord(ra=0.0 * _u.deg, dec=0.0 * _u.deg), _now.strftime("%Y-%m-%d")
+        )
+
         logger.debug("Pre-warmed astropy/erfa machinery")
     except Exception as e:
         logger.warning(f"Could not pre-warm astropy machinery (will retry lazily later): {e}")
+
+    splash.set_status("Loading database...")
 
     # Initialize database manager and get data
     db_manager = DatabaseManager()
@@ -8179,12 +8227,14 @@ if __name__ == "__main__":
             # Create and show the main window with loaded data
             window = MainWindow(dso_data, catalogs, total_count)
             window.show()
+            splash.close()
 
             # Check if location is configured after window is shown
             QTimer.singleShot(500, window._check_location_on_startup)
 
         except Exception as e:
             logger.error(f"Error creating main window: {e}", exc_info=True)
+            splash.close()
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(None, "Error", f"Failed to initialize application: {str(e)}")
             sys.exit(1)
@@ -8193,6 +8243,7 @@ if __name__ == "__main__":
         """Handle initial data load failure"""
         from PySide6.QtWidgets import QMessageBox
         logger.error(f"Failed to load initial data: {error_msg}")
+        splash.close()
         QMessageBox.critical(None, "Error", f"Failed to load DSO data from database:\n{error_msg}")
         sys.exit(1)
 
@@ -8213,6 +8264,7 @@ if __name__ == "__main__":
 
     except Exception as e:
         logger.error(f"Error initializing application: {str(e)}", exc_info=True)
+        splash.close()
         from PySide6.QtWidgets import QMessageBox
 
         QMessageBox.critical(None, "Error", f"Failed to initialize application: {str(e)}")

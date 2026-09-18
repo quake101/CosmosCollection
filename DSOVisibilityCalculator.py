@@ -599,6 +599,26 @@ class DSOVisibilityCalculator:
             return None
 
 
+def visibility_hours_to_color(hours):
+    """Map a day's visibility hours to (background, foreground) QColor pair.
+    Shared by VisibilityCalendar and SessionManager's calendar view so both use
+    the same 7-tier green->red scale rather than duplicating the thresholds."""
+    if hours >= 8:
+        return QColor(0, 150, 0), QColor(255, 255, 255)
+    elif hours >= 6:
+        return QColor(0, 120, 0), QColor(255, 255, 255)
+    elif hours >= 4:
+        return QColor(100, 120, 0), QColor(255, 255, 255)
+    elif hours >= 2:
+        return QColor(150, 100, 0), QColor(255, 255, 255)
+    elif hours >= 1:
+        return QColor(150, 60, 0), QColor(255, 255, 255)
+    elif hours > 0:
+        return QColor(120, 40, 0), QColor(255, 255, 255)
+    else:
+        return QColor(80, 0, 0), QColor(180, 180, 180)
+
+
 class MonthlyVisibilityThread(QThread):
     """Thread for calculating visibility hours for all days in a month"""
     progress = Signal(int, float)  # day, hours
@@ -705,20 +725,7 @@ class VisibilityCalendar(QCalendarWidget):
 
     def get_color_for_hours(self, hours):
         """Get background and foreground colors for given visibility hours"""
-        if hours >= 8:
-            return QColor(0, 150, 0), QColor(255, 255, 255)
-        elif hours >= 6:
-            return QColor(0, 120, 0), QColor(255, 255, 255)
-        elif hours >= 4:
-            return QColor(100, 120, 0), QColor(255, 255, 255)
-        elif hours >= 2:
-            return QColor(150, 100, 0), QColor(255, 255, 255)
-        elif hours >= 1:
-            return QColor(150, 60, 0), QColor(255, 255, 255)
-        elif hours > 0:
-            return QColor(120, 40, 0), QColor(255, 255, 255)
-        else:
-            return QColor(80, 0, 0), QColor(180, 180, 180)
+        return visibility_hours_to_color(hours)
 
     def paintCell(self, painter, rect, date):
         """Override to paint custom cell backgrounds"""

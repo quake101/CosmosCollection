@@ -1536,6 +1536,9 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             slew_action = nina_menu.addAction("Slew to Target")
             slew_action.triggered.connect(lambda: self._context_slew_to_target(row))
 
+        plan_session_action = context_menu.addAction("Plan a Session")
+        plan_session_action.triggered.connect(lambda: self._context_plan_session(row))
+
         context_menu.addSeparator()
 
         edit_action = context_menu.addAction("Edit Target")
@@ -1657,6 +1660,22 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             target_data.get("ra_deg"), target_data.get("dec_deg"),
             target_data.get("name", "Unknown"), self
         )
+
+    def _context_plan_session(self, row):
+        """Open Session Manager pre-filled with this target, from context menu"""
+        name_item = self.targets_table.item(row, 0)
+        if not name_item:
+            return
+
+        target_data = name_item.data(Qt.UserRole)
+        try:
+            from SessionManager import SessionManagerWindow
+            if not hasattr(self, 'session_manager_window') or not self.session_manager_window.isVisible():
+                self.session_manager_window = SessionManagerWindow()
+            self.session_manager_window.create_session_from_dso(target_data)
+        except Exception as e:
+            logger.error(f"Error opening Session Manager: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Session Manager: {str(e)}")
 
     def _context_edit_target(self, row):
         """Edit target from context menu"""

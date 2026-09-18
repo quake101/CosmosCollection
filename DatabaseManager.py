@@ -183,7 +183,66 @@ class DatabaseManager:
                         FOREIGN KEY (userimage_id) REFERENCES userimages(id) ON DELETE CASCADE
                     )
                 """)
-                
+
+                # Create usersessions table for planned/logged observing sessions
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS usersessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        target_id INTEGER REFERENCES usertargetlist(id) ON DELETE SET NULL,
+                        dso_name TEXT NOT NULL,
+                        ra_deg REAL,
+                        dec_deg REAL,
+                        status TEXT NOT NULL DEFAULT 'Planned',
+                        session_date TEXT NOT NULL,
+                        start_time TEXT,
+                        end_time TEXT,
+                        location_lat REAL,
+                        location_lon REAL,
+                        location_name TEXT,
+                        location_timezone TEXT,
+                        location_source TEXT DEFAULT 'active',
+                        telescope_id INTEGER REFERENCES usertelescopes(id) ON DELETE SET NULL,
+                        camera TEXT,
+                        filters_used TEXT,
+                        sub_count INTEGER DEFAULT 0,
+                        integration_seconds REAL DEFAULT 0,
+                        earliest_sub_date TEXT,
+                        latest_sub_date TEXT,
+                        notes TEXT,
+                        created_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                        modified_date TEXT
+                    )
+                """)
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_target_id ON usersessions(target_id)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_session_date ON usersessions(session_date)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_status ON usersessions(status)")
+
+                # Create usersessionfiles table for FITS/XISF subs scanned into a session
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS usersessionfiles (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL REFERENCES usersessions(id) ON DELETE CASCADE,
+                        file_path TEXT NOT NULL,
+                        file_type TEXT,
+                        frame_type TEXT,
+                        object_name TEXT,
+                        date_obs TEXT,
+                        exptime_seconds REAL,
+                        filter_name TEXT,
+                        camera TEXT,
+                        telescope TEXT,
+                        gain REAL,
+                        offset_value REAL,
+                        ccd_temp REAL,
+                        xbinning INTEGER,
+                        ybinning INTEGER,
+                        header_json TEXT,
+                        added_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(session_id, file_path)
+                    )
+                """)
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessionfiles_session_id ON usersessionfiles(session_id)")
+
                 conn.commit()
                 logger.debug("Database tables initialized successfully")
                 
