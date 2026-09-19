@@ -1505,6 +1505,9 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             slew_action = nina_menu.addAction("Slew to Target")
             slew_action.triggered.connect(lambda: self._context_slew_to_target(row))
 
+        plan_session_action = context_menu.addAction("Plan a Session")
+        plan_session_action.triggered.connect(lambda: self._context_plan_session(row))
+
         context_menu.addSeparator()
 
         # Check if DSO is already in target list
@@ -1692,6 +1695,55 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         target_name = dso_data.get("dso_info", {}).get("name", "Unknown")
         NINAIntegration.slew_to_coordinates(ra_deg, dec_deg, target_name, self)
+
+    def _context_plan_session(self, row):
+        """Open Session Manager pre-filled with this DSO, from context menu"""
+        try:
+            # Get DSO data from the name item (column 0) of the selected row
+            name_item = self.results_table.item(row, 0)
+            if name_item:
+                dso_data = name_item.data(Qt.UserRole)
+                if dso_data:
+                    # Get coordinates
+                    coordinates = dso_data.get("coordinates")
+                    if coordinates:
+                        ra_deg = coordinates.ra.degree
+                        dec_deg = coordinates.dec.degree
+                    else:
+                        # Fallback - try to get coordinates again
+                        from astropy.coordinates import SkyCoord
+                        try:
+                            coord = SkyCoord.from_name(dso_data["dso_info"]["name"])
+                            ra_deg = coord.ra.degree
+                            dec_deg = coord.dec.degree
+                        except:
+                            ra_deg = 0.0
+                            dec_deg = 0.0
+
+                    # Create data dictionary for Session Manager
+                    target_data = {
+                        'name': dso_data["dso_info"]["name"],
+                        'ra_deg': ra_deg,
+                        'dec_deg': dec_deg,
+                        'magnitude': dso_data["dso_info"]["magnitude"],
+                        'size_min': dso_data["dso_info"]["size_min"],
+                        'size_max': dso_data["dso_info"]["size_max"],
+                        'constellation': dso_data["dso_info"]["constellation"],
+                        'dso_type': dso_data["dso_info"]["type"],
+                        'dso_class': dso_data["dso_info"]["dso_class"],
+                        'designations': dso_data["dso_info"].get("designations", "")
+                    }
+
+                    # Import and open Session Manager, then create a session for the DSO
+                    from SessionManager import SessionManagerWindow
+                    if not hasattr(self, 'session_manager_window') or not self.session_manager_window.isVisible():
+                        self.session_manager_window = SessionManagerWindow()
+
+                    self.session_manager_window.create_session_from_dso(target_data)
+                else:
+                    QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open Session Manager: {str(e)}")
 
     def _context_add_to_target_list(self, row):
         """Add DSO to target list from context menu"""
