@@ -185,3 +185,30 @@ coll = COLLECT(
     upx_exclude=[],
     name='CosmosCollection',
 )
+
+if sys.platform == 'darwin':
+    # Without this, macOS release builds were a bare COLLECT() folder full of loose
+    # Mach-O binaries/.so files instead of a proper .app bundle. Unsigned loose
+    # binaries get Gatekeeper-challenged one at a time as the dynamic linker touches
+    # each one (the "have to authorize every file" report), instead of Gatekeeper
+    # evaluating one signed bundle as a single unit. The CI codesign step (ad-hoc,
+    # see build-release.yml) is what actually consolidates that into one prompt --
+    # this BUNDLE() just gives it something bundle-shaped to sign.
+    import re as _re
+    with open('version.py', 'r', encoding='utf-8') as _vf:
+        _version_match = _re.search(r'_FALLBACK_VERSION = "([^"]*)"', _vf.read())
+    _app_version = _version_match.group(1) if _version_match else '0.0.0'
+
+    app = BUNDLE(
+        coll,
+        name='CosmosCollection.app',
+        icon='images/CosmosCollection.png',
+        bundle_identifier='io.github.quake101.cosmoscollection',
+        info_plist={
+            'CFBundleName': 'CosmosCollection',
+            'CFBundleDisplayName': 'CosmosCollection',
+            'CFBundleShortVersionString': _app_version,
+            'CFBundleVersion': _app_version,
+            'NSHighResolutionCapable': True,
+        },
+    )

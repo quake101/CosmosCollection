@@ -62,6 +62,15 @@ Cosmos Collection is designed to help astrophotographers manage their image coll
 3. Extract the downloaded file
 4. Run the application executable
 
+#### macOS First Launch
+
+The app is ad-hoc signed but not notarized, so macOS will still flag it as being from an unidentified developer the first time. Right-click (or Control-click) `CosmosCollection.app` and choose **Open**, then confirm in the dialog that appears — this only needs to be done once.
+
+If macOS still won't open it after that, clear the quarantine flag from Terminal:
+```bash
+xattr -cr /path/to/CosmosCollection.app
+```
+
 #### Linux System Requirements
 
 Before running Cosmos Collection on Linux, you need to install the required Qt system libraries:
@@ -148,8 +157,11 @@ Cosmos Collection supports command line operations for scripting and automation.
 # Windows
 CosmosCollection-CLI.exe --list-dsos
 
-# Linux/macOS
+# Linux
 ./CosmosCollection-CLI --list-dsos
+
+# macOS (bundled inside the .app)
+./CosmosCollection.app/Contents/MacOS/CosmosCollection-CLI --list-dsos
 ```
 
 **From Source:** Use Python directly:

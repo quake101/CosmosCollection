@@ -67,23 +67,51 @@ jobs:
       run: |
         Copy-Item dist/CosmosCollectionUpdater.exe dist/CosmosCollection/CosmosCollectionUpdater.exe
 
-    - name: Bundle updater helper into distribution (Linux/macOS)
-      if: matrix.os != 'windows-latest'
+    - name: Bundle updater helper into distribution (Linux)
+      if: matrix.os == 'ubuntu-latest'
       run: |
         cp dist/CosmosCollectionUpdater dist/CosmosCollection/CosmosCollectionUpdater
         chmod +x dist/CosmosCollection/CosmosCollectionUpdater
+
+    - name: Bundle updater helper into distribution (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        cp dist/CosmosCollectionUpdater dist/CosmosCollection.app/Contents/MacOS/CosmosCollectionUpdater
+        chmod +x dist/CosmosCollection.app/Contents/MacOS/CosmosCollectionUpdater
+
+    - name: Code sign app bundle (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        # Ad-hoc signing (-s -, no Apple Developer account/certificate needed) signs the
+        # whole .app as one unit, so Gatekeeper evaluates/challenges it once instead of
+        # flagging every loose internal binary individually. Deliberately not adding
+        # --options runtime (hardened runtime): that's only needed for notarization, and
+        # turning it on without the matching entitlements (e.g. allow-jit) can crash
+        # Qt WebEngine's Chromium renderer process, which is a worse problem than the one
+        # this step is fixing.
+        codesign --deep --force -s - dist/CosmosCollection.app
+        codesign --verify --deep --strict dist/CosmosCollection.app
 
     - name: Create distribution zip (Windows)
       if: matrix.os == 'windows-latest'
       run: |
         Compress-Archive -Path dist/CosmosCollection/* -DestinationPath dist/CosmosCollection-${{ matrix.platform }}.zip
 
-    - name: Create distribution zip (Linux/macOS)
-      if: matrix.os != 'windows-latest'
+    - name: Create distribution zip (Linux)
+      if: matrix.os == 'ubuntu-latest'
       run: |
         cd dist/CosmosCollection
         zip -r ../CosmosCollection-${{ matrix.platform }}.zip .
         cd ../..
+
+    - name: Create distribution zip (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        # ditto (not zip) preserves the .app bundle's symlinks and code signature
+        # correctly - Apple's own recommended way to archive a signed app bundle.
+        cd dist
+        ditto -c -k --keepParent CosmosCollection.app CosmosCollection-${{ matrix.platform }}.zip
+        cd ..
 
     - name: Generate checksum (Windows)
       if: matrix.os == 'windows-latest'
