@@ -828,6 +828,90 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
             logger.error(f"Error recomputing session aggregates: {e}")
 
 
+class LinkTargetDialog(WindowPositionMixin, QDialog):
+    """Pick a Target List entry to link a session to (sets usersessions.target_id -
+    doesn't touch the session's own dso_name/ra_deg/dec_deg, same as the existing
+    automatic name-match linking in AddEditSessionDialog._resolve_target_id_by_name)."""
+
+    WINDOW_POSITION_KEY = "LinkTargetDialog"
+
+    def __init__(self, db_manager, parent=None):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.selected_target = None
+        self.setWindowTitle("Link to Target List")
+        self.setModal(True)
+        self.resize(420, 480)  # default size the first time this dialog is ever opened
+        self._setup_ui()
+        self._load_targets()
+        self.setup_window_position()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search:"))
+        self.search_box = QLineEdit()
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.textChanged.connect(self._filter_targets)
+        search_row.addWidget(self.search_box)
+        layout.addLayout(search_row)
+
+        self.targets_list = QListWidget()
+        self.targets_list.itemSelectionChanged.connect(self._on_selection_changed)
+        self.targets_list.itemDoubleClicked.connect(lambda _: self._on_confirm())
+        layout.addWidget(self.targets_list, 1)
+
+        buttons_row = QHBoxLayout()
+        buttons_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons_row.addWidget(cancel_btn)
+        self.ok_btn = QPushButton("Link")
+        self.ok_btn.setDefault(True)
+        self.ok_btn.setEnabled(False)
+        self.ok_btn.clicked.connect(self._on_confirm)
+        buttons_row.addWidget(self.ok_btn)
+        layout.addLayout(buttons_row)
+
+    def _load_targets(self):
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, name, dso_type, constellation, magnitude, ra_deg, dec_deg
+                    FROM usertargetlist ORDER BY name
+                """)
+                for target_id, name, dso_type, constellation, magnitude, ra_deg, dec_deg in cursor.fetchall():
+                    details = ", ".join(p for p in (dso_type, constellation) if p)
+                    label = f"{name} ({details})" if details else name
+                    if magnitude is not None:
+                        label += f" - Mag {magnitude:.1f}"
+                    item = QListWidgetItem(label)
+                    item.setData(Qt.UserRole, {
+                        "id": target_id, "name": name, "ra_deg": ra_deg, "dec_deg": dec_deg,
+                    })
+                    self.targets_list.addItem(item)
+        except Exception as e:
+            logger.error(f"Error loading target list for linking: {e}")
+
+    def _filter_targets(self, text):
+        text = text.strip().lower()
+        for i in range(self.targets_list.count()):
+            item = self.targets_list.item(i)
+            item.setHidden(text not in item.text().lower())
+
+    def _on_selection_changed(self):
+        self.ok_btn.setEnabled(bool(self.targets_list.selectedItems()))
+
+    def _on_confirm(self):
+        items = self.targets_list.selectedItems()
+        if not items:
+            return
+        self.selected_target = items[0].data(Qt.UserRole)
+        self.accept()
+
+
 class SessionScanThread(QThread):
     """Background scan of dropped files/folders so large folders don't block the UI."""
     progress = Signal(int, int)
@@ -1540,6 +1624,7 @@ class SessionCalendarWidget(QWidget):
 
 class SessionManagerWindow(WindowPositionMixin, QMainWindow):
     WINDOW_POSITION_KEY = "SessionManager"
+    COLUMNS_SETTING = "session_manager_table_columns_hidden"
     """Main window for planning and logging observing sessions"""
 
     def __init__(self):
@@ -1688,22 +1773,26 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
 
         self.sessions_table = QTableWidget()
-        self.sessions_table.setColumnCount(10)
-        self.sessions_table.setHorizontalHeaderLabels([
+        self._column_labels = [
             "DSO Name", "Status", "Date", "Time", "Location", "Telescope",
             "Filters", "Subs", "Integration", "Linked Target"
-        ])
+        ]
+        self.sessions_table.setColumnCount(len(self._column_labels))
+        self.sessions_table.setHorizontalHeaderLabels(self._column_labels)
         self.sessions_table.setSortingEnabled(True)
         header = self.sessions_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         for col in range(1, 10):
             header.setSectionResizeMode(col, QHeaderView.Interactive)
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._show_column_menu)
         self.sessions_table.setAlternatingRowColors(True)
         self.sessions_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.sessions_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.sessions_table.itemDoubleClicked.connect(self._edit_selected_session)
         self.sessions_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.sessions_table.customContextMenuRequested.connect(self._show_context_menu)
+        self._apply_saved_column_visibility()
         splitter.addWidget(self.sessions_table)
 
         self.detail_panel = self._build_detail_panel()
@@ -2215,6 +2304,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         if not item:
             return
         self.sessions_table.selectRow(item.row())
+        session_data = self.sessions_table.item(item.row(), 0).data(Qt.UserRole)
 
         menu = QMenu(self)
         edit_action = menu.addAction("Edit Session")
@@ -2222,9 +2312,90 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         duplicate_action = menu.addAction("Duplicate Session")
         duplicate_action.triggered.connect(self._duplicate_selected_session)
         menu.addSeparator()
+        if session_data and session_data.get("target_id"):
+            change_link_action = menu.addAction("Change Linked Target...")
+            change_link_action.triggered.connect(self._link_session_to_target)
+            unlink_action = menu.addAction("Unlink Target")
+            unlink_action.triggered.connect(self._unlink_session_target)
+        else:
+            link_action = menu.addAction("Link to Target List...")
+            link_action.triggered.connect(self._link_session_to_target)
+        menu.addSeparator()
         delete_action = menu.addAction("Delete Session")
         delete_action.triggered.connect(self._delete_selected_session)
         menu.exec(self.sessions_table.mapToGlobal(position))
+
+    def _link_session_to_target(self):
+        row = self.sessions_table.currentRow()
+        if row < 0:
+            return
+        session_data = self.sessions_table.item(row, 0).data(Qt.UserRole)
+
+        dialog = LinkTargetDialog(self.db_manager, parent=self)
+        if dialog.exec() == QDialog.Accepted and dialog.selected_target:
+            target = dialog.selected_target
+            try:
+                with self.db_manager.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE usersessions SET target_id = ? WHERE id = ?",
+                                   (target["id"], session_data["id"]))
+                    conn.commit()
+                self._load_sessions()
+                self._select_session_by_id(session_data["id"])
+            except Exception as e:
+                logger.error(f"Error linking session to target: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to link target: {e}")
+
+    def _unlink_session_target(self):
+        row = self.sessions_table.currentRow()
+        if row < 0:
+            return
+        session_data = self.sessions_table.item(row, 0).data(Qt.UserRole)
+
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE usersessions SET target_id = NULL WHERE id = ?", (session_data["id"],))
+                conn.commit()
+            self._load_sessions()
+            self._select_session_by_id(session_data["id"])
+        except Exception as e:
+            logger.error(f"Error unlinking target: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to unlink target: {e}")
+
+    def _show_column_menu(self, position):
+        """Right-click menu on the sessions table's header - toggle which columns
+        are shown. Selection is persisted via QSettings and restored on next launch."""
+        header = self.sessions_table.horizontalHeader()
+        menu = QMenu(self)
+        for col, label in enumerate(self._column_labels):
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(not self.sessions_table.isColumnHidden(col))
+            action.toggled.connect(lambda checked, c=col: self._toggle_column_visibility(c, checked))
+        menu.exec(header.mapToGlobal(position))
+
+    def _toggle_column_visibility(self, col, visible):
+        self.sessions_table.setColumnHidden(col, not visible)
+        self._save_column_visibility()
+
+    def _save_column_visibility(self):
+        hidden = [str(col) for col in range(self.sessions_table.columnCount())
+                  if self.sessions_table.isColumnHidden(col)]
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue(self.COLUMNS_SETTING, ",".join(hidden))
+
+    def _apply_saved_column_visibility(self):
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        saved = settings.value(self.COLUMNS_SETTING, "", type=str)
+        if not saved:
+            return
+        for part in saved.split(","):
+            part = part.strip()
+            if part.isdigit():
+                col = int(part)
+                if 0 <= col < self.sessions_table.columnCount():
+                    self.sessions_table.setColumnHidden(col, True)
 
     def create_session_from_dso(self, dso_data):
         """Public entry point: open a pre-filled planned session for a Target List DSO."""
