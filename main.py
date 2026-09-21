@@ -7702,6 +7702,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self._show_best_dso_tonight()
         elif action_name == "target_list":
             self._show_target_list()
+        elif action_name == "session_manager":
+            self._show_session_manager()
         elif action_name == "weather":
             self._show_weather_forecast()
         elif action_name == "gallery":

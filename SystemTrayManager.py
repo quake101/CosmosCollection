@@ -21,7 +21,7 @@ class SystemTrayManager(QObject):
     # Signals for communicating with the main window
     restore_requested = Signal()
     quit_requested = Signal()
-    action_triggered = Signal(str)  # Emits action name: "best_dso", "target_list", "weather", "gallery"
+    action_triggered = Signal(str)  # Emits action name: "best_dso", "target_list", "session_manager", "weather", "gallery", "nina_dashboard"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -130,6 +130,10 @@ class SystemTrayManager(QObject):
         target_list_action = QAction("Target List", self._menu)
         target_list_action.triggered.connect(lambda: self._on_action_clicked("target_list"))
         self._menu.addAction(target_list_action)
+
+        session_manager_action = QAction("Session Manager", self._menu)
+        session_manager_action.triggered.connect(lambda: self._on_action_clicked("session_manager"))
+        self._menu.addAction(session_manager_action)
 
         weather_action = QAction("Weather Forecast", self._menu)
         weather_action.triggered.connect(lambda: self._on_action_clicked("weather"))
