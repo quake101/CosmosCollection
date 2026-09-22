@@ -446,11 +446,11 @@ class ImageViewerWindow(QDialog):
             return
 
         try:
-            # Check if file is a FITS file
+            # Check if file is a FITS/XISF file
             file_ext = Path(self.file_path).suffix.lower()
-            if file_ext in ['.fits', '.fit', '.fts']:
+            if file_ext in ['.fits', '.fit', '.fts', '.xisf']:
                 QMessageBox.warning(self, "Unsupported Format",
-                                  "FITS files cannot be set as desktop background.\n"
+                                  "FITS/XISF files cannot be set as desktop background.\n"
                                   "Please export to a standard image format (PNG, JPG, etc.) first.")
                 return
 
@@ -707,15 +707,127 @@ class ImageViewerWindow(QDialog):
             # Any other error reading EXIF
             return None
 
-    def _get_fits_info(self):
-        """Extract FITS header information from the image file"""
-        try:
-            from astropy.io import fits
+    @staticmethod
+    def _format_header_keywords(header):
+        """Build the {description: formatted value} info dict from a FITS-style
+        header - works with either an astropy Header (FITS) or a plain dict
+        (XISF, via SessionFileScanner.extract_xisf_header), since both support
+        'in'/'[]' the same way. Shared by both formats' branches in
+        _get_fits_info() below so the keyword list/formatting rules stay in
+        exactly one place."""
+        fits_info = {}
 
-            # Check if file is a FITS file
-            file_ext = Path(self.file_path).suffix.lower()
-            if file_ext not in ['.fits', '.fit', '.fts']:
-                return None
+        # Common FITS keywords we want to show
+        useful_keywords = {
+            'OBJECT': 'Object Name',
+            'TELESCOP': 'Telescope',
+            'INSTRUME': 'Instrument',
+            'OBSERVER': 'Observer',
+            'DATE-OBS': 'Observation Date',
+            'EXPTIME': 'Exposure Time (s)',
+            'FILTER': 'Filter',
+            'FOCALLEN': 'Focal Length (mm)',
+            'APTDIA': 'Aperture Diameter (mm)',
+            'APTAREA': 'Aperture Area (mm^2)',
+            'FWHM': 'FWHM (arcsec)',
+            'EQUINOX': 'Equinox',
+            'RA': 'Right Ascension',
+            'DEC': 'Declination',
+            'OBJCTRA': 'Object RA',
+            'OBJCTDEC': 'Object Dec',
+            'AIRMASS': 'Airmass',
+            'GAIN': 'Gain',
+            'OFFSET': 'Offset',
+            'TEMP': 'Temperature (C)',
+            'CCD-TEMP': 'CCD Temperature (C)',
+            'SET-TEMP': 'Set Temperature (C)',
+            'XBINNING': 'X Binning',
+            'YBINNING': 'Y Binning',
+            'IMAGETYP': 'Image Type',
+            'FRAME': 'Frame Type',
+            'SWCREATE': 'Software Created',
+            'SWMODIFY': 'Software Modified'
+        }
+
+        for keyword, description in useful_keywords.items():
+            if keyword in header:
+                value = header[keyword]
+
+                # Format specific values
+                if keyword in ['DATE-OBS'] and isinstance(value, str):
+                    # Try to format the date nicely
+                    try:
+                        if 'T' in value:
+                            dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                            value = dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+                    except:
+                        pass
+                elif keyword in ['EXPTIME'] and isinstance(value, (int, float)):
+                    if value >= 60:
+                        minutes = int(value // 60)
+                        seconds = value % 60
+                        if seconds == 0:
+                            value = f"{value} s ({minutes}m)"
+                        else:
+                            value = f"{value} s ({minutes}m {seconds:.1f}s)"
+                    else:
+                        value = f"{value} s"
+                elif keyword in ['RA', 'OBJCTRA'] and isinstance(value, (int, float)):
+                    # Convert RA from degrees to hours:minutes:seconds
+                    ra_hours = value / 15.0
+                    hours = int(ra_hours)
+                    minutes = int((ra_hours - hours) * 60)
+                    seconds = ((ra_hours - hours) * 60 - minutes) * 60
+                    value = f"{value} deg ({hours:02d}h {minutes:02d}m {seconds:05.2f}s)"
+                elif keyword in ['DEC', 'OBJCTDEC'] and isinstance(value, (int, float)):
+                    # Format declination as degrees:arcminutes:arcseconds
+                    dec_deg = abs(value)
+                    sign = '+' if value >= 0 else '-'
+                    degrees = int(dec_deg)
+                    arcmin = int((dec_deg - degrees) * 60)
+                    arcsec = ((dec_deg - degrees) * 60 - arcmin) * 60
+                    value = f"{value} deg ({sign}{degrees:02d} deg {arcmin:02d}' {arcsec:05.2f}\")"
+                elif keyword in ['TEMP', 'CCD-TEMP', 'SET-TEMP'] and isinstance(value, (int, float)):
+                    value = f"{value} C"
+
+                fits_info[description] = str(value)
+
+        return fits_info
+
+    def _get_fits_info(self):
+        """Extract FITS/XISF header information from the image file"""
+        file_ext = Path(self.file_path).suffix.lower()
+        if file_ext not in ['.fits', '.fit', '.fts', '.xisf']:
+            return None
+
+        try:
+            if file_ext == '.xisf':
+                from SessionFileScanner import extract_xisf_header, read_xisf_xml
+
+                header = extract_xisf_header(self.file_path)
+                if not header:
+                    return None
+
+                fits_info = self._format_header_keywords(header)
+
+                # XISF doesn't carry NAXIS-style keywords in the curated header
+                # dict above - read image dimensions straight from the <Image>
+                # element's geometry attribute instead.
+                try:
+                    _, image_el, _ = read_xisf_xml(self.file_path)
+                    geometry = image_el.get('geometry') if image_el is not None else None
+                    if geometry:
+                        dims = geometry.split(':')
+                        if len(dims) == 2:
+                            fits_info['Image Dimensions'] = f"{dims[0]} x {dims[1]} pixels"
+                        elif len(dims) == 3:
+                            fits_info['Image Dimensions'] = f"{dims[0]} x {dims[1]} x {dims[2]} pixels"
+                except Exception:
+                    pass
+
+                return fits_info if fits_info else None
+
+            from astropy.io import fits
 
             # Open FITS file and read header
             with fits.open(self.file_path) as hdul:
@@ -724,83 +836,7 @@ class ImageViewerWindow(QDialog):
                 if not header:
                     return None
 
-                # Extract useful FITS header information
-                fits_info = {}
-
-                # Common FITS keywords we want to show
-                useful_keywords = {
-                    'OBJECT': 'Object Name',
-                    'TELESCOP': 'Telescope',
-                    'INSTRUME': 'Instrument',
-                    'OBSERVER': 'Observer',
-                    'DATE-OBS': 'Observation Date',
-                    'EXPTIME': 'Exposure Time (s)',
-                    'FILTER': 'Filter',
-                    'FOCALLEN': 'Focal Length (mm)',
-                    'APTDIA': 'Aperture Diameter (mm)',
-                    'APTAREA': 'Aperture Area (mm^2)',
-                    'FWHM': 'FWHM (arcsec)',
-                    'EQUINOX': 'Equinox',
-                    'RA': 'Right Ascension',
-                    'DEC': 'Declination',
-                    'OBJCTRA': 'Object RA',
-                    'OBJCTDEC': 'Object Dec',
-                    'AIRMASS': 'Airmass',
-                    'GAIN': 'Gain',
-                    'OFFSET': 'Offset',
-                    'TEMP': 'Temperature (C)',
-                    'CCD-TEMP': 'CCD Temperature (C)',
-                    'SET-TEMP': 'Set Temperature (C)',
-                    'XBINNING': 'X Binning',
-                    'YBINNING': 'Y Binning',
-                    'IMAGETYP': 'Image Type',
-                    'FRAME': 'Frame Type',
-                    'SWCREATE': 'Software Created',
-                    'SWMODIFY': 'Software Modified'
-                }
-
-                for keyword, description in useful_keywords.items():
-                    if keyword in header:
-                        value = header[keyword]
-
-                        # Format specific values
-                        if keyword in ['DATE-OBS'] and isinstance(value, str):
-                            # Try to format the date nicely
-                            try:
-                                if 'T' in value:
-                                    dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                                    value = dt.strftime('%Y-%m-%d %H:%M:%S UTC')
-                            except:
-                                pass
-                        elif keyword in ['EXPTIME'] and isinstance(value, (int, float)):
-                            if value >= 60:
-                                minutes = int(value // 60)
-                                seconds = value % 60
-                                if seconds == 0:
-                                    value = f"{value} s ({minutes}m)"
-                                else:
-                                    value = f"{value} s ({minutes}m {seconds:.1f}s)"
-                            else:
-                                value = f"{value} s"
-                        elif keyword in ['RA', 'OBJCTRA'] and isinstance(value, (int, float)):
-                            # Convert RA from degrees to hours:minutes:seconds
-                            ra_hours = value / 15.0
-                            hours = int(ra_hours)
-                            minutes = int((ra_hours - hours) * 60)
-                            seconds = ((ra_hours - hours) * 60 - minutes) * 60
-                            value = f"{value} deg ({hours:02d}h {minutes:02d}m {seconds:05.2f}s)"
-                        elif keyword in ['DEC', 'OBJCTDEC'] and isinstance(value, (int, float)):
-                            # Format declination as degrees:arcminutes:arcseconds
-                            dec_deg = abs(value)
-                            sign = '+' if value >= 0 else '-'
-                            degrees = int(dec_deg)
-                            arcmin = int((dec_deg - degrees) * 60)
-                            arcsec = ((dec_deg - degrees) * 60 - arcmin) * 60
-                            value = f"{value} deg ({sign}{degrees:02d} deg {arcmin:02d}' {arcsec:05.2f}\")"
-                        elif keyword in ['TEMP', 'CCD-TEMP', 'SET-TEMP'] and isinstance(value, (int, float)):
-                            value = f"{value} C"
-
-                        fits_info[description] = str(value)
+                fits_info = self._format_header_keywords(header)
 
                 # Add image dimensions from FITS if available
                 if 'NAXIS1' in header and 'NAXIS2' in header:
@@ -824,7 +860,7 @@ class ImageViewerWindow(QDialog):
             # Astropy not available
             return None
         except Exception as e:
-            # Any other error reading FITS
+            # Any other error reading FITS/XISF
             return None
 
     def _show_annotations_dialog(self):

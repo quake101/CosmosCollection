@@ -7,6 +7,7 @@ Displays all DSO objects with images in a responsive grid gallery format
 import sys
 import os
 import re
+import logging
 from datetime import datetime
 from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
@@ -17,15 +18,17 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QCompleter, QSlider, QProgressDialog, QPlainTextEdit,
                                QSizePolicy)
 from PySide6.QtCore import QSettings
-from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtGui import QPixmap
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS
-import numpy as np
+from ImageLoader import load_astro_pixmap
+
+logger = logging.getLogger(__name__)
 
 # Image extensions supported for DSO images throughout the gallery
-SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.fits', '.fit', '.fts'}
+SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.fits', '.fit', '.fts', '.xisf'}
 
 
 class ThumbnailCache:
@@ -142,99 +145,6 @@ class ThumbnailRunnable(QRunnable):
         except Exception:
             pass  # Silently fail if we can't save cache
 
-    def _load_fits_thumbnail(self, fits_path):
-        """Load a FITS file and convert to QPixmap thumbnail"""
-        try:
-            from astropy.io import fits
-            from astropy.visualization import simple_norm
-
-            # Open FITS file
-            with fits.open(fits_path) as hdul:
-                # Get the primary image data
-                image_data = None
-                for hdu in hdul:
-                    if hdu.data is not None and len(hdu.data.shape) >= 2:
-                        image_data = hdu.data
-                        break
-
-                if image_data is None:
-                    return None
-
-                # Handle different dimensionalities
-                is_rgb = False
-                if len(image_data.shape) > 2:
-                    # Check if this is an RGB image (3 color planes)
-                    if len(image_data.shape) == 3 and image_data.shape[2] == 3:
-                        is_rgb = True
-                    elif len(image_data.shape) == 3 and image_data.shape[0] == 3:
-                        # RGB planes in first dimension, transpose
-                        image_data = np.transpose(image_data, (1, 2, 0))
-                        is_rgb = True
-                    elif len(image_data.shape) == 3:
-                        # Take first 2D slice
-                        image_data = image_data[0]
-                    elif len(image_data.shape) == 4:
-                        image_data = image_data[0, 0]
-                    else:
-                        return None
-
-                # Normalize the data
-                image_data = np.nan_to_num(image_data, nan=0.0, posinf=0.0, neginf=0.0)
-
-                if is_rgb:
-                    # Handle RGB FITS - normalize each channel separately
-                    normalized_data = np.zeros_like(image_data)
-                    for channel in range(3):
-                        channel_data = image_data[:, :, channel]
-                        try:
-                            norm = simple_norm(channel_data, stretch='linear', percent=99.5)
-                            normalized_data[:, :, channel] = norm(channel_data)
-                        except Exception:
-                            data_min, data_max = np.percentile(channel_data, [0.5, 99.5])
-                            if data_max > data_min:
-                                normalized_data[:, :, channel] = (channel_data - data_min) / (data_max - data_min)
-                            else:
-                                normalized_data[:, :, channel] = channel_data
-
-                    # Clip and convert to 8-bit RGB
-                    normalized_data = np.clip(normalized_data, 0, 1)
-                    rgb_data = (normalized_data * 255).astype(np.uint8)
-
-                    if not rgb_data.flags['C_CONTIGUOUS']:
-                        rgb_data = np.ascontiguousarray(rgb_data)
-
-                    height, width, channels = rgb_data.shape
-                    bytes_per_line = width * channels
-                    qimage = QImage(rgb_data.data, width, height, bytes_per_line, QImage.Format_RGB888)
-                else:
-                    # Handle grayscale FITS
-                    try:
-                        norm = simple_norm(image_data, stretch='linear', percent=99.5)
-                        normalized_data = norm(image_data)
-                    except Exception:
-                        data_min, data_max = np.percentile(image_data, [0.5, 99.5])
-                        if data_max > data_min:
-                            normalized_data = (image_data - data_min) / (data_max - data_min)
-                        else:
-                            normalized_data = image_data
-                        normalized_data = np.clip(normalized_data, 0, 1)
-
-                    # Convert to 8-bit grayscale
-                    image_8bit = (normalized_data * 255).astype(np.uint8)
-
-                    if not image_8bit.flags['C_CONTIGUOUS']:
-                        image_8bit = np.ascontiguousarray(image_8bit)
-
-                    height, width = image_8bit.shape
-                    bytes_per_line = width
-                    qimage = QImage(image_8bit.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
-
-                # Convert to QPixmap
-                return QPixmap.fromImage(qimage)
-
-        except Exception as e:
-            return None
-
     def run(self):
         """Generate thumbnail for single image"""
         # Check if cancelled before starting
@@ -286,11 +196,11 @@ class ThumbnailRunnable(QRunnable):
 
                 pixmap = None
 
-                # Handle FITS files
-                if ext in ['.fits', '.fit', '.fts']:
-                    pixmap = self._load_fits_thumbnail(self.image_path)
+                # Handle FITS/XISF files
+                if ext in ['.fits', '.fit', '.fts', '.xisf']:
+                    pixmap = load_astro_pixmap(self.image_path)
                     if pixmap is None:
-                        self.signals.thumbnail_error.emit(self.card, "FITS Load Error")
+                        self.signals.thumbnail_error.emit(self.card, "Image Load Error")
                         return
                 else:
                     # Load regular image formats
@@ -486,7 +396,7 @@ class DataLoaderRunnable(QRunnable):
 
 
 def _load_preview_pixmap(image_path, max_dim=200):
-    """Load a small preview pixmap for an image path, including FITS files.
+    """Load a small preview pixmap for an image path, including FITS/XISF files.
 
     Returns None if the file can't be read/decoded (e.g. unsupported format).
     """
@@ -494,64 +404,12 @@ def _load_preview_pixmap(image_path, max_dim=200):
         return None
 
     _, ext = os.path.splitext(image_path.lower())
-    pixmap = None
 
-    if ext in ('.fits', '.fit', '.fts'):
-        try:
-            from astropy.io import fits
-            from astropy.visualization import simple_norm
+    if ext in ('.fits', '.fit', '.fts', '.xisf'):
+        return load_astro_pixmap(image_path, max_dim=max_dim)
 
-            with fits.open(image_path) as hdul:
-                image_data = None
-                for hdu in hdul:
-                    if hdu.data is not None and len(hdu.data.shape) >= 2:
-                        image_data = hdu.data
-                        break
-                if image_data is None:
-                    return None
-
-                if len(image_data.shape) == 3 and image_data.shape[0] == 3:
-                    image_data = np.transpose(image_data, (1, 2, 0))
-                elif len(image_data.shape) == 3 and image_data.shape[2] != 3:
-                    image_data = image_data[0]
-                elif len(image_data.shape) == 4:
-                    image_data = image_data[0, 0]
-
-                image_data = np.nan_to_num(image_data, nan=0.0, posinf=0.0, neginf=0.0)
-                is_rgb = len(image_data.shape) == 3 and image_data.shape[2] == 3
-
-                def _normalize(channel):
-                    try:
-                        norm = simple_norm(channel, stretch='linear', percent=99.5)
-                        return norm(channel)
-                    except Exception:
-                        lo, hi = np.percentile(channel, [0.5, 99.5])
-                        return (channel - lo) / (hi - lo) if hi > lo else channel
-
-                if is_rgb:
-                    normalized = np.zeros_like(image_data, dtype=float)
-                    for c in range(3):
-                        normalized[:, :, c] = _normalize(image_data[:, :, c])
-                    rgb = (np.clip(normalized, 0, 1) * 255).astype(np.uint8)
-                    if not rgb.flags['C_CONTIGUOUS']:
-                        rgb = np.ascontiguousarray(rgb)
-                    h, w, c = rgb.shape
-                    qimage = QImage(rgb.data, w, h, w * c, QImage.Format_RGB888)
-                else:
-                    normalized = np.clip(_normalize(image_data), 0, 1)
-                    img8 = (normalized * 255).astype(np.uint8)
-                    if not img8.flags['C_CONTIGUOUS']:
-                        img8 = np.ascontiguousarray(img8)
-                    h, w = img8.shape
-                    qimage = QImage(img8.data, w, h, w, QImage.Format_Grayscale8)
-
-                pixmap = QPixmap.fromImage(qimage.copy())
-        except Exception:
-            return None
-    else:
-        pixmap = QPixmap(image_path)
-
-    if pixmap is None or pixmap.isNull():
+    pixmap = QPixmap(image_path)
+    if pixmap.isNull():
         return None
 
     return pixmap.scaled(max_dim, max_dim, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -568,6 +426,12 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self.selected_file = None
         self.dso_data = []  # List of (dsodetailid, name) tuples, index-aligned with dso_combo
         self._dso_auto_selected = False
+        self._capture_header = None  # FITS/XISF header dict for the selected file, or None
+        self._telescope_auto_filled = False
+        self._camera_auto_filled = False
+        self._date_auto_filled = False
+        self._integration_auto_filled = False
+        self._matching_sessions = []  # Session Manager sessions found for the current DSO
 
         self.setAcceptDrops(True)
         self._init_ui()
@@ -657,6 +521,19 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self.detected_label.setMaximumWidth(260)
         self.detected_label.hide()
         right_col.addWidget(self.detected_label)
+
+        # Offers to import telescope/camera/date/integration time from an
+        # existing Session Manager session for the same DSO, when the file's
+        # own metadata didn't supply them (e.g. a PixelMath-composited XISF
+        # result, which carries no acquisition metadata at all). Never
+        # auto-applied - always an explicit click, matching this app's
+        # existing "always confirm, never silently auto-attach" convention
+        # for cross-feature data reuse (see SessionManager.DropMatchDialog).
+        self.session_import_btn = QPushButton("Import from Session...")
+        self.session_import_btn.setMaximumWidth(260)
+        self.session_import_btn.clicked.connect(self._show_session_import_menu)
+        self.session_import_btn.hide()
+        right_col.addWidget(self.session_import_btn)
         right_col.addStretch()
 
         top_row.addLayout(right_col)
@@ -819,23 +696,46 @@ class AddImageDialog(WindowPositionMixin, QDialog):
             self,
             "Select Image File",
             os.path.expanduser("~"),
-            "Image Files (*.png *.jpg *.jpeg *.tif *.tiff *.fits *.fit *.fts);;"
+            "Image Files (*.png *.jpg *.jpeg *.tif *.tiff *.fits *.fit *.fts *.xisf);;"
             "PNG Files (*.png);;"
             "JPEG Files (*.jpg *.jpeg);;"
             "TIFF Files (*.tif *.tiff);;"
             "FITS Files (*.fits *.fit *.fts);;"
+            "XISF Files (*.xisf);;"
             "All Files (*.*)"
         )
         if file_name:
             self.set_file_path(file_name)
 
     def set_file_path(self, path):
-        """Set the selected file path, refresh the preview and try to auto-detect the DSO"""
+        """Set the selected file path, refresh the preview and try to auto-detect
+        the DSO and capture info (telescope/camera/date) from the file's metadata"""
         self.selected_file = path
         self.file_path_edit.setText(path)
         self._clear_error(self.file_path_edit)
+        self._capture_header = self._read_capture_header()
         self._update_preview()
         self._try_auto_detect_dso()
+        self._try_auto_detect_capture_info()
+        self._check_for_matching_sessions()
+
+    def _read_capture_header(self):
+        """Read FITS/XISF header keywords (OBJECT, TELESCOP, INSTRUME, DATE-OBS,
+        ...) from the selected file, if it's one of those formats. Returns None
+        for other formats, or if the header can't be read."""
+        if not self.selected_file:
+            return None
+        ext = os.path.splitext(self.selected_file)[1].lower()
+        try:
+            if ext in ('.fits', '.fit', '.fts'):
+                from SessionFileScanner import extract_fits_header
+                return extract_fits_header(self.selected_file)
+            elif ext == '.xisf':
+                from SessionFileScanner import extract_xisf_header
+                return extract_xisf_header(self.selected_file)
+        except Exception as e:
+            logger.debug(f"Could not read capture header from {self.selected_file}: {e}")
+        return None
 
     def _update_preview(self):
         """(Re)load the preview source for the selected file and render it at the
@@ -865,15 +765,16 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         super().resizeEvent(event)
         self._render_preview()
 
-    def _guess_dso_index_from_filename(self, file_path):
-        """Look for a DSO catalogue designation (e.g. 'M31', 'NGC 7000') embedded in the filename"""
+    def _match_dso_index(self, text):
+        """Look for a DSO catalogue designation (e.g. 'M31', 'NGC 7000') embedded
+        in an arbitrary piece of text - a filename, or a FITS/XISF header's
+        OBJECT value."""
         # Keep hyphens (but drop other punctuation/whitespace) so distinct
         # designations that only differ by a hyphen - e.g. Messier "M 16"
         # vs. Minkowski "M 1-6" - don't collapse into the same "M16" string
         # and get confused for one another.
-        basename = os.path.splitext(os.path.basename(file_path))[0]
-        base_norm = re.sub(r'[^A-Z0-9-]', '', basename.upper())
-        if not base_norm:
+        text_norm = re.sub(r'[^A-Z0-9-]', '', text.upper())
+        if not text_norm:
             return None
 
         best_index = None
@@ -881,22 +782,38 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         for index, (dsodetailid, name) in enumerate(self.dso_data):
             for designation in name.split(','):
                 d_norm = re.sub(r'[^A-Z0-9-]', '', designation.upper())
-                if len(d_norm) >= 2 and len(d_norm) > best_len and d_norm in base_norm:
+                if len(d_norm) >= 2 and len(d_norm) > best_len and d_norm in text_norm:
                     best_index = index
                     best_len = len(d_norm)
         return best_index
 
+    def _guess_dso_index_from_filename(self, file_path):
+        basename = os.path.splitext(os.path.basename(file_path))[0]
+        return self._match_dso_index(basename)
+
     def _try_auto_detect_dso(self):
-        """Auto-select the DSO combo if the filename clearly names one, without
-        overriding a selection the user made themselves"""
+        """Auto-select the DSO combo, preferring the OBJECT name from the file's
+        FITS/XISF header over a filename guess, without overriding a selection
+        the user made themselves"""
         if not self.selected_file or (self.dso_combo.currentIndex() >= 0 and not self._dso_auto_selected):
             return
 
-        index = self._guess_dso_index_from_filename(self.selected_file)
+        source = None
+        index = None
+        object_name = self._capture_header.get('OBJECT') if self._capture_header else None
+        if object_name:
+            index = self._match_dso_index(str(object_name))
+            if index is not None:
+                source = "image metadata"
+        if index is None:
+            index = self._guess_dso_index_from_filename(self.selected_file)
+            if index is not None:
+                source = "filename"
+
         if index is not None:
             self.dso_combo.setCurrentIndex(index)
             self._dso_auto_selected = True
-            self.detected_label.setText("Auto-detected from filename — please verify this is correct.")
+            self.detected_label.setText(f"Auto-detected from {source} — please verify this is correct.")
             self.detected_label.show()
         elif self._dso_auto_selected:
             self.dso_combo.setCurrentIndex(-1)
@@ -904,11 +821,165 @@ class AddImageDialog(WindowPositionMixin, QDialog):
             self._dso_auto_selected = False
             self.detected_label.hide()
 
+    def _try_auto_detect_capture_info(self):
+        """Fill telescope/camera/date from the file's FITS/XISF header, each
+        only if that field is still empty - mirrors _try_auto_detect_dso's
+        auto-vs-manual tracking so switching to a different dropped file
+        replaces a previous auto-fill but never clobbers a manual edit."""
+        header = self._capture_header or {}
+
+        telescope = header.get('TELESCOP')
+        if telescope and (self._telescope_auto_filled or not self.telescope_combo.currentText().strip()):
+            self.telescope_combo.setCurrentText(str(telescope).strip())
+            self._telescope_auto_filled = True
+        elif not telescope and self._telescope_auto_filled:
+            self.telescope_combo.setCurrentText("")
+            self._telescope_auto_filled = False
+
+        camera = header.get('INSTRUME')
+        if camera and (self._camera_auto_filled or not self.camera_combo.currentText().strip()):
+            self.camera_combo.setCurrentText(str(camera).strip())
+            self._camera_auto_filled = True
+        elif not camera and self._camera_auto_filled:
+            self.camera_combo.setCurrentText("")
+            self._camera_auto_filled = False
+
+        date_str = self._format_date_obs(header.get('DATE-OBS'))
+        if date_str and (self._date_auto_filled or not self.date_edit.text().strip()):
+            self.date_edit.setText(date_str)
+            self._date_auto_filled = True
+        elif not date_str and self._date_auto_filled:
+            self.date_edit.setText("")
+            self._date_auto_filled = False
+
+    @staticmethod
+    def _format_date_obs(date_obs):
+        """Reformat a FITS/XISF DATE-OBS value (e.g. '2024-01-15T22:30:00.000')
+        to just the date portion, matching this dialog's date_edit convention."""
+        if not date_obs:
+            return None
+        return str(date_obs).strip()[:10] or None
+
+    def _find_matching_sessions(self, dso_index):
+        """Find Session Manager sessions for the DSO at dso_data[dso_index],
+        matching by normalized designation (the same normalization
+        _match_dso_index uses) since a session's dso_name is free text a user
+        typed when logging it, not a catalog ID. Only returns sessions that
+        have at least one importable field (telescope/camera/integration
+        time) - a bare 'Planned' session with nothing filled in yet isn't
+        worth suggesting."""
+        if dso_index is None or dso_index < 0 or dso_index >= len(self.dso_data):
+            return []
+
+        _, designations_str = self.dso_data[dso_index]
+        designations_norm = {
+            re.sub(r'[^A-Z0-9-]', '', d.upper()) for d in designations_str.split(',')
+        }
+
+        matches = []
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT s.id, s.dso_name, s.session_date, tel.name as telescope_name,
+                           s.camera, s.integration_seconds, s.status
+                    FROM usersessions s
+                    LEFT JOIN usertelescopes tel ON s.telescope_id = tel.id
+                    ORDER BY s.session_date DESC, s.id DESC
+                """)
+                for session_id, dso_name, session_date, telescope_name, camera, integration_seconds, status in cursor.fetchall():
+                    if not dso_name:
+                        continue
+                    name_norm = re.sub(r'[^A-Z0-9-]', '', dso_name.upper())
+                    if name_norm not in designations_norm:
+                        continue
+                    if not (telescope_name or camera or integration_seconds):
+                        continue
+                    matches.append({
+                        "id": session_id, "dso_name": dso_name, "session_date": session_date,
+                        "telescope_name": telescope_name, "camera": camera,
+                        "integration_seconds": integration_seconds, "status": status,
+                    })
+        except Exception as e:
+            logger.debug(f"Error finding matching sessions: {e}")
+
+        return matches
+
+    def _check_for_matching_sessions(self):
+        """Show/hide the 'Import from Session...' button depending on whether
+        the currently-selected DSO has any matching sessions with data to offer."""
+        self._matching_sessions = self._find_matching_sessions(self.dso_combo.currentIndex())
+        if self._matching_sessions:
+            count = len(self._matching_sessions)
+            self.session_import_btn.setText(
+                "Import from Session..." if count == 1 else f"Import from Session... ({count} found)")
+            self.session_import_btn.show()
+        else:
+            self.session_import_btn.hide()
+
+    def _show_session_import_menu(self):
+        """Let the user pick which matching session to import equipment/date/
+        integration time from, when there's more than one - never guesses."""
+        if not self._matching_sessions:
+            return
+
+        menu = QMenu(self)
+        for session in self._matching_sessions:
+            hours = (session["integration_seconds"] or 0) / 3600.0
+            parts = [session["session_date"] or "Unknown date"]
+            if session["telescope_name"]:
+                parts.append(session["telescope_name"])
+            if session["camera"]:
+                parts.append(session["camera"])
+            if hours > 0:
+                parts.append(f"{hours:.1f}h")
+            parts.append(f"({session['status']})")
+            action = menu.addAction(" — ".join(parts))
+            action.triggered.connect(lambda checked=False, s=session: self._import_session_data(s))
+
+        menu.exec(self.session_import_btn.mapToGlobal(
+            self.session_import_btn.rect().bottomLeft()))
+
+    def _import_session_data(self, session):
+        """Apply a chosen session's telescope/camera/date/integration time.
+        An explicit user click (via the menu above), so unlike the passive
+        metadata auto-fill this always overwrites the fields - the user just
+        told us which session's data they want."""
+        if session["telescope_name"]:
+            self.telescope_combo.setCurrentText(session["telescope_name"])
+            self._telescope_auto_filled = True
+        if session["camera"]:
+            self.camera_combo.setCurrentText(session["camera"])
+            self._camera_auto_filled = True
+        if session["session_date"]:
+            self.date_edit.setText(str(session["session_date"])[:10])
+            self._date_auto_filled = True
+        if session["integration_seconds"]:
+            self.integration_edit.setText(self._format_integration_seconds(session["integration_seconds"]))
+            self._integration_auto_filled = True
+
+        self._clear_error(self.telescope_combo)
+        self._clear_error(self.camera_combo)
+
+    @staticmethod
+    def _format_integration_seconds(seconds):
+        """Format a session's total integration_seconds as 'Xh Ym', matching
+        this dialog's integration_edit placeholder convention (e.g. '2h 30m')."""
+        total_minutes = round(seconds / 60.0)
+        hours, minutes = divmod(total_minutes, 60)
+        if hours and minutes:
+            return f"{hours}h {minutes}m"
+        elif hours:
+            return f"{hours}h"
+        return f"{minutes}m"
+
     def _on_dso_manually_changed(self, index):
         """User picked a DSO themselves; stop treating the selection as a guess"""
         self._dso_auto_selected = False
         self.detected_label.hide()
         self._clear_error(self.dso_combo)
+        self._check_for_matching_sessions()
 
     def _fill_today_date(self):
         """Fill the date field with today's date"""
@@ -1789,87 +1860,13 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
             # Check if image loaded successfully
             if pixmap.isNull():
-                # Try FITS format if standard loading failed
+                # Try FITS/XISF format if standard loading failed
                 _, ext = os.path.splitext(image_path.lower())
-                if ext in ['.fits', '.fit', '.fts']:
-                    # Use FITS loader
-                    from astropy.io import fits
-                    from astropy.visualization import simple_norm
-
-                    try:
-                        with fits.open(image_path) as hdul:
-                            image_data = None
-                            for hdu in hdul:
-                                if hdu.data is not None and len(hdu.data.shape) >= 2:
-                                    image_data = hdu.data
-                                    break
-
-                            if image_data is None:
-                                raise ValueError("No valid image data in FITS file")
-
-                            # Handle different dimensionalities
-                            is_rgb = False
-                            if len(image_data.shape) > 2:
-                                if len(image_data.shape) == 3 and image_data.shape[2] == 3:
-                                    is_rgb = True
-                                elif len(image_data.shape) == 3 and image_data.shape[0] == 3:
-                                    image_data = np.transpose(image_data, (1, 2, 0))
-                                    is_rgb = True
-                                elif len(image_data.shape) == 3:
-                                    image_data = image_data[0]
-                                elif len(image_data.shape) == 4:
-                                    image_data = image_data[0, 0]
-
-                            # Normalize
-                            image_data = np.nan_to_num(image_data, nan=0.0, posinf=0.0, neginf=0.0)
-
-                            if is_rgb:
-                                # RGB FITS - normalize each channel
-                                normalized_data = np.zeros_like(image_data)
-                                for channel in range(3):
-                                    channel_data = image_data[:, :, channel]
-                                    try:
-                                        norm = simple_norm(channel_data, stretch='linear', percent=99.5)
-                                        normalized_data[:, :, channel] = norm(channel_data)
-                                    except Exception:
-                                        data_min, data_max = np.percentile(channel_data, [0.5, 99.5])
-                                        if data_max > data_min:
-                                            normalized_data[:, :, channel] = (channel_data - data_min) / (data_max - data_min)
-                                        else:
-                                            normalized_data[:, :, channel] = channel_data
-
-                                normalized_data = np.clip(normalized_data, 0, 1)
-                                rgb_data = (normalized_data * 255).astype(np.uint8)
-                                if not rgb_data.flags['C_CONTIGUOUS']:
-                                    rgb_data = np.ascontiguousarray(rgb_data)
-
-                                height, width, channels = rgb_data.shape
-                                bytes_per_line = width * channels
-                                qimage = QImage(rgb_data.data, width, height, bytes_per_line, QImage.Format_RGB888)
-                            else:
-                                # Grayscale FITS
-                                try:
-                                    norm = simple_norm(image_data, stretch='linear', percent=99.5)
-                                    normalized_data = norm(image_data)
-                                except Exception:
-                                    data_min, data_max = np.percentile(image_data, [0.5, 99.5])
-                                    if data_max > data_min:
-                                        normalized_data = (image_data - data_min) / (data_max - data_min)
-                                    else:
-                                        normalized_data = image_data
-                                    normalized_data = np.clip(normalized_data, 0, 1)
-
-                                image_8bit = (normalized_data * 255).astype(np.uint8)
-                                if not image_8bit.flags['C_CONTIGUOUS']:
-                                    image_8bit = np.ascontiguousarray(image_8bit)
-
-                                height, width = image_8bit.shape
-                                qimage = QImage(image_8bit.data, width, height, width, QImage.Format_Grayscale8)
-
-                            pixmap = QPixmap.fromImage(qimage)
-                    except Exception as fits_error:
+                if ext in ['.fits', '.fit', '.fts', '.xisf']:
+                    pixmap = load_astro_pixmap(image_path)
+                    if pixmap is None:
                         QMessageBox.critical(self, "Error",
-                                           f"Failed to load FITS image:\n{str(fits_error)}")
+                                           f"Failed to load image:\n{image_path}")
                         return
                 else:
                     QMessageBox.critical(self, "Error",

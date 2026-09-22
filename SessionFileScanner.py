@@ -78,10 +78,13 @@ def extract_fits_header(file_path):
         return {kw: header[kw] for kw in FITS_KEYWORDS if kw in header}
 
 
-def extract_xisf_header(file_path):
-    """Read only the XML header block of an XISF file (never the pixel data) and
-    return the same shape as extract_fits_header() by mapping FITSKeyword/Property
-    elements onto the equivalent FITS keywords."""
+def read_xisf_xml(file_path):
+    """Read the signature + header-length-prefixed XML header block of an XISF
+    file (never the pixel data) and return (root, image_el, ns) - the parsed XML
+    root, its <Image> element (or None), and the namespace map to use for further
+    xisf: lookups on either. Shared by extract_xisf_header() below and
+    XISFReader.read_xisf_pixels(), which needs the same <Image> element's
+    geometry/sampleFormat/location/compression attributes."""
     with open(file_path, 'rb') as f:
         signature = f.read(8)
         if signature != XISF_SIGNATURE:
@@ -96,6 +99,15 @@ def extract_xisf_header(file_path):
     image_el = root.find('xisf:Image', ns)
     if image_el is None:
         image_el = root.find('Image')
+
+    return root, image_el, ns
+
+
+def extract_xisf_header(file_path):
+    """Read only the XML header block of an XISF file (never the pixel data) and
+    return the same shape as extract_fits_header() by mapping FITSKeyword/Property
+    elements onto the equivalent FITS keywords."""
+    root, image_el, ns = read_xisf_xml(file_path)
 
     result = {}
 
