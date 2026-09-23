@@ -4,6 +4,7 @@ ImageViewer module for Cosmos Collection
 Provides the ImageViewerWindow class for displaying images with zoom, pan, and annotation support.
 """
 
+import json
 import logging
 import platform
 import ctypes
@@ -12,8 +13,8 @@ import os
 from pathlib import Path
 from datetime import datetime
 
-from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QSettings
-from PySide6.QtGui import QPixmap, QPainter
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QSettings, QThread, QRectF
+from PySide6.QtGui import QPixmap, QPainter, QImage
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
     QGroupBox, QScrollArea, QFileDialog, QMessageBox, QCheckBox, QProgressBar
@@ -28,12 +29,90 @@ from TimeFormatHelper import format_datetime
 logger = logging.getLogger(__name__)
 
 
+# Image load workers that outlived their viewer window. A QThread that's
+# destroyed while still running crashes the app, so keep a reference until
+# the load finishes instead of blocking the window close on it.
+_orphaned_workers = set()
+
+
+class ImageLoadWorker(QThread):
+    """Decodes an image file (including FITS/XISF) into a QImage off the GUI thread"""
+    image_loaded = Signal(object)  # QImage
+    load_failed = Signal(str)  # error message
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self):
+        try:
+            from ImageLoader import load_image_qimage
+            qimage, error = load_image_qimage(self.file_path)
+            if qimage is not None:
+                self.image_loaded.emit(qimage)
+            else:
+                self.load_failed.emit(error)
+        except Exception as e:
+            logger.error(f"Failed to load image {self.file_path}: {e}", exc_info=True)
+            self.load_failed.emit(str(e))
+
+
+class ImageSaveWorker(QThread):
+    """Encodes and writes a QImage to disk off the GUI thread (PNG compression
+    of a large image takes seconds)"""
+    image_saved = Signal(bool, str)  # success, save path
+
+    def __init__(self, image, save_path, image_format, quality=-1):
+        super().__init__()
+        self.image = image
+        self.save_path = save_path
+        self.image_format = image_format
+        self.quality = quality
+
+    def run(self):
+        try:
+            ok = self.image.save(self.save_path, self.image_format, self.quality)
+        except Exception as e:
+            logger.error(f"Failed to save image to {self.save_path}: {e}", exc_info=True)
+            ok = False
+        self.image_saved.emit(ok, self.save_path)
+
+
+class BackgroundSetterWorker(QThread):
+    """Converts a FITS/XISF render to PNG (if needed) and sets it as the desktop
+    background off the GUI thread"""
+    background_set = Signal(str, str)  # level ('success'/'warning'/'error'), message
+
+    def __init__(self, file_path, image=None):
+        super().__init__()
+        self.file_path = file_path
+        self.image = image  # QImage to convert to PNG first, or None to use file_path directly
+
+    def run(self):
+        try:
+            if self.image is not None:
+                abs_path = ImageViewerWindow._export_background_png(self.image, self.file_path)
+                if not abs_path:
+                    self.background_set.emit("error", "Failed to convert image to PNG for desktop background")
+                    return
+            else:
+                abs_path = str(Path(self.file_path).resolve())
+
+            level, message = ImageViewerWindow._apply_desktop_background(abs_path)
+            self.background_set.emit(level, message)
+        except Exception as e:
+            logger.error(f"Failed to set desktop background: {e}", exc_info=True)
+            self.background_set.emit("error", f"Failed to set desktop background: {str(e)}")
+
+
 class ImageViewerWindow(QDialog):
     """Window to display an image in full size with enhanced controls"""
     zoom_changed = Signal(float)  # Signal for zoom level changes
 
     def __init__(self, pixmap: QPixmap, title: str, file_path: str = None, parent=None,
                  dso_ra: float = None, dso_dec: float = None):
+        """pixmap may be None when file_path is given - the window then opens
+        straight away and loads the image in a background thread."""
         super().__init__(parent)
         self.setWindowTitle(f"{title} - Image Viewer - Cosmos Collection")
         self.setWindowFlags(
@@ -51,6 +130,8 @@ class ImageViewerWindow(QDialog):
         self.image_position = [0, 0]
         self.last_mouse_pos = None
         self.is_panning = False
+        self._scaled_cache = None  # (zoom_factor, downscaled pixmap) for zoom < 100%
+        self.image_load_worker = None
 
         # Store DSO coordinates for plate solving hints
         self.dso_ra = dso_ra  # RA in degrees
@@ -89,11 +170,11 @@ class ImageViewerWindow(QDialog):
             open_location_button.clicked.connect(self._open_file_location)
             toolbar.addWidget(open_location_button)
 
-            set_bg_button = QPushButton("Set as Background")
-            set_bg_button.setFixedHeight(30)
-            set_bg_button.setToolTip("Set this image as your desktop background")
-            set_bg_button.clicked.connect(self._set_as_background)
-            toolbar.addWidget(set_bg_button)
+            self.set_bg_button = QPushButton("Set as Background")
+            self.set_bg_button.setFixedHeight(30)
+            self.set_bg_button.setToolTip("Set this image as your desktop background")
+            self.set_bg_button.clicked.connect(self._set_as_background)
+            toolbar.addWidget(self.set_bg_button)
 
             self.annotations_button = QPushButton("Show Annotations")
             self.annotations_button.setFixedHeight(30)
@@ -127,6 +208,8 @@ class ImageViewerWindow(QDialog):
         self.annotations_enabled = settings.value("annotation_enabled", False, type=bool)
         self.plate_solve_result = None
         self.plate_solve_worker = None
+        self.background_worker = None
+        self.save_worker = None
 
         main_layout.addLayout(toolbar)
 
@@ -140,7 +223,11 @@ class ImageViewerWindow(QDialog):
 
         # Create image label
         self.image_label = QLabel()
-        self.image_label.setPixmap(pixmap)
+        if pixmap is not None:
+            self.image_label.setPixmap(pixmap)
+        else:
+            self.image_label.setText(f"Loading {Path(file_path).name}..." if file_path else "No image")
+            self.image_label.setStyleSheet("color: #aaaaaa; font-size: 12pt;")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMouseTracking(True)
         self.image_label.installEventFilter(self)
@@ -249,8 +336,52 @@ class ImageViewerWindow(QDialog):
         # Flag to track if initial fit has been done
         self.initial_fit_done = False
 
+        # No pixmap given - load the file in the background so the UI stays responsive
+        if self.original_pixmap is None and self.file_path:
+            self._start_image_load()
+
         # Update status
         self._update_status()
+
+    def _image_buttons(self):
+        """Toolbar buttons that need the image to be loaded"""
+        return [getattr(self, name) for name in
+                ('set_bg_button', 'annotations_button', 'save_annotated_button')
+                if hasattr(self, name)]
+
+    def _start_image_load(self):
+        """Load self.file_path in a worker thread"""
+        for button in self._image_buttons():
+            button.setEnabled(False)
+
+        self.image_load_worker = ImageLoadWorker(self.file_path)
+        self.image_load_worker.image_loaded.connect(self._on_image_loaded)
+        self.image_load_worker.load_failed.connect(self._on_image_load_failed)
+        self.image_load_worker.start()
+
+    def _on_image_loaded(self, qimage):
+        """Show the image once the worker has decoded it"""
+        # QPixmap must be created on the GUI thread
+        pixmap = QPixmap.fromImage(qimage)
+        if pixmap.isNull():
+            self._on_image_load_failed("Failed to convert image")
+            return
+
+        self.original_pixmap = pixmap
+        self._scaled_cache = None
+        self.image_label.setStyleSheet("")
+        self.image_label.setText("")
+        for button in self._image_buttons():
+            button.setEnabled(True)
+
+        if self.isVisible():
+            self._do_initial_fit()
+        # Otherwise showEvent does the initial fit
+
+    def _on_image_load_failed(self, error_message):
+        """Show why the image couldn't be loaded"""
+        logger.error(f"Image viewer failed to load {self.file_path}: {error_message}")
+        self.image_label.setText(f"Failed to load image:\n{Path(self.file_path).name}\n\n{error_message}")
 
     def showEvent(self, event):
         """Handle window show event - fit image to window on first show"""
@@ -261,6 +392,10 @@ class ImageViewerWindow(QDialog):
 
     def _do_initial_fit(self):
         """Perform initial fit to window and set up initial zoom factor"""
+        # Still loading - _on_image_loaded calls this again when the image arrives
+        if self.original_pixmap is None:
+            return
+
         if not self.initial_fit_done:
             self._fit_to_window()
             self.initial_zoom_factor = self.zoom_factor
@@ -311,17 +446,12 @@ class ImageViewerWindow(QDialog):
         if self.original_pixmap is None:
             return
 
-        # Calculate new size
-        new_width = int(self.original_pixmap.width() * self.zoom_factor)
-        new_height = int(self.original_pixmap.height() * self.zoom_factor)
+        img_w = self.original_pixmap.width()
+        img_h = self.original_pixmap.height()
 
-        # Scale the image
-        scaled_pixmap = self.original_pixmap.scaled(
-            new_width,
-            new_height,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        )
+        # Size of the whole image at the current zoom
+        new_width = int(img_w * self.zoom_factor)
+        new_height = int(img_h * self.zoom_factor)
 
         # Create a new pixmap with the same size as the label
         label_size = self.image_label.size()
@@ -332,11 +462,43 @@ class ImageViewerWindow(QDialog):
         painter = QPainter(final_pixmap)
 
         # Calculate the position to draw the image
-        x = (label_size.width() - scaled_pixmap.width()) // 2 + self.image_position[0]
-        y = (label_size.height() - scaled_pixmap.height()) // 2 + self.image_position[1]
+        x = (label_size.width() - new_width) // 2 + self.image_position[0]
+        y = (label_size.height() - new_height) // 2 + self.image_position[1]
 
-        # Draw the image
-        painter.drawPixmap(x, y, scaled_pixmap)
+        # Draw only the part of the image that's visible in the label, rather
+        # than scaling the whole image on every pan/zoom (at high zoom on a large
+        # image that meant building a pixmap of a gigabyte or more each time).
+        # Zoomed out, use a downscaled copy cached per zoom level - Qt's smooth
+        # scaling averages pixels properly when shrinking, whereas the painter's
+        # bilinear filtering would alias. Zoomed in, sample the original directly.
+        if new_width < 1 or new_height < 1:
+            source_pixmap = None  # Window not sized yet - nothing to draw
+        elif self.zoom_factor < 1.0:
+            if self._scaled_cache is None or self._scaled_cache[0] != self.zoom_factor:
+                self._scaled_cache = (self.zoom_factor, self.original_pixmap.scaled(
+                    new_width, new_height, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            source_pixmap = self._scaled_cache[1]
+        else:
+            self._scaled_cache = None
+            source_pixmap = self.original_pixmap
+
+        # Visible region in image coordinates, clamped to the image bounds
+        if source_pixmap is not None:
+            left = max(0.0, -x / self.zoom_factor)
+            top = max(0.0, -y / self.zoom_factor)
+            right = min(float(img_w), (label_size.width() - x) / self.zoom_factor)
+            bottom = min(float(img_h), (label_size.height() - y) / self.zoom_factor)
+
+        if source_pixmap is not None and right > left and bottom > top:
+            target = QRectF(x + left * self.zoom_factor, y + top * self.zoom_factor,
+                            (right - left) * self.zoom_factor, (bottom - top) * self.zoom_factor)
+            # Source pixmap may be the downscaled copy - map image coords onto it
+            sx = source_pixmap.width() / img_w
+            sy = source_pixmap.height() / img_h
+            source = QRectF(left * sx, top * sy, (right - left) * sx, (bottom - top) * sy)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.drawPixmap(target, source_pixmap, source)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
 
         # Draw annotations if enabled
         if self.annotations_enabled and self.annotation_renderer:
@@ -405,22 +567,32 @@ class ImageViewerWindow(QDialog):
 
     def _zoom_in(self):
         """Zoom in on the image"""
+        if self.original_pixmap is None:
+            return
         self.zoom_factor = min(self.zoom_factor * 1.2, 8.0)
         self._update_zoom()
 
     def _zoom_out(self):
         """Zoom out on the image"""
+        if self.original_pixmap is None:
+            return
         self.zoom_factor = max(self.zoom_factor / 1.2, 0.1)
         self._update_zoom()
 
     def _reset_zoom(self):
         """Reset zoom to 100%"""
+        if self.original_pixmap is None:
+            return
         self.zoom_factor = 1.0
         self.image_position = [0, 0]
         self._update_zoom()
 
     def _update_status(self, annotation_status=None):
         """Update the status bar with current zoom level and image size"""
+        if self.original_pixmap is None:
+            self.status_bar.setText("Loading image...")
+            return
+
         zoom_percent = int(self.zoom_factor * 100)
         image_size = f"{self.original_pixmap.width()}x{self.original_pixmap.height()}"
         base_status = f"Zoom: {zoom_percent}% | Image Size: {image_size} pixels"
@@ -440,71 +612,184 @@ class ImageViewerWindow(QDialog):
                 QMessageBox.critical(self, "Error", "Failed to open file location")
 
     def _set_as_background(self):
-        """Set the current image as the desktop background"""
+        """Set the current image as the desktop background. The PNG conversion and
+        OS call run in a worker thread so the window doesn't hang on large images."""
         if not self.file_path:
             QMessageBox.warning(self, "Warning", "No file path available")
             return
 
-        try:
-            # Check if file is a FITS/XISF file
-            file_ext = Path(self.file_path).suffix.lower()
-            if file_ext in ['.fits', '.fit', '.fts', '.xisf']:
-                QMessageBox.warning(self, "Unsupported Format",
-                                  "FITS/XISF files cannot be set as desktop background.\n"
-                                  "Please export to a standard image format (PNG, JPG, etc.) first.")
+        if self.background_worker and self.background_worker.isRunning():
+            return
+
+        # FITS/XISF can't be used as a wallpaper directly - convert the stretched
+        # render already shown in the viewer to PNG. QPixmap isn't safe to use off
+        # the GUI thread, so hand the worker a QImage copy.
+        image = None
+        if Path(self.file_path).suffix.lower() in ['.fits', '.fit', '.fts', '.xisf']:
+            if self.original_pixmap is None or self.original_pixmap.isNull():
+                QMessageBox.critical(self, "Error", "No image available to convert for desktop background")
                 return
+            image = self.original_pixmap.toImage()
 
-            # Ensure the file path is absolute
-            abs_path = str(Path(self.file_path).resolve())
+        self.set_bg_button.setEnabled(False)
+        self.setCursor(Qt.BusyCursor)
+        self._update_status("Converting image to PNG..." if image is not None
+                            else "Setting desktop background...")
 
-            if platform.system() == "Windows":
-                # Windows implementation using ctypes
-                SPI_SETDESKWALLPAPER = 20
-                SPIF_UPDATEINIFILE = 0x01
-                SPIF_SENDCHANGE = 0x02
+        self.background_worker = BackgroundSetterWorker(self.file_path, image)
+        self.background_worker.background_set.connect(self._on_background_set)
+        self.background_worker.start()
 
-                # Call SystemParametersInfoW to set the wallpaper
-                result = ctypes.windll.user32.SystemParametersInfoW(
-                    SPI_SETDESKWALLPAPER,
-                    0,
-                    abs_path,
-                    SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
-                )
+    def _on_background_set(self, level, message):
+        """Show the result of the background worker"""
+        self.set_bg_button.setEnabled(True)
+        self.unsetCursor()
+        self._update_status()
 
-                if result:
-                    QMessageBox.information(self, "Success", "Desktop background updated successfully!")
-                else:
-                    QMessageBox.critical(self, "Error", "Failed to set desktop background")
+        if level == "success":
+            QMessageBox.information(self, "Success", message)
+        elif level == "warning":
+            QMessageBox.warning(self, "Warning", message)
+        else:
+            QMessageBox.critical(self, "Error", message)
 
-            elif platform.system() == "Darwin":
-                # macOS implementation
-                script = f'''
-                tell application "Finder"
-                    set desktop picture to POSIX file "{abs_path}"
-                end tell
-                '''
-                subprocess.run(["osascript", "-e", script], check=True)
-                QMessageBox.information(self, "Success", "Desktop background updated successfully!")
+    @staticmethod
+    def _apply_desktop_background(abs_path):
+        """Set abs_path as the desktop wallpaper. Safe to call from a worker thread.
+        Returns (level, message) where level is 'success', 'warning' or 'error'."""
+        success = ("success", "Desktop background updated successfully!")
 
-            elif platform.system() == "Linux":
-                # Linux implementation (works with GNOME)
+        if platform.system() == "Windows":
+            # Windows implementation using ctypes
+            SPI_SETDESKWALLPAPER = 20
+            SPIF_UPDATEINIFILE = 0x01
+            SPIF_SENDCHANGE = 0x02
+
+            # Call SystemParametersInfoW to set the wallpaper
+            result = ctypes.windll.user32.SystemParametersInfoW(
+                SPI_SETDESKWALLPAPER,
+                0,
+                abs_path,
+                SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
+            )
+            return success if result else ("error", "Failed to set desktop background")
+
+        if platform.system() == "Darwin":
+            # macOS implementation
+            script = f'''
+            tell application "Finder"
+                set desktop picture to POSIX file "{abs_path}"
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", script], check=True)
+            return success
+
+        if platform.system() == "Linux":
+            desktop = ImageViewerWindow._linux_desktop_name()
+            if ImageViewerWindow._set_linux_background(abs_path, desktop):
+                return success
+            return ("warning",
+                    f"Could not set background on this desktop environment "
+                    f"({desktop or 'unknown'}).\n"
+                    f"Supported: KDE Plasma, GNOME, Cinnamon, MATE, XFCE.")
+
+        return ("warning", f"Setting desktop background is not supported on {platform.system()}")
+
+    @staticmethod
+    def _linux_desktop_name():
+        """Return the current desktop environment in lowercase, e.g. 'kde:plasma'
+        or 'ubuntu:gnome' (XDG_CURRENT_DESKTOP can hold several names separated by ':')"""
+        return (os.environ.get('XDG_CURRENT_DESKTOP')
+                or os.environ.get('DESKTOP_SESSION')
+                or '').lower()
+
+    @staticmethod
+    def _set_linux_background(abs_path, desktop):
+        """Set the wallpaper using the right tool for the Linux desktop environment.
+        Returns True on success, False if the desktop isn't supported or the command failed."""
+        uri = Path(abs_path).as_uri()
+
+        def run(*args):
+            subprocess.run(list(args), check=True, capture_output=True, timeout=15)
+
+        try:
+            if 'kde' in desktop or 'plasma' in desktop:
+                # Plasma 5.24+ ships a CLI tool for this
                 try:
-                    # Try GNOME
-                    subprocess.run([
-                        "gsettings", "set", "org.gnome.desktop.background",
-                        "picture-uri", f"file://{abs_path}"
-                    ], check=True)
-                    QMessageBox.information(self, "Success", "Desktop background updated successfully!")
+                    run("plasma-apply-wallpaperimage", abs_path)
+                    return True
                 except (subprocess.CalledProcessError, FileNotFoundError):
-                    # Try other desktop environments if needed
-                    QMessageBox.warning(self, "Warning",
-                                      "Could not set background. This feature may not be supported on your desktop environment.")
-            else:
-                QMessageBox.warning(self, "Warning",
-                                  f"Setting desktop background is not supported on {platform.system()}")
+                    pass
 
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to set desktop background: {str(e)}")
+                # Older Plasma - set it through a plasmashell script over D-Bus
+                script = (
+                    "var allDesktops = desktops();"
+                    "for (var i = 0; i < allDesktops.length; i++) {"
+                    "  var d = allDesktops[i];"
+                    "  d.wallpaperPlugin = 'org.kde.image';"
+                    "  d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General'];"
+                    f"  d.writeConfig('Image', {json.dumps(uri)});"
+                    "}"
+                )
+                for qdbus in ("qdbus6", "qdbus", "qdbus-qt5"):
+                    try:
+                        run(qdbus, "org.kde.plasmashell", "/PlasmaShell",
+                            "org.kde.PlasmaShell.evaluateScript", script)
+                        return True
+                    except (subprocess.CalledProcessError, FileNotFoundError):
+                        continue
+                return False
+
+            if 'xfce' in desktop:
+                # Every monitor/workspace has its own last-image property
+                result = subprocess.run(["xfconf-query", "-c", "xfce4-desktop", "-l"],
+                                        check=True, capture_output=True, text=True, timeout=15)
+                props = [p for p in result.stdout.split() if p.endswith('/last-image')]
+                if not props:
+                    return False
+                for prop in props:
+                    run("xfconf-query", "-c", "xfce4-desktop", "-p", prop, "-s", abs_path)
+                return True
+
+            if 'cinnamon' in desktop:
+                run("gsettings", "set", "org.cinnamon.desktop.background", "picture-uri", uri)
+                return True
+
+            if 'mate' in desktop:
+                run("gsettings", "set", "org.mate.background", "picture-filename", abs_path)
+                return True
+
+            if any(name in desktop for name in ('gnome', 'unity', 'budgie', 'pantheon')):
+                run("gsettings", "set", "org.gnome.desktop.background", "picture-uri", uri)
+                # GNOME 42+ uses a separate key in dark mode; older versions lack it
+                try:
+                    run("gsettings", "set", "org.gnome.desktop.background", "picture-uri-dark", uri)
+                except subprocess.CalledProcessError:
+                    pass
+                return True
+
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.warning(f"Failed to set background on desktop '{desktop}': {e}")
+            return False
+
+        logger.warning(f"Setting background not supported on desktop '{desktop}'")
+        return False
+
+    @staticmethod
+    def _export_background_png(image, file_path):
+        """Save image (a QImage) as a PNG next to the original file for use as a
+        desktop background. The file has to persist since macOS/GNOME reference it
+        directly. Safe to call from a worker thread. Returns the absolute path, or
+        None on failure."""
+        # "_background" suffix so an existing PNG of the same name isn't overwritten
+        source = Path(file_path).resolve()
+        png_path = source.with_name(f"{source.stem}_background.png")
+        if not image.save(str(png_path), "PNG"):
+            logger.error(f"Failed to save background PNG to {png_path}")
+            return None
+
+        logger.info(f"Converted {file_path} to {png_path} for desktop background")
+        return str(png_path)
 
     def _save_with_annotations(self):
         """Save the current image with annotations overlaid"""
@@ -518,45 +803,90 @@ class ImageViewerWindow(QDialog):
                               "and enable annotations using 'Show Annotations'.")
             return
 
+        if self.save_worker and self.save_worker.isRunning():
+            return
+
         try:
-            # Create a copy of the original pixmap to draw on
-            annotated_pixmap = self.original_pixmap.copy()
+            # Draw onto a QImage copy rather than a QPixmap - the encoding and
+            # writing happen in a worker thread, where QPixmap isn't safe to use.
+            # Painting stays here on the GUI thread (it's quick, and the
+            # annotation renderer isn't thread-safe).
+            annotated_image = self.original_pixmap.toImage().convertToFormat(QImage.Format_RGB32)
 
             # Create a painter to draw annotations
-            painter = QPainter(annotated_pixmap)
+            painter = QPainter(annotated_image)
             painter.setRenderHint(QPainter.Antialiasing, True)
 
-            # Render annotations at 100% zoom (1.0) with no offset
-            self.annotation_renderer.render(painter, 1.0, 0, 0)
+            # Render annotations at 100% zoom (1.0) with no offset. Labels and line
+            # widths are fixed screen sizes, so at full resolution they'd look much
+            # smaller relative to the image than in the viewer - scale them up by
+            # how much the viewer shrinks the image to fit the window, so the
+            # saved file matches the fit-to-window view. Never shrink them for
+            # images smaller than the window.
+            available = self.image_container.size()
+            fit_zoom = min(available.width() / self.original_pixmap.width(),
+                           available.height() / self.original_pixmap.height())
+            ui_scale = max(1.0, 1.0 / fit_zoom) if fit_zoom > 0 else 1.0
+            self.annotation_renderer.render(painter, 1.0, 0, 0, ui_scale=ui_scale)
             painter.end()
 
-            # Generate default filename
+            # Generate default filename - keep JPEG as JPEG, everything else
+            # (including FITS/XISF, which can only be saved as PNG/JPEG here) as PNG
             original_path = Path(self.file_path)
-            default_name = f"{original_path.stem}_annotated{original_path.suffix}"
+            default_ext = '.jpg' if original_path.suffix.lower() in ('.jpg', '.jpeg') else '.png'
+            default_name = f"{original_path.stem}_annotated{default_ext}"
             default_path = str(original_path.parent / default_name)
 
             # Open save dialog
+            png_filter = "PNG Image (*.png)"
+            jpeg_filter = "JPEG Image (*.jpg *.jpeg)"
             save_path, selected_filter = QFileDialog.getSaveFileName(
                 self,
                 "Save Annotated Image",
                 default_path,
-                "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;All Files (*.*)"
+                f"{png_filter};;{jpeg_filter}",
+                jpeg_filter if default_ext == '.jpg' else png_filter
             )
 
             if save_path:
-                # Determine format from extension
+                # Only PNG and JPEG can be written - if the name has any other
+                # extension (e.g. .xisf), use the chosen filter's extension so the
+                # file's name matches its contents
                 save_ext = Path(save_path).suffix.lower()
-                if save_ext in ['.jpg', '.jpeg']:
-                    quality = 95
-                    annotated_pixmap.save(save_path, "JPEG", quality)
-                else:
-                    annotated_pixmap.save(save_path, "PNG")
+                if save_ext not in ('.png', '.jpg', '.jpeg'):
+                    save_ext = '.jpg' if selected_filter == jpeg_filter else '.png'
+                    save_path = str(Path(save_path).with_suffix(save_ext))
+                    if Path(save_path).exists() and QMessageBox.question(
+                            self, "Overwrite File",
+                            f"{Path(save_path).name} already exists.\nDo you want to replace it?"
+                    ) != QMessageBox.Yes:
+                        return
 
-                QMessageBox.information(self, "Success",
-                                      f"Annotated image saved successfully!\n{save_path}")
+                if save_ext in ('.jpg', '.jpeg'):
+                    self.save_worker = ImageSaveWorker(annotated_image, save_path, "JPEG", 95)
+                else:
+                    self.save_worker = ImageSaveWorker(annotated_image, save_path, "PNG")
+
+                self.save_annotated_button.setEnabled(False)
+                self.setCursor(Qt.BusyCursor)
+                self._update_status(f"Saving {Path(save_path).name}...")
+                self.save_worker.image_saved.connect(self._on_annotated_image_saved)
+                self.save_worker.start()
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save annotated image: {str(e)}")
+
+    def _on_annotated_image_saved(self, success, save_path):
+        """Show the result of the save worker"""
+        self.save_annotated_button.setEnabled(True)
+        self.unsetCursor()
+        self._update_status()
+
+        if success:
+            QMessageBox.information(self, "Success",
+                                  f"Annotated image saved successfully!\n{save_path}")
+        else:
+            QMessageBox.critical(self, "Error", f"Failed to save annotated image:\n{save_path}")
 
     def _toggle_file_info(self):
         """Toggle the visibility of the file information panel"""
@@ -1214,6 +1544,28 @@ class ImageViewerWindow(QDialog):
         if self.plate_solve_worker and self.plate_solve_worker.isRunning():
             self.plate_solve_worker.cancel()
             self.plate_solve_worker.wait(1000)
+
+        # Don't block the close on a slow load - drop its result and keep the
+        # thread object alive until it finishes
+        if self.image_load_worker and self.image_load_worker.isRunning():
+            worker = self.image_load_worker
+            worker.image_loaded.disconnect()
+            worker.load_failed.disconnect()
+            _orphaned_workers.add(worker)
+            worker.finished.connect(lambda: _orphaned_workers.discard(worker))
+
+        # Let a save carry on in the background after the window closes, so the
+        # file still gets written
+        if self.save_worker and self.save_worker.isRunning():
+            worker = self.save_worker
+            worker.image_saved.disconnect()
+            _orphaned_workers.add(worker)
+            worker.finished.connect(lambda: _orphaned_workers.discard(worker))
+
+        # Let a background change finish - destroying a running QThread crashes
+        if self.background_worker and self.background_worker.isRunning():
+            self.background_worker.background_set.disconnect()
+            self.background_worker.wait()
 
         WindowPositionManager.save_window_position(self, "ImageViewer")
         event.accept()

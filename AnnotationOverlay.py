@@ -368,6 +368,9 @@ class AnnotationRenderer:
         self.constellation_color = QColor(100, 150, 255, 100)  # Dim blue
         self.grid_color = QColor(100, 255, 100, 80)  # Dim green
 
+        # Size multiplier for fonts/line widths, set per render() call
+        self._ui = 1.0
+
         # Data
         self.wcs: Optional[WCSTransform] = None
         self.stars: List[CelestialObject] = []
@@ -387,7 +390,8 @@ class AnnotationRenderer:
         self.stars = stars
         self.dsos = dsos
 
-    def render(self, painter: QPainter, scale: float = 1.0, offset_x: float = 0, offset_y: float = 0):
+    def render(self, painter: QPainter, scale: float = 1.0, offset_x: float = 0, offset_y: float = 0,
+               ui_scale: float = 1.0):
         """
         Render all enabled annotations
 
@@ -395,10 +399,17 @@ class AnnotationRenderer:
             painter: QPainter to draw on
             scale: Current zoom scale factor
             offset_x, offset_y: Image offset in display coordinates
+            ui_scale: Multiplier for sizes that are fixed on screen (fonts, line
+                widths, label spacing). Markers already scale with the image via
+                `scale`. When rendering into a full-resolution image for saving,
+                pass 1 / the viewer's zoom so labels keep the size relative to
+                the image that they have on screen.
         """
         if not self.wcs:
             logger.warning("render() called but no WCS transform available")
             return
+
+        self._ui = ui_scale
 
         logger.debug(f"render() called: scale={scale}, offset=({offset_x}, {offset_y}), "
                      f"show_grid={self.show_grid}, show_stars={self.show_stars}, "
@@ -420,18 +431,27 @@ class AnnotationRenderer:
 
         painter.restore()
 
+    def _font(self, point_size: float, bold: bool = False) -> QFont:
+        """Label font scaled by the current ui_scale"""
+        font = QFont("Arial")
+        font.setPointSizeF(point_size * self._ui)
+        font.setBold(bold)
+        return font
+
+    def _pen(self, color: QColor, width: float = 1) -> QPen:
+        """Pen with its width scaled by the current ui_scale"""
+        pen = QPen(color)
+        pen.setWidthF(width * self._ui)
+        return pen
+
     def _to_display_coords(self, px: float, py: float, scale: float, offset_x: float, offset_y: float) -> Tuple[float, float]:
         """Convert pixel coords to display coords"""
         return px * scale + offset_x, py * scale + offset_y
 
     def _render_grid(self, painter: QPainter, scale: float, offset_x: float, offset_y: float):
         """Render coordinate grid"""
-        pen = QPen(self.grid_color)
-        pen.setWidth(1)
-        painter.setPen(pen)
-
-        font = QFont("Arial", 8)
-        painter.setFont(font)
+        painter.setPen(self._pen(self.grid_color, 1))
+        painter.setFont(self._font(8))
 
         # Get field bounds
         min_ra, max_ra, min_dec, max_dec = self.wcs.get_field_of_view()
@@ -476,9 +496,7 @@ class AnnotationRenderer:
 
     def _render_constellations(self, painter: QPainter, scale: float, offset_x: float, offset_y: float):
         """Render constellation lines"""
-        pen = QPen(self.constellation_color)
-        pen.setWidth(2)
-        painter.setPen(pen)
+        painter.setPen(self._pen(self.constellation_color, 2))
 
         for const, ra1, dec1, ra2, dec2 in CONSTELLATION_LINES:
             px1, py1 = self.wcs.sky_to_pixel(ra1, dec1)
@@ -495,11 +513,8 @@ class AnnotationRenderer:
 
     def _render_stars(self, painter: QPainter, scale: float, offset_x: float, offset_y: float):
         """Render star labels"""
-        pen = QPen(self.star_color)
-        painter.setPen(pen)
-
-        font = QFont("Arial", 9)
-        painter.setFont(font)
+        painter.setPen(self._pen(self.star_color, 1))
+        painter.setFont(self._font(9))
 
         for star in self.stars:
             px, py = self.wcs.sky_to_pixel(star.ra, star.dec)
@@ -515,16 +530,13 @@ class AnnotationRenderer:
                 painter.drawEllipse(QPointF(dx, dy), radius, radius)
 
                 # Draw label
-                painter.drawText(int(dx + radius + 2), int(dy + 4), star.name)
+                painter.drawText(int(dx + radius + 2 * self._ui), int(dy + 4 * self._ui), star.name)
 
     def _render_dsos(self, painter: QPainter, scale: float, offset_x: float, offset_y: float):
         """Render DSO labels and markers"""
-        pen = QPen(self.dso_color)
-        pen.setWidth(2)
+        pen = self._pen(self.dso_color, 2)
         painter.setPen(pen)
-
-        font = QFont("Arial", 10, QFont.Bold)
-        painter.setFont(font)
+        painter.setFont(self._font(10, bold=True))
 
         # Log first few DSO positions for debugging
         for i, dso in enumerate(self.dsos[:3]):
@@ -562,7 +574,7 @@ class AnnotationRenderer:
                     painter.drawEllipse(QPointF(dx, dy), marker_size, marker_size)
 
                 # Draw label
-                painter.drawText(int(dx + marker_size + 3), int(dy + 5), dso.name)
+                painter.drawText(int(dx + marker_size + 3 * self._ui), int(dy + 5 * self._ui), dso.name)
 
     def _frange(self, start: float, stop: float, step: float):
         """Float range generator"""

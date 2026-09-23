@@ -1855,30 +1855,13 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                                   f"The file may have been moved or deleted.")
                 return
 
-            # Load the image into a QPixmap
-            pixmap = QPixmap(image_path)
-
-            # Check if image loaded successfully
-            if pixmap.isNull():
-                # Try FITS/XISF format if standard loading failed
-                _, ext = os.path.splitext(image_path.lower())
-                if ext in ['.fits', '.fit', '.fts', '.xisf']:
-                    pixmap = load_astro_pixmap(image_path)
-                    if pixmap is None:
-                        QMessageBox.critical(self, "Error",
-                                           f"Failed to load image:\n{image_path}")
-                        return
-                else:
-                    QMessageBox.critical(self, "Error",
-                                       f"Failed to load image:\n{image_path}\n\n"
-                                       f"The file may be corrupted or in an unsupported format.")
-                    return
-
-            # Create and show image viewer window (pixmap, title, file_path, parent, dso_ra, dso_dec)
+            # Open the viewer straight away with no pixmap - it loads the image in
+            # a background thread, so large files don't freeze the UI
+            # (pixmap, title, file_path, parent, dso_ra, dso_dec)
             ra_deg = item_data.get('ra_deg')
             dec_deg = item_data.get('dec_deg')
             self.image_viewer = ImageViewerWindow(
-                pixmap, item_data['name'], image_path, self,
+                None, item_data['name'], image_path, self,
                 dso_ra=ra_deg, dso_dec=dec_deg
             )
             self.image_viewer.show()

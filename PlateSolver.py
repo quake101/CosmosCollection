@@ -6,6 +6,7 @@ Provides plate solving functionality using ASTAP (local) or Astrometry.net API (
 
 import os
 import sys
+import shutil
 import subprocess
 import tempfile
 import time
@@ -60,6 +61,38 @@ def test_astrometry_key(api_key: str, timeout: int = 30) -> Tuple[bool, str]:
         return False, f"Connection failed: {str(e)}"
     except Exception as e:
         return False, f"Error testing API key: {str(e)}"
+
+
+# Formats neither ASTAP nor astrometry.net can read - converted to a temporary
+# FITS file before solving
+_CONVERT_TO_FITS_EXTENSIONS = ('.xisf',)
+
+
+def _write_solver_fits(image_path: str, out_dir: str) -> str:
+    """Convert an image the solvers can't read (XISF) into a 16-bit mono FITS
+    file in out_dir and return its path. Luminance is enough for star matching
+    and keeps the file small (a 5000x2850 RGB float stack becomes ~28 MB)."""
+    import numpy as np
+    from astropy.io import fits
+    from XISFReader import read_xisf_pixels
+
+    data = read_xisf_pixels(image_path)
+    if data is None:
+        raise ValueError("Could not read image pixels")
+
+    lum = data.mean(axis=2) if data.ndim == 3 else data
+    lum = np.nan_to_num(lum.astype(np.float32))
+    lo, hi = float(lum.min()), float(lum.max())
+    if hi > lo:
+        lum = (lum - lo) / (hi - lo)
+    u16 = (np.clip(lum, 0, 1) * 65535).astype(np.uint16)
+
+    # XISF rows run top-down, FITS rows bottom-up. Flip so the solved WCS uses
+    # the standard FITS orientation AnnotationOverlay expects (display top row
+    # = highest FITS y), same as when ASTAP solves a PNG/JPG directly.
+    out_path = os.path.join(out_dir, Path(image_path).stem + ".fits")
+    fits.PrimaryHDU(np.flipud(u16)).writeto(out_path, overwrite=True)
+    return out_path
 
 
 class PlateSolveResult:
@@ -123,7 +156,16 @@ class PlateSolverWorker(QThread):
             self.solve_finished.emit(result)
             return
 
-        # Fall back to astrometry.net
+        # Fall back to astrometry.net - only with a usable API key
+        key_problem = solver.astrometry_key_problem()
+        if key_problem:
+            result = PlateSolveResult()
+            result.solver_used = 'astrometry.net'
+            result.error_message = f"ASTAP: {astap_error}\n\nAstrometry.net: {key_problem}"
+            logger.info(f"Skipping astrometry.net: {key_problem}")
+            self.solve_finished.emit(result)
+            return
+
         self.progress.emit("Solving with Astrometry.net (this may take a few minutes)...")
         result = solver.solve_with_astrometry_net(self.image_path, self.hints)
 
@@ -155,9 +197,36 @@ class PlateSolver:
         try:
             from PySide6.QtCore import QSettings
             settings = QSettings("CosmosCollection", "CosmosCollection")
-            return settings.value("astrometry_api_key", "", type=str)
+            return settings.value("astrometry_api_key", "", type=str).strip()
         except Exception:
             return ""
+
+    def astrometry_key_problem(self) -> Optional[str]:
+        """Return why astrometry.net can't be used (no key, or a key it already
+        rejected), or None if it's worth trying. Avoids a pointless login call -
+        astrometry.net no longer accepts anonymous logins."""
+        if not self.astrometry_api_key:
+            return ("No API key set. Register free at nova.astrometry.net "
+                    "and add your key in Settings to use the online solver.")
+        try:
+            from PySide6.QtCore import QSettings
+            settings = QSettings("CosmosCollection", "CosmosCollection")
+            if settings.value("astrometry_invalid_api_key", "", type=str) == self.astrometry_api_key:
+                return ("Your API key was rejected by astrometry.net. "
+                        "Check the key in Settings.")
+        except Exception:
+            pass
+        return None
+
+    def _remember_invalid_api_key(self):
+        """Record that astrometry.net rejected the current key, so it isn't
+        retried until the key is changed in Settings"""
+        try:
+            from PySide6.QtCore import QSettings
+            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings.setValue("astrometry_invalid_api_key", self.astrometry_api_key)
+        except Exception:
+            pass
 
     def _find_astap(self) -> Optional[str]:
         """Find ASTAP executable"""
@@ -249,11 +318,7 @@ class PlateSolver:
                 result.ra_center = result.wcs_header.get('CRVAL1')
                 result.dec_center = result.wcs_header.get('CRVAL2')
 
-                # Calculate pixel scale
-                if 'CD1_1' in result.wcs_header:
-                    result.pixel_scale = abs(result.wcs_header['CD1_1']) * 3600
-                elif 'CDELT1' in result.wcs_header:
-                    result.pixel_scale = abs(result.wcs_header['CDELT1']) * 3600
+                result.pixel_scale = self._pixel_scale_from_wcs(result.wcs_header)
 
                 logger.info(f"Loaded cached WCS: RA={result.ra_center}, Dec={result.dec_center}, scale={result.pixel_scale}")
                 return result
@@ -262,9 +327,19 @@ class PlateSolver:
             result.error_message = "ASTAP not found"
             return result
 
+        temp_dir = None
         try:
+            # ASTAP can't read XISF - solve a temporary FITS copy instead. ASTAP
+            # writes its .wcs/.ini next to the file it solves, so those land in
+            # the temp dir and the .wcs gets copied next to the original.
+            solve_path = image_path
+            if Path(image_path).suffix.lower() in _CONVERT_TO_FITS_EXTENSIONS:
+                temp_dir = tempfile.mkdtemp(prefix="cosmos_solve_")
+                logger.info(f"Converting {image_path} to FITS for ASTAP")
+                solve_path = _write_solver_fits(image_path, temp_dir)
+
             # Build command
-            cmd = [self.astap_path, "-f", image_path]
+            cmd = [self.astap_path, "-f", solve_path]
 
             # Add hints if provided
             hints = hints or {}
@@ -293,7 +368,11 @@ class PlateSolver:
                 logger.warning(f"ASTAP stderr: {process.stderr[:500]}")
 
             # Check for WCS file
-            ini_file = Path(image_path).with_suffix('.ini')
+            ini_file = Path(solve_path).with_suffix('.ini')
+            solved_wcs = Path(solve_path).with_suffix('.wcs')
+            if temp_dir and solved_wcs.exists():
+                # Cache the solution next to the original image
+                shutil.copyfile(solved_wcs, wcs_file)
 
             logger.info(f"Checking for WCS file: {wcs_file} - exists: {wcs_file.exists()}")
 
@@ -306,13 +385,7 @@ class PlateSolver:
                     result.ra_center = result.wcs_header.get('CRVAL1')
                     result.dec_center = result.wcs_header.get('CRVAL2')
 
-                    # Calculate pixel scale from CD matrix or CDELT
-                    if 'CD1_1' in result.wcs_header:
-                        cd1_1 = result.wcs_header['CD1_1']
-                        cd1_2 = result.wcs_header.get('CD1_2', 0)
-                        result.pixel_scale = abs(cd1_1) * 3600  # Convert to arcsec
-                    elif 'CDELT1' in result.wcs_header:
-                        result.pixel_scale = abs(result.wcs_header['CDELT1']) * 3600
+                    result.pixel_scale = self._pixel_scale_from_wcs(result.wcs_header)
 
                     logger.info(f"ASTAP solve successful: RA={result.ra_center}, Dec={result.dec_center}, scale={result.pixel_scale}")
 
@@ -323,17 +396,53 @@ class PlateSolver:
                 except:
                     pass
             else:
-                error_detail = process.stderr.strip() if process.stderr else process.stdout.strip() if process.stdout else 'No output'
+                # astap_cli usually prints nothing - the reason is in the ERROR=
+                # line of the .ini it writes, which would otherwise be left behind
+                error_detail = self._read_astap_ini_error(ini_file)
+                if not error_detail:
+                    error_detail = (process.stderr.strip() or process.stdout.strip()
+                                    or f"No solution (exit code {process.returncode})")
                 result.error_message = f"ASTAP solve failed: {error_detail}"
                 logger.warning(f"ASTAP failed - no WCS file produced. Error: {error_detail}")
+                try:
+                    if ini_file.exists():
+                        ini_file.unlink()
+                except OSError:
+                    pass
 
         except subprocess.TimeoutExpired:
             result.error_message = "ASTAP solve timed out"
         except Exception as e:
             result.error_message = f"ASTAP error: {str(e)}"
             logger.exception("ASTAP solve failed")
+        finally:
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
         return result
+
+    @staticmethod
+    def _pixel_scale_from_wcs(wcs_header: Dict[str, Any]) -> Optional[float]:
+        """Pixel scale in arcsec/pixel. Uses the CD matrix determinant, which
+        holds at any rotation - abs(CD1_1) alone is only right for unrotated
+        images (at ~90 degrees rotation it's near zero)."""
+        if 'CD1_1' in wcs_header:
+            det = (wcs_header['CD1_1'] * wcs_header.get('CD2_2', 0)
+                   - wcs_header.get('CD1_2', 0) * wcs_header.get('CD2_1', 0))
+            return (abs(det) ** 0.5) * 3600
+        if 'CDELT1' in wcs_header:
+            return abs(wcs_header['CDELT1']) * 3600
+        return None
+
+    @staticmethod
+    def _read_astap_ini_error(ini_file: Path) -> Optional[str]:
+        """Return the ERROR= (or WARNING=) message from an ASTAP .ini file, if any"""
+        try:
+            with open(ini_file, 'r', errors='replace') as f:
+                values = dict(line.strip().split('=', 1) for line in f if '=' in line)
+            return values.get('ERROR') or values.get('WARNING')
+        except OSError:
+            return None
 
     def _parse_wcs_file(self, wcs_path: Path) -> Dict[str, Any]:
         """Parse ASTAP WCS output file"""
@@ -377,13 +486,16 @@ class PlateSolver:
         result = PlateSolveResult()
         result.solver_used = 'astrometry.net'
 
+        key_problem = self.astrometry_key_problem()
+        if key_problem:
+            result.error_message = key_problem
+            return result
+
+        temp_dir = None
         try:
-            # Step 1: Login (use API key if available, otherwise anonymous)
-            api_key = self.astrometry_api_key or ""
-            if api_key:
-                self._log("Logging in to astrometry.net with API key...")
-            else:
-                self._log("Logging in to astrometry.net (anonymous)...")
+            # Step 1: Login
+            api_key = self.astrometry_api_key
+            self._log("Logging in to astrometry.net with API key...")
             login_url = self.ASTROMETRY_NET_API_URL + "login"
             login_response = requests.post(login_url, data={
                 'request-json': json.dumps({"apikey": api_key})
@@ -400,10 +512,9 @@ class PlateSolver:
             if login_data.get('status') != 'success':
                 error_msg = login_data.get('errormessage', 'Unknown error')
                 if 'apikey' in error_msg.lower():
-                    result.error_message = (
-                        "Astrometry.net requires an API key. "
-                        "Register free at nova.astrometry.net and add your key in Settings."
-                    )
+                    self._remember_invalid_api_key()
+                    result.error_message = ("Your API key was rejected by astrometry.net. "
+                                            "Check the key in Settings.")
                 else:
                     result.error_message = f"Astrometry.net login failed: {error_msg}"
                 logger.warning(f"Astrometry.net login failed: {login_data}")
@@ -416,7 +527,13 @@ class PlateSolver:
                 return result
             logger.info(f"Astrometry.net session: {session_key[:20]}...")
 
-            # Step 2: Upload image
+            # Step 2: Upload image (astrometry.net can't read XISF - upload a
+            # temporary FITS copy, which is also much smaller)
+            if Path(image_path).suffix.lower() in _CONVERT_TO_FITS_EXTENSIONS:
+                temp_dir = tempfile.mkdtemp(prefix="cosmos_solve_")
+                logger.info(f"Converting {image_path} to FITS for upload")
+                image_path = _write_solver_fits(image_path, temp_dir)
+
             self._log("Uploading image...")
             logger.info(f"Uploading image: {image_path}")
             upload_url = self.ASTROMETRY_NET_API_URL + "upload"
@@ -567,6 +684,9 @@ class PlateSolver:
         except Exception as e:
             result.error_message = f"Astrometry.net error: {str(e)}"
             logger.exception("Astrometry.net solve failed")
+        finally:
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
         return result
 
