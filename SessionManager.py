@@ -8,10 +8,12 @@ equipment, and (via drag-and-drop) the FITS/XISF subs a session produced.
 import os
 import calendar
 import logging
+from collections import Counter
 from datetime import datetime, date as date_cls, timedelta
 
-from PySide6.QtCore import Qt, QDate, QEvent, QTime, QTimer, QPoint, QSettings, Signal, QThread, QStringListModel
-from PySide6.QtGui import QColor
+from PySide6.QtCore import (Qt, QDate, QDateTime, QEvent, QTime, QTimer, QPoint, QSettings, Signal, QThread,
+                            QStringListModel, QUrl)
+from PySide6.QtGui import QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
@@ -19,13 +21,15 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QLineEdit, QCheckBox, QDateEdit, QTimeEdit, QMenu,
                                QCompleter, QSplitter, QFormLayout, QRadioButton,
                                QListWidget, QListWidgetItem, QProgressDialog,
-                               QCalendarWidget, QTabWidget, QTableView)
+                               QCalendarWidget, QTabWidget, QTableView, QDateTimeEdit,
+                               QSpinBox, QDoubleSpinBox, QFileDialog, QAbstractItemView)
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from TimeFormatHelper import format_time
 from Theme import COLORS
 import SessionFileScanner
+import SessionObservations
 
 logger = logging.getLogger(__name__)
 
@@ -192,18 +196,22 @@ class LocationOverrideWidget(QWidget):
             self.timezone_combo.setCurrentText(timezone)
 
 
-class AddEditSessionDialog(WindowPositionMixin, QDialog):
-    """Add/edit dialog for a planned or logged session."""
+def _rollback(db_manager):
+    try:
+        with db_manager.get_connection() as conn:
+            conn.rollback()
+    except Exception as e:
+        logger.error(f"Error rolling back: {e}")
 
-    WINDOW_POSITION_KEY = "AddEditSessionDialog"
+
+class SessionFormWidget(QWidget):
+    """The session's own fields (DSO, schedule, location, equipment, notes), shared
+    by AddEditSessionDialog and SessionDetailsDialog's Overview tab. write() never
+    commits, so a caller can save it in the same transaction as other changes."""
 
     def __init__(self, session_data=None, target_data=None, parsed_metadata=None,
                  initial_status="Planned", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("New Session")
-        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
-        self.setModal(True)
-        self.resize(520, 680)  # default size the first time this dialog is ever opened
 
         self.db_manager = DatabaseManager()
         self.is_edit_mode = False
@@ -232,10 +240,9 @@ class AddEditSessionDialog(WindowPositionMixin, QDialog):
         if session_data:
             self._populate_from_session_data(session_data)
 
-        self.setup_window_position()
-
     def _setup_ui(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
 
         schedule_group = QGroupBox("DSO && Schedule")
         schedule_layout = QVBoxLayout()
@@ -323,17 +330,7 @@ class AddEditSessionDialog(WindowPositionMixin, QDialog):
         notes_layout.addWidget(self.notes_edit)
         notes_group.setLayout(notes_layout)
         layout.addWidget(notes_group)
-
-        buttons_layout = QHBoxLayout()
-        buttons_layout.addStretch()
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        buttons_layout.addWidget(cancel_btn)
-        self.save_btn = QPushButton("Save Session")
-        self.save_btn.setDefault(True)
-        self.save_btn.clicked.connect(self._save_session)
-        buttons_layout.addWidget(self.save_btn)
-        layout.addLayout(buttons_layout)
+        layout.addStretch()
 
         self.setLayout(layout)
 
@@ -462,8 +459,6 @@ class AddEditSessionDialog(WindowPositionMixin, QDialog):
         if edit_mode:
             self.is_edit_mode = True
             self.session_id = session_data.get("id")
-            self.save_btn.setText("Save Changes")
-            self.setWindowTitle("Edit Session")
             self._existing_aggregate = {
                 "sub_count": session_data.get("sub_count", 0),
                 "integration_seconds": session_data.get("integration_seconds", 0),
@@ -537,90 +532,147 @@ class AddEditSessionDialog(WindowPositionMixin, QDialog):
             logger.error(f"Error resolving target list link for '{name}': {e}")
         return None
 
+    def validate(self):
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Validation Error", "DSO name is required.")
+            return False
+        return True
+
+    def collect(self):
+        """The form's values as a usersessions row dict (not validated)."""
+        name = self.name_edit.text().strip()
+        lat, lon, loc_name, tz, source = self.location_widget.get_location()
+        has_times = self.time_checkbox.isChecked()
+        aggregate = self._scanned_aggregate or self._existing_aggregate or {}
+        resolved_target_id = self._resolve_target_id_by_name(name)
+        return {
+            "target_id": resolved_target_id if resolved_target_id is not None else self._target_id,
+            "dso_name": name,
+            "ra_deg": self._ra_deg,
+            "dec_deg": self._dec_deg,
+            "status": self.status_combo.currentText(),
+            "session_date": self.date_edit.date().toString("yyyy-MM-dd"),
+            "start_time": self.start_time_edit.time().toString("HH:mm") if has_times else None,
+            "end_time": self.end_time_edit.time().toString("HH:mm") if has_times else None,
+            "location_lat": lat,
+            "location_lon": lon,
+            "location_name": loc_name,
+            "location_timezone": tz,
+            "location_source": source,
+            "telescope_id": self.telescope_combo.currentData(),
+            "camera": self.camera_edit.text().strip(),
+            "filters_used": self.filters_edit.text().strip(),
+            "sub_count": aggregate.get("sub_count", 0),
+            "integration_seconds": aggregate.get("integration_seconds", 0),
+            "earliest_sub_date": aggregate.get("earliest_sub_date"),
+            "latest_sub_date": aggregate.get("latest_sub_date"),
+            "notes": self.notes_edit.toPlainText().strip(),
+            "modified_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def snapshot(self):
+        """Comparable form state, for detecting unsaved edits."""
+        data = self.collect()
+        data.pop("modified_date", None)
+        return data
+
+    def write(self, conn):
+        """Insert or update the session row. Does not commit."""
+        data = self.collect()
+        cursor = conn.cursor()
+        if self.is_edit_mode and self.session_id:
+            cursor.execute("""
+                UPDATE usersessions SET
+                    target_id=?, dso_name=?, ra_deg=?, dec_deg=?, status=?, session_date=?,
+                    start_time=?, end_time=?, location_lat=?, location_lon=?, location_name=?,
+                    location_timezone=?, location_source=?, telescope_id=?, camera=?, filters_used=?,
+                    sub_count=?, integration_seconds=?, earliest_sub_date=?, latest_sub_date=?,
+                    notes=?, modified_date=?
+                WHERE id=?
+            """, (
+                data["target_id"], data["dso_name"], data["ra_deg"], data["dec_deg"], data["status"],
+                data["session_date"], data["start_time"], data["end_time"], data["location_lat"],
+                data["location_lon"], data["location_name"], data["location_timezone"],
+                data["location_source"], data["telescope_id"], data["camera"], data["filters_used"],
+                data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
+                data["latest_sub_date"], data["notes"], data["modified_date"], self.session_id,
+            ))
+        else:
+            cursor.execute("""
+                INSERT INTO usersessions (
+                    target_id, dso_name, ra_deg, dec_deg, status, session_date, start_time, end_time,
+                    location_lat, location_lon, location_name, location_timezone, location_source,
+                    telescope_id, camera, filters_used, sub_count, integration_seconds,
+                    earliest_sub_date, latest_sub_date, notes, modified_date
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                data["target_id"], data["dso_name"], data["ra_deg"], data["dec_deg"], data["status"],
+                data["session_date"], data["start_time"], data["end_time"], data["location_lat"],
+                data["location_lon"], data["location_name"], data["location_timezone"],
+                data["location_source"], data["telescope_id"], data["camera"], data["filters_used"],
+                data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
+                data["latest_sub_date"], data["notes"], data["modified_date"],
+            ))
+            self.session_id = cursor.lastrowid
+            self.is_edit_mode = True
+        self.saved_session_data = data
+        return data
+
+
+class AddEditSessionDialog(WindowPositionMixin, QDialog):
+    """Add dialog for a planned or logged session (also used to duplicate one)."""
+
+    WINDOW_POSITION_KEY = "AddEditSessionDialog"
+
+    def __init__(self, session_data=None, target_data=None, parsed_metadata=None,
+                 initial_status="Planned", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Session" if session_data else "New Session")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setModal(True)
+        self.resize(520, 680)  # default size the first time this dialog is ever opened
+
+        self.db_manager = DatabaseManager()
+        self.form = SessionFormWidget(session_data=session_data, target_data=target_data,
+                                      parsed_metadata=parsed_metadata, initial_status=initial_status)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.form)
+
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons_layout.addWidget(cancel_btn)
+        self.save_btn = QPushButton("Save Changes" if session_data else "Save Session")
+        self.save_btn.setDefault(True)
+        self.save_btn.clicked.connect(self._save_session)
+        buttons_layout.addWidget(self.save_btn)
+        layout.addLayout(buttons_layout)
+
+        self.setup_window_position()
+
+    @property
+    def session_id(self):
+        return self.form.session_id
+
+    @property
+    def saved_session_data(self):
+        return self.form.saved_session_data
+
+    def load_as_duplicate(self, session_data):
+        self.form.load_as_duplicate(session_data)
+
     def _save_session(self):
+        if not self.form.validate():
+            return
         try:
-            name = self.name_edit.text().strip()
-            if not name:
-                QMessageBox.warning(self, "Validation Error", "DSO name is required.")
-                return
-
-            lat, lon, loc_name, tz, source = self.location_widget.get_location()
-            session_date = self.date_edit.date().toString("yyyy-MM-dd")
-            has_times = self.time_checkbox.isChecked()
-            start_time = self.start_time_edit.time().toString("HH:mm") if has_times else None
-            end_time = self.end_time_edit.time().toString("HH:mm") if has_times else None
-
-            aggregate = self._scanned_aggregate or self._existing_aggregate or {}
-            resolved_target_id = self._resolve_target_id_by_name(name)
-            target_id = resolved_target_id if resolved_target_id is not None else self._target_id
-
-            data = {
-                "target_id": target_id,
-                "dso_name": name,
-                "ra_deg": self._ra_deg,
-                "dec_deg": self._dec_deg,
-                "status": self.status_combo.currentText(),
-                "session_date": session_date,
-                "start_time": start_time,
-                "end_time": end_time,
-                "location_lat": lat,
-                "location_lon": lon,
-                "location_name": loc_name,
-                "location_timezone": tz,
-                "location_source": source,
-                "telescope_id": self.telescope_combo.currentData(),
-                "camera": self.camera_edit.text().strip(),
-                "filters_used": self.filters_edit.text().strip(),
-                "sub_count": aggregate.get("sub_count", 0),
-                "integration_seconds": aggregate.get("integration_seconds", 0),
-                "earliest_sub_date": aggregate.get("earliest_sub_date"),
-                "latest_sub_date": aggregate.get("latest_sub_date"),
-                "notes": self.notes_edit.toPlainText().strip(),
-                "modified_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
             with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                if self.is_edit_mode and self.session_id:
-                    cursor.execute("""
-                        UPDATE usersessions SET
-                            target_id=?, dso_name=?, ra_deg=?, dec_deg=?, status=?, session_date=?,
-                            start_time=?, end_time=?, location_lat=?, location_lon=?, location_name=?,
-                            location_timezone=?, location_source=?, telescope_id=?, camera=?, filters_used=?,
-                            sub_count=?, integration_seconds=?, earliest_sub_date=?, latest_sub_date=?,
-                            notes=?, modified_date=?
-                        WHERE id=?
-                    """, (
-                        data["target_id"], data["dso_name"], data["ra_deg"], data["dec_deg"], data["status"],
-                        data["session_date"], data["start_time"], data["end_time"], data["location_lat"],
-                        data["location_lon"], data["location_name"], data["location_timezone"],
-                        data["location_source"], data["telescope_id"], data["camera"], data["filters_used"],
-                        data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
-                        data["latest_sub_date"], data["notes"], data["modified_date"], self.session_id,
-                    ))
-                else:
-                    cursor.execute("""
-                        INSERT INTO usersessions (
-                            target_id, dso_name, ra_deg, dec_deg, status, session_date, start_time, end_time,
-                            location_lat, location_lon, location_name, location_timezone, location_source,
-                            telescope_id, camera, filters_used, sub_count, integration_seconds,
-                            earliest_sub_date, latest_sub_date, notes, modified_date
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (
-                        data["target_id"], data["dso_name"], data["ra_deg"], data["dec_deg"], data["status"],
-                        data["session_date"], data["start_time"], data["end_time"], data["location_lat"],
-                        data["location_lon"], data["location_name"], data["location_timezone"],
-                        data["location_source"], data["telescope_id"], data["camera"], data["filters_used"],
-                        data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
-                        data["latest_sub_date"], data["notes"], data["modified_date"],
-                    ))
-                    self.session_id = cursor.lastrowid
+                self.form.write(conn)
                 conn.commit()
-
-            self.saved_session_data = data
             self.accept()
-
         except Exception as e:
+            _rollback(self.db_manager)
             logger.error(f"Error saving session: {e}")
             QMessageBox.critical(self, "Error", f"Failed to save session: {e}")
 
@@ -640,6 +692,13 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setModal(True)
         self.resize(520, 480)  # default size the first time this dialog is ever opened
+        try:
+            with self.db_manager.get_connection() as conn:
+                self._already_attached = SessionObservations.count_already_attached(conn, summary.get("files", []))
+        except Exception as e:
+            logger.error(f"Error checking for already-attached files: {e}")
+            self._already_attached = Counter()
+        self._already_attached_total = sum(self._already_attached.values())
         self._setup_ui()
         self._load_existing_sessions()
         self.setup_window_position()
@@ -658,6 +717,14 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
         form.addRow("Camera:", QLabel(self.summary.get("camera") or "(unknown)"))
         form.addRow("Telescope:", QLabel(self.summary.get("telescope") or "(unknown)"))
         form.addRow("Filters:", QLabel(", ".join(self.summary.get("filters_used", [])) or "(none)"))
+        if self._already_attached_total:
+            already_label = QLabel(
+                f"{self._already_attached_total} file(s) already belong to a session and will be skipped:\n"
+                + self._already_attached_text()
+            )
+            already_label.setWordWrap(True)
+            already_label.setStyleSheet(f"color: {COLORS['warning']};")
+            form.addRow("Already Attached:", already_label)
         summary_group.setLayout(form)
         layout.addWidget(summary_group)
 
@@ -737,95 +804,52 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
 
     def _on_confirm(self):
         if self.create_radio.isChecked():
+            files = self.summary.get("files", [])
+            if files and self._already_attached_total >= len(files):
+                QMessageBox.information(
+                    self, "Already Attached",
+                    "Every scanned file already belongs to an existing session, so a new session "
+                    "would have no data.\n\n" + self._already_attached_text(),
+                )
+                return
             dialog = AddEditSessionDialog(parsed_metadata=self.summary, initial_status="In Progress", parent=self)
             if dialog.exec() == QDialog.Accepted and dialog.session_id:
-                self._insert_file_rows(dialog.session_id)
-                self._recompute_session_aggregates(dialog.session_id)
-                self.result_session_id = dialog.session_id
-                self.accept()
+                if self._attach_to(dialog.session_id):
+                    self.accept()
         else:
             item = self.sessions_list.currentItem()
             if not item:
                 QMessageBox.warning(self, "No Selection", "Please select an existing session.")
                 return
-            session_id = item.data(Qt.UserRole)
-            self._insert_file_rows(session_id)
-            self._recompute_session_aggregates(session_id)
-            self.result_session_id = session_id
-            self.accept()
+            if self._attach_to(item.data(Qt.UserRole)):
+                self.accept()
 
-    def _insert_file_rows(self, session_id):
-        files = self.summary.get("files", [])
-        if not files:
-            return
+    def _already_attached_text(self):
+        return "\n".join(f"• {count} in {label}" for label, count in self._already_attached.most_common())
+
+    def _attach_to(self, session_id):
+        """Attach the scanned files (skipping duplicates), place them on their
+        observing nights and recompute the session's totals, in one transaction."""
         try:
             with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                for f in files:
-                    row = SessionFileScanner.file_dict_to_row(f)
-                    cursor.execute("""
-                        INSERT OR IGNORE INTO usersessionfiles (
-                            session_id, file_path, file_type, frame_type, object_name, date_obs,
-                            exptime_seconds, filter_name, camera, telescope, gain, offset_value,
-                            ccd_temp, xbinning, ybinning, header_json
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (
-                        session_id, row["file_path"], row["file_type"], row["frame_type"],
-                        row["object_name"], row["date_obs"], row["exptime_seconds"], row["filter_name"],
-                        row["camera"], row["telescope"], row["gain"], row["offset_value"],
-                        row["ccd_temp"], row["xbinning"], row["ybinning"], row["header_json"],
-                    ))
+                report = SessionObservations.attach_files(conn, session_id, self.summary.get("files", []))
+                SessionObservations.assign_files_to_observations(conn, session_id)
+                SessionObservations.recompute_session_aggregates(conn, session_id)
                 conn.commit()
         except Exception as e:
-            logger.error(f"Error inserting session files: {e}")
+            _rollback(self.db_manager)
+            logger.error(f"Error attaching session files: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to attach files: {e}")
+            return False
 
-    def _recompute_session_aggregates(self, session_id):
-        """Recompute sub_count/integration_seconds/filters/date-range from the
-        usersessionfiles rows actually stored for this session, rather than adding
-        the new drop's totals on top of the old ones - since INSERT OR IGNORE
-        (keyed on session_id + file_path) silently skips files already attached,
-        recomputing from that table is what makes re-dropping the same folder a
-        true no-op instead of double-counting integration time.
-
-        Also promotes a 'Planned' session to 'In Progress' the first time data is
-        actually attached to it - a session stays 'In Progress' (accumulating
-        across as many nights/drops as needed) until the user manually marks it
-        'Completed'. 'Completed'/'Cancelled' sessions are left alone."""
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT status FROM usersessions WHERE id = ?", (session_id,))
-                status_row = cursor.fetchone()
-                current_status = status_row[0] if status_row else None
-                new_status = "In Progress" if current_status == "Planned" else current_status
-
-                cursor.execute("""
-                    SELECT COUNT(*),
-                           COALESCE(SUM(CASE WHEN frame_type = 'Light' THEN exptime_seconds ELSE 0 END), 0),
-                           MIN(date_obs), MAX(date_obs)
-                    FROM usersessionfiles WHERE session_id = ?
-                """, (session_id,))
-                sub_count, integration_seconds, earliest, latest = cursor.fetchone()
-
-                cursor.execute("""
-                    SELECT DISTINCT filter_name FROM usersessionfiles
-                    WHERE session_id = ? AND frame_type = 'Light'
-                          AND filter_name IS NOT NULL AND filter_name != ''
-                """, (session_id,))
-                filters = sorted(row[0] for row in cursor.fetchall())
-
-                cursor.execute("""
-                    UPDATE usersessions SET
-                        sub_count = ?, integration_seconds = ?, earliest_sub_date = ?, latest_sub_date = ?,
-                        filters_used = ?, status = ?, modified_date = ?
-                    WHERE id = ?
-                """, (
-                    sub_count, integration_seconds, earliest, latest,
-                    ", ".join(filters), new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), session_id,
-                ))
-                conn.commit()
-        except Exception as e:
-            logger.error(f"Error recomputing session aggregates: {e}")
+        message = SessionObservations.format_attach_report(report)
+        if report["inserted"] == 0:
+            QMessageBox.information(self, "Nothing New Attached",
+                                    message or "No new files were attached.")
+        elif message:
+            QMessageBox.information(self, "Files Attached", message)
+        self.result_session_id = session_id
+        return True
 
 
 class LinkTargetDialog(WindowPositionMixin, QDialog):
@@ -910,6 +934,996 @@ class LinkTargetDialog(WindowPositionMixin, QDialog):
             return
         self.selected_target = items[0].data(Qt.UserRole)
         self.accept()
+
+
+def format_duration(seconds):
+    """'2h 05m', '45m', '30s' - integration times read better than decimal hours."""
+    seconds = float(seconds or 0)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    total_minutes = int(round(seconds / 60.0))
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+
+
+def format_exposure(exposure_seconds):
+    return f"{float(exposure_seconds or 0):g}s"
+
+
+def dropped_sub_paths(mime_data):
+    """Local folders and FITS/XISF files in a drag's mime data (empty if none)."""
+    if not mime_data.hasUrls():
+        return []
+    paths = []
+    for url in mime_data.urls():
+        if not url.isLocalFile():
+            continue
+        path = url.toLocalFile()
+        if os.path.isdir(path) or os.path.splitext(path)[1].lower() in SessionFileScanner.SUPPORTED_EXTENSIONS:
+            paths.append(path)
+    return paths
+
+
+def _make_table(columns, stretch_last=True):
+    table = QTableWidget(0, len(columns))
+    table.setHorizontalHeaderLabels(columns)
+    table.setEditTriggers(QTableWidget.NoEditTriggers)
+    table.setSelectionBehavior(QTableWidget.SelectRows)
+    table.setAlternatingRowColors(True)
+    table.verticalHeader().setVisible(False)
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.ResizeToContents)
+    header.setStretchLastSection(stretch_last)
+    return table
+
+
+def _table_item(text, align=None, user_data=None, tooltip=None):
+    item = QTableWidgetItem(text)
+    if align is not None:
+        item.setTextAlignment(align)
+    if user_data is not None:
+        item.setData(Qt.UserRole, user_data)
+    if tooltip:
+        item.setToolTip(tooltip)
+    return item
+
+
+def _to_qdatetime(dt):
+    return QDateTime(QDate(dt.year, dt.month, dt.day), QTime(dt.hour, dt.minute))
+
+
+class ObservationDialog(WindowPositionMixin, QDialog):
+    """Add/edit one observation (one observing night): its time span, notes and
+    hand-logged subs. The night's scanned files are shown read-only - files always
+    follow their own timestamps, so they can't be moved or edited here."""
+
+    WINDOW_POSITION_KEY = "ObservationDialog"
+
+    def __init__(self, observation=None, default_date=None, filter_choices=(), taken_nights=(), parent=None):
+        super().__init__(parent)
+        self.observation = observation or {}
+        self.filter_choices = sorted({f for f in filter_choices if f}, key=str.lower)
+        self.taken_nights = set(taken_nights)
+        self.result = None
+        self.setWindowTitle("Edit Observation" if observation else "Add Observation")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setModal(True)
+        self.resize(580, 600)  # default size the first time this dialog is ever opened
+        self._setup_ui(default_date or date_cls.today())
+        self.setup_window_position()
+
+    def _setup_ui(self, default_date):
+        layout = QVBoxLayout(self)
+
+        time_group = QGroupBox("Night")
+        time_form = QFormLayout()
+        self.start_edit = QDateTimeEdit()
+        self.end_edit = QDateTimeEdit()
+        for edit in (self.start_edit, self.end_edit):
+            edit.setCalendarPopup(True)
+            edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+
+        start = SessionObservations.parse_obs_datetime(self.observation.get("start_datetime"))
+        end = SessionObservations.parse_obs_datetime(self.observation.get("end_datetime"))
+        if start is None:
+            night = self.observation.get("night_date")
+            base = datetime.strptime(night, "%Y-%m-%d") if night else datetime.combine(default_date, datetime.min.time())
+            start = base.replace(hour=21, minute=0)
+        if end is None or end <= start:
+            end = start + timedelta(hours=3)
+        self.start_edit.setDateTime(_to_qdatetime(start))
+        self.end_edit.setDateTime(_to_qdatetime(end))
+        self._last_start = self.start_edit.dateTime()
+
+        self.start_edit.dateTimeChanged.connect(self._on_start_changed)
+        self.end_edit.editingFinished.connect(self._on_end_edited)
+        self.end_edit.dateTimeChanged.connect(lambda _dt: self._update_night_label())
+
+        time_form.addRow("Start:", self.start_edit)
+        time_form.addRow("End:", self.end_edit)
+        self.night_label = QLabel()
+        time_form.addRow("Observing night:", self.night_label)
+        hint = QLabel("A night that runs past midnight is one observation. An end time earlier "
+                      "than the start time moves to the next morning.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        time_form.addRow(hint)
+        time_group.setLayout(time_form)
+        layout.addWidget(time_group)
+
+        file_groups = self.observation.get("file_groups") or []
+        if self.observation.get("file_count"):
+            files_group = QGroupBox(f"Scanned Files ({self.observation['file_count']} attached, read-only)")
+            files_layout = QVBoxLayout()
+            files_table = _make_table(["Filter", "Exposure", "Subs", "Integration"])
+            files_table.setRowCount(len(file_groups))
+            for row, group in enumerate(sorted(file_groups, key=lambda g: (
+                    SessionObservations.normalize_filter(g["filter_name"]), g["exposure_seconds"] or 0))):
+                files_table.setItem(row, 0, _table_item(group["filter_name"] or "(no filter)"))
+                files_table.setItem(row, 1, _table_item(format_exposure(group["exposure_seconds"]), Qt.AlignCenter))
+                files_table.setItem(row, 2, _table_item(str(group["count"]), Qt.AlignCenter))
+                files_table.setItem(row, 3, _table_item(format_duration(group["seconds"]), Qt.AlignCenter))
+            files_table.setMaximumHeight(140)
+            files_layout.addWidget(files_table)
+            files_group.setLayout(files_layout)
+            layout.addWidget(files_group)
+
+        logged_group = QGroupBox("Logged Subs (entered by hand)")
+        logged_layout = QVBoxLayout()
+        logged_hint = QLabel("For subs you didn't import. Where these overlap scanned files with the same "
+                             "filter and exposure, the larger count is used - they are never added together.")
+        logged_hint.setWordWrap(True)
+        logged_hint.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        logged_layout.addWidget(logged_hint)
+        self.logged_table = _make_table(["Filter", "Exposure (s)", "Subs", "Integration"])
+        self.logged_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.logged_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        logged_layout.addWidget(self.logged_table)
+
+        row_buttons = QHBoxLayout()
+        add_row_btn = QPushButton("Add Filter")
+        add_row_btn.clicked.connect(lambda: self._add_logged_row())
+        row_buttons.addWidget(add_row_btn)
+        remove_row_btn = QPushButton("Remove Filter")
+        remove_row_btn.clicked.connect(self._remove_logged_row)
+        row_buttons.addWidget(remove_row_btn)
+        row_buttons.addStretch()
+        self.logged_total_label = QLabel()
+        row_buttons.addWidget(self.logged_total_label)
+        logged_layout.addLayout(row_buttons)
+        logged_group.setLayout(logged_layout)
+        layout.addWidget(logged_group, 1)
+
+        for logged in self.observation.get("logged") or []:
+            self._add_logged_row(logged["filter_name"] or "", logged["exposure_seconds"] or 0, logged["sub_count"] or 0)
+
+        notes_group = QGroupBox("Notes")
+        notes_layout = QVBoxLayout()
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setMaximumHeight(70)
+        self.notes_edit.setPlainText(self.observation.get("notes") or "")
+        notes_layout.addWidget(self.notes_edit)
+        notes_group.setLayout(notes_layout)
+        layout.addWidget(notes_group)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(cancel_btn)
+        ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self._on_ok)
+        buttons.addWidget(ok_btn)
+        layout.addLayout(buttons)
+
+        self._update_night_label()
+        self._update_logged_totals()
+
+    def _on_start_changed(self, new_start):
+        """Moving the start moves the end by the same amount, keeping the span."""
+        delta_secs = self._last_start.secsTo(new_start)
+        self._last_start = new_start
+        self.end_edit.blockSignals(True)
+        self.end_edit.setDateTime(self.end_edit.dateTime().addSecs(delta_secs))
+        self.end_edit.blockSignals(False)
+        self._update_night_label()
+
+    def _on_end_edited(self):
+        """An end earlier than the start on the same date means the next morning."""
+        start, end = self.start_edit.dateTime(), self.end_edit.dateTime()
+        if end <= start and end.date() == start.date():
+            self.end_edit.setDateTime(end.addDays(1))
+        self._update_night_label()
+
+    def _night_date(self):
+        return SessionObservations.night_date_for(self.start_edit.dateTime().toPython()).isoformat()
+
+    def _update_night_label(self):
+        start = self.start_edit.dateTime().toPython()
+        end = self.end_edit.dateTime().toPython()
+        text = f"Night of {self._night_date()}"
+        if end > start:
+            text += f"  ({format_duration((end - start).total_seconds())})"
+        self.night_label.setText(text)
+
+    def _add_logged_row(self, filter_name="", exposure=None, count=None):
+        row = self.logged_table.rowCount()
+        if exposure is None:
+            exposure = self.logged_table.cellWidget(row - 1, 1).value() if row else 300
+        self.logged_table.insertRow(row)
+
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.addItems(self.filter_choices)
+        combo.setCurrentText(filter_name)
+        exposure_spin = QDoubleSpinBox()
+        exposure_spin.setRange(0, 36000)
+        exposure_spin.setDecimals(1)
+        exposure_spin.setValue(float(exposure))
+        count_spin = QSpinBox()
+        count_spin.setRange(0, 100000)
+        count_spin.setValue(int(count if count is not None else 1))
+        exposure_spin.valueChanged.connect(self._update_logged_totals)
+        count_spin.valueChanged.connect(self._update_logged_totals)
+
+        self.logged_table.setCellWidget(row, 0, combo)
+        self.logged_table.setCellWidget(row, 1, exposure_spin)
+        self.logged_table.setCellWidget(row, 2, count_spin)
+        self.logged_table.setItem(row, 3, _table_item("", Qt.AlignCenter))
+        self._update_logged_totals()
+
+    def _remove_logged_row(self):
+        row = self.logged_table.currentRow()
+        if row < 0:
+            row = self.logged_table.rowCount() - 1
+        if row >= 0:
+            self.logged_table.removeRow(row)
+            self._update_logged_totals()
+
+    def _update_logged_totals(self):
+        total = 0.0
+        for row in range(self.logged_table.rowCount()):
+            seconds = self.logged_table.cellWidget(row, 1).value() * self.logged_table.cellWidget(row, 2).value()
+            total += seconds
+            item = self.logged_table.item(row, 3)
+            if item:
+                item.setText(format_duration(seconds))
+        self.logged_total_label.setText(f"Logged total: {format_duration(total)}")
+
+    def _on_ok(self):
+        start = self.start_edit.dateTime().toPython().replace(second=0, microsecond=0)
+        end = self.end_edit.dateTime().toPython().replace(second=0, microsecond=0)
+        if end <= start:
+            QMessageBox.warning(self, "Invalid Times", "The end must be after the start.")
+            return
+        if end - start > SessionObservations.MAX_OBSERVATION_SPAN:
+            QMessageBox.warning(self, "Invalid Times",
+                                "One observation covers a single night (at most 24 hours). "
+                                "Add another observation for the next night.")
+            return
+
+        night = self._night_date()
+        original_night = self.observation.get("night_date")
+        if self.observation.get("file_count") and night != original_night:
+            QMessageBox.warning(
+                self, "Night Can't Change",
+                f"This observation has {self.observation['file_count']} attached file(s) taken on the "
+                f"night of {original_night}, so it can't move to another night. Adjust the times only.",
+            )
+            return
+        if night != original_night and night in self.taken_nights:
+            QMessageBox.warning(self, "Night Already Logged",
+                                f"There is already an observation for the night of {night}. Edit that one instead.")
+            return
+
+        logged = []
+        for row in range(self.logged_table.rowCount()):
+            filter_name = self.logged_table.cellWidget(row, 0).currentText().strip()
+            exposure = self.logged_table.cellWidget(row, 1).value()
+            count = self.logged_table.cellWidget(row, 2).value()
+            if count == 0:
+                continue
+            if exposure <= 0:
+                QMessageBox.warning(self, "Invalid Exposure", f"Row {row + 1}: the exposure must be more than 0 seconds.")
+                return
+            logged.append({"filter_name": filter_name, "exposure_seconds": exposure, "sub_count": count})
+
+        self.result = {
+            "night_date": night,
+            "start_datetime": SessionObservations.format_datetime(start),
+            "end_datetime": SessionObservations.format_datetime(end),
+            "notes": self.notes_edit.toPlainText().strip(),
+            "logged": logged,
+        }
+        self.accept()
+
+
+class SessionDetailsDialog(WindowPositionMixin, QDialog):
+    """Everything about one session: its editable fields (Overview), its
+    observations with per-filter counted totals (Observations), whole-session
+    per-filter totals (Filter Summary) and every attached file (Files).
+
+    Observation adds/edits/deletes are held in memory and written together with
+    the session's fields in one transaction on Save. Attaching or removing files
+    scans/changes data on disk-backed rows, so those are written immediately
+    (saving any pending edits first)."""
+
+    WINDOW_POSITION_KEY = "SessionDetailsDialog"
+    OVERVIEW_TAB, OBSERVATIONS_TAB, FILTERS_TAB, FILES_TAB = range(4)
+
+    def __init__(self, session_data, start_tab=0, start_add=False, parent=None):
+        super().__init__(parent)
+        self.db_manager = DatabaseManager()
+        self.session_data = dict(session_data)
+        self.session_id = session_data["id"]
+        self.data_changed = False
+        self._observations = []
+        self._deleted_ids = []
+        self._files = []
+        self._session_meta = {}
+        self._obs_dirty = False
+        self._added_any = False
+        self._scan_thread = None
+
+        self.setWindowTitle(f"{session_data.get('dso_name', '')} — {session_data.get('session_date', '')}")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.WindowMaximizeButtonHint)
+        self.setModal(True)
+        self.resize(1000, 720)  # default size the first time this dialog is ever opened
+
+        self._setup_ui()
+        self._enable_file_drops()
+        self._reload_from_db()
+        self._form_snapshot = self.form.snapshot()
+        self.tabs.setCurrentIndex(start_tab)
+        self.setup_window_position()
+        if start_add:
+            QTimer.singleShot(0, self._add_observation)
+
+    # ---- UI -------------------------------------------------------------
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_overview_tab(), "Overview")
+        self.tabs.addTab(self._build_observations_tab(), "Observations")
+        self.tabs.addTab(self._build_filters_tab(), "Filter Summary")
+        self.tabs.addTab(self._build_files_tab(), "Files")
+        layout.addWidget(self.tabs, 1)
+
+        buttons = QHBoxLayout()
+        note = QLabel("Drop FITS/XISF files or folders anywhere here to attach them. "
+                      "Attaching or removing files is saved immediately.")
+        note.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        buttons.addWidget(note)
+        buttons.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(cancel_btn)
+        save_btn = QPushButton("Save Changes")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._save)
+        buttons.addWidget(save_btn)
+        layout.addLayout(buttons)
+
+    def _build_overview_tab(self):
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        self.form = SessionFormWidget(session_data=self.session_data)
+        layout.addWidget(self.form, 3)
+
+        summary_group = QGroupBox("Summary")
+        summary_form = QFormLayout()
+        self.summary_labels = {}
+        for key, label in (("subs", "Light Subs:"), ("integration", "Integration:"), ("nights", "Nights:"),
+                           ("filters", "Filters:"), ("range", "Date Range:"), ("files", "Attached Files:"),
+                           ("target", "Linked Target:"), ("created", "Created:"), ("modified", "Modified:")):
+            value_label = QLabel()
+            value_label.setWordWrap(True)
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            summary_form.addRow(label, value_label)
+            self.summary_labels[key] = value_label
+        summary_group.setLayout(summary_form)
+
+        summary_column = QVBoxLayout()
+        summary_column.addWidget(summary_group)
+        summary_column.addStretch()
+        layout.addLayout(summary_column, 2)
+        return tab
+
+    def _build_observations_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        hint = QLabel("Each observation is one observing night - a night that runs past midnight stays one "
+                      "observation. Hand-logged subs and scanned files with the same filter and exposure are the "
+                      "same subs, so the larger count is used, never both.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        layout.addWidget(hint)
+
+        buttons = QHBoxLayout()
+        add_btn = QPushButton("Add Observation...")
+        add_btn.clicked.connect(self._add_observation)
+        buttons.addWidget(add_btn)
+        self.edit_obs_btn = QPushButton("Edit...")
+        self.edit_obs_btn.clicked.connect(self._edit_observation)
+        buttons.addWidget(self.edit_obs_btn)
+        self.delete_obs_btn = QPushButton("Delete")
+        self.delete_obs_btn.clicked.connect(self._delete_observation)
+        buttons.addWidget(self.delete_obs_btn)
+        buttons.addStretch()
+        attach_btn = QPushButton("Attach Files ▾")
+        attach_menu = QMenu(attach_btn)
+        attach_menu.addAction("Sub Files...").triggered.connect(lambda: self._attach_files(folder=False))
+        attach_menu.addAction("Folder...").triggered.connect(lambda: self._attach_files(folder=True))
+        attach_btn.setMenu(attach_menu)
+        buttons.addWidget(attach_btn)
+        layout.addLayout(buttons)
+
+        splitter = QSplitter(Qt.Vertical)
+        self.obs_table = _make_table(["Night", "Filters", "Subs", "Integration", "Source", "Notes"])
+        self.obs_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.obs_table.itemSelectionChanged.connect(self._on_observation_selected)
+        self.obs_table.itemDoubleClicked.connect(lambda _item: self._edit_observation())
+        splitter.addWidget(self.obs_table)
+
+        breakdown_widget = QWidget()
+        breakdown_layout = QVBoxLayout(breakdown_widget)
+        breakdown_layout.setContentsMargins(0, 0, 0, 0)
+        self.breakdown_label = QLabel("Select an observation to see its per-filter breakdown.")
+        breakdown_layout.addWidget(self.breakdown_label)
+        self.breakdown_table = _make_table(["Filter", "Exposure", "Files", "Logged", "Counted", "Integration"])
+        self.breakdown_table.setSelectionMode(QAbstractItemView.NoSelection)
+        breakdown_layout.addWidget(self.breakdown_table)
+        splitter.addWidget(breakdown_widget)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
+        return tab
+
+    def _build_filters_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.filter_table = _make_table(["Filter", "Subs", "Integration", "Nights"])
+        self.filter_table.setSelectionMode(QAbstractItemView.NoSelection)
+        layout.addWidget(self.filter_table)
+        return tab
+
+    def _build_files_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.files_count_label = QLabel()
+        layout.addWidget(self.files_count_label)
+        self.files_table = _make_table(["File", "Night", "Frame", "Filter", "Exposure", "Gain", "Temp", "Binning"])
+        self.files_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.files_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.files_table.customContextMenuRequested.connect(self._show_files_menu)
+        layout.addWidget(self.files_table)
+        return tab
+
+    # ---- Data -----------------------------------------------------------
+
+    def _reload_from_db(self):
+        try:
+            with self.db_manager.get_connection() as conn:
+                self._observations = SessionObservations.load_observations(conn, self.session_id)
+                self._files = SessionObservations.load_session_files(conn, self.session_id)
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT s.created_date, s.modified_date, t.name
+                    FROM usersessions s LEFT JOIN usertargetlist t ON t.id = s.target_id
+                    WHERE s.id = ?
+                """, (self.session_id,))
+                row = cursor.fetchone()
+                self._session_meta = {"created": row[0], "modified": row[1], "target": row[2]} if row else {}
+        except Exception as e:
+            logger.error(f"Error loading session details: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to load session details: {e}")
+        for obs in self._observations:
+            obs["state"] = None
+        self._deleted_ids = []
+        self._obs_dirty = False
+        self._added_any = False
+        self._refresh_all()
+
+    def _visible_files(self):
+        """Files not belonging to an observation that's pending deletion."""
+        deleted = set(self._deleted_ids)
+        return [f for f in self._files if f["observation_id"] not in deleted]
+
+    def _loose_light_files(self):
+        """Light files that couldn't be placed on a night (no DATE-OBS)."""
+        return [f for f in self._files if f["observation_id"] is None and f["frame_type"] == "Light"]
+
+    @staticmethod
+    def _breakdown(obs):
+        return SessionObservations.combine_breakdown(obs["file_groups"], obs["logged"])
+
+    def _filter_totals(self):
+        """[(display name, subs, seconds, nights)] across the session, counted values."""
+        totals = {}
+        for obs in self._observations:
+            for row in self._breakdown(obs):
+                if not row["counted_subs"]:
+                    continue
+                key = SessionObservations.normalize_filter(row["filter_name"])
+                entry = totals.setdefault(key, {"name": row["filter_name"] or "(no filter)",
+                                                "subs": 0, "seconds": 0.0, "nights": set()})
+                entry["subs"] += row["counted_subs"]
+                entry["seconds"] += row["counted_seconds"]
+                entry["nights"].add(obs["night_date"])
+        for f in self._loose_light_files():
+            key = SessionObservations.normalize_filter(f["filter_name"])
+            entry = totals.setdefault(key, {"name": f["filter_name"] or "(no filter)",
+                                            "subs": 0, "seconds": 0.0, "nights": set()})
+            entry["subs"] += 1
+            entry["seconds"] += f["exptime_seconds"] or 0
+        return sorted(((e["name"], e["subs"], e["seconds"], len(e["nights"])) for e in totals.values()),
+                      key=lambda t: t[0].lower())
+
+    def _filter_choices(self):
+        choices = {f.strip() for f in (self.form.filters_edit.text() or "").split(",") if f.strip()}
+        for obs in self._observations:
+            choices.update(g["filter_name"] for g in obs["file_groups"] if g["filter_name"])
+            choices.update(l["filter_name"] for l in obs["logged"] if l["filter_name"])
+        return choices
+
+    def _has_unsaved_changes(self):
+        return self._obs_dirty or self.form.snapshot() != self._form_snapshot
+
+    # ---- Refresh --------------------------------------------------------
+
+    def _refresh_all(self):
+        self._observations.sort(key=lambda o: o["night_date"])
+        self._refresh_observations_table()
+        self._refresh_filter_table()
+        self._refresh_files_table()
+        self._refresh_summary()
+        has_observations = bool(self._observations)
+        self.form.filters_edit.setReadOnly(has_observations)
+        self.form.filters_edit.setToolTip(
+            "Calculated from this session's observations." if has_observations else "")
+
+    def _refresh_observations_table(self, select_obs=None):
+        if select_obs is None:
+            select_obs = self._selected_observation()
+        self.obs_table.setRowCount(len(self._observations))
+        select_row = -1
+        for row, obs in enumerate(self._observations):
+            subs, seconds, filters = SessionObservations.summarize_breakdown(self._breakdown(obs))
+            has_files = obs["file_count"] > 0
+            has_logged = any(l["sub_count"] for l in obs["logged"])
+            source = ("Files + Logged" if has_files and has_logged else
+                      "Files" if has_files else "Logged" if has_logged else "—")
+            night_text = SessionObservations.format_night_span(
+                obs["night_date"], obs["start_datetime"], obs["end_datetime"])
+            if obs["state"]:
+                night_text += "  *"
+            notes = (obs["notes"] or "").splitlines()[0] if obs["notes"] else ""
+            self.obs_table.setItem(row, 0, _table_item(night_text, tooltip="* unsaved" if obs["state"] else None))
+            self.obs_table.setItem(row, 1, _table_item(", ".join(filters)))
+            self.obs_table.setItem(row, 2, _table_item(str(subs), Qt.AlignCenter))
+            self.obs_table.setItem(row, 3, _table_item(format_duration(seconds), Qt.AlignCenter))
+            self.obs_table.setItem(row, 4, _table_item(source, Qt.AlignCenter))
+            self.obs_table.setItem(row, 5, _table_item(notes, tooltip=obs["notes"] or None))
+            if obs is select_obs:
+                select_row = row
+        if select_row < 0 and self._observations:
+            select_row = 0
+        if select_row >= 0:
+            self.obs_table.selectRow(select_row)
+        self._on_observation_selected()
+
+    def _selected_observation(self):
+        row = self.obs_table.currentRow()
+        if 0 <= row < len(self._observations):
+            return self._observations[row]
+        return None
+
+    def _on_observation_selected(self):
+        obs = self._selected_observation()
+        self.edit_obs_btn.setEnabled(obs is not None)
+        self.delete_obs_btn.setEnabled(obs is not None)
+        if obs is None:
+            self.breakdown_label.setText("Select an observation to see its per-filter breakdown.")
+            self.breakdown_table.setRowCount(0)
+            return
+
+        rows = self._breakdown(obs)
+        self.breakdown_label.setText(
+            f"<b>Night of {obs['night_date']}</b> — {obs['file_count']} attached file(s)")
+        self.breakdown_table.setRowCount(len(rows) + (1 if rows else 0))
+        for row, r in enumerate(rows):
+            self.breakdown_table.setItem(row, 0, _table_item(r["filter_name"] or "(no filter)"))
+            self.breakdown_table.setItem(row, 1, _table_item(format_exposure(r["exposure_seconds"]), Qt.AlignCenter))
+            self.breakdown_table.setItem(row, 2, _table_item(str(r["file_subs"]), Qt.AlignCenter))
+            self.breakdown_table.setItem(row, 3, _table_item(str(r["logged_subs"]), Qt.AlignCenter))
+            self.breakdown_table.setItem(row, 4, _table_item(str(r["counted_subs"]), Qt.AlignCenter))
+            self.breakdown_table.setItem(row, 5, _table_item(format_duration(r["counted_seconds"]), Qt.AlignCenter))
+        if rows:
+            subs, seconds, _filters = SessionObservations.summarize_breakdown(rows)
+            self._set_total_row(self.breakdown_table, len(rows),
+                                ["Total", "", str(sum(r["file_subs"] for r in rows)),
+                                 str(sum(r["logged_subs"] for r in rows)), str(subs), format_duration(seconds)])
+
+    @staticmethod
+    def _set_total_row(table, row, values):
+        bold = QFont()
+        bold.setBold(True)
+        for col, value in enumerate(values):
+            item = _table_item(value, Qt.AlignCenter if col else None)
+            item.setFont(bold)
+            table.setItem(row, col, item)
+
+    def _refresh_filter_table(self):
+        totals = self._filter_totals()
+        self.filter_table.setRowCount(len(totals) + (1 if totals else 0))
+        for row, (name, subs, seconds, nights) in enumerate(totals):
+            self.filter_table.setItem(row, 0, _table_item(name))
+            self.filter_table.setItem(row, 1, _table_item(str(subs), Qt.AlignCenter))
+            self.filter_table.setItem(row, 2, _table_item(format_duration(seconds), Qt.AlignCenter))
+            self.filter_table.setItem(row, 3, _table_item(str(nights), Qt.AlignCenter))
+        if totals:
+            self._set_total_row(self.filter_table, len(totals), [
+                "Total", str(sum(t[1] for t in totals)), format_duration(sum(t[2] for t in totals)),
+                str(len(self._observations)),
+            ])
+
+    def _refresh_files_table(self):
+        files = self._visible_files()
+        self.files_table.setRowCount(len(files))
+        for row, f in enumerate(files):
+            path = f["file_path"] or ""
+            self.files_table.setItem(row, 0, _table_item(os.path.basename(path), user_data=f["id"], tooltip=path))
+            night = f["night_date"] or ("—" if f["date_obs"] else "(no date)")
+            self.files_table.setItem(row, 1, _table_item(night, Qt.AlignCenter))
+            self.files_table.setItem(row, 2, _table_item(f["frame_type"] or "", Qt.AlignCenter))
+            self.files_table.setItem(row, 3, _table_item(f["filter_name"] or "", Qt.AlignCenter))
+            exposure = format_exposure(f["exptime_seconds"]) if f["exptime_seconds"] is not None else ""
+            self.files_table.setItem(row, 4, _table_item(exposure, Qt.AlignCenter))
+            gain = f"{f['gain']:g}" if f["gain"] is not None else ""
+            self.files_table.setItem(row, 5, _table_item(gain, Qt.AlignCenter))
+            temp = f"{f['ccd_temp']:.1f}°C" if f["ccd_temp"] is not None else ""
+            self.files_table.setItem(row, 6, _table_item(temp, Qt.AlignCenter))
+            binning = f"{f['xbinning']}x{f['ybinning'] or f['xbinning']}" if f["xbinning"] else ""
+            self.files_table.setItem(row, 7, _table_item(binning, Qt.AlignCenter))
+
+        frame_counts = Counter(f["frame_type"] or "Unknown" for f in files)
+        breakdown = ", ".join(f"{count} {frame}" for frame, count in frame_counts.most_common())
+        self.files_count_label.setText(
+            f"{len(files)} attached file(s)" + (f" — {breakdown}" if breakdown else "")
+            + ("   (right-click to open a folder or remove files)" if files else ""))
+
+    def _refresh_summary(self):
+        totals = self._filter_totals()
+        subs = sum(t[1] for t in totals)
+        seconds = sum(t[2] for t in totals)
+        starts = [o["start_datetime"] or o["night_date"] for o in self._observations]
+        ends = [o["end_datetime"] or o["night_date"] for o in self._observations]
+        if starts:
+            first, last = min(starts).replace("T", " ")[:16], max(ends).replace("T", " ")[:16]
+            date_range = first if first == last else f"{first} → {last}"
+        else:
+            date_range = "(no observations yet)"
+
+        labels = self.summary_labels
+        labels["subs"].setText(str(subs))
+        labels["integration"].setText(f"{format_duration(seconds)}  ({seconds / 3600.0:.2f} h)")
+        labels["nights"].setText(str(len(self._observations)))
+        labels["filters"].setText(", ".join(t[0] for t in totals) or "(none)")
+        labels["range"].setText(date_range)
+        labels["files"].setText(str(len(self._visible_files())))
+        labels["target"].setText(self._session_meta.get("target") or "(not linked)")
+        labels["created"].setText(self._session_meta.get("created") or "")
+        labels["modified"].setText(self._session_meta.get("modified") or "")
+
+    # ---- Observation edits (held in memory until Save) -------------------
+
+    def _mark_dirty(self, select_obs=None):
+        self._obs_dirty = True
+        self._observations.sort(key=lambda o: o["night_date"])
+        self._refresh_observations_table(select_obs=select_obs)
+        self._refresh_filter_table()
+        self._refresh_files_table()
+        self._refresh_summary()
+
+    def _add_observation(self):
+        self.tabs.setCurrentIndex(self.OBSERVATIONS_TAB)
+        taken = {o["night_date"] for o in self._observations}
+        default_date = self.form.date_edit.date().toPython()
+        if default_date.isoformat() in taken:
+            default_date = date_cls.today()
+        dialog = ObservationDialog(default_date=default_date, filter_choices=self._filter_choices(),
+                                   taken_nights=taken, parent=self)
+        if dialog.exec() != QDialog.Accepted or not dialog.result:
+            return
+        obs = {"id": None, "state": "new", "is_manual": True, "file_groups": [], "file_count": 0}
+        obs.update(dialog.result)
+        self._observations.append(obs)
+        self._added_any = True
+        self._mark_dirty(select_obs=obs)
+
+    def _edit_observation(self):
+        obs = self._selected_observation()
+        if obs is None:
+            return
+        taken = {o["night_date"] for o in self._observations if o is not obs}
+        dialog = ObservationDialog(observation=obs, filter_choices=self._filter_choices(),
+                                   taken_nights=taken, parent=self)
+        if dialog.exec() != QDialog.Accepted or not dialog.result:
+            return
+        obs.update(dialog.result)
+        if obs["id"] is not None:
+            obs["state"] = "modified"
+        self._mark_dirty(select_obs=obs)
+
+    def _delete_observation(self):
+        obs = self._selected_observation()
+        if obs is None:
+            return
+        message = f"Delete the observation for the night of {obs['night_date']}?"
+        if obs["file_count"]:
+            message += (f"\n\nIts {obs['file_count']} attached file(s) will also be removed from this session "
+                        f"(the files on disk are not touched).")
+        message += "\n\nThis takes effect when you click Save Changes."
+        if QMessageBox.question(self, "Delete Observation", message,
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._observations.remove(obs)
+        if obs["id"] is not None:
+            self._deleted_ids.append(obs["id"])
+        self._mark_dirty()
+
+    # ---- Saving ---------------------------------------------------------
+
+    @staticmethod
+    def _insert_logged(cursor, observation_id, logged_rows):
+        for logged in logged_rows:
+            cursor.execute("""
+                INSERT INTO usersessionobservationfilters (observation_id, filter_name, exposure_seconds, sub_count)
+                VALUES (?, ?, ?, ?)
+            """, (observation_id, logged["filter_name"], logged["exposure_seconds"], logged["sub_count"]))
+
+    def _commit(self):
+        """Write the form and every pending observation change in one transaction."""
+        if not self.form.validate():
+            self.tabs.setCurrentIndex(self.OVERVIEW_TAB)
+            return False
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                self.form.write(conn)
+                for obs_id in self._deleted_ids:
+                    SessionObservations.delete_observation(conn, obs_id)
+                for obs in self._observations:
+                    if obs["state"] == "modified":
+                        cursor.execute("""
+                            UPDATE usersessionobservations SET night_date = ?, start_datetime = ?, end_datetime = ?,
+                                notes = ?, is_manual = 1, modified_date = ?
+                            WHERE id = ?
+                        """, (obs["night_date"], obs["start_datetime"], obs["end_datetime"], obs["notes"],
+                              now, obs["id"]))
+                        cursor.execute("DELETE FROM usersessionobservationfilters WHERE observation_id = ?",
+                                       (obs["id"],))
+                        self._insert_logged(cursor, obs["id"], obs["logged"])
+                for obs in self._observations:
+                    if obs["state"] == "new":
+                        cursor.execute("""
+                            INSERT INTO usersessionobservations
+                                (session_id, night_date, start_datetime, end_datetime, notes, is_manual, modified_date)
+                            VALUES (?, ?, ?, ?, ?, 1, ?)
+                        """, (self.session_id, obs["night_date"], obs["start_datetime"], obs["end_datetime"],
+                              obs["notes"], now))
+                        self._insert_logged(cursor, cursor.lastrowid, obs["logged"])
+                SessionObservations.assign_files_to_observations(conn, self.session_id)
+                SessionObservations.recompute_session_aggregates(conn, self.session_id, promote=self._added_any)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error saving session details: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save session: {e}")
+            return False
+        self.data_changed = True
+        return True
+
+    def _save(self):
+        if self._commit():
+            self.accept()
+
+    def reject(self):
+        if self._has_unsaved_changes():
+            reply = QMessageBox.question(self, "Discard Changes?", "Discard your unsaved changes to this session?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+        super().reject()
+
+    def _save_pending_before(self, action):
+        """Immediate writes (attach/remove files) first save any pending edits,
+        so the dialog never mixes committed and uncommitted state."""
+        if not self._has_unsaved_changes():
+            return True
+        reply = QMessageBox.question(
+            self, "Save Changes First?",
+            f"{action} is saved immediately, so your other unsaved changes will be saved first. Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if reply != QMessageBox.Yes or not self._commit():
+            return False
+        self._after_immediate_write()
+        return True
+
+    def _after_immediate_write(self):
+        self.data_changed = True
+        self._reload_from_db()
+        self._form_snapshot = self.form.snapshot()
+
+    # ---- Files (written immediately) -------------------------------------
+
+    def _attach_files(self, folder):
+        if not self._save_pending_before("Attaching files"):
+            return
+        if folder:
+            path = QFileDialog.getExistingDirectory(self, "Attach a Folder of Subs")
+            paths = [path] if path else []
+        else:
+            patterns = " ".join(f"*{ext}" for ext in sorted(SessionFileScanner.SUPPORTED_EXTENSIONS))
+            paths, _ = QFileDialog.getOpenFileNames(self, "Attach Sub Files", "", f"FITS/XISF Files ({patterns})")
+        if paths:
+            self._scan_and_attach(paths)
+
+    def _enable_file_drops(self):
+        """Accept dropped files/folders anywhere in the dialog. Text fields accept
+        drops themselves (a dropped file would be pasted in as a path), so they're
+        filtered: a drop carrying sub files or folders goes to attaching instead."""
+        self.setAcceptDrops(True)
+        for widget in self.findChildren(QWidget):
+            if widget.acceptDrops():
+                widget.installEventFilter(self)
+
+    def _scan_running(self):
+        return self._scan_thread is not None and self._scan_thread.isRunning()
+
+    def _accept_file_drag(self, event):
+        if not self._scan_running() and dropped_sub_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return True
+        return False
+
+    def _handle_file_drop(self, event):
+        paths = dropped_sub_paths(event.mimeData())
+        if not paths or self._scan_running():
+            return False
+        event.acceptProposedAction()
+        # Defer: showing dialogs inside dropEvent would keep the source app's
+        # drag operation (e.g. Explorer) blocked until they close.
+        QTimer.singleShot(0, lambda: self._attach_dropped(paths))
+        return True
+
+    def _attach_dropped(self, paths):
+        if self._save_pending_before("Attaching files"):
+            self._scan_and_attach(paths)
+
+    def dragEnterEvent(self, event):
+        if not self._accept_file_drag(event):
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if not self._accept_file_drag(event):
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not self._handle_file_drop(event):
+            event.ignore()
+
+    def eventFilter(self, obj, event):
+        event_type = event.type()
+        if event_type in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+            if self._accept_file_drag(event):
+                return True
+        elif event_type == QEvent.Type.Drop:
+            if self._handle_file_drop(event):
+                return True
+        return super().eventFilter(obj, event)
+
+    def _scan_and_attach(self, paths):
+        self._progress_dialog = QProgressDialog("Scanning files...", "Cancel", 0, 0, self)
+        self._progress_dialog.setWindowTitle("Attach Files")
+        self._progress_dialog.setWindowModality(Qt.WindowModal)
+        self._progress_dialog.setMinimumDuration(0)
+        self._progress_dialog.show()
+
+        self._scan_thread = SessionScanThread(paths)
+        self._scan_thread.progress.connect(self._on_scan_progress)
+        self._scan_thread.scan_finished.connect(self._on_scan_finished)
+        self._scan_thread.scan_error.connect(self._on_scan_error)
+        self._progress_dialog.canceled.connect(self._scan_thread.terminate)
+        self._scan_thread.start()
+
+    def _on_scan_progress(self, current, total):
+        if total > 0:
+            self._progress_dialog.setMaximum(total)
+            self._progress_dialog.setValue(current)
+
+    def _on_scan_error(self, message):
+        self._progress_dialog.close()
+        QMessageBox.critical(self, "Scan Error", f"Failed to scan files: {message}")
+
+    def _on_scan_finished(self, files):
+        self._progress_dialog.close()
+        if not files:
+            QMessageBox.information(self, "No Files Found", "No supported FITS/XISF files were found.")
+            return
+        try:
+            with self.db_manager.get_connection() as conn:
+                report = SessionObservations.attach_files(conn, self.session_id, files)
+                SessionObservations.assign_files_to_observations(conn, self.session_id)
+                SessionObservations.recompute_session_aggregates(conn, self.session_id)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error attaching files: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to attach files: {e}")
+            return
+        self._after_immediate_write()
+        QMessageBox.information(self, "Attach Files",
+                                SessionObservations.format_attach_report(report)
+                                or f"{report['inserted']} new file(s) attached.")
+
+    def _selected_file_ids(self):
+        rows = sorted({index.row() for index in self.files_table.selectedIndexes()})
+        return [self.files_table.item(row, 0).data(Qt.UserRole) for row in rows if self.files_table.item(row, 0)]
+
+    def _show_files_menu(self, position):
+        item = self.files_table.itemAt(position)
+        if not item:
+            return
+        if not self.files_table.item(item.row(), 0).isSelected():
+            self.files_table.selectRow(item.row())
+        path = self.files_table.item(item.row(), 0).toolTip()
+        count = len(self._selected_file_ids())
+
+        menu = QMenu(self)
+        menu.addAction("Open Containing Folder").triggered.connect(lambda: self._open_folder(path))
+        menu.addSeparator()
+        menu.addAction(f"Remove {count} File(s) from Session...").triggered.connect(self._remove_selected_files)
+        menu.exec(self.files_table.viewport().mapToGlobal(position))
+
+    def _open_folder(self, path):
+        folder = os.path.dirname(path)
+        if not os.path.isdir(folder):
+            QMessageBox.warning(self, "Folder Not Found", f"The folder no longer exists:\n{folder}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def _remove_selected_files(self):
+        file_ids = self._selected_file_ids()
+        if not file_ids:
+            return
+        if QMessageBox.question(
+                self, "Remove Files",
+                f"Remove {len(file_ids)} file(s) from this session? The files on disk are not touched.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        if not self._save_pending_before("Removing files"):
+            return
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                for i in range(0, len(file_ids), 500):
+                    chunk = file_ids[i:i + 500]
+                    cursor.execute(f"DELETE FROM usersessionfiles WHERE session_id = ? AND id IN "
+                                   f"({','.join('?' * len(chunk))})", [self.session_id] + chunk)
+                SessionObservations.assign_files_to_observations(conn, self.session_id)
+                SessionObservations.recompute_session_aggregates(conn, self.session_id, promote=False)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error removing session files: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to remove files: {e}")
+            return
+        self._after_immediate_write()
 
 
 class SessionScanThread(QThread):
@@ -1549,68 +2563,53 @@ class SessionCalendarWidget(QWidget):
 
     def _query_session_markers(self, start_date, end_date):
         """Returns date -> [(session_id, dso_name, status, night_integration_seconds,
-        night_filters), ...]. Groups files into "observing nights" rather than raw
-        calendar dates: a sub taken before noon belongs to the PREVIOUS evening's
-        night (e.g. a 2 AM sub on Saturday is part of "Friday night"), so a session
-        that runs past midnight is one continuous night, not two fragments - and
-        that night's combined totals are shown on EVERY calendar date it actually
-        touches (both Friday and Saturday get the same, complete night data),
-        rather than splitting the totals across the two dates."""
+        night_filters), ...], one entry per observation (observing night). A night
+        that runs past midnight (e.g. Friday 21:00 to Saturday 04:00) is one
+        observation, and its complete counted totals are shown on EVERY calendar
+        date it touches (both Friday and Saturday) rather than split across them."""
         markers = {}
         try:
-            # Pad by a day on each side so a night starting the evening before
-            # start_date, or ending the morning after end_date, is fully captured
-            # before grouping - only dates inside [start_date, end_date] get
-            # returned, but the night's totals reflect all of its subs.
+            # A night starting the evening before start_date can reach into it.
             padded_start = start_date - timedelta(days=1)
-            padded_end = end_date + timedelta(days=1)
 
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT f.session_id, s.status, s.dso_name, f.date_obs, f.frame_type,
-                           f.exptime_seconds, f.filter_name
-                    FROM usersessionfiles f
-                    JOIN usersessions s ON s.id = f.session_id
-                    WHERE f.date_obs IS NOT NULL
-                      AND date(f.date_obs) BETWEEN ? AND ?
-                """, (padded_start.isoformat(), padded_end.isoformat()))
+                    SELECT o.id, o.session_id, s.status, s.dso_name, o.night_date,
+                           o.start_datetime, o.end_datetime
+                    FROM usersessionobservations o
+                    JOIN usersessions s ON s.id = o.session_id
+                    WHERE o.night_date BETWEEN ? AND ?
+                """, (padded_start.isoformat(), end_date.isoformat()))
+                observations = cursor.fetchall()
+                breakdowns = SessionObservations.load_breakdowns(conn, [row[0] for row in observations])
 
-                nights = {}  # (session_id, night_date) -> aggregate dict
-                for session_id, status, dso_name, date_obs, frame_type, exptime, filter_name in cursor.fetchall():
+                for obs_id, session_id, status, dso_name, night_date, start_dt, end_dt in observations:
+                    _subs, seconds, filters = SessionObservations.summarize_breakdown(breakdowns[obs_id])
+                    marker = (session_id, dso_name, status, seconds, ",".join(filters) or None)
                     try:
-                        dt = datetime.fromisoformat(str(date_obs).replace('Z', ''))
-                    except ValueError:
+                        night = datetime.strptime(night_date, "%Y-%m-%d").date()
+                    except (ValueError, TypeError):
                         continue
-                    calendar_date = dt.date()
-                    night_date = calendar_date - timedelta(days=1) if dt.hour < 12 else calendar_date
+                    start = SessionObservations.parse_obs_datetime(start_dt)
+                    end = SessionObservations.parse_obs_datetime(end_dt)
+                    first_day = start.date() if start else night
+                    last_day = end.date() if start and end and end >= start else first_day
+                    day = first_day
+                    while day <= last_day:
+                        if start_date <= day <= end_date:
+                            markers.setdefault(day, []).append(marker)
+                        day += timedelta(days=1)
 
-                    night = nights.setdefault((session_id, night_date), {
-                        "status": status, "dso_name": dso_name, "seconds": 0.0,
-                        "filters": set(), "calendar_dates": set(),
-                    })
-                    night["calendar_dates"].add(calendar_date)
-                    if frame_type == "Light":
-                        night["seconds"] += exptime or 0
-                        if filter_name:
-                            night["filters"].add(filter_name)
-
-                for (session_id, _night_date), night in nights.items():
-                    filters_str = ",".join(sorted(night["filters"])) if night["filters"] else None
-                    marker = (session_id, night["dso_name"], night["status"], night["seconds"], filters_str)
-                    for calendar_date in night["calendar_dates"]:
-                        if start_date <= calendar_date <= end_date:
-                            markers.setdefault(calendar_date, []).append(marker)
-
-                cursor.execute("SELECT DISTINCT session_id FROM usersessionfiles")
-                sessions_with_files = {row[0] for row in cursor.fetchall()}
+                cursor.execute("SELECT DISTINCT session_id FROM usersessionobservations")
+                sessions_with_observations = {row[0] for row in cursor.fetchall()}
 
                 cursor.execute("""
                     SELECT id, session_date, status, dso_name FROM usersessions
                     WHERE session_date BETWEEN ? AND ?
                 """, (start_date.isoformat(), end_date.isoformat()))
                 for session_id, session_date, status, dso_name in cursor.fetchall():
-                    if session_id in sessions_with_files:
+                    if session_id in sessions_with_observations:
                         continue
                     try:
                         day = datetime.strptime(session_date, "%Y-%m-%d").date()
@@ -1701,7 +2700,10 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                     )
                 """)
                 conn.commit()
+                # Observation tables, then place any not-yet-grouped files on their nights.
+                SessionObservations.migrate(conn)
         except Exception as e:
+            _rollback(self.db_manager)
             logger.error(f"Error initializing session manager database: {e}")
 
     def _init_ui(self):
@@ -2067,26 +3069,13 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         return start or ""
 
     def _count_observation_nights(self, session_id):
-        """Counts distinct observing nights (not calendar dates) with logged subs
-        for this session, using the same before-noon-belongs-to-the-previous-
-        evening convention as the calendar's session markers, so a night that
-        runs past midnight counts once, not twice."""
+        """Number of observations (observing nights - one that runs past midnight
+        is still one night) recorded for this session."""
         try:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT date_obs FROM usersessionfiles WHERE session_id = ? AND date_obs IS NOT NULL",
-                    (session_id,),
-                )
-                nights = set()
-                for (date_obs,) in cursor.fetchall():
-                    try:
-                        dt = datetime.fromisoformat(str(date_obs).replace('Z', ''))
-                    except ValueError:
-                        continue
-                    night_date = dt.date() - timedelta(days=1) if dt.hour < 12 else dt.date()
-                    nights.add(night_date)
-                return len(nights)
+                cursor.execute("SELECT COUNT(*) FROM usersessionobservations WHERE session_id = ?", (session_id,))
+                return cursor.fetchone()[0]
         except Exception as e:
             logger.error(f"Error counting observation nights: {e}")
             return 0
@@ -2249,16 +3238,20 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             if dialog.session_id:
                 self._select_session_by_id(dialog.session_id)
 
-    def _edit_selected_session(self):
+    def _edit_selected_session(self, _item=None, start_tab=0, start_add=False):
         row = self.sessions_table.currentRow()
         if row < 0:
             return
         name_item = self.sessions_table.item(row, 0)
         session_data = name_item.data(Qt.UserRole)
-        dialog = AddEditSessionDialog(session_data=session_data, parent=self)
-        if dialog.exec() == QDialog.Accepted:
+        dialog = SessionDetailsDialog(session_data, start_tab=start_tab, start_add=start_add, parent=self)
+        # Attaching/removing files writes immediately, so reload even on Cancel.
+        if dialog.exec() == QDialog.Accepted or dialog.data_changed:
             self._load_sessions()
             self._select_session_by_id(session_data["id"])
+
+    def _add_observation_to_selected(self):
+        self._edit_selected_session(start_tab=SessionDetailsDialog.OBSERVATIONS_TAB, start_add=True)
 
     def _duplicate_selected_session(self):
         row = self.sessions_table.currentRow()
@@ -2291,11 +3284,12 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         try:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM usersessionfiles WHERE session_id = ?", (session_data["id"],))
+                SessionObservations.delete_session_children(conn, session_data["id"])
                 cursor.execute("DELETE FROM usersessions WHERE id = ?", (session_data["id"],))
                 conn.commit()
             self._load_sessions()
         except Exception as e:
+            _rollback(self.db_manager)
             logger.error(f"Error deleting session: {e}")
             QMessageBox.critical(self, "Error", f"Failed to delete session: {e}")
 
@@ -2307,8 +3301,10 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         session_data = self.sessions_table.item(item.row(), 0).data(Qt.UserRole)
 
         menu = QMenu(self)
-        edit_action = menu.addAction("Edit Session")
-        edit_action.triggered.connect(self._edit_selected_session)
+        edit_action = menu.addAction("Session Details...")
+        edit_action.triggered.connect(lambda: self._edit_selected_session())
+        add_obs_action = menu.addAction("Add Observation...")
+        add_obs_action.triggered.connect(self._add_observation_to_selected)
         duplicate_action = menu.addAction("Duplicate Session")
         duplicate_action.triggered.connect(self._duplicate_selected_session)
         menu.addSeparator()
@@ -2419,14 +3415,9 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         self._select_session_by_id(session_id)
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            for url in event.mimeData().urls():
-                if not url.isLocalFile():
-                    continue
-                path = url.toLocalFile()
-                if os.path.isdir(path) or os.path.splitext(path)[1].lower() in SessionFileScanner.SUPPORTED_EXTENSIONS:
-                    event.acceptProposedAction()
-                    return
+        if dropped_sub_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
         event.ignore()
 
     def dropEvent(self, event):

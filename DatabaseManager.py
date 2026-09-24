@@ -243,6 +243,10 @@ class DatabaseManager:
                 """)
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessionfiles_session_id ON usersessionfiles(session_id)")
 
+                # Observations (one per observing night) + usersessionfiles.observation_id/sub_key
+                import SessionObservations
+                SessionObservations.ensure_schema(conn)
+
                 conn.commit()
                 logger.debug("Database tables initialized successfully")
                 
