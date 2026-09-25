@@ -26,6 +26,7 @@ FITS_KEYWORDS = [
     'FOCALLEN', 'APTDIA', 'APTAREA', 'FWHM', 'EQUINOX', 'RA', 'DEC', 'OBJCTRA',
     'OBJCTDEC', 'AIRMASS', 'GAIN', 'OFFSET', 'TEMP', 'CCD-TEMP', 'SET-TEMP',
     'XBINNING', 'YBINNING', 'IMAGETYP', 'FRAME', 'SWCREATE', 'SWMODIFY',
+    'BAYERPAT',  # present on one-shot-colour subs - ProcessingHandoff debayers those
 ]
 
 XISF_SIGNATURE = b"XISF0100"
@@ -40,6 +41,7 @@ XISF_PROPERTY_TO_FITS = {
     'Instrument:Filter:Name': 'FILTER',
     'Observation:Time:Start': 'DATE-OBS',
     'Observation:Object:Name': 'OBJECT',
+    'PCL:CFASourcePattern': 'BAYERPAT',
 }
 
 FRAME_TYPE_KEYWORDS = [

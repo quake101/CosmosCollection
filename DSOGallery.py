@@ -31,6 +31,26 @@ logger = logging.getLogger(__name__)
 SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.fits', '.fit', '.fts', '.xisf'}
 
 
+def insert_user_image(db_manager, image_data):
+    """Insert an AddImageDialog.get_image_data() result into userimages and commit."""
+    with db_manager.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO userimages (
+                dsodetailid, image_path, integration_time,
+                equipment, date_taken, notes, created_date
+            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+        """, (
+            image_data['dsodetailid'],
+            image_data['image_path'],
+            image_data['integration_time'],
+            image_data['equipment'],
+            image_data['date_taken'],
+            image_data['notes']
+        ))
+        conn.commit()
+
+
 class ThumbnailCache:
     """Cache for storing generated thumbnails to avoid regeneration"""
 
@@ -940,6 +960,21 @@ class AddImageDialog(WindowPositionMixin, QDialog):
 
         menu.exec(self.session_import_btn.mapToGlobal(
             self.session_import_btn.rect().bottomLeft()))
+
+    def prefill_from_session(self, session):
+        """Pre-fill from a Session Manager session (the completion handoff): its
+        DSO, then its telescope/camera/date/integration time. Call after
+        set_file_path() so the session's values win over the file's metadata."""
+        index = self._match_dso_index(session.get("dso_name") or "")
+        if index is not None:
+            self.dso_combo.setCurrentIndex(index)
+            # Chosen from the session, not guessed - a later file won't replace it.
+            self._dso_auto_selected = False
+            self.detected_label.setText(f"From session '{session.get('dso_name')}' — please verify.")
+            self.detected_label.show()
+            self._clear_error(self.dso_combo)
+            self._check_for_matching_sessions()
+        self._import_session_data(session)
 
     def _import_session_data(self, session):
         """Apply a chosen session's telescope/camera/date/integration time.
@@ -2118,22 +2153,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     def _add_image_to_database(self, image_data):
         """Add an image to the database and refresh the gallery"""
         try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO userimages (
-                        dsodetailid, image_path, integration_time,
-                        equipment, date_taken, notes, created_date
-                    ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-                """, (
-                    image_data['dsodetailid'],
-                    image_data['image_path'],
-                    image_data['integration_time'],
-                    image_data['equipment'],
-                    image_data['date_taken'],
-                    image_data['notes']
-                ))
-                conn.commit()
+            insert_user_image(self.db_manager, image_data)
 
             # Show success message
             QMessageBox.information(self, "Image Added",

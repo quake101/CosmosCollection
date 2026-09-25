@@ -55,6 +55,30 @@ def open_url(url):
         return False
 
 
+def clean_subprocess_env():
+    """
+    Environment for launching external programs, without the variables this
+    app sets for its own use:
+    - QTWEBENGINE_CHROMIUM_FLAGS (main.py) is read by every QtWebEngine app,
+      e.g. PixInsight - its --enable-logging makes each of their Chromium
+      helper processes flash a console window on Windows (and --log-file
+      would send their logs into this app's chromium_debug.log).
+    - SSL/CA bundle variables and XDG_CACHE_HOME point at this app's own
+      certificates and cache folder.
+    On Linux a PyInstaller-frozen build also exports its bundled
+    LD_LIBRARY_PATH (and friends) to child processes, which causes library
+    conflicts (e.g. readline symbol errors) in them, so those are removed too.
+    """
+    env = os.environ.copy()
+    for var in ['QTWEBENGINE_CHROMIUM_FLAGS', 'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
+                'XDG_CACHE_HOME']:
+        env.pop(var, None)
+    if sys.platform.startswith('linux'):
+        for var in ['LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH']:
+            env.pop(var, None)
+    return env
+
+
 def _open_url_linux(url_str):
     """
     Open URL on Linux with workarounds for shell/readline issues.
@@ -64,11 +88,7 @@ def _open_url_linux(url_str):
     2. xdg-open with clean environment
     3. Direct browser invocation
     """
-    # Create a clean environment without variables that can cause library conflicts
-    clean_env = os.environ.copy()
-    # Remove variables that can cause readline/library symbol issues
-    for var in ['LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH']:
-        clean_env.pop(var, None)
+    clean_env = clean_subprocess_env()
 
     # Method 1: Try gio open (GNOME/modern freedesktop)
     if shutil.which('gio'):

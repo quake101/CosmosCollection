@@ -2295,11 +2295,56 @@ class SessionMonthCalendar(QCalendarWidget):
         self.tooltip_label.raise_()
 
 
+# Superseded worker threads that are still running. quit() can't interrupt a
+# QThread whose work is in run() (no event loop), and wait()-ing for one froze
+# the UI until it finished - e.g. clicking a second session mid-fetch. So they're
+# abandoned instead: kept referenced here (PySide6 can hard-crash, natively, if a
+# QThread is garbage-collected while its OS thread is still running) with their
+# signals blocked so late results are dropped, and pruned once they've ended.
+_retired_threads = set()
+
+
+def _retire_thread(thread):
+    _retired_threads.difference_update([t for t in _retired_threads if not t.isRunning()])
+    if thread is not None and thread.isRunning():
+        thread.blockSignals(True)
+        _retired_threads.add(thread)
+
+
+class SharedWeatherFetch:
+    """At most one WeatherWorker per location, shared by the calendar's weather
+    stripe and the details panel - selecting a session used to start two
+    identical fetches. A running worker is referenced here until it ends (see
+    _retired_threads for why), and its result is cached before callbacks run."""
+
+    _workers = {}  # (lat, lon) rounded -> running WeatherWorker
+
+    @classmethod
+    def key(cls, lat, lon):
+        return round(float(lat), 2), round(float(lon), 2)
+
+    @classmethod
+    def request(cls, lat, lon, timezone, on_loaded, on_error):
+        from WeatherForecast import WeatherCache, WeatherWorker
+        key = cls.key(lat, lon)
+        worker = cls._workers.get(key)
+        is_new = worker is None or not worker.isRunning()
+        if is_new:
+            worker = WeatherWorker(lat, lon, timezone)
+            worker.weather_loaded.connect(lambda data: WeatherCache().set(lat, lon, data))
+            worker.finished.connect(lambda w=worker: cls._workers.pop(key, None) if cls._workers.get(key) is w else None)
+            cls._workers[key] = worker
+        worker.weather_loaded.connect(on_loaded)
+        worker.error_occurred.connect(on_error)
+        if is_new:
+            worker.start()
+
+
 class SessionCalendarWidget(QWidget):
     """The Session Manager 'Calendar' tab: 1-3 side-by-side SessionMonthCalendar
     instances kept chronologically chained, with weather/visibility layers that
-    follow the currently selected session (falling back to the app's active
-    location for weather when nothing is selected)."""
+    follow the currently selected session. Nothing is fetched until a session
+    is selected."""
 
     MONTH_COUNT_SETTING = "session_calendar_month_count"
 
@@ -2313,7 +2358,7 @@ class SessionCalendarWidget(QWidget):
         self.visibility_hours = {}
         self.session_markers = {}
         self.on_date_with_session_clicked = None
-        self._weather_worker = None
+        self._weather_key = None
         self._visibility_thread = None
 
         today = QDate.currentDate()
@@ -2453,59 +2498,37 @@ class SessionCalendarWidget(QWidget):
         self._refresh_weather_layer()
         self._refresh_visibility_layer()
 
-    def _get_active_location(self):
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-                if row:
-                    return row[0], row[1], row[2]
-        except Exception as e:
-            logger.error(f"Error loading active location for calendar: {e}")
-        return None, None, None
-
     def _refresh_weather_layer(self):
+        # Weather is only fetched for a selected session - opening the Session
+        # Manager doesn't start a download.
         session = self._current_session
-        if session and session.get("location_lat") is not None:
-            lat, lon, tz = session.get("location_lat"), session.get("location_lon"), session.get("location_timezone")
-        else:
-            lat, lon, tz = self._get_active_location()
-
+        lat = session.get("location_lat") if session else None
+        lon = session.get("location_lon") if session else None
         if lat is None or lon is None:
+            self._weather_key = None
             self._apply_weather_scores({}, {})
             return
 
-        from WeatherForecast import WeatherCache, WeatherWorker
+        from WeatherForecast import WeatherCache
 
-        cache = WeatherCache()
-        cached = cache.get(lat, lon)
+        cached = WeatherCache().get(lat, lon)
+        self._weather_key = SharedWeatherFetch.key(lat, lon)
         if cached:
             self._apply_weather_list(cached)
             return
+        key = self._weather_key
+        SharedWeatherFetch.request(
+            lat, lon, session.get("location_timezone"),
+            lambda data: self._on_weather_loaded(data, key),
+            lambda msg: logger.debug(f"Calendar weather fetch failed: {msg}"))
 
-        # Never replace a still-running thread's reference - PySide6 can hard-crash
-        # (native, uncatchable) if a QThread object is garbage-collected while its
-        # underlying OS thread is still executing. Same guard already used by
-        # DSOVisibilityCalculator.start_monthly_visibility_calculation().
-        if self._weather_worker and self._weather_worker.isRunning():
-            self._weather_worker.quit()
-            self._weather_worker.wait()
-
-        self._weather_worker = WeatherWorker(lat, lon, tz)
-        self._weather_worker.weather_loaded.connect(lambda data: self._on_weather_loaded(data, lat, lon))
-        self._weather_worker.error_occurred.connect(
-            lambda msg: logger.debug(f"Calendar weather fetch failed: {msg}")
-        )
-        self._weather_worker.start()
-
-    def _on_weather_loaded(self, data, lat, lon):
-        from WeatherForecast import WeatherCache
-        WeatherCache().set(lat, lon, data)
-        self._apply_weather_list(data)
+    def _on_weather_loaded(self, data, key):
+        if key != self._weather_key:
+            return  # a different session/location has been selected since
+        try:
+            self._apply_weather_list(data)
+        except RuntimeError:
+            pass  # the window was closed while the fetch ran
 
     def _apply_weather_list(self, daily_summaries):
         scores = {}
@@ -2535,10 +2558,7 @@ class SessionCalendarWidget(QWidget):
 
         start_date, end_date = self._display_range()
 
-        if self._visibility_thread and self._visibility_thread.isRunning():
-            self._visibility_thread.quit()
-            self._visibility_thread.wait()
-
+        _retire_thread(self._visibility_thread)
         self._visibility_thread = SessionMonthlyVisibilityThread(
             session.get("ra_deg"), session.get("dec_deg"), session.get("dso_name"),
             session.get("location_lat"), session.get("location_lon"), session.get("location_timezone"),
@@ -2637,7 +2657,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         self.sessions_data = []
         self._current_session = None
         self._visibility_thread = None
-        self._weather_worker = None
+        self._weather_key = None  # location of the forecast the details panel is waiting for
         self._init_database()
         self._init_ui()
         self._load_sessions()
@@ -3018,6 +3038,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             self.detail_location_label.setText("")
             self.detail_visibility_label.setText("")
             self.detail_weather_label.setText("")
+            self._weather_key = None
             self.detail_equipment_label.setText("")
             self.view_target_btn.setVisible(False)
             self.calendar_widget.set_active_session(None)
@@ -3101,13 +3122,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         header = f"<b>Tonight</b> ({visibility_date}):" if showing_tonight else f"On {visibility_date}:"
         session_id = session.get("id")
 
-        # Never replace a still-running thread's reference - PySide6 can hard-crash
-        # (native, uncatchable) if a QThread object is garbage-collected while its
-        # underlying OS thread is still executing. Same guard already used by
-        # DSOVisibilityCalculator.start_monthly_visibility_calculation().
-        if self._visibility_thread and self._visibility_thread.isRunning():
-            self._visibility_thread.quit()
-            self._visibility_thread.wait()
+        _retire_thread(self._visibility_thread)
 
         # Runs off the GUI thread - the first calculation per app run can otherwise
         # take several seconds (see VisibilityCalcThread) and would freeze the whole
@@ -3146,43 +3161,45 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         # forecast (index 0 of the 7-day array) rather than the session's original
         # planned date, since an ongoing session isn't tied to one fixed night.
         if status not in ("Planned", "In Progress") or lat is None or lon is None:
+            self._weather_key = None
             self.detail_weather_label.setText(
                 "Weather forecast is only shown for planned or ongoing sessions with a location set."
             )
             return
 
-        from WeatherForecast import WeatherCache, WeatherWorker
+        from WeatherForecast import WeatherCache
 
-        cache = WeatherCache()
-        cached = None if force else cache.get(lat, lon)
+        cached = None if force else WeatherCache().get(lat, lon)
+        self._weather_key = SharedWeatherFetch.key(lat, lon)
         if cached:
             self._apply_weather_summary(cached[0])
             return
 
-        # Never replace a still-running thread's reference - PySide6 can hard-crash
-        # (native, uncatchable) if a QThread object is garbage-collected while its
-        # underlying OS thread is still executing.
-        if self._weather_worker and self._weather_worker.isRunning():
-            self._weather_worker.quit()
-            self._weather_worker.wait()
-
         self.detail_weather_label.setText("Loading weather forecast...")
-        self._weather_worker = WeatherWorker(lat, lon, session.get("location_timezone"))
-        self._weather_worker.weather_loaded.connect(
-            lambda data: self._on_weather_loaded(data, lat, lon)
-        )
-        self._weather_worker.error_occurred.connect(
-            lambda msg: self.detail_weather_label.setText(f"Weather fetch failed: {msg}")
-        )
-        self._weather_worker.start()
+        key = self._weather_key
+        SharedWeatherFetch.request(
+            lat, lon, session.get("location_timezone"),
+            lambda data: self._on_weather_loaded(data, key),
+            lambda msg: self._on_weather_error(msg, key))
 
-    def _on_weather_loaded(self, data, lat, lon):
-        from WeatherForecast import WeatherCache
-        WeatherCache().set(lat, lon, data)
-        if data:
-            self._apply_weather_summary(data[0])
-        else:
-            self.detail_weather_label.setText("No forecast data available.")
+    def _on_weather_loaded(self, data, key):
+        if key != self._weather_key:
+            return  # a different session/location has been selected since
+        try:
+            if data:
+                self._apply_weather_summary(data[0])
+            else:
+                self.detail_weather_label.setText("No forecast data available.")
+        except RuntimeError:
+            pass  # the window was closed while the fetch ran
+
+    def _on_weather_error(self, message, key):
+        if key != self._weather_key:
+            return
+        try:
+            self.detail_weather_label.setText(f"Weather fetch failed: {message}")
+        except RuntimeError:
+            pass
 
     def _apply_weather_summary(self, day_summary):
         from WeatherForecast import get_rating_label
@@ -3249,6 +3266,14 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         if dialog.exec() == QDialog.Accepted or dialog.data_changed:
             self._load_sessions()
             self._select_session_by_id(session_data["id"])
+            # Compared against the status the dialog opened with, so a change
+            # committed early (attaching files saves pending edits) still counts.
+            updated = next((s for s in self.sessions_data if s["id"] == session_data["id"]), None)
+            if updated and updated["status"] == "Completed" and session_data.get("status") != "Completed":
+                from SessionCompletion import SessionCompletionDialog
+                SessionCompletionDialog(updated, parent=self).exec()
+                self._load_sessions()  # the target list entry may have been marked Completed
+                self._select_session_by_id(session_data["id"])
 
     def _add_observation_to_selected(self):
         self._edit_selected_session(start_tab=SessionDetailsDialog.OBSERVATIONS_TAB, start_add=True)

@@ -1834,7 +1834,8 @@ class SettingsDialog(QDialog):
 
         self.integrations_list = QListWidget()
         self.integrations_list.setMinimumWidth(180)
-        self.integrations_list.addItems(["NINA", "ASTAP", "Astrometry.net", "OpenWeather", "VisualCrossing", "WeatherAPI"])
+        self.integrations_list.addItems(["NINA", "ASTAP", "Astrometry.net", "PixInsight", "Siril",
+                                         "OpenWeather", "VisualCrossing", "WeatherAPI"])
         integrations_left_layout.addWidget(self.integrations_list)
         integrations_layout.addWidget(integrations_left_panel)
 
@@ -2004,6 +2005,22 @@ class SettingsDialog(QDialog):
 
         astrometry_page_layout.addStretch()
         self.integrations_stack.addWidget(astrometry_page)
+
+        # PixInsight and Siril pages (stacking handoff when a session is completed)
+        self.processing_app_widgets = {}
+        self.integrations_stack.addWidget(self._build_processing_app_page(
+            "pixinsight", "PixInsight",
+            "Path to PixInsight.exe (auto-detected if empty)",
+            "When a session in the Session Manager is marked Completed, you can hand its frames to "
+            "PixInsight's WeightedBatchPreprocessing (WBPP): the subs are linked into a workspace folder "
+            "and WBPP opens with them loaded. Your original subs are never moved or changed."))
+        self.integrations_stack.addWidget(self._build_processing_app_page(
+            "siril", "Siril",
+            "Path to siril-cli (auto-detected if empty)",
+            "When a session in the Session Manager is marked Completed, you can stack it in Siril: "
+            "the subs are linked into a workspace folder and a generated script calibrates, registers and "
+            "stacks them per filter. Requires Siril 1.3.4 or newer (1.4+ for XISF subs). Download from "
+            "<a href='https://siril.org/download/' style='color: #0078d7;'>siril.org</a>."))
 
         # OpenWeather page
         openweather_page = QWidget()
@@ -2350,6 +2367,12 @@ class SettingsDialog(QDialog):
             nina_port = settings.value("nina_api_port", 1888, type=int)
             self.nina_port_spinbox.setValue(nina_port)
 
+            # Load PixInsight / Siril settings
+            for app, widgets in self.processing_app_widgets.items():
+                widgets["enabled"].setChecked(settings.value(f"{app}_integration_enabled", False, type=bool))
+                widgets["path"].setText(settings.value(f"{app}_path", "", type=str))
+                widgets["workspace"].setText(settings.value(f"{app}_workspace_dir", "", type=str))
+
             # Load OpenWeather settings
             openweather_enabled = settings.value("openweather_integration_enabled", False, type=bool)
             self.openweather_enabled_checkbox.setChecked(openweather_enabled)
@@ -2611,6 +2634,12 @@ class SettingsDialog(QDialog):
             settings.setValue("nina_api_host", self.nina_ip_input.text().strip() or "localhost")
             settings.setValue("nina_api_port", self.nina_port_spinbox.value())
 
+            # Save PixInsight / Siril settings
+            for app, widgets in self.processing_app_widgets.items():
+                settings.setValue(f"{app}_integration_enabled", widgets["enabled"].isChecked())
+                settings.setValue(f"{app}_path", widgets["path"].text().strip())
+                settings.setValue(f"{app}_workspace_dir", widgets["workspace"].text().strip())
+
             # Save OpenWeather settings
             settings.setValue("openweather_integration_enabled", self.openweather_enabled_checkbox.isChecked())
             settings.setValue("openweather_api_key", self.openweather_api_key_input.text().strip())
@@ -2664,6 +2693,113 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "Error",
                 f"Failed to open map picker: {str(e)}\n\n"
                 "Please enter coordinates manually.")
+
+    def _build_processing_app_page(self, app, label, path_placeholder, help_html):
+        """Integrations page for a stacking app (PixInsight / Siril): enable
+        checkbox, executable path, test button and default workspace folder.
+        Widgets are kept in self.processing_app_widgets[app] for load/save."""
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+
+        title = QLabel(label)
+        title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        page_layout.addWidget(title)
+
+        enabled_checkbox = QCheckBox(f"Enable {label} Integration")
+        enabled_checkbox.setToolTip(f"Offer {label} as a next step when a session is marked Completed.")
+        page_layout.addWidget(enabled_checkbox)
+
+        path_layout = QHBoxLayout()
+        path_label = QLabel("Executable:")
+        path_label.setMinimumWidth(120)
+        path_input = QLineEdit()
+        path_input.setPlaceholderText(path_placeholder)
+        path_browse_btn = QPushButton("Browse...")
+        path_browse_btn.setFixedWidth(80)
+        path_browse_btn.clicked.connect(lambda: self._browse_processing_app_path(app, label))
+        path_layout.addWidget(path_label)
+        path_layout.addWidget(path_input)
+        path_layout.addWidget(path_browse_btn)
+        page_layout.addLayout(path_layout)
+
+        workspace_layout = QHBoxLayout()
+        workspace_label = QLabel("Workspace Folder:")
+        workspace_label.setMinimumWidth(120)
+        workspace_input = QLineEdit()
+        workspace_input.setPlaceholderText("Default: next to the session's lights folder")
+        workspace_input.setToolTip("Each completed session gets its own subfolder here.")
+        workspace_browse_btn = QPushButton("Browse...")
+        workspace_browse_btn.setFixedWidth(80)
+        workspace_browse_btn.clicked.connect(lambda: self._browse_processing_workspace(app))
+        workspace_layout.addWidget(workspace_label)
+        workspace_layout.addWidget(workspace_input)
+        workspace_layout.addWidget(workspace_browse_btn)
+        page_layout.addLayout(workspace_layout)
+
+        test_layout = QHBoxLayout()
+        test_spacer = QLabel("")
+        test_spacer.setMinimumWidth(120)
+        test_btn = QPushButton("Test")
+        test_btn.setToolTip(f"Check that {label} can be found")
+        test_btn.clicked.connect(lambda: self._test_processing_app(app, label))
+        test_layout.addWidget(test_spacer)
+        test_layout.addWidget(test_btn)
+        test_layout.addStretch()
+        page_layout.addLayout(test_layout)
+
+        help_label = QLabel(help_html)
+        help_label.setOpenExternalLinks(True)
+        help_label.setWordWrap(True)
+        help_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        help_label.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        page_layout.addWidget(help_label)
+
+        page_layout.addStretch()
+        self.processing_app_widgets[app] = {
+            "enabled": enabled_checkbox, "path": path_input, "workspace": workspace_input,
+        }
+        return page
+
+    def _browse_processing_app_path(self, app, label):
+        path_input = self.processing_app_widgets[app]["path"]
+        start_dir = os.path.dirname(path_input.text().strip()) or (
+            "C:/Program Files" if sys.platform == 'win32' else "/usr/bin")
+        filter_str = "Executable Files (*.exe);;All Files (*.*)" if sys.platform == 'win32' else "All Files (*)"
+        file_path, _ = QFileDialog.getOpenFileName(self, f"Select {label} Executable", start_dir, filter_str)
+        if file_path:
+            path_input.setText(os.path.normpath(file_path))
+
+    def _browse_processing_workspace(self, app):
+        workspace_input = self.processing_app_widgets[app]["workspace"]
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Default Workspace Folder", workspace_input.text().strip() or os.path.expanduser("~"))
+        if folder:
+            workspace_input.setText(os.path.normpath(folder))
+
+    def _test_processing_app(self, app, label):
+        import ProcessingHandoff
+        configured = self.processing_app_widgets[app]["path"].text().strip()
+        if app == "siril":
+            exe = ProcessingHandoff.find_siril_cli(configured)
+            version = ProcessingHandoff.siril_version(exe) if exe else None
+            if not exe:
+                QMessageBox.warning(self, label, "siril-cli wasn't found. Set its path above.")
+            elif not version:
+                QMessageBox.warning(self, label, f"Found {exe}, but couldn't read its version.")
+            elif version < ProcessingHandoff.SIRIL_MIN_VERSION:
+                QMessageBox.warning(self, label, f"Found Siril {'.'.join(map(str, version))} at:\n{exe}\n\n"
+                                                 "Version 1.3.4 or newer is required.")
+            else:
+                QMessageBox.information(self, label, f"Found Siril {'.'.join(map(str, version))} at:\n{exe}")
+        else:
+            exe = ProcessingHandoff.find_pixinsight(configured)
+            wbpp = ProcessingHandoff.find_wbpp_script(exe) if exe else None
+            if not exe:
+                QMessageBox.warning(self, label, "PixInsight wasn't found. Set its path above.")
+            elif not wbpp:
+                QMessageBox.warning(self, label, f"Found {exe}, but not the WBPP script in that installation.")
+            else:
+                QMessageBox.information(self, label, f"Found PixInsight at:\n{exe}\n\nWBPP:\n{wbpp}")
 
     def _browse_astap_path(self):
         """Browse for ASTAP executable"""
@@ -7434,22 +7570,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _add_image_to_database(self, image_data):
         """Add an image to the database and refresh the DSO list"""
         try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO userimages (
-                        dsodetailid, image_path, integration_time,
-                        equipment, date_taken, notes, created_date
-                    ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-                """, (
-                    image_data['dsodetailid'],
-                    image_data['image_path'],
-                    image_data['integration_time'],
-                    image_data['equipment'],
-                    image_data['date_taken'],
-                    image_data['notes']
-                ))
-                conn.commit()
+            from DSOGallery import insert_user_image
+            insert_user_image(self.db_manager, image_data)
 
             QMessageBox.information(self, "Image Added", "Image successfully added to database.")
             self._refresh_data()
