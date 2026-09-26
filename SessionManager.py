@@ -2393,7 +2393,7 @@ class SessionCalendarWidget(QWidget):
 
         row.addStretch()
 
-        row.addWidget(QLabel("Background: DSO visibility • Top stripe: weather • Dot: session"))
+        row.addWidget(QLabel("Background: DSO visibility • Top stripe: weather • Dot: selected session's nights"))
         for label, color in (
             ("Excellent", COLORS['success']), ("Good", COLORS['info']),
             ("Moderate", COLORS['warning']), ("Poor", COLORS['error']),
@@ -2576,17 +2576,22 @@ class SessionCalendarWidget(QWidget):
             cal.set_data(visibility_hours=hours_by_date)
 
     def refresh_session_markers(self):
+        # Dots only for the selected session's nights - none when nothing is selected.
+        session_id = self._current_session.get("id") if self._current_session else None
         start_date, end_date = self._display_range()
-        self.session_markers = self._query_session_markers(start_date, end_date)
+        self.session_markers = (self._query_session_markers(start_date, end_date, session_id)
+                                if session_id is not None else {})
         for cal in self.calendars:
             cal.set_data(session_markers=self.session_markers)
 
-    def _query_session_markers(self, start_date, end_date):
+    def _query_session_markers(self, start_date, end_date, session_id):
         """Returns date -> [(session_id, dso_name, status, night_integration_seconds,
-        night_filters), ...], one entry per observation (observing night). A night
-        that runs past midnight (e.g. Friday 21:00 to Saturday 04:00) is one
-        observation, and its complete counted totals are shown on EVERY calendar
-        date it touches (both Friday and Saturday) rather than split across them."""
+        night_filters), ...] for one session, one entry per observation (observing
+        night). A night that runs past midnight (e.g. Friday 21:00 to Saturday
+        04:00) is one observation, and its complete counted totals are shown on
+        EVERY calendar date it touches (both Friday and Saturday) rather than
+        split across them. A session with no observations is marked on its
+        session_date."""
         markers = {}
         try:
             # A night starting the evening before start_date can reach into it.
@@ -2599,8 +2604,8 @@ class SessionCalendarWidget(QWidget):
                            o.start_datetime, o.end_datetime
                     FROM usersessionobservations o
                     JOIN usersessions s ON s.id = o.session_id
-                    WHERE o.night_date BETWEEN ? AND ?
-                """, (padded_start.isoformat(), end_date.isoformat()))
+                    WHERE o.session_id = ? AND o.night_date BETWEEN ? AND ?
+                """, (session_id, padded_start.isoformat(), end_date.isoformat()))
                 observations = cursor.fetchall()
                 breakdowns = SessionObservations.load_breakdowns(conn, [row[0] for row in observations])
 
@@ -2621,21 +2626,20 @@ class SessionCalendarWidget(QWidget):
                             markers.setdefault(day, []).append(marker)
                         day += timedelta(days=1)
 
-                cursor.execute("SELECT DISTINCT session_id FROM usersessionobservations")
-                sessions_with_observations = {row[0] for row in cursor.fetchall()}
-
-                cursor.execute("""
-                    SELECT id, session_date, status, dso_name FROM usersessions
-                    WHERE session_date BETWEEN ? AND ?
-                """, (start_date.isoformat(), end_date.isoformat()))
-                for session_id, session_date, status, dso_name in cursor.fetchall():
-                    if session_id in sessions_with_observations:
-                        continue
-                    try:
-                        day = datetime.strptime(session_date, "%Y-%m-%d").date()
-                    except (ValueError, TypeError):
-                        continue
-                    markers.setdefault(day, []).append((session_id, dso_name, status, 0, None))
+                cursor.execute("SELECT 1 FROM usersessionobservations WHERE session_id = ? LIMIT 1", (session_id,))
+                if cursor.fetchone() is None:
+                    cursor.execute("""
+                        SELECT session_date, status, dso_name FROM usersessions
+                        WHERE id = ? AND session_date BETWEEN ? AND ?
+                    """, (session_id, start_date.isoformat(), end_date.isoformat()))
+                    row = cursor.fetchone()
+                    if row:
+                        session_date, status, dso_name = row
+                        try:
+                            day = datetime.strptime(session_date, "%Y-%m-%d").date()
+                            markers.setdefault(day, []).append((session_id, dso_name, status, 0, None))
+                        except (ValueError, TypeError):
+                            pass
         except Exception as e:
             logger.error(f"Error querying session markers: {e}")
         return markers
@@ -3333,6 +3337,8 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         duplicate_action = menu.addAction("Duplicate Session")
         duplicate_action.triggered.connect(self._duplicate_selected_session)
         menu.addSeparator()
+        self._add_target_tool_actions(menu, session_data)
+        menu.addSeparator()
         if session_data and session_data.get("target_id"):
             change_link_action = menu.addAction("Change Linked Target...")
             change_link_action.triggered.connect(self._link_session_to_target)
@@ -3345,6 +3351,92 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         delete_action = menu.addAction("Delete Session")
         delete_action.triggered.connect(self._delete_selected_session)
         menu.exec(self.sessions_table.mapToGlobal(position))
+
+    # ---- Right-click tools (processing, FOV Simulator, DSO Details, NINA) ----
+
+    def _add_target_tool_actions(self, menu, session):
+        import ProcessingHandoff as handoff
+        from NINAIntegration import NINAIntegration
+
+        # Processing apps are listed only when enabled under Settings → Integrations.
+        processing_apps = [app for app in (handoff.PIXINSIGHT, handoff.SIRIL)
+                           if QSettings("CosmosCollection", "CosmosCollection")
+                           .value(f"{app}_integration_enabled", False, type=bool)]
+        if processing_apps:
+            processing_menu = menu.addMenu("Processing")
+            for app in processing_apps:
+                action = processing_menu.addAction(f"{handoff.APP_LABELS[app]}...")
+                ready, message = handoff.integration_status(app)
+                if ready:
+                    action.triggered.connect(lambda _=False, a=app: self._process_session(session, a))
+                else:
+                    action.setEnabled(False)
+                    action.setToolTip(message)
+            processing_menu.setToolTipsVisible(True)
+
+        menu.addAction("FOV Simulator").triggered.connect(lambda: self._open_fov_simulator(session))
+        menu.addAction("DSO Details").triggered.connect(lambda: self._open_dso_details(session))
+
+        if NINAIntegration.is_enabled():
+            nina_menu = menu.addMenu("NINA")
+            nina_menu.addAction("Send to Framing Assistant").triggered.connect(
+                lambda: self._nina_action(session, NINAIntegration.send_to_framing_assistant))
+            nina_menu.addAction("Slew to Target").triggered.connect(
+                lambda: self._nina_action(session, NINAIntegration.slew_to_coordinates))
+
+    def _process_session(self, session, app):
+        """Hand the session to Siril/PixInsight from the right-click menu - the
+        same handoff as on completion, without the completion choices."""
+        from SessionCompletion import SessionCompletionDialog
+        SessionCompletionDialog(session, parent=self, app=app).exec()
+
+    def _catalog_data(self, session):
+        """Catalogue data for the session's object (for DSO Details / FOV
+        Simulator, and coordinates when the session has none), or None."""
+        from DSOTargetList import find_full_dso_data
+        return find_full_dso_data(self.db_manager, session.get("dso_name", ""), session)
+
+    def _session_coordinates(self, session):
+        """(ra_deg, dec_deg) - the session's own, else its object's catalogue position."""
+        if session.get("ra_deg") is not None and session.get("dec_deg") is not None:
+            return session["ra_deg"], session["dec_deg"]
+        data = self._catalog_data(session)
+        return (data["ra_deg"], data["dec_deg"]) if data else (None, None)
+
+    def _open_dso_details(self, session):
+        data = self._catalog_data(session)
+        if not data:
+            QMessageBox.warning(self, "Object Not Found",
+                                f"Could not find {session.get('dso_name', 'this object')} in the DSO catalogue.")
+            return
+        try:
+            from main import DSODetailWindow
+            DSODetailWindow(data, self).show()
+        except Exception as e:
+            logger.error(f"Error opening DSO details: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open DSO details: {e}")
+
+    def _open_fov_simulator(self, session):
+        data = self._catalog_data(session)
+        if not data:
+            QMessageBox.warning(self, "Object Not Found",
+                                f"Could not find {session.get('dso_name', 'this object')} in the DSO catalogue.")
+            return
+        try:
+            from main import AladinLiteWindow
+            AladinLiteWindow(data, self).show()
+        except Exception as e:
+            logger.error(f"Error opening FOV Simulator: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open FOV Simulator: {e}")
+
+    def _nina_action(self, session, nina_function):
+        ra_deg, dec_deg = self._session_coordinates(session)
+        if ra_deg is None or dec_deg is None:
+            QMessageBox.warning(self, "No Coordinates",
+                                f"This session has no coordinates and {session.get('dso_name', 'its object')} "
+                                "wasn't found in the DSO catalogue.")
+            return
+        nina_function(ra_deg, dec_deg, session.get("dso_name") or "Unknown", self)
 
     def _link_session_to_target(self):
         row = self.sessions_table.currentRow()

@@ -6,6 +6,7 @@ Allows users to manage their observing target list for deep sky objects
 
 import sys
 import os
+import re
 import calendar
 from datetime import datetime
 from PySide6.QtCore import Qt, QTimer, Signal, QStringListModel
@@ -480,6 +481,153 @@ class AddTargetDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Failed to save target: {str(e)}")
 
 
+# ---- Catalogue lookup (shared with the Session Manager's right-click menu) ----
+
+_DSO_DETAIL_QUERY = """
+    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
+           CAST(d.sizemin/60.0 AS REAL) as sizemin,
+           CAST(d.sizemax/60.0 AS REAL) as sizemax,
+           d.constellation, d.dsotype, d.dsoclass,
+           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
+               CASE c.catalogue
+                   WHEN 'M' THEN 1
+                   WHEN 'NGC' THEN 2
+                   WHEN 'IC' THEN 3
+                   ELSE 4
+               END, c.designation) as designations,
+           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+           (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
+    FROM dsodetail d
+    JOIN cataloguenr c ON d.id = c.dsodetailid
+    LEFT JOIN userimages ui ON d.id = ui.dsodetailid
+"""
+
+
+def _split_designation(name):
+    """('M', '31') from 'M 31' or 'M31'; ('NGC', '7000') from 'NGC7000'; else None.
+    Session names often come from FITS OBJECT headers, which usually drop the space."""
+    parts = (name or "").split()
+    if len(parts) >= 2:
+        return parts[0], " ".join(parts[1:])
+    match = re.fullmatch(r"([A-Za-z]+)[-_ ]?(\d[\w.+-]*)", (name or "").strip())
+    return (match.group(1), match.group(2)) if match else None
+
+
+def find_full_dso_data(db_manager, target_name, target_data):
+    """Full catalogue data for a target (the dict DSODetailWindow and
+    AladinLiteWindow expect) - looked up by catalogue designation, falling
+    back to the nearest object within 0.1 degrees of target_data's
+    ra_deg/dec_deg. None if not found."""
+    try:
+        split = _split_designation(target_name)
+        if split:
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                # Query the full DSO data using the same method as Main.py
+                cursor.execute(_DSO_DETAIL_QUERY + """
+                    WHERE d.id = (
+                        SELECT d2.id FROM dsodetail d2
+                        JOIN cataloguenr c2 ON d2.id = c2.dsodetailid
+                        WHERE c2.catalogue = ? COLLATE NOCASE AND c2.designation = ? COLLATE NOCASE
+                        LIMIT 1)
+                    GROUP BY d.id
+                """, split)
+                result = cursor.fetchone()
+            if result:
+                return _process_dso_query_result(result, target_data)
+        # If not found by name, try by coordinates
+        return _dso_data_by_coordinates(db_manager, target_data)
+    except Exception as e:
+        logger.error(f"Error querying DSO database: {str(e)}")
+        return None
+
+
+def _dso_data_by_coordinates(db_manager, target_data):
+    """Try to find DSO by coordinates (within reasonable tolerance)"""
+    ra_deg, dec_deg = target_data.get("ra_deg"), target_data.get("dec_deg")
+    if ra_deg is None or dec_deg is None:
+        return None
+    tolerance = 0.1  # degrees
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(_DSO_DETAIL_QUERY + """
+                WHERE ABS(d.ra - ?) < ? AND ABS(d.dec - ?) < ?
+                GROUP BY d.id
+                ORDER BY ABS(d.ra - ?) + ABS(d.dec - ?) ASC
+                LIMIT 1
+            """, (ra_deg, tolerance, dec_deg, tolerance, ra_deg, dec_deg))
+            result = cursor.fetchone()
+        if result:
+            return _process_dso_query_result(result, target_data)
+    except Exception as e:
+        logger.error(f"Error querying DSO by coordinates: {str(e)}")
+    return None
+
+
+def _process_dso_query_result(result, target_data):
+    """Process database query result into DSODetailWindow format"""
+    try:
+        obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max,             constellation, dso_type, dso_class, designations, image_path, integration_time,             equipment, date_taken, notes, image_count = result
+
+        # Get the primary designation
+        primary_designation = designations.split(',')[0].strip()
+
+        # Handle size values
+        size_min_arcmin = float(size_min) if size_min is not None else 0.0
+        size_max_arcmin = float(size_max) if size_max is not None else 0.0
+
+        return {
+            "name": primary_designation,
+            "ra": _format_ra_for_display(ra),
+            "dec": _format_dec_for_display(dec),
+            "ra_deg": ra,
+            "dec_deg": dec,
+            "magnitude": magnitude,
+            "surface_brightness": surface_brightness,
+            "size_min": size_min_arcmin,
+            "size_max": size_max_arcmin,
+            "constellation": constellation,
+            "dso_type": dso_type,
+            "dso_class": dso_class,
+            "designations": designations,
+            "catalogue": primary_designation.split()[0] if " " in primary_designation else "",
+            "id": " ".join(primary_designation.split()[1:]) if " " in primary_designation else primary_designation,
+            "dsodetailid": obj_id,
+            "image_path": image_path,
+            "integration_time": integration_time,
+            "equipment": equipment,
+            "date_taken": date_taken,
+            "notes": notes if notes else target_data.get("notes", ""),  # Use target notes if DB notes empty
+            "image_count": image_count
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing DSO query result: {str(e)}")
+        return None
+
+
+def _format_ra_for_display(ra_deg):
+    """Format RA in degrees to HMS format for display"""
+    ra_hours = ra_deg / 15.0
+    ra_h = int(ra_hours)
+    ra_remaining = (ra_hours - ra_h) * 60
+    ra_m = int(ra_remaining)
+    ra_s = (ra_remaining - ra_m) * 60
+    return f"{ra_h:02d}h{ra_m:02d}m{ra_s:05.2f}s"
+
+
+def _format_dec_for_display(dec_deg):
+    """Format Dec in degrees to DMS format for display"""
+    dec_sign = '-' if dec_deg < 0 else '+'
+    dec_abs = abs(dec_deg)
+    dec_d = int(dec_abs)
+    dec_remaining = (dec_abs - dec_d) * 60
+    dec_m = int(dec_remaining)
+    dec_s = (dec_remaining - dec_m) * 60
+    return f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
+
+
 class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
     WINDOW_POSITION_KEY = "DSOTargetList"
     """Main window for DSO target list management"""
@@ -863,168 +1011,9 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             logger.error(f"Error opening target details: {str(e)}")
     
     def _get_full_dso_data(self, target_name, target_data):
-        """Get full DSO data from the main database"""
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Parse the target name to get catalogue and designation
-                name_parts = target_name.split()
-                if len(name_parts) >= 2:
-                    catalogue = name_parts[0]
-                    designation = " ".join(name_parts[1:])
-                else:
-                    # If name doesn't have clear catalogue/designation, try to find by coordinates
-                    return self._get_dso_data_by_coordinates(target_data)
-                
-                # Query the full DSO data using the same method as Main.py
-                cursor.execute("""
-                    WITH object_dsodetailid AS (
-                        SELECT d.id 
-                        FROM dsodetail d
-                        JOIN cataloguenr c ON d.id = c.dsodetailid
-                        WHERE c.catalogue = ? AND c.designation = ?
-                    )
-                    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness, 
-                           CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                           CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                           d.constellation, d.dsotype, d.dsoclass,
-                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY 
-                               CASE c.catalogue 
-                                   WHEN 'M' THEN 1
-                                   WHEN 'NGC' THEN 2
-                                   WHEN 'IC' THEN 3
-                                   ELSE 4
-                               END, c.designation) as designations,
-                           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
-                           (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-                    FROM dsodetail d
-                    JOIN cataloguenr c ON d.id = c.dsodetailid
-                    LEFT JOIN userimages ui ON d.id = ui.dsodetailid
-                    WHERE d.id = (SELECT id FROM object_dsodetailid)
-                    GROUP BY d.id
-                """, (catalogue, designation))
-                
-                result = cursor.fetchone()
-                
-                if result:
-                    return self._process_dso_query_result(result, target_data)
-                else:
-                    # If not found by name, try by coordinates
-                    return self._get_dso_data_by_coordinates(target_data)
-                    
-        except Exception as e:
-            logger.error(f"Error querying DSO database: {str(e)}")
-            return None
-    
-    def _get_dso_data_by_coordinates(self, target_data):
-        """Try to find DSO by coordinates (within reasonable tolerance)"""
-        try:
-            ra_deg = target_data.get("ra_deg", 0)
-            dec_deg = target_data.get("dec_deg", 0)
-            tolerance = 0.1  # degrees
-            
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                cursor.execute("""
-                    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness, 
-                           CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                           CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                           d.constellation, d.dsotype, d.dsoclass,
-                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY 
-                               CASE c.catalogue 
-                                   WHEN 'M' THEN 1
-                                   WHEN 'NGC' THEN 2
-                                   WHEN 'IC' THEN 3
-                                   ELSE 4
-                               END, c.designation) as designations,
-                           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
-                           (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-                    FROM dsodetail d
-                    JOIN cataloguenr c ON d.id = c.dsodetailid
-                    LEFT JOIN userimages ui ON d.id = ui.dsodetailid
-                    WHERE ABS(d.ra - ?) < ? AND ABS(d.dec - ?) < ?
-                    GROUP BY d.id
-                    ORDER BY ABS(d.ra - ?) + ABS(d.dec - ?) ASC
-                    LIMIT 1
-                """, (ra_deg, tolerance, dec_deg, tolerance, ra_deg, dec_deg))
-                
-                result = cursor.fetchone()
-                if result:
-                    return self._process_dso_query_result(result, target_data)
-                    
-        except Exception as e:
-            logger.error(f"Error querying DSO by coordinates: {str(e)}")
-            
-        return None
-    
-    def _process_dso_query_result(self, result, target_data):
-        """Process database query result into DSODetailWindow format"""
-        try:
-            obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
-                constellation, dso_type, dso_class, designations, image_path, integration_time, \
-                equipment, date_taken, notes, image_count = result
+        """Get full DSO data from the main database (see find_full_dso_data)"""
+        return find_full_dso_data(self.db_manager, target_name, target_data)
 
-            # Get the primary designation
-            primary_designation = designations.split(',')[0].strip()
-            
-            # Handle size values
-            size_min_arcmin = float(size_min) if size_min is not None else 0.0
-            size_max_arcmin = float(size_max) if size_max is not None else 0.0
-
-            # Format coordinates for display
-            ra_str = self._format_ra_for_display(ra)
-            dec_str = self._format_dec_for_display(dec)
-
-            return {
-                "name": primary_designation,
-                "ra": ra_str,
-                "dec": dec_str,
-                "ra_deg": ra,
-                "dec_deg": dec,
-                "magnitude": magnitude,
-                "surface_brightness": surface_brightness,
-                "size_min": size_min_arcmin,
-                "size_max": size_max_arcmin,
-                "constellation": constellation,
-                "dso_type": dso_type,
-                "dso_class": dso_class,
-                "designations": designations,
-                "catalogue": primary_designation.split()[0] if " " in primary_designation else "",
-                "id": " ".join(primary_designation.split()[1:]) if " " in primary_designation else primary_designation,
-                "dsodetailid": obj_id,
-                "image_path": image_path,
-                "integration_time": integration_time,
-                "equipment": equipment,
-                "date_taken": date_taken,
-                "notes": notes if notes else target_data.get("notes", ""),  # Use target notes if DB notes empty
-                "image_count": image_count
-            }
-            
-        except Exception as e:
-            logger.error(f"Error processing DSO query result: {str(e)}")
-            return None
-    
-    def _format_ra_for_display(self, ra_deg):
-        """Format RA in degrees to HMS format for display"""
-        ra_hours = ra_deg / 15.0
-        ra_h = int(ra_hours)
-        ra_remaining = (ra_hours - ra_h) * 60
-        ra_m = int(ra_remaining)
-        ra_s = (ra_remaining - ra_m) * 60
-        return f"{ra_h:02d}h{ra_m:02d}m{ra_s:05.2f}s"
-    
-    def _format_dec_for_display(self, dec_deg):
-        """Format Dec in degrees to DMS format for display"""
-        dec_sign = '-' if dec_deg < 0 else '+'
-        dec_abs = abs(dec_deg)
-        dec_d = int(dec_abs)
-        dec_remaining = (dec_abs - dec_d) * 60
-        dec_m = int(dec_remaining)
-        dec_s = (dec_remaining - dec_m) * 60
-        return f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
-    
     def _filter_targets(self):
         """Apply filters to the targets table"""
         status_filter = self.status_filter.currentText()

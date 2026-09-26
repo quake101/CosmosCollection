@@ -144,9 +144,13 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
     CALIBRATION_KINDS = (("Dark", "Darks"), ("Flat", "Flats"), ("Bias", "Bias"))
     OSC_LABEL = "Color camera (debayer the subs)"
 
-    def __init__(self, session, parent=None):
+    def __init__(self, session, parent=None, app=None):
+        """With app (handoff.SIRIL / handoff.PIXINSIGHT) the dialog is the Session
+        Manager's 'Processing' action instead: that app preselected, and no
+        completion choices, target option or remembered choice."""
         super().__init__(parent)
         self.session = dict(session)
+        self._fixed_app = app
         self.db_manager = DatabaseManager()
         self.frames = handoff.FrameSet()
         self.target = None  # {"id", "name", "status"} when linked
@@ -156,7 +160,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self._frame_check = None
         self._osc_touched = False
 
-        self.setWindowTitle("Session Completed")
+        self.setWindowTitle(f"Process in {handoff.APP_LABELS[app]}" if app else "Session Completed")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setModal(True)
         self.resize(560, 520)  # default size the first time this dialog is ever opened
@@ -192,8 +196,9 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
-        title = QLabel(f"<b>{self.session.get('dso_name', '')}</b> — {self.session.get('session_date', '')} "
-                       "is marked Completed.")
+        name_and_date = f"<b>{self.session.get('dso_name', '')}</b> — {self.session.get('session_date', '')}"
+        title = QLabel(f"Process {name_and_date} in {handoff.APP_LABELS[self._fixed_app]}." if self._fixed_app
+                       else f"{name_and_date} is marked Completed.")
         title.setStyleSheet("font-size: 11pt;")
         layout.addWidget(title)
 
@@ -234,15 +239,17 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
                     radio.setToolTip(message)
             self.choice_group.addButton(radio, choice_id)
             choice_layout.addWidget(radio)
-        self._disable_apps_without_lights()
+        if not self._fixed_app:  # (with a fixed app, _restore_choices handles no-lights once the buttons exist)
+            self._disable_apps_without_lights()
         self.choice_group.button(self.CHOICE_NOTHING).setChecked(True)
         self.choice_group.idToggled.connect(lambda _id, checked: checked and self._on_choice_changed())
         layout.addWidget(choice_box)
+        choice_box.setVisible(self._fixed_app is None)  # the app is already chosen from the menu
 
         layout.addWidget(self._build_handoff_options())
 
         self.target_checkbox = QCheckBox()
-        if self.target and self.target.get("status") != "Completed":
+        if self.target and self.target.get("status") != "Completed" and not self._fixed_app:
             self.target_checkbox.setText(f"Also mark target '{self.target['name']}' as Completed in the Target List")
             self.target_checkbox.setChecked(True)
         else:
@@ -253,18 +260,26 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
 
         buttons = QHBoxLayout()
         buttons.addStretch()
-        skip_btn = QPushButton("Skip")
-        skip_btn.setToolTip("Close without doing anything else - the session stays Completed.")
+        skip_btn = QPushButton("Cancel" if self._fixed_app else "Skip")
+        if not self._fixed_app:
+            skip_btn.setToolTip("Close without doing anything else - the session stays Completed.")
         skip_btn.clicked.connect(self.reject)
         buttons.addWidget(skip_btn)
-        self.continue_btn = QPushButton("Continue")
+        self.continue_btn = QPushButton("Start" if self._fixed_app else "Continue")
         self.continue_btn.setDefault(True)
         self.continue_btn.clicked.connect(self._on_continue)
         buttons.addWidget(self.continue_btn)
         layout.addLayout(buttons)
 
+    def _no_lights_to_process(self):
+        self.continue_btn.setEnabled(False)
+        self.continue_btn.setToolTip("This session has no light frames (on disk) to process.")
+
     def _disable_apps_without_lights(self):
         if self.frames.light_count:
+            return
+        if self._fixed_app:
+            self._no_lights_to_process()
             return
         for choice_id in self._app_for_choice:
             radio = self.choice_group.button(choice_id)
@@ -421,12 +436,18 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
 
     def _restore_choices(self):
         settings = QSettings("CosmosCollection", "CosmosCollection")
-        name = settings.value(self.CHOICE_SETTING, "nothing", type=str)
-        choice = next((c for c, n in self.CHOICE_NAMES.items() if n == name), self.CHOICE_NOTHING)
-        button = self.choice_group.button(choice)
-        # A remembered app that's since been disabled (or has no lights here)
-        # falls back to the default.
-        (button if button.isEnabled() else self.choice_group.button(self.CHOICE_NOTHING)).setChecked(True)
+        if self._fixed_app:
+            choice = next(c for c, a in self._app_for_choice.items() if a == self._fixed_app)
+            self.choice_group.button(choice).setChecked(True)
+            if not self.frames.light_count:
+                self._no_lights_to_process()
+        else:
+            name = settings.value(self.CHOICE_SETTING, "nothing", type=str)
+            choice = next((c for c, n in self.CHOICE_NAMES.items() if n == name), self.CHOICE_NOTHING)
+            button = self.choice_group.button(choice)
+            # A remembered app that's since been disabled (or has no lights here)
+            # falls back to the default.
+            (button if button.isEnabled() else self.choice_group.button(self.CHOICE_NOTHING)).setChecked(True)
         self.run_now_checkbox.setChecked(settings.value(self.RUN_NOW_SETTING, False, type=bool))
         self.copy_checkbox.setChecked(settings.value(self.COPY_SETTING, False, type=bool))
         if not self.target_checkbox.isHidden():
@@ -434,7 +455,8 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
 
     def _save_choices(self):
         settings = QSettings("CosmosCollection", "CosmosCollection")
-        settings.setValue(self.CHOICE_SETTING, self.CHOICE_NAMES[self.choice_group.checkedId()])
+        if not self._fixed_app:  # a menu's Processing action isn't a completion choice
+            settings.setValue(self.CHOICE_SETTING, self.CHOICE_NAMES[self.choice_group.checkedId()])
         settings.setValue(self.RUN_NOW_SETTING, self.run_now_checkbox.isChecked())
         settings.setValue(self.COPY_SETTING, self.copy_checkbox.isChecked())
         if not self.target_checkbox.isHidden():
