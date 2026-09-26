@@ -1695,6 +1695,14 @@ class SettingsDialog(QDialog):
         )
         ui_prefs_layout.addWidget(self.minimize_to_tray_checkbox)
 
+        # SIMBAD lookup on search failure checkbox
+        self.simbad_lookup_checkbox = QCheckBox("Offer SIMBAD lookup when search finds no results")
+        self.simbad_lookup_checkbox.setToolTip(
+            "When enabled, searching for an object that isn't in the local database\n"
+            "prompts you to look it up in the SIMBAD astronomical database"
+        )
+        ui_prefs_layout.addWidget(self.simbad_lookup_checkbox)
+
         # Enable log file checkbox + open folder button
         log_file_layout = QHBoxLayout()
         self.enable_logfile_checkbox = QCheckBox("Enable log file")
@@ -2317,6 +2325,9 @@ class SettingsDialog(QDialog):
             minimize_to_tray = settings.value("minimize_to_tray", True, type=bool)
             self.minimize_to_tray_checkbox.setChecked(minimize_to_tray)
 
+            simbad_lookup = settings.value("simbad_lookup_on_search_failure", True, type=bool)
+            self.simbad_lookup_checkbox.setChecked(simbad_lookup)
+
             enable_logfile = settings.value("enable_logfile", False, type=bool)
             self.enable_logfile_checkbox.setChecked(enable_logfile)
 
@@ -2615,6 +2626,7 @@ class SettingsDialog(QDialog):
             settings.setValue("show_observer_location", self.show_observer_location_checkbox.isChecked())
             settings.setValue("check_updates_on_startup", self.check_updates_checkbox.isChecked())
             settings.setValue("minimize_to_tray", self.minimize_to_tray_checkbox.isChecked())
+            settings.setValue("simbad_lookup_on_search_failure", self.simbad_lookup_checkbox.isChecked())
             settings.setValue("enable_logfile", self.enable_logfile_checkbox.isChecked())
             settings.setValue("time_format", self.time_format_combo.currentText())
             settings.setValue("max_threads", self.thread_count_spinbox.value())
@@ -6590,7 +6602,10 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         # 2. No results found in local database
         # 3. All data has been loaded (not still in lazy loading)
         # 4. No other filters are active (catalog/type filters should be "All")
+        # 5. SIMBAD lookup on search failure is enabled in settings
         if (text and
+            QSettings("CosmosCollection", "CosmosCollection").value(
+                "simbad_lookup_on_search_failure", True, type=bool) and
             len(self.model.filtered_data) == 0 and
             self.model.load_offset >= self.model.total_count and
             self.catalog_combo.currentText() == "All Catalogs" and
