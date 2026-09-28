@@ -140,6 +140,18 @@ def migrate(conn):
         WHERE observation_id IS NULL AND date_obs IS NOT NULL AND frame_type = 'Light'
     """)
     affected |= {row[0] for row in cursor.fetchall()}
+    # Sessions whose files were attached before recompute filled in the camera -
+    # a direct fill, not a full recompute, so it stays cheap on every startup.
+    cursor.execute("""
+        UPDATE usersessions SET camera = (
+            SELECT f.camera FROM usersessionfiles f
+            WHERE f.session_id = usersessions.id AND f.camera IS NOT NULL AND f.camera != ''
+            GROUP BY f.camera ORDER BY COUNT(*) DESC LIMIT 1
+        )
+        WHERE (camera IS NULL OR TRIM(camera) = '')
+          AND EXISTS (SELECT 1 FROM usersessionfiles f
+                      WHERE f.session_id = usersessions.id AND f.camera IS NOT NULL AND f.camera != '')
+    """)
     for session_id in sorted(affected):
         assign_files_to_observations(conn, session_id)
         recompute_session_aggregates(conn, session_id, promote=False)
@@ -479,6 +491,16 @@ def recompute_session_aggregates(conn, session_id, promote=True):
         """, (session_id,))
         earliest, latest = cursor.fetchone()
 
+    # Most common camera across the attached files - only fills an empty
+    # session camera below, never overwrites one the user typed.
+    cursor.execute("""
+        SELECT camera FROM usersessionfiles
+        WHERE session_id = ? AND camera IS NOT NULL AND camera != ''
+        GROUP BY camera ORDER BY COUNT(*) DESC LIMIT 1
+    """, (session_id,))
+    camera_row = cursor.fetchone()
+    file_camera = camera_row[0] if camera_row else None
+
     has_data = bool(obs_ids) or file_count > 0
     new_status = "In Progress" if (promote and has_data and current_status == "Planned") else current_status
     modified = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -487,10 +509,11 @@ def recompute_session_aggregates(conn, session_id, promote=True):
         cursor.execute("""
             UPDATE usersessions SET
                 sub_count = ?, integration_seconds = ?, earliest_sub_date = ?, latest_sub_date = ?,
-                filters_used = ?, status = ?, modified_date = ?
+                filters_used = ?, status = ?, modified_date = ?,
+                camera = COALESCE(NULLIF(TRIM(camera), ''), ?)
             WHERE id = ?
         """, (sub_count, integration_seconds, earliest, latest, ", ".join(filters),
-              new_status, modified, session_id))
+              new_status, modified, file_camera, session_id))
     else:
         cursor.execute("""
             UPDATE usersessions SET
