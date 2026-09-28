@@ -39,6 +39,10 @@ COMMON_TIMEZONES = [
     "Europe/London", "Europe/Paris", "Europe/Berlin", "Asia/Tokyo", "Australia/Sydney",
 ]
 
+# Dropped subs whose mean pointing is within this of a session's coordinates are
+# treated as the same target - loose enough to absorb framing offsets.
+DROP_MATCH_MAX_SEPARATION_DEG = 1.0
+
 
 class LocationOverrideWidget(QWidget):
     """Per-session location picker: defaults to the active saved location, with a
@@ -711,6 +715,7 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
         frame_counts = self.summary.get("frame_type_counts", {})
         counts_text = ", ".join(f"{v} {k}" for k, v in frame_counts.items()) or "0 files"
         form.addRow("DSO Name:", QLabel(self.summary.get("dso_name") or "(unknown)"))
+        form.addRow("Coordinates:", QLabel(self._format_coordinates()))
         form.addRow("Date Range:", QLabel(self._format_date_range()))
         form.addRow("Files:", QLabel(f"{self.summary.get('sub_count', 0)} ({counts_text})"))
         form.addRow("Integration Time:", QLabel(self._format_integration()))
@@ -768,31 +773,58 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
         seconds = self.summary.get("integration_seconds", 0)
         return f"{seconds / 3600.0:.2f} h ({int(seconds)} s)"
 
+    def _format_coordinates(self):
+        ra, dec = self.summary.get("ra_deg"), self.summary.get("dec_deg")
+        if ra is None or dec is None:
+            return "(unknown)"
+        return f"RA {ra:.3f}°, Dec {dec:+.3f}°"
+
+    def _match_score(self, dso_name, ra_deg, dec_deg):
+        """How strongly a session looks like the scanned subs' target: 2 = name and
+        pointing agree, 1 = either does, 0 = neither. A session's dso_name is free
+        text ('Sh2 129 (Squid Nebula)') while OBJECT is whatever the capture app
+        wrote ('SH2 129'), so pointing catches what name normalization can't."""
+        normalized_dso = SessionFileScanner.normalize_object_name(self.summary.get("dso_name"))
+        name_match = bool(normalized_dso) and SessionFileScanner.normalize_object_name(dso_name) == normalized_dso
+        coord_match = False
+        scan_ra, scan_dec = self.summary.get("ra_deg"), self.summary.get("dec_deg")
+        if None not in (scan_ra, scan_dec, ra_deg, dec_deg):
+            separation = SessionFileScanner.angular_separation_deg(scan_ra, scan_dec, ra_deg, dec_deg)
+            coord_match = separation <= DROP_MATCH_MAX_SEPARATION_DEG
+        return int(name_match) + int(coord_match)
+
     def _load_existing_sessions(self):
-        normalized_dso = (self.summary.get("dso_name") or "").replace(" ", "").strip().upper()
-        suggested_item = None
+        rows = []
         try:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT id, dso_name, status, session_date FROM usersessions
+                    SELECT id, dso_name, status, session_date, ra_deg, dec_deg FROM usersessions
                     ORDER BY session_date DESC, id DESC
                 """)
-                for session_id, dso_name, status, session_date in cursor.fetchall():
-                    label = f"{dso_name} — {status} — {session_date}"
-                    is_ongoing_match = (
-                        status == "In Progress" and normalized_dso
-                        and (dso_name or "").replace(" ", "").strip().upper() == normalized_dso
-                    )
-                    if is_ongoing_match:
-                        label += "  (ongoing — suggested match)"
-                    item = QListWidgetItem(label)
-                    item.setData(Qt.UserRole, session_id)
-                    self.sessions_list.addItem(item)
-                    if is_ongoing_match and suggested_item is None:
-                        suggested_item = item
+                rows = cursor.fetchall()
         except Exception as e:
             logger.error(f"Error loading sessions for drop match: {e}")
+
+        # Matching sessions float to the top (ongoing first, then strongest match),
+        # everything else keeps its newest-first order below them. sorted() is
+        # stable, so date order holds within each group.
+        scored = [(row, self._match_score(row[1], row[4], row[5])) for row in rows]
+        scored.sort(key=lambda entry: (entry[1] == 0, entry[0][2] != "In Progress", -entry[1]))
+
+        suggested_item = None
+        for (session_id, dso_name, status, session_date, _ra, _dec), score in scored:
+            label = f"{dso_name} — {status} — {session_date}"
+            is_ongoing_match = score > 0 and status == "In Progress"
+            if is_ongoing_match:
+                label += "  (ongoing — suggested match)"
+            elif score > 0:
+                label += "  (same target)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, session_id)
+            self.sessions_list.addItem(item)
+            if is_ongoing_match and suggested_item is None:
+                suggested_item = item
 
         # Still always requires the user to click OK - this only changes the
         # dialog's *default* selection so continuing an already-ongoing session

@@ -6,7 +6,9 @@ from FITS and XISF sub-exposure files for the Session Manager.
 """
 
 import os
+import re
 import json
+import math
 import struct
 import logging
 import xml.etree.ElementTree as ET
@@ -204,6 +206,68 @@ def scan_folder(folder_path, progress_callback=None):
     return results
 
 
+def normalize_object_name(name):
+    """Reduce a free-text object name to a comparable key: drop parenthetical/
+    bracketed common names, then everything but letters and digits, so
+    'Sh2 129 (Squid Nebula)', 'SH2-129' and 'sh2_129' all become 'SH2129'."""
+    if not name:
+        return ""
+    name = re.sub(r'\([^)]*\)|\[[^\]]*\]', '', str(name))
+    return re.sub(r'[^A-Z0-9]', '', name.upper())
+
+
+def _parse_sexagesimal(value):
+    """Parse '21 11 45' / '+59:57:41' style strings to a float in the same unit
+    as the first field, or None."""
+    parts = re.split(r'[\s:hdms°\'"]+', str(value).strip())
+    parts = [p for p in parts if p]
+    if not parts:
+        return None
+    try:
+        sign = -1.0 if parts[0].startswith('-') else 1.0
+        fields = [abs(float(p)) for p in parts[:3]]
+    except ValueError:
+        return None
+    total = sum(f / (60.0 ** i) for i, f in enumerate(fields))
+    return sign * total
+
+
+def _file_coordinates(f):
+    """(ra_deg, dec_deg) a sub was pointed at, from numeric RA/DEC (degrees)
+    or the OBJCTRA (hours)/OBJCTDEC (degrees) strings, or None."""
+    ra, dec = f.get('RA'), f.get('DEC')
+    if isinstance(ra, (int, float)) and isinstance(dec, (int, float)):
+        return float(ra), float(dec)
+    if f.get('OBJCTRA') is not None and f.get('OBJCTDEC') is not None:
+        ra_h = _parse_sexagesimal(f.get('OBJCTRA'))
+        dec_d = _parse_sexagesimal(f.get('OBJCTDEC'))
+        if ra_h is not None and dec_d is not None:
+            return ra_h * 15.0, dec_d
+    return None
+
+
+def _mean_coordinates(coords):
+    """Mean of (ra_deg, dec_deg) pairs via unit vectors, so RA wrapping at
+    0/360 doesn't skew the result."""
+    x = y = z = 0.0
+    for ra, dec in coords:
+        ra_r, dec_r = math.radians(ra), math.radians(dec)
+        x += math.cos(dec_r) * math.cos(ra_r)
+        y += math.cos(dec_r) * math.sin(ra_r)
+        z += math.sin(dec_r)
+    ra = math.degrees(math.atan2(y, x)) % 360.0
+    dec = math.degrees(math.atan2(z, math.hypot(x, y)))
+    return ra, dec
+
+
+def angular_separation_deg(ra1, dec1, ra2, dec2):
+    """Great-circle separation in degrees between two RA/Dec points (degrees)."""
+    ra1, dec1, ra2, dec2 = map(math.radians, (ra1, dec1, ra2, dec2))
+    cos_sep = (math.sin(dec1) * math.sin(dec2)
+               + math.cos(dec1) * math.cos(dec2) * math.cos(ra1 - ra2))
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos_sep))))
+
+
 def summarize_files(file_dicts):
     """Aggregate a list of scan_file()/scan_folder() results into a session summary."""
     summary = {
@@ -213,6 +277,8 @@ def summarize_files(file_dicts):
         'camera': None,
         'telescope': None,
         'dso_name': None,
+        'ra_deg': None,   # mean pointing of the Light frames, when their headers carry it
+        'dec_deg': None,
         'earliest_sub_date': None,
         'latest_sub_date': None,
         'frame_type_counts': Counter(),
@@ -225,6 +291,8 @@ def summarize_files(file_dicts):
     cameras = Counter()
     telescopes = Counter()
     objects = Counter()
+    light_objects = Counter()  # calibration frames often carry OBJECT='FlatWizard' etc.
+    light_coords = []
     dates = []
 
     for f in file_dicts:
@@ -238,6 +306,12 @@ def summarize_files(file_dicts):
             filt = _clean_str(f.get('FILTER'))
             if filt:
                 filters.add(filt)
+            light_obj = _clean_str(f.get('OBJECT'))
+            if light_obj:
+                light_objects[light_obj] += 1
+            coords = _file_coordinates(f)
+            if coords:
+                light_coords.append(coords)
 
         camera = _clean_str(f.get('INSTRUME'))
         if camera:
@@ -256,7 +330,10 @@ def summarize_files(file_dicts):
     summary['filters_used'] = sorted(filters)
     summary['camera'] = cameras.most_common(1)[0][0] if cameras else None
     summary['telescope'] = telescopes.most_common(1)[0][0] if telescopes else None
-    summary['dso_name'] = objects.most_common(1)[0][0] if objects else None
+    best_objects = light_objects or objects
+    summary['dso_name'] = best_objects.most_common(1)[0][0] if best_objects else None
+    if light_coords:
+        summary['ra_deg'], summary['dec_deg'] = _mean_coordinates(light_coords)
     if dates:
         summary['earliest_sub_date'] = min(dates)
         summary['latest_sub_date'] = max(dates)
