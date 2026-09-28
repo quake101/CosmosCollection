@@ -6,7 +6,10 @@ Displays real-time NINA status, current imaging, live stack images, and guiding 
 
 import hashlib
 import logging
+import math
+import re
 import sys
+import warnings
 from collections import deque
 from datetime import datetime
 from io import BytesIO
@@ -16,6 +19,8 @@ matplotlib.use('QtAgg')
 
 # Suppress matplotlib font_manager debug messages
 logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+# Harmless: raised when a graph in a hidden dock tab is drawn at zero size
+warnings.filterwarnings('ignore', message='constrained_layout not applied')
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -30,9 +35,10 @@ from PySide6.QtWidgets import (
     QLabel, QGroupBox, QProgressBar, QComboBox, QFrame,
     QGridLayout, QSizePolicy, QDockWidget, QCheckBox, QSpinBox,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLineEdit,
-    QTabWidget, QListWidget, QListWidgetItem
+    QTabWidget, QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView
 )
-from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QIcon
+from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QIcon, QColor
 
 from NINAIntegration import NINAIntegration
 from WindowPositionManager import WindowPositionMixin
@@ -41,6 +47,10 @@ from TimeFormatHelper import format_time
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+# A failed/cancelled autofocus never emits AUTOFOCUS-FINISHED; treat a run with no
+# AF events for this long as ended. Points normally arrive every ~15-30 seconds.
+AUTOFOCUS_STALE_SECONDS = 180
 
 
 class ZoomableImageWidget(QWidget):
@@ -193,6 +203,8 @@ class NINAStatusWorker(QThread):
     liveview_updated = Signal(bytes)  # Emits prepared image JPEG frame data
     guiding_updated = Signal(list)  # Emits guiding graph data points
     event_occurred = Signal(dict)  # Emits new NINA event data
+    events_loaded = Signal(list)  # Emits recent past events once on connect (for the event log)
+    autofocus_report = Signal(dict)  # Emits the last-af report when an autofocus run completes
     error_occurred = Signal(str)  # Emits error message
     connection_changed = Signal(bool, str, str, int)  # Emits connected state, version, host, port
     history_thumbnail = Signal(int, bytes, dict)  # Emits (index, small_thumbnail_data, image_stats)
@@ -200,6 +212,8 @@ class NINAStatusWorker(QThread):
     # Adaptive polling rates
     POLL_RATE_ACTIVE = 0.5  # when exposing/guiding
     POLL_RATE_IDLE = 2    # when idle
+
+    INITIAL_EVENT_BACKLOG = 200  # Past events shown in the event log on connect
 
     def __init__(self, host, port):
         super().__init__()
@@ -220,7 +234,8 @@ class NINAStatusWorker(QThread):
         self._livestack_filter = None  # User-selected livestack filter
         self._consecutive_failures = 0  # Track consecutive API failures to detect disconnect
         self._version = ""  # Store NINA API version
-        self._last_event_time = None  # Track last processed event timestamp
+        self._last_event_time = None  # Aware datetime of the newest processed event
+        self._seen_at_last_time = set()  # (Time, Event) keys already emitted at _last_event_time
         # Image quality/size settings
         self._image_quality = -1  # -1 = PNG (lossless)
         self._image_size = "1920x1080"
@@ -250,13 +265,7 @@ class NINAStatusWorker(QThread):
         if success:
             self._version = version or "Unknown"
             self.connection_changed.emit(True, self._version, self.host, self.port)
-            # Initialize event time to skip old events on startup
-            events = NINAIntegration.get_event_history(self.host, self.port)
-            if events:
-                # Get the latest event timestamp
-                latest_time = max((e.get('Time') for e in events if e.get('Time')), default=None)
-                if latest_time:
-                    self._last_event_time = latest_time
+            self._load_initial_events()
         else:
             self.connection_changed.emit(False, "", self.host, self.port)
             self.error_occurred.emit(message)
@@ -530,14 +539,12 @@ class NINAStatusWorker(QThread):
 
                 # Fetch event history and emit new events
                 events = NINAIntegration.get_event_history(self.host, self.port)
-                if events:
-                    for event in events:
-                        event_time = event.get('Time')
-                        if event_time:
-                            # Only process events newer than last seen
-                            if self._last_event_time is None or event_time > self._last_event_time:
-                                self._last_event_time = event_time
-                                self.event_occurred.emit(event)
+                for event in self._new_events(events):
+                    self.event_occurred.emit(event)
+                    if event.get('Event') == 'AUTOFOCUS-FINISHED':
+                        report = NINAIntegration.get_last_autofocus(self.host, self.port)
+                        if report:
+                            self.autofocus_report.emit(report)
 
                 # Fetch live view (prepared image) — only when tab 0 is active
                 if self._active_image_tab == 0 and self._liveview_active and not is_exposing:
@@ -562,6 +569,54 @@ class NINAStatusWorker(QThread):
                     if not self._running:
                         break
                     self.msleep(50)
+
+    @staticmethod
+    def _parse_event_time(time_str):
+        """Parse a NINA event timestamp into an aware datetime (None if unparseable).
+
+        Most NINA timestamps carry a UTC offset, but some (e.g. ERROR-PLATESOLVE)
+        do not; those are assumed to be local time.
+        """
+        try:
+            dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        return dt if dt.tzinfo else dt.astimezone()
+
+    def _new_events(self, events):
+        """Return events not seen before, in order, and advance the seen marker."""
+        new_events = []
+        for event in events or []:
+            event_time = self._parse_event_time(event.get('Time'))
+            if event_time is None:
+                continue
+            key = (event.get('Time'), event.get('Event'))
+            if self._last_event_time is not None:
+                if event_time < self._last_event_time:
+                    continue
+                # Events can share a timestamp; dedupe those at the boundary
+                if event_time == self._last_event_time and key in self._seen_at_last_time:
+                    continue
+            if self._last_event_time is None or event_time > self._last_event_time:
+                self._last_event_time = event_time
+                self._seen_at_last_time = set()
+            self._seen_at_last_time.add(key)
+            new_events.append(event)
+        return new_events
+
+    def _load_initial_events(self):
+        """Mark existing events as seen and send the last AF report and recent events to the UI."""
+        events = NINAIntegration.get_event_history(self.host, self.port)
+        self._new_events(events)  # Advance the marker so old events aren't re-emitted
+
+        # Show the last completed AF run so the graph isn't empty on open
+        # (emitted first so an in-progress run from the backlog replaces it)
+        report = NINAIntegration.get_last_autofocus(self.host, self.port)
+        if report:
+            self.autofocus_report.emit(report)
+
+        if events:
+            self.events_loaded.emit(events[-self.INITIAL_EVENT_BACKLOG:])
 
     def stop(self):
         """Stop the polling loop."""
@@ -723,6 +778,153 @@ class GuidingGraph(FigureCanvas):
         self.dec_data.clear()
         self.time_data.clear()
         self._create_empty_chart()
+
+
+class AutofocusGraph(FigureCanvas):
+    """Matplotlib canvas for the autofocus V-curve (focuser position vs HFR)."""
+
+    _NUM = r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)'
+    _HYPERBOLIC_RE = re.compile(rf'y = {_NUM} \* cosh\(asinh\(\({_NUM} - x\) / {_NUM}\)\)')
+    _QUADRATIC_RE = re.compile(rf'y = {_NUM} \* x\^2 \+ {_NUM} \* x \+ {_NUM}')
+    _LINE_RE = re.compile(rf'y = {_NUM} \* x \+ {_NUM}')
+
+    POINT_COLOR = '#4488ff'
+    FIT_COLOR = '#ff8844'
+    TREND_COLOR = '#aaaaaa'
+
+    def __init__(self, parent=None):
+        # Constrained layout re-fits margins on every draw, including dock resizes
+        self.figure = Figure(figsize=(6, 3.5), facecolor='#2b2b2b', layout='constrained')
+        self.figure.get_layout_engine().set(h_pad=0.04, w_pad=0.04)
+        super().__init__(self.figure)
+        self.setParent(parent)
+
+        self.points = []  # [(position, hfr, error)]
+        self.report = None  # last-af report for the completed run, None while running
+        self.title = 'AutoFocus'
+        self._redraw_chart()
+
+    def start_run(self):
+        """Clear the graph for a new autofocus run."""
+        self.points = []
+        self.report = None
+        self.title = 'AutoFocus running...'
+        self._redraw_chart()
+
+    def add_point(self, position, hfr):
+        """Add a measured point from an AUTOFOCUS-POINT-ADDED event."""
+        self.points.append((position, hfr, 0))
+        self._redraw_chart()
+
+    def end_run(self, title):
+        """Mark the current run as ended without a report (failed or cancelled)."""
+        self.title = title
+        self._redraw_chart()
+
+    def set_report(self, report):
+        """Show a completed run from the last-af report, including the fitted curve."""
+        self.report = report
+        self.points = [
+            (p.get('Position'), p.get('Value'), p.get('Error') or 0)
+            for p in report.get('MeasurePoints', [])
+            if isinstance(p.get('Position'), (int, float)) and isinstance(p.get('Value'), (int, float))
+        ]
+        focus = report.get('CalculatedFocusPoint') or {}
+        position, hfr = focus.get('Position'), focus.get('Value')
+        if isinstance(position, (int, float)) and isinstance(hfr, (int, float)):
+            self.title = f'AutoFocus: position {position}  |  HFR {hfr:.2f}'
+        else:
+            self.title = 'AutoFocus complete'
+        self._redraw_chart()
+
+    def _fit_curves(self, x_min, x_max):
+        """Build (label, xs, ys, color, style) curves from the report's fitting formulas."""
+        report = self.report or {}
+        fitting = str(report.get('Fitting', '')).upper()
+        fittings = report.get('Fittings') or {}
+        steps = 200
+        xs = [x_min + (x_max - x_min) * i / steps for i in range(steps + 1)]
+        curves = []
+
+        if 'HYPERBOLIC' in fitting:
+            m = self._HYPERBOLIC_RE.search(fittings.get('Hyperbolic', ''))
+            if m:
+                a, p, b = (float(g) for g in m.groups())
+                if b:
+                    ys = [a * math.cosh(math.asinh((p - x) / b)) for x in xs]
+                    curves.append(('Hyperbolic', xs, ys, self.FIT_COLOR, '-'))
+
+        if 'PARABOLIC' in fitting:
+            m = self._QUADRATIC_RE.search(fittings.get('Quadratic', ''))
+            if m:
+                a, b, c = (float(g) for g in m.groups())
+                ys = [a * x * x + b * x + c for x in xs]
+                curves.append(('Parabolic', xs, ys, self.FIT_COLOR, '-'))
+
+        if 'TREND' in fitting:
+            trend_x = ((report.get('Intersections') or {}).get('TrendLineIntersection') or {}).get('Position')
+            if isinstance(trend_x, (int, float)) and x_min < trend_x < x_max:
+                for key, lo, hi in (('LeftTrend', x_min, trend_x), ('RightTrend', trend_x, x_max)):
+                    m = self._LINE_RE.search(fittings.get(key, ''))
+                    if m:
+                        slope, intercept = (float(g) for g in m.groups())
+                        curves.append(('Trend' if key == 'LeftTrend' else None, [lo, hi],
+                                       [slope * lo + intercept, slope * hi + intercept],
+                                       self.TREND_COLOR, '--'))
+        return curves
+
+    def _redraw_chart(self):
+        """Redraw the chart with current data."""
+        self.figure.clear()
+        self.ax = self.figure.add_subplot(111)
+        ax = self.ax
+
+        if self.points:
+            positions = [p[0] for p in self.points]
+            hfrs = [p[1] for p in self.points]
+            x_min, x_max = min(positions), max(positions)
+            pad = max((x_max - x_min) * 0.05, 5)
+
+            if self.report:
+                for label, xs, ys, color, style in self._fit_curves(x_min - pad, x_max + pad):
+                    ax.plot(xs, ys, color=color, linestyle=style, linewidth=1.2, label=label, alpha=0.9)
+                ax.errorbar(positions, hfrs, yerr=[p[2] for p in self.points], fmt='o',
+                            color=self.POINT_COLOR, ecolor=self.POINT_COLOR, elinewidth=1,
+                            capsize=2, markersize=5, label='Measured', alpha=0.9)
+                focus = self.report.get('CalculatedFocusPoint') or {}
+                if isinstance(focus.get('Position'), (int, float)) and isinstance(focus.get('Value'), (int, float)):
+                    ax.axvline(focus['Position'], color=COLORS['success'], linestyle=':', linewidth=1, alpha=0.7)
+                    ax.plot([focus['Position']], [focus['Value']], marker='*', markersize=12,
+                            color=COLORS['success'], linestyle='none', label='Focus')
+            else:
+                ax.plot(positions, hfrs, 'o', color=self.POINT_COLOR, markersize=6, label='Measured')
+                best = min(self.points, key=lambda p: p[1])
+                ax.plot([best[0]], [best[1]], 'o', markersize=10, markerfacecolor='none',
+                        markeredgecolor=COLORS['success'], linestyle='none', label='Best so far')
+
+            ax.set_xlim(x_min - pad, x_max + pad)
+            y_max = max(h + e for _, h, e in self.points)
+            ax.set_ylim(0, y_max * 1.3)  # Headroom for the legend
+            ax.legend(loc='upper center', fontsize=8, ncol=4,
+                      facecolor='#353535', edgecolor=COLORS['border'], labelcolor=COLORS['text'])
+        else:
+            ax.text(0.5, 0.5, 'No autofocus data', transform=ax.transAxes, ha='center', va='center',
+                    color=COLORS['text_secondary'], fontsize=10)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        ax.set_title(self.title, color=COLORS['text'], fontsize=10, fontweight='bold')
+        ax.set_xlabel('Focuser Position', color=COLORS['text'], fontsize=9)
+        ax.set_ylabel('HFR', color=COLORS['text'], fontsize=9)
+
+        # Style
+        ax.set_facecolor('#2b2b2b')
+        ax.tick_params(colors=COLORS['text_secondary'], labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(COLORS['border'])
+        ax.grid(True, linestyle=':', alpha=0.3, color=COLORS['border'])
+
+        self.draw()
 
 
 class CaptureSettingsDialog(QDialog):
@@ -1042,6 +1244,7 @@ class SlewDialog(QDialog):
 class NINADashboardWindow(WindowPositionMixin, QMainWindow):
     """Main NINA Dashboard window."""
     WINDOW_POSITION_KEY = "NINADashboard"
+    DOCK_LAYOUT_VERSION = 2  # Bump when adding docks so older saved layouts get default placement
     _image_fetch_done = Signal(object)
 
     def __init__(self):
@@ -1116,6 +1319,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._create_actions_docks()
         self._create_guiding_dock()
         self._create_image_history_dock()
+        self._create_autofocus_dock()
+        self._create_event_log_dock()
 
         # Set up View menu
         self._setup_view_menu()
@@ -1728,6 +1933,71 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         self.image_history_dock.setWidget(history_widget)
 
+    def _create_autofocus_dock(self):
+        """Create the AutoFocus Graph dock widget (live V-curve from NINA events)."""
+        self.autofocus_dock = QDockWidget("AutoFocus Graph", self)
+        self.autofocus_dock.setObjectName("AutofocusGraphDock")
+        self.autofocus_dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea |
+            Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea
+        )
+        self.autofocus_dock.setFeatures(
+            QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable
+        )
+
+        autofocus_widget = QWidget()
+        autofocus_layout = QVBoxLayout(autofocus_widget)
+        autofocus_layout.setContentsMargins(5, 5, 5, 5)
+
+        self.autofocus_graph = AutofocusGraph(self)
+        self.autofocus_graph.setMinimumHeight(200)
+        self.autofocus_graph.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        autofocus_layout.addWidget(self.autofocus_graph)
+
+        self.autofocus_info_label = QLabel("")
+        self.autofocus_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        autofocus_layout.addWidget(self.autofocus_info_label)
+
+        self.autofocus_dock.setWidget(autofocus_widget)
+
+        # Autofocus run state, driven by NINA events
+        self._autofocus_running = False
+        self._focuser_connected = False
+        self._autofocus_stale_timer = QTimer(self)
+        self._autofocus_stale_timer.setSingleShot(True)
+        self._autofocus_stale_timer.setInterval(AUTOFOCUS_STALE_SECONDS * 1000)
+        self._autofocus_stale_timer.timeout.connect(self._on_autofocus_stale)
+
+    def _create_event_log_dock(self):
+        """Create the NINA Event Log dock widget."""
+        self.event_log_dock = QDockWidget("Event Log", self)
+        self.event_log_dock.setObjectName("EventLogDock")
+        self.event_log_dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea |
+            Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea
+        )
+        self.event_log_dock.setFeatures(
+            QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable
+        )
+
+        log_widget = QWidget()
+        log_layout = QVBoxLayout(log_widget)
+        log_layout.setContentsMargins(5, 5, 5, 5)
+
+        self.event_log_table = QTableWidget(0, 3)
+        self.event_log_table.setHorizontalHeaderLabels(["Time", "Event", "Details"])
+        self.event_log_table.verticalHeader().setVisible(False)
+        self.event_log_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.event_log_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.event_log_table.setWordWrap(False)
+        header = self.event_log_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        log_layout.addWidget(self.event_log_table)
+
+        self.event_log_dock.setWidget(log_widget)
+
     def _setup_view_menu(self):
         """Set up the View menu for panel visibility and layout reset."""
         view_menu = self.menuBar().addMenu("View")
@@ -1748,6 +2018,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         equipment_menu.addAction(self.statistics_dock.toggleViewAction())
 
         view_menu.addAction(self.guiding_dock.toggleViewAction())
+        view_menu.addAction(self.autofocus_dock.toggleViewAction())
+        view_menu.addAction(self.event_log_dock.toggleViewAction())
         view_menu.addAction(self.image_history_dock.toggleViewAction())
         view_menu.addSeparator()
         reset_action = view_menu.addAction("Reset Layout")
@@ -1786,8 +2058,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.splitDockWidget(self.filterwheel_dock, self.focuser_dock, Qt.Vertical)
         self.splitDockWidget(self.focuser_dock, self.statistics_dock, Qt.Vertical)
 
-        # Add guiding graph at bottom
+        # Add guiding graph at bottom, with autofocus graph and event log as tabs
         self.addDockWidget(Qt.BottomDockWidgetArea, self.guiding_dock)
+        self._tabify_bottom_docks()
 
         # Add image history on right
         self.addDockWidget(Qt.RightDockWidgetArea, self.image_history_dock)
@@ -1796,6 +2069,17 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.resizeDocks([self.imaging_dock], [60], Qt.Vertical)  # Compact height for imaging
         self.resizeDocks([self.camera_dock], [250], Qt.Horizontal)
         self.resizeDocks([self.guiding_dock], [200], Qt.Vertical)
+
+    def _tabify_bottom_docks(self):
+        """Place the autofocus graph and event log as tabs alongside the guiding graph."""
+        # Re-tabifying a dock that's already in the group leaves an empty tab bar
+        # layered over the real one, which swallows clicks
+        already_tabbed = self.tabifiedDockWidgets(self.guiding_dock)
+        for dock in (self.autofocus_dock, self.event_log_dock):
+            if dock not in already_tabbed:
+                self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+                self.tabifyDockWidget(self.guiding_dock, dock)
+        self.guiding_dock.raise_()
 
     def _reset_layout(self):
         """Reset dock layout to defaults."""
@@ -1811,6 +2095,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.removeDockWidget(self.focuser_dock)
         self.removeDockWidget(self.statistics_dock)
         self.removeDockWidget(self.guiding_dock)
+        self.removeDockWidget(self.autofocus_dock)
+        self.removeDockWidget(self.event_log_dock)
         self.removeDockWidget(self.image_history_dock)
 
         # Re-add in default positions
@@ -1828,7 +2114,10 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.focuser_dock.show()
         self.statistics_dock.show()
         self.guiding_dock.show()
+        self.autofocus_dock.show()
+        self.event_log_dock.show()
         self.image_history_dock.show()
+        self.guiding_dock.raise_()
 
     def _restore_settings(self):
         """Restore saved dock layout, refresh rate, and image quality settings."""
@@ -1881,8 +2170,14 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.addDockWidget(Qt.LeftDockWidgetArea, self.focuser_dock)
                 self.addDockWidget(Qt.LeftDockWidgetArea, self.statistics_dock)
                 self.addDockWidget(Qt.BottomDockWidgetArea, self.guiding_dock)
+                self.addDockWidget(Qt.BottomDockWidgetArea, self.autofocus_dock)
+                self.addDockWidget(Qt.BottomDockWidgetArea, self.event_log_dock)
                 self.addDockWidget(Qt.RightDockWidgetArea, self.image_history_dock)
                 self.restoreState(state_bytes)
+                # Layouts saved before the autofocus/event log docks existed don't place them
+                layout_version = settings.value("nina_dashboard_dock_layout_version", 1, type=int)
+                if layout_version < self.DOCK_LAYOUT_VERSION:
+                    self._tabify_bottom_docks()
                 logger.debug(f"Restored dock state, size={state_bytes.size()}")
             else:
                 self._set_default_layout()
@@ -1904,6 +2199,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         dock_state = self.saveState()
         state_bytes = bytes(dock_state.data())
         settings.setValue("nina_dashboard_dock_state", state_bytes)
+        settings.setValue("nina_dashboard_dock_layout_version", self.DOCK_LAYOUT_VERSION)
         logger.debug(f"Saved dock state, size={dock_state.size()}")
 
         # Save image quality/size settings
@@ -1929,6 +2225,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         """Reconnect to NINA."""
         # Stop existing worker
         self._stop_worker()
+        # AF state is rebuilt from the event backlog on connect
+        self._autofocus_running = False
+        self._autofocus_stale_timer.stop()
 
         self.connection_label.setText("Connection: Connecting...")
         self.connection_label.setStyleSheet(f"color: {COLORS['info']};")
@@ -1947,6 +2246,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.worker.liveview_updated.connect(self._on_liveview_updated)
         self.worker.guiding_updated.connect(self._on_guiding_updated)
         self.worker.event_occurred.connect(self._on_event_occurred)
+        self.worker.events_loaded.connect(self._on_events_loaded)
+        self.worker.autofocus_report.connect(self._on_autofocus_report)
         self.worker.error_occurred.connect(self._on_error)
         self.worker.history_thumbnail.connect(self._on_history_thumbnail)
         self._apply_image_settings_to_worker()
@@ -2366,6 +2667,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.focuser_position_label.setText("--")
                 self.focuser_temp_label.setText("--")
                 # Disable autofocus buttons when focuser disconnected
+                self._focuser_connected = False
                 self.autofocus_start_btn.setEnabled(False)
                 self.autofocus_cancel_btn.setEnabled(False)
             else:
@@ -2377,9 +2679,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                     self.focuser_status_label.setText("Connected")
                     self.focuser_status_label.setStyleSheet(f"color: {COLORS['success']};")
 
-                # Update autofocus button states based on focuser movement
-                self.autofocus_start_btn.setEnabled(self._connected and not is_moving)
-                self.autofocus_cancel_btn.setEnabled(self._connected and is_moving)
+                # Update autofocus button states. The focuser is idle while each AF frame
+                # exposes, so use the event-driven run state rather than focuser movement.
+                self._focuser_connected = True
+                self.autofocus_start_btn.setEnabled(self._connected and not is_moving and not self._autofocus_running)
+                self.autofocus_cancel_btn.setEnabled(self._connected and (is_moving or self._autofocus_running))
 
                 # Position
                 position = focuser.get('Position')
@@ -2402,6 +2706,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.focuser_position_label.setText("--")
             self.focuser_temp_label.setText("--")
             # Disable autofocus buttons when no focuser data
+            self._focuser_connected = False
             self.autofocus_start_btn.setEnabled(False)
             self.autofocus_cancel_btn.setEnabled(False)
 
@@ -2858,25 +3163,196 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.status_label.setText(f"Error: {error_message}")
         self.status_label.setStyleSheet(f"color: {COLORS['error']};")
 
+    EVENT_LOG_MAX_ROWS = 500
+
     def _on_event_occurred(self, event):
         """Handle NINA event from worker."""
         event_type = event.get('Event', '')
 
+        self._append_event_log(event)
+        self._handle_autofocus_event(event)
+
         # Map events to user-friendly messages
         event_messages = {
-            'AUTOFOCUS-STARTING': ("AutoFocus running...", COLORS['text_secondary']),
             'AUTOFOCUS-FINISHED': ("AutoFocus complete", COLORS['success']),
             'SEQUENCE-STARTING': ("Sequence started", COLORS['text_secondary']),
             'SEQUENCE-FINISHED': ("Sequence finished", COLORS['success']),
             'GUIDER-START': ("Guiding started", COLORS['text_secondary']),
             'GUIDER-STOP': ("Guiding stopped", COLORS['text_secondary']),
             'IMAGE-SAVE': ("Image saved", COLORS['text_secondary']),
+            'MOUNT-HOMED': ("Mount homed", COLORS['text_secondary']),
         }
 
         if event_type in event_messages:
             message, color = event_messages[event_type]
             self.status_label.setText(message)
             self.status_label.setStyleSheet(f"color: {color};")
+        elif event_type == 'AUTOFOCUS-STARTING':
+            self.status_label.setText("AutoFocus running...")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        elif event_type == 'AUTOFOCUS-POINT-ADDED':
+            count = len(self.autofocus_graph.points)
+            hfr = event.get('HFR')
+            hfr_text = f", HFR {hfr:.2f}" if isinstance(hfr, (int, float)) else ""
+            self.status_label.setText(f"AutoFocus running... point {count} (position {event.get('Position')}{hfr_text})")
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        elif event_type.startswith('ERROR-'):
+            self.status_label.setText(f"NINA error: {self._event_display_name(event_type)}")
+            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    def _on_events_loaded(self, events):
+        """Backfill the event log on connect and pick up an autofocus run already in progress."""
+        self.event_log_table.setRowCount(0)
+        for event in events:
+            self._append_event_log(event)
+
+        # Find the most recent AF run; replay it if it hasn't finished and is still active.
+        # A failed run never emits AUTOFOCUS-FINISHED, so require recent activity too.
+        af_events = [e for e in events if str(e.get('Event', '')).startswith(('AUTOFOCUS-', 'ERROR-AF'))]
+        start_idx = next((i for i in range(len(af_events) - 1, -1, -1)
+                          if af_events[i].get('Event') == 'AUTOFOCUS-STARTING'), None)
+        if start_idx is None:
+            return
+        run = af_events[start_idx:]
+        if any(e.get('Event') != 'AUTOFOCUS-POINT-ADDED' for e in run[1:]):
+            return  # Finished or failed
+        last_time = NINAStatusWorker._parse_event_time(run[-1].get('Time'))
+        if last_time and (datetime.now().astimezone() - last_time).total_seconds() < AUTOFOCUS_STALE_SECONDS:
+            for event in run:
+                self._handle_autofocus_event(event)
+
+    def _handle_autofocus_event(self, event):
+        """Update the autofocus graph and running state from an AF-related event."""
+        event_type = event.get('Event', '')
+        if event_type == 'AUTOFOCUS-STARTING':
+            self._autofocus_running = True
+            self.autofocus_graph.start_run()
+            self.autofocus_info_label.setText("")
+            self._autofocus_stale_timer.start()
+        elif event_type == 'AUTOFOCUS-POINT-ADDED':
+            position, hfr = event.get('Position'), event.get('HFR')
+            if not self._autofocus_running:
+                # Joined mid-run (or missed the start event)
+                self._autofocus_running = True
+                self.autofocus_graph.start_run()
+            if isinstance(position, (int, float)) and isinstance(hfr, (int, float)):
+                self.autofocus_graph.add_point(position, hfr)
+            self._autofocus_stale_timer.start()
+        elif event_type == 'AUTOFOCUS-FINISHED':
+            # The graph is completed by the last-af report the worker fetches next
+            self._autofocus_running = False
+            self._autofocus_stale_timer.stop()
+        elif event_type.startswith('ERROR-AF'):
+            self._autofocus_running = False
+            self._autofocus_stale_timer.stop()
+            self.autofocus_graph.end_run('AutoFocus failed')
+        else:
+            return
+        self._update_autofocus_buttons()
+
+    def _on_autofocus_stale(self):
+        """No AF events for a while and no finish event: the run failed or was cancelled."""
+        if self._autofocus_running:
+            self._autofocus_running = False
+            self.autofocus_graph.end_run('AutoFocus ended without a result')
+            self._update_autofocus_buttons()
+
+    def _on_autofocus_report(self, report):
+        """Show a completed autofocus run's fitted curve and summary."""
+        if self._autofocus_running:
+            return  # Stale report from before the current run
+        self.autofocus_graph.set_report(report)
+
+        parts = []
+        if report.get('Filter'):
+            parts.append(f"Filter: {report['Filter']}")
+        temp = report.get('Temperature')
+        if isinstance(temp, (int, float)) and not math.isnan(temp):
+            parts.append(f"Temp: {temp:.1f}°C")
+        fitting = report.get('Fitting')
+        if fitting:
+            fitting_names = {
+                'TRENDHYPERBOLIC': 'Trend + Hyperbolic', 'TRENDPARABOLIC': 'Trend + Parabolic',
+                'TRENDLINES': 'Trend lines', 'HYPERBOLIC': 'Hyperbolic', 'PARABOLIC': 'Parabolic',
+            }
+            parts.append(f"Fitting: {fitting_names.get(str(fitting).upper(), fitting)}")
+        fitting_upper = str(fitting).upper()
+        r2_key = ('Hyperbolic' if 'HYPERBOLIC' in fitting_upper
+                  else 'Quadratic' if 'PARABOLIC' in fitting_upper else None)
+        r2 = (report.get('RSquares') or {}).get(r2_key) if r2_key else None
+        if isinstance(r2, (int, float)) and not math.isnan(r2):
+            parts.append(f"R²: {r2:.3f}")
+        duration = report.get('Duration')
+        if isinstance(duration, str) and ':' in duration:
+            h, m, s = duration.split('.')[0].split(':')[-3:]
+            parts.append(f"Duration: {int(h) * 60 + int(m)}m {int(s)}s")
+        time_str = report.get('Timestamp')
+        finished = NINAStatusWorker._parse_event_time(time_str)
+        if finished:
+            parts.append(f"Finished: {format_time(finished.astimezone())}")
+        self.autofocus_info_label.setText("  |  ".join(parts))
+
+    def _update_autofocus_buttons(self):
+        """Refresh AutoFocus Start/Cancel buttons from the event-driven running state."""
+        if not self._connected:
+            return
+        self.autofocus_start_btn.setEnabled(not self._autofocus_running and self._focuser_connected)
+        self.autofocus_cancel_btn.setEnabled(self._autofocus_running)
+
+    @staticmethod
+    def _event_display_name(event_type):
+        """Turn 'AUTOFOCUS-POINT-ADDED' into 'Autofocus point added'."""
+        return event_type.replace('-', ' ').capitalize()
+
+    @staticmethod
+    def _format_event_details(event):
+        """Summarize an event's payload fields for the event log."""
+        event_type = event.get('Event', '')
+        if event_type == 'AUTOFOCUS-POINT-ADDED':
+            hfr = event.get('HFR')
+            hfr_text = f"{hfr:.2f}" if isinstance(hfr, (int, float)) else hfr
+            return f"Position {event.get('Position')}, HFR {hfr_text}"
+        if event_type == 'STACK-UPDATED':
+            return f"{event.get('Target', '')} ({event.get('Filter', '')}) - {event.get('StackCount', '?')} stacked"
+
+        def simplify(value):
+            if isinstance(value, dict):
+                # e.g. FILTERWHEEL-CHANGED {"Name": ..., "Id": ...}
+                value = value.get('Name', value)
+            if isinstance(value, list):
+                value = ", ".join(str(v) for v in value) or "--"
+            return value
+
+        previous, new = event.get('Previous'), event.get('New')
+        if previous is not None or new is not None:
+            return f"{simplify(previous)} → {simplify(new)}"
+        extras = {k: v for k, v in event.items() if k not in ('Event', 'Time')}
+        return ", ".join(f"{k}: {simplify(v)}" for k, v in extras.items())
+
+    def _append_event_log(self, event):
+        """Insert an event at the top of the event log table."""
+        event_type = event.get('Event', '')
+        event_time = NINAStatusWorker._parse_event_time(event.get('Time'))
+        time_text = format_time(event_time.astimezone(), seconds=True) if event_time else ""
+
+        if event_type.startswith('ERROR-'):
+            color = COLORS['error']
+        elif event_type.endswith('-DISCONNECTED'):
+            color = COLORS['warning']
+        elif event_type.endswith(('-FINISHED', '-CONNECTED')):
+            color = COLORS['success']
+        else:
+            color = None
+
+        self.event_log_table.insertRow(0)
+        for col, text in enumerate((time_text, event_type, self._format_event_details(event))):
+            item = QTableWidgetItem(str(text))
+            if color:
+                item.setForeground(QColor(color))
+            self.event_log_table.setItem(0, col, item)
+
+        if self.event_log_table.rowCount() > self.EVENT_LOG_MAX_ROWS:
+            self.event_log_table.setRowCount(self.EVENT_LOG_MAX_ROWS)
 
     def _on_cooling_changed(self, state):
         """Handle cooling checkbox change."""
@@ -3051,6 +3527,10 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         if success:
             self.status_label.setText("AutoFocus started")
             self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            # Mark running now so the next status poll doesn't flip the buttons back
+            # before AUTOFOCUS-STARTING arrives
+            self._autofocus_running = True
+            self._autofocus_stale_timer.start()
             self.autofocus_start_btn.setEnabled(False)
             self.autofocus_cancel_btn.setEnabled(True)
         else:
@@ -3064,6 +3544,10 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         if success:
             self.status_label.setText("AutoFocus cancelled")
             self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            if self._autofocus_running:
+                self._autofocus_running = False
+                self._autofocus_stale_timer.stop()
+                self.autofocus_graph.end_run('AutoFocus cancelled')
             self.autofocus_start_btn.setEnabled(True)
             self.autofocus_cancel_btn.setEnabled(False)
         else:

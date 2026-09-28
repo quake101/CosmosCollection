@@ -1436,6 +1436,32 @@ class NINAIntegration:
             return []
 
     @staticmethod
+    def get_last_autofocus(host, port):
+        """
+        Get the report of the last completed autofocus run from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            dict: AF report with 'MeasurePoints', 'CalculatedFocusPoint', 'Fitting',
+                  'Fittings', 'RSquares', 'Filter', 'Temperature', 'Duration', etc.
+                  None if unavailable.
+        """
+        url = f"http://{host}:{port}/v2/api/equipment/focuser/last-af"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('Success') and isinstance(result.get('Response'), dict):
+                    return result['Response']
+                return None
+        except Exception as e:
+            logger.debug(f"Error getting last autofocus: {e}")
+            return None
+
+    @staticmethod
     def get_guiding_graph_data(host, port):
         """
         Get guiding graph data (RA/Dec deviations) from NINA.
