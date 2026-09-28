@@ -48,6 +48,17 @@ from TimeFormatHelper import format_time
 # Set up logging
 logger = logging.getLogger(__name__)
 
+def format_image_stat(value, decimals=None, allow_negative=True):
+    """Format an image-history statistic, returning "--" when it wasn't measured.
+
+    Non-LIGHT frames (e.g. flats) report Stars as -1 and HFR as NaN, which NINA
+    serializes as the string "NaN".
+    """
+    if not isinstance(value, (int, float)) or math.isnan(value) or (not allow_negative and value < 0):
+        return "--"
+    return f"{value:.{decimals}f}" if decimals is not None else str(int(value))
+
+
 # A failed/cancelled autofocus never emits AUTOFOCUS-FINISHED; treat a run with no
 # AF events for this long as ended. Points normally arrive every ~15-30 seconds.
 AUTOFOCUS_STALE_SECONDS = 180
@@ -2724,30 +2735,16 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
     def _update_statistics_dock(self, statistics):
         """Update the statistics dock labels from an image-history stats dict."""
+        fmt = format_image_stat
         if statistics:
-            stars = statistics.get('Stars')
-            self.stats_stars_label.setText(str(int(stars)) if stars is not None else "--")
-
-            hfr = statistics.get('HFR')
-            self.stats_hfr_label.setText(f"{hfr:.2f}" if hfr is not None else "--")
-
-            median = statistics.get('Median')
-            self.stats_median_label.setText(str(int(median)) if median is not None else "--")
-
-            hfrstdev = statistics.get('HFRStDev')
-            self.stats_hfrstdev_label.setText(f"{hfrstdev:.2f}" if hfrstdev is not None else "--")
-
-            mean = statistics.get('Mean')
-            self.stats_mean_label.setText(str(int(mean)) if mean is not None else "--")
-
-            stdev = statistics.get('StDev')
-            self.stats_stdev_label.setText(str(int(stdev)) if stdev is not None else "--")
-
-            min_val = statistics.get('Min')
-            self.stats_min_label.setText(str(int(min_val)) if min_val is not None else "--")
-
-            max_val = statistics.get('Max')
-            self.stats_max_label.setText(str(int(max_val)) if max_val is not None else "--")
+            self.stats_stars_label.setText(fmt(statistics.get('Stars'), allow_negative=False))
+            self.stats_hfr_label.setText(fmt(statistics.get('HFR'), 2, allow_negative=False))
+            self.stats_median_label.setText(fmt(statistics.get('Median')))
+            self.stats_hfrstdev_label.setText(fmt(statistics.get('HFRStDev'), 2, allow_negative=False))
+            self.stats_mean_label.setText(fmt(statistics.get('Mean')))
+            self.stats_stdev_label.setText(fmt(statistics.get('StDev')))
+            self.stats_min_label.setText(fmt(statistics.get('Min')))
+            self.stats_max_label.setText(fmt(statistics.get('Max')))
         else:
             self.stats_stars_label.setText("--")
             self.stats_hfr_label.setText("--")
@@ -2805,17 +2802,17 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 if isinstance(selected_filter, dict):
                     filter_name = selected_filter.get('Name', '')
 
-            # Stars/HFR from image-history
-            stars = statistics.get('Stars')
-            hfr = statistics.get('HFR')
+            # Stars/HFR from image-history (not measured on non-LIGHT frames)
+            stars = format_image_stat(statistics.get('Stars'), allow_negative=False)
+            hfr = format_image_stat(statistics.get('HFR'), 2, allow_negative=False)
 
             info_text = f"Exp: {exp_text}"
             if filter_name:
                 info_text += f" | {filter_name}"
-            if stars is not None:
-                info_text += f" | Stars: {int(stars)}"
-            if hfr is not None:
-                info_text += f" | HFR: {hfr:.2f}"
+            if stars != "--":
+                info_text += f" | Stars: {stars}"
+            if hfr != "--":
+                info_text += f" | HFR: {hfr}"
 
             self.image_info_label.setText(info_text)
         else:
@@ -2846,18 +2843,13 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             gain = stats.get('Gain')
             if gain is not None:
                 lines.append(f"Gain: {gain}")
-            stars = stats.get('Stars')
-            if stars is not None:
-                lines.append(f"Stars: {int(stars)}")
-            hfr = stats.get('HFR')
-            if hfr is not None:
-                lines.append(f"HFR: {hfr:.2f}")
-            median = stats.get('Median')
-            if median is not None:
-                lines.append(f"Median: {int(median)}")
-            mean = stats.get('Mean')
-            if mean is not None:
-                lines.append(f"Mean: {int(mean)}")
+            for label, key, decimals, allow_negative in (
+                ("Stars", 'Stars', None, False), ("HFR", 'HFR', 2, False),
+                ("Median", 'Median', None, True), ("Mean", 'Mean', None, True),
+            ):
+                text = format_image_stat(stats.get(key), decimals, allow_negative)
+                if text != "--":
+                    lines.append(f"{label}: {text}")
             temp = stats.get('Temperature')
             if temp:
                 lines.append(f"Temp: {temp}")
@@ -2918,12 +2910,12 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 filt = stats.get('Filter')
                 if filt:
                     info_parts.append(filt)
-                stars = stats.get('Stars')
-                if stars is not None:
-                    info_parts.append(f"Stars: {int(stars)}")
-                hfr = stats.get('HFR')
-                if hfr is not None:
-                    info_parts.append(f"HFR: {hfr:.2f}")
+                stars = format_image_stat(stats.get('Stars'), allow_negative=False)
+                if stars != "--":
+                    info_parts.append(f"Stars: {stars}")
+                hfr = format_image_stat(stats.get('HFR'), 2, allow_negative=False)
+                if hfr != "--":
+                    info_parts.append(f"HFR: {hfr}")
                 self._update_statistics_dock(stats)
             self.image_info_label.setText(" | ".join(info_parts))
 

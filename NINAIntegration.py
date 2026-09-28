@@ -952,8 +952,9 @@ class NINAIntegration:
         Args:
             host: The hostname or IP address of the NINA instance
             port: The API port number
-            index: Optional image index to get stats for a specific image.
-                   If None, gets the latest image (all=false).
+            index: Optional image index (into the full, unfiltered history, matching
+                   get_image/get_image_thumbnail) to get stats for a specific image.
+                   If None, gets the latest LIGHT image (all=false).
 
         Returns:
             dict: Image history entry on success, None on failure.
@@ -961,12 +962,12 @@ class NINAIntegration:
                   ExposureTime, Filter, Gain, Offset, Temperature, TargetName,
                   ImageType, Filename, Date, CameraName, TelescopeName, etc.
         """
-        params = []
+        # NINA applies imageType before index, so filtering would shift indexes whenever
+        # the history contains non-LIGHT frames (e.g. flats) and go out of range
         if index is not None:
-            params.append(f"index={index}")
+            params = [f"index={index}"]
         else:
-            params.append("all=false")
-        params.append("imageType=LIGHT")
+            params = ["all=false", "imageType=LIGHT"]
         query = "&".join(params)
         url = f"http://{host}:{port}/v2/api/image-history?{query}"
         try:
