@@ -22,7 +22,7 @@ from PySide6.QtGui import QPixmap
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import themed_style, COLORS
+from Theme import COLORS, font_px, font_size, themed_style
 from ImageLoader import load_astro_pixmap
 
 logger = logging.getLogger(__name__)
@@ -491,7 +491,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
                 border: 2px dashed {COLORS['border_light']};
                 border-radius: 6px;
                 color: {COLORS['text_secondary']};
-                font-size: 9pt;
+                font-size: {font_size(9)};
                 padding: 6px;
             }}
         """)
@@ -536,7 +536,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         right_col.addWidget(self.dso_combo)
 
         self.detected_label = QLabel("")
-        themed_style(self.detected_label, lambda: f"color: {COLORS['info']}; font-size: 9pt;")
+        themed_style(self.detected_label, lambda: f"color: {COLORS['info']}; font-size: {font_size(9)};")
         self.detected_label.setWordWrap(True)
         self.detected_label.setMaximumWidth(260)
         self.detected_label.hide()
@@ -1135,14 +1135,14 @@ class GalleryCard(QFrame):
 
         # DSO name label
         name_label = QLabel(self.item_data.get('name', 'Unknown'))
-        name_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        themed_style(name_label, lambda: f"font-weight: bold; font-size: {font_px(12)};")
         name_label.setAlignment(Qt.AlignCenter)
         name_label.setWordWrap(True)
         layout.addWidget(name_label)
 
         # DSO type label
         type_label = QLabel(self.item_data.get('friendly_type', 'Unknown'))
-        themed_style(type_label, lambda: f"font-size: 10px; color: {COLORS['text_secondary']};")
+        themed_style(type_label, lambda: f"font-size: {font_px(10)}; color: {COLORS['text_secondary']};")
         type_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(type_label)
 
@@ -1326,7 +1326,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Header
         header_label = QLabel("DSO Image Gallery")
         header_label.setAlignment(Qt.AlignCenter)
-        header_label.setStyleSheet("font-size: 18px; font-weight: bold; margin: 10px;")
+        themed_style(header_label, lambda: f"font-size: {font_px(18)}; font-weight: bold; margin: 10px;")
         main_layout.addWidget(header_label)
 
         # Filters group
@@ -1561,15 +1561,15 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             if not self.data_loaded:
                 # Still loading initial data
                 loading_label = QLabel("Loading DSO images from database...")
-                themed_style(loading_label, lambda: f"font-size: 14px; color: {COLORS['text_secondary']}; padding: 50px;")
+                themed_style(loading_label, lambda: f"font-size: {font_px(14)}; color: {COLORS['text_secondary']}; padding: 50px;")
             elif len(self.all_items) == 0:
                 # Data loaded but database has no images
                 loading_label = QLabel("No images in your database.\n\nAdd images to DSO objects to see them here.")
-                themed_style(loading_label, lambda: f"font-size: 14px; color: {COLORS['text_disabled']}; padding: 50px;")
+                themed_style(loading_label, lambda: f"font-size: {font_px(14)}; color: {COLORS['text_disabled']}; padding: 50px;")
             else:
                 # Data loaded but no matches for current filters
                 loading_label = QLabel("No DSO images found matching your filters")
-                themed_style(loading_label, lambda: f"font-size: 14px; color: {COLORS['text_disabled']}; padding: 50px;")
+                themed_style(loading_label, lambda: f"font-size: {font_px(14)}; color: {COLORS['text_disabled']}; padding: 50px;")
             loading_label.setAlignment(Qt.AlignCenter)
             self.grid_layout.addWidget(loading_label, 0, 0)
 
@@ -1613,17 +1613,17 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self.thumbnail_progress_dialog.setMinimumDuration(500)  # Only show if takes > 500ms
             self.thumbnail_progress_dialog.setMinimumWidth(400)
             self.thumbnail_progress_dialog.setMinimumHeight(120)
-            self.thumbnail_progress_dialog.setStyleSheet("""
-                QProgressDialog {
-                    font-size: 12pt;
-                }
-                QProgressBar {
+            themed_style(self.thumbnail_progress_dialog, lambda: f"""
+                QProgressDialog {{
+                    font-size: {font_size(12)};
+                }}
+                QProgressBar {{
                     min-height: 25px;
-                    font-size: 11pt;
-                }
-                QLabel {
-                    font-size: 12pt;
-                }
+                    font-size: {font_size(11)};
+                }}
+                QLabel {{
+                    font-size: {font_size(12)};
+                }}
             """)
             self.thumbnail_progress_dialog.setValue(0)
             QApplication.processEvents()  # Ensure dialog can be displayed

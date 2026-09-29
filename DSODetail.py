@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager
-from Theme import COLORS, adapt_color, themed_style, themed_text
+from Theme import COLORS, adapt_color, font_size, themed_style, themed_text
 from NINAIntegration import NINAIntegration
 from UrlOpener import open_url
 
@@ -738,12 +738,12 @@ class DSODetailWindow(QDialog):
             # Add zoom controls
             zoom_layout = QHBoxLayout()
             zoom_out_button = QPushButton("-")
-            zoom_out_button.setStyleSheet("QPushButton { font-size: 12pt; }")
+            themed_style(zoom_out_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
             zoom_out_button.clicked.connect(self._zoom_out)
             zoom_layout.addWidget(zoom_out_button)
 
             zoom_in_button = QPushButton("+")
-            zoom_in_button.setStyleSheet("QPushButton { font-size: 12pt; }")
+            themed_style(zoom_in_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
             zoom_in_button.clicked.connect(self._zoom_in)
             zoom_layout.addWidget(zoom_in_button)
 
@@ -754,50 +754,50 @@ class DSODetailWindow(QDialog):
 
             # Add image navigation controls
             nav_separator = QLabel("|")
-            themed_style(nav_separator, lambda: f"font-size: 12pt; color: {COLORS['border_light']}; padding: 0 5px;")
+            themed_style(nav_separator, lambda: f"font-size: {font_size(12)}; color: {COLORS['border_light']}; padding: 0 5px;")
             zoom_layout.addWidget(nav_separator)
 
             self.prev_image_button = QPushButton("<-")
-            self.prev_image_button.setStyleSheet("QPushButton { font-size: 12pt; }")
+            themed_style(self.prev_image_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
             self.prev_image_button.clicked.connect(self._previous_image)
             self.prev_image_button.setToolTip("Previous image")
             zoom_layout.addWidget(self.prev_image_button)
 
             self.image_counter_label = QLabel("1/1")
-            themed_style(self.image_counter_label, lambda: f"font-size: 10pt; color: {COLORS['border_light']}; padding: 0 5px;")
+            themed_style(self.image_counter_label, lambda: f"font-size: {font_size(10)}; color: {COLORS['border_light']}; padding: 0 5px;")
             self.image_counter_label.setMinimumWidth(40)
             self.image_counter_label.setAlignment(Qt.AlignCenter)
             zoom_layout.addWidget(self.image_counter_label)
 
             self.next_image_button = QPushButton("->")
-            self.next_image_button.setStyleSheet("QPushButton { font-size: 12pt; }")
+            themed_style(self.next_image_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
             self.next_image_button.clicked.connect(self._next_image)
             self.next_image_button.setToolTip("Next image")
             zoom_layout.addWidget(self.next_image_button)
 
             # Add image button
             add_separator = QLabel("|")
-            themed_style(add_separator, lambda: f"font-size: 12pt; color: {COLORS['border_light']}; padding: 0 5px;")
+            themed_style(add_separator, lambda: f"font-size: {font_size(12)}; color: {COLORS['border_light']}; padding: 0 5px;")
             zoom_layout.addWidget(add_separator)
 
             self.add_image_button = QPushButton("+")
             self.add_image_button.clicked.connect(self._add_user_image)
             self.add_image_button.setToolTip("Add new image")
-            themed_style(self.add_image_button, lambda: f"QPushButton {{ color: {COLORS['success']}; font-size: 12pt; }}")
+            themed_style(self.add_image_button, lambda: f"QPushButton {{ color: {COLORS['success']}; font-size: {font_size(12)}; }}")
             zoom_layout.addWidget(self.add_image_button)
 
             # Delete image button
             self.delete_image_button = QPushButton("X")
             self.delete_image_button.clicked.connect(self._delete_current_image)
             self.delete_image_button.setToolTip("Delete current image")
-            themed_style(self.delete_image_button, lambda: f"QPushButton {{ color: {COLORS['error']}; font-size: 12pt; }}")
+            themed_style(self.delete_image_button, lambda: f"QPushButton {{ color: {COLORS['error']}; font-size: {font_size(12)}; }}")
             zoom_layout.addWidget(self.delete_image_button)
 
             # Favorite image button
             self.favorite_button = QPushButton("*")
             self.favorite_button.clicked.connect(self._toggle_favorite)
             self.favorite_button.setToolTip("Mark as favorite")
-            self.favorite_button.setStyleSheet("QPushButton { font-size: 12pt; }")
+            themed_style(self.favorite_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
             zoom_layout.addWidget(self.favorite_button)
 
             zoom_layout.addStretch()
@@ -806,7 +806,7 @@ class DSODetailWindow(QDialog):
             # Image label
             self.image_label = QLabel("Loading...")
             self.image_label.setAlignment(Qt.AlignCenter)
-            themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
+            themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
             self.image_label.setMinimumSize(600, 400)  # Increased minimum size
             self.image_label.installEventFilter(self)  # Install event filter for mouse events
             self.image_label.setMouseTracking(True)  # Enable mouse tracking
@@ -818,8 +818,7 @@ class DSODetailWindow(QDialog):
 
             # Create container for image information form
             self.info_form_container = QGroupBox("Image Information")
-            self.info_form_container.setStyleSheet(
-                "QGroupBox:title { subcontrol-position: top center; font-size: 16pt; font-weight: bold; }")
+            themed_style(self.info_form_container, lambda: f"QGroupBox:title {{ subcontrol-position: top center; font-size: {font_size(16)}; font-weight: bold; }}")
             info_form_layout = QGridLayout()
             info_form_layout.setSpacing(5)  # Reduce spacing between elements
             info_form_layout.setVerticalSpacing(5)
@@ -882,8 +881,7 @@ class DSODetailWindow(QDialog):
 
             # Create Object information groupbox
             object_info_groupbox = QGroupBox(self.data["name"])
-            object_info_groupbox.setStyleSheet(
-                "QGroupBox:title { subcontrol-position: top center; font-size: 28pt; font-weight: bold; }")
+            themed_style(object_info_groupbox, lambda: f"QGroupBox:title {{ subcontrol-position: top center; font-size: {font_size(28)}; font-weight: bold; }}")
             object_info_layout = QVBoxLayout()
 
             # Add Object information with proper null handling
@@ -953,8 +951,7 @@ class DSODetailWindow(QDialog):
 
             # --- Emission Lines / Gases GroupBox ---
             self.emission_groupbox = QGroupBox("Emission Lines / Gases")
-            self.emission_groupbox.setStyleSheet(
-                "QGroupBox:title { subcontrol-position: top center; font-size: 16pt; font-weight: bold; }")
+            themed_style(self.emission_groupbox, lambda: f"QGroupBox:title {{ subcontrol-position: top center; font-size: {font_size(16)}; font-weight: bold; }}")
             emission_layout = QVBoxLayout()
 
             self.emission_label = QLabel("Loading emission data from SIMBAD...")
@@ -979,8 +976,7 @@ class DSODetailWindow(QDialog):
 
             # --- Season / Dates GroupBox ---
             season_groupbox = QGroupBox("Viewing Season / Dates")
-            season_groupbox.setStyleSheet(
-                "QGroupBox:title { subcontrol-position: top center; font-size: 16pt; font-weight: bold; }")
+            themed_style(season_groupbox, lambda: f"QGroupBox:title {{ subcontrol-position: top center; font-size: {font_size(16)}; font-weight: bold; }}")
             season_layout = QVBoxLayout()
             self.season_label = QLabel("")
             self.season_label.setAlignment(Qt.AlignLeft)
@@ -1310,7 +1306,7 @@ class DSODetailWindow(QDialog):
                                 if img['id'] == new_image_id:
                                     # Show loading state
                                     self.image_label.setText("Loading image...")
-                                    themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                                    themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
 
                                     self.current_image_index = i
                                     self._load_user_image(img['image_path'])
@@ -1653,7 +1649,7 @@ class DSODetailWindow(QDialog):
 
                     if self.user_images:
                         self.image_label.setText("Loading image...")
-                        themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                        themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
 
                         self.current_image_index = 0
                         current_image = self.user_images[self.current_image_index]
@@ -1662,18 +1658,18 @@ class DSODetailWindow(QDialog):
                         self.info_form_container.setVisible(True)
                     else:
                         self.image_label.setText("No image attached to this DSO.")
-                        themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                        themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
                         self.info_form_container.setVisible(False)
                 else:
                     logger.error(f"Could not find dsodetailid for {self.data['name']}")
                     self.image_label.setText("No image attached to this DSO.")
-                    themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                    themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
                     self.info_form_container.setVisible(False)
 
         except Exception as e:
             logger.error(f"Error loading user images: {str(e)}", exc_info=True)
             self.image_label.setText("Error loading images.")
-            themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['error']};")
+            themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['error']};")
             self.info_form_container.setVisible(False)
 
     def _update_image_navigation(self):
@@ -1700,7 +1696,7 @@ class DSODetailWindow(QDialog):
         """Navigate to the previous image"""
         if self.user_images and self.current_image_index > 0:
             self.image_label.setText("Loading image...")
-            themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
+            themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
 
             self.current_image_index -= 1
             current_image = self.user_images[self.current_image_index]
@@ -1713,7 +1709,7 @@ class DSODetailWindow(QDialog):
         """Navigate to the next image"""
         if self.user_images and self.current_image_index < len(self.user_images) - 1:
             self.image_label.setText("Loading image...")
-            themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
+            themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
 
             self.current_image_index += 1
             current_image = self.user_images[self.current_image_index]
@@ -1734,11 +1730,11 @@ class DSODetailWindow(QDialog):
             is_favorite = current_image.get('is_favorite', 0)
             if is_favorite:
                 self.favorite_button.setText("*")
-                themed_style(self.favorite_button, lambda: f"QPushButton {{ color: {COLORS['favorite']}; font-size: 12pt; }}")
+                themed_style(self.favorite_button, lambda: f"QPushButton {{ color: {COLORS['favorite']}; font-size: {font_size(12)}; }}")
                 self.favorite_button.setToolTip("Unmark as favorite")
             else:
                 self.favorite_button.setText("*")
-                themed_style(self.favorite_button, lambda: f"QPushButton {{ color: {COLORS['text_disabled']}; font-size: 12pt; }}")
+                themed_style(self.favorite_button, lambda: f"QPushButton {{ color: {COLORS['text_disabled']}; font-size: {font_size(12)}; }}")
                 self.favorite_button.setToolTip("Mark as favorite")
 
     def _toggle_favorite(self):
@@ -1835,7 +1831,7 @@ class DSODetailWindow(QDialog):
 
                     self.relocate_button.setVisible(False)
                     self.image_label.setText("Loading image...")
-                    themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                    themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
                     self._load_user_image(new_image_path)
 
                     QMessageBox.information(self, "Success", f"Image location updated successfully!")
@@ -1896,7 +1892,7 @@ class DSODetailWindow(QDialog):
                 else:
                     self.current_image_index = 0
                     self.image_label.setText("No Image Loaded")
-                    themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                    themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
                     self._clear_image_info()
 
                 self._update_image_navigation()

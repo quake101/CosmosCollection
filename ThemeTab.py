@@ -16,9 +16,8 @@ from PySide6.QtWidgets import (
 )
 
 from Theme import (
-    ACCENT_PRESETS, COLORS, FONT_SIZE_MAX, FONT_SIZE_MIN, MODES, ThemeSettings,
-    build_colors, build_font, build_stylesheet, platform_color_scheme, platform_font,
-    themed_style,
+    COLORS, ACCENT_PRESETS, build_colors, build_font, build_stylesheet, font_size, FONT_SIZE_MAX,
+    FONT_SIZE_MIN, MODES, platform_color_scheme, platform_font, themed_style, ThemeSettings,
 )
 
 SWATCH_SIZE = 26
@@ -109,7 +108,7 @@ class ThemeSettingsTab(QWidget):
 
         self.night_accent_note = QLabel("Night Vision uses a fixed deep-red accent.")
         self.night_accent_note.setWordWrap(True)
-        themed_style(self.night_accent_note, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; }}")
+        themed_style(self.night_accent_note, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; }}")
         self.night_accent_note.hide()
         accent_layout.addWidget(self.night_accent_note)
         controls_layout.addWidget(accent_group)
@@ -126,8 +125,7 @@ class ThemeSettingsTab(QWidget):
         self.font_size_spin.setRange(FONT_SIZE_MIN, FONT_SIZE_MAX)
         self.font_size_spin.setSuffix(" pt")
         self.font_size_spin.setToolTip(
-            "Base text size. Some labels use their own fixed size and\n"
-            "won't follow this setting yet."
+            "Base text size. Headings, help text and charts scale along with it."
         )
         self.font_size_spin.valueChanged.connect(self._schedule_preview)
         text_layout.addRow("Size:", self.font_size_spin)
@@ -152,7 +150,7 @@ class ThemeSettingsTab(QWidget):
             "that are already open update the next time they're opened."
         )
         reopen_note.setWordWrap(True)
-        themed_style(reopen_note, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; }}")
+        themed_style(reopen_note, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; }}")
         controls_layout.addWidget(reopen_note)
         controls_layout.addStretch()
         return scroll

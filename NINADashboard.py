@@ -39,7 +39,10 @@ from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, Q
 
 from NINAIntegration import NINAIntegration
 from WindowPositionManager import WindowPositionMixin
-from Theme import themed_style, COLORS, adapt_color, chart_background, chart_color, theme_manager
+from Theme import (
+    COLORS, adapt_color, chart_background, chart_color, chart_font_size, font_px, theme_manager,
+    themed_style,
+)
 from TimeFormatHelper import format_time
 
 # Set up logging
@@ -688,9 +691,9 @@ class GuidingGraph(FigureCanvas):
 
         self.ax.set_xlim(0, self.max_points)
         self.ax.set_ylim(-3, 3)
-        self.ax.set_ylabel('Deviation (arcsec)', color=COLORS['text'], fontsize=9)
-        self.ax.set_xlabel('Time', color=COLORS['text'], fontsize=9)
-        self.ax.set_title('Guiding Performance', color=COLORS['text'], fontsize=10, fontweight='bold')
+        self.ax.set_ylabel('Deviation (arcsec)', color=COLORS['text'], fontsize=chart_font_size(9))
+        self.ax.set_xlabel('Time', color=COLORS['text'], fontsize=chart_font_size(9))
+        self.ax.set_title('Guiding Performance', color=COLORS['text'], fontsize=chart_font_size(10), fontweight='bold')
 
         # Add threshold lines
         self.ax.axhline(y=1, color=COLORS['warning'], linestyle='--', alpha=0.5, linewidth=1, label='+1"')
@@ -699,7 +702,7 @@ class GuidingGraph(FigureCanvas):
 
         # Style
         self.ax.set_facecolor(COLORS['background_light'])
-        self.ax.tick_params(colors=COLORS['text_secondary'], labelsize=8)
+        self.ax.tick_params(colors=COLORS['text_secondary'], labelsize=chart_font_size(8))
         self.ax.spines['bottom'].set_color(COLORS['border'])
         self.ax.spines['top'].set_color(COLORS['border'])
         self.ax.spines['left'].set_color(COLORS['border'])
@@ -712,7 +715,7 @@ class GuidingGraph(FigureCanvas):
             Line2D([0], [0], color=chart_color('#4488ff'), linewidth=2, label='RA'),
             Line2D([0], [0], color=chart_color('#ff8844'), linewidth=2, label='Dec'),
         ]
-        self.ax.legend(handles=legend_elements, loc='upper right', fontsize=8,
+        self.ax.legend(handles=legend_elements, loc='upper right', fontsize=chart_font_size(8),
                        facecolor=COLORS['background_lighter'], edgecolor=COLORS['border'], labelcolor=COLORS['text'])
 
         self.figure.tight_layout()
@@ -761,9 +764,9 @@ class GuidingGraph(FigureCanvas):
             dec_rms = math.sqrt(sum(x**2 for x in self.dec_data) / len(self.dec_data))
             total_rms = math.sqrt(ra_rms**2 + dec_rms**2)
             self.ax.set_title(f'Guiding Performance  |  RMS: {total_rms:.2f}" (RA: {ra_rms:.2f}", Dec: {dec_rms:.2f}")',
-                              color=COLORS['text'], fontsize=10, fontweight='bold')
+                              color=COLORS['text'], fontsize=chart_font_size(10), fontweight='bold')
         else:
-            self.ax.set_title('Guiding Performance', color=COLORS['text'], fontsize=10, fontweight='bold')
+            self.ax.set_title('Guiding Performance', color=COLORS['text'], fontsize=chart_font_size(10), fontweight='bold')
 
         # Axis limits
         self.ax.set_xlim(0, max(len(self.ra_data), 60))
@@ -771,12 +774,12 @@ class GuidingGraph(FigureCanvas):
                           abs(min(self.dec_data)), abs(max(self.dec_data))) * 1.2)
         self.ax.set_ylim(-y_max, y_max)
 
-        self.ax.set_ylabel('Deviation (arcsec)', color=COLORS['text'], fontsize=9)
-        self.ax.set_xlabel('Samples', color=COLORS['text'], fontsize=9)
+        self.ax.set_ylabel('Deviation (arcsec)', color=COLORS['text'], fontsize=chart_font_size(9))
+        self.ax.set_xlabel('Samples', color=COLORS['text'], fontsize=chart_font_size(9))
 
         # Style
         self.ax.set_facecolor(COLORS['background_light'])
-        self.ax.tick_params(colors=COLORS['text_secondary'], labelsize=8)
+        self.ax.tick_params(colors=COLORS['text_secondary'], labelsize=chart_font_size(8))
         self.ax.spines['bottom'].set_color(COLORS['border'])
         self.ax.spines['top'].set_color(COLORS['border'])
         self.ax.spines['left'].set_color(COLORS['border'])
@@ -784,7 +787,7 @@ class GuidingGraph(FigureCanvas):
         self.ax.yaxis.grid(True, linestyle=':', alpha=0.3, color=COLORS['border'])
 
         # Legend
-        self.ax.legend(loc='upper right', fontsize=8,
+        self.ax.legend(loc='upper right', fontsize=chart_font_size(8),
                        facecolor=COLORS['background_lighter'], edgecolor=COLORS['border'], labelcolor=COLORS['text'])
 
         self.figure.tight_layout()
@@ -925,21 +928,21 @@ class AutofocusGraph(FigureCanvas):
             ax.set_xlim(x_min - pad, x_max + pad)
             y_max = max(h + e for _, h, e in self.points)
             ax.set_ylim(0, y_max * 1.3)  # Headroom for the legend
-            ax.legend(loc='upper center', fontsize=8, ncol=4,
+            ax.legend(loc='upper center', fontsize=chart_font_size(8), ncol=4,
                       facecolor=COLORS['background_lighter'], edgecolor=COLORS['border'], labelcolor=COLORS['text'])
         else:
             ax.text(0.5, 0.5, 'No autofocus data', transform=ax.transAxes, ha='center', va='center',
-                    color=COLORS['text_secondary'], fontsize=10)
+                    color=COLORS['text_secondary'], fontsize=chart_font_size(10))
             ax.set_xticks([])
             ax.set_yticks([])
 
-        ax.set_title(self.title, color=COLORS['text'], fontsize=10, fontweight='bold')
-        ax.set_xlabel('Focuser Position', color=COLORS['text'], fontsize=9)
-        ax.set_ylabel('HFR', color=COLORS['text'], fontsize=9)
+        ax.set_title(self.title, color=COLORS['text'], fontsize=chart_font_size(10), fontweight='bold')
+        ax.set_xlabel('Focuser Position', color=COLORS['text'], fontsize=chart_font_size(9))
+        ax.set_ylabel('HFR', color=COLORS['text'], fontsize=chart_font_size(9))
 
         # Style
         ax.set_facecolor(COLORS['background_light'])
-        ax.tick_params(colors=COLORS['text_secondary'], labelsize=8)
+        ax.tick_params(colors=COLORS['text_secondary'], labelsize=chart_font_size(8))
         for spine in ax.spines.values():
             spine.set_color(COLORS['border'])
         ax.grid(True, linestyle=':', alpha=0.3, color=COLORS['border'])
@@ -1894,7 +1897,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.livestack_info_label = QLabel("")
         self.livestack_info_label.setAlignment(Qt.AlignCenter)
         self.livestack_info_label.setFixedHeight(28)
-        themed_style(self.livestack_info_label, lambda: f"color: {COLORS['text_secondary']}; font-size: 16px;")
+        themed_style(self.livestack_info_label, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_px(16)};")
         livestack_layout.addWidget(self.livestack_info_label, 0)
 
         self.image_tabs.addTab(livestack_widget, "Live Stack")

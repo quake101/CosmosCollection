@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from TimeFormatHelper import format_time
-from Theme import themed_style, COLORS
+from Theme import COLORS, font_px, font_size, themed_style
 import SessionFileScanner
 import SessionObservations
 
@@ -2169,7 +2169,7 @@ class SessionMonthCalendar(QCalendarWidget):
                 border: 1px solid {COLORS['border_light']};
                 border-radius: 3px;
                 padding: 4px 8px;
-                font-size: 10pt;
+                font-size: {font_size(10)};
             }}
         """)
         self.tooltip_label.hide()
@@ -2771,7 +2771,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
 
         header_label = QLabel("Session Manager")
         header_label.setAlignment(Qt.AlignCenter)
-        header_label.setStyleSheet("font-size: 18px; font-weight: bold; margin: 10px;")
+        themed_style(header_label, lambda: f"font-size: {font_px(18)}; font-weight: bold; margin: 10px;")
         main_layout.addWidget(header_label)
 
         control_group = QGroupBox("Session Management")

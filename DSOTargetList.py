@@ -21,7 +21,7 @@ from PySide6.QtGui import QFont
 from DatabaseManager import DatabaseManager
 from BestDSOTonight import BestDSOTonightWindow
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS
+from Theme import COLORS, font_px, themed_style
 from NINAIntegration import NINAIntegration
 import logging
 
@@ -708,7 +708,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         # Header
         header_label = QLabel("DSO Target List")
         header_label.setAlignment(Qt.AlignCenter)
-        header_label.setStyleSheet("font-size: 18px; font-weight: bold; margin: 10px;")
+        themed_style(header_label, lambda: f"font-size: {font_px(18)}; font-weight: bold; margin: 10px;")
         main_layout.addWidget(header_label)
         
         # Control panel

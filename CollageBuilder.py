@@ -660,7 +660,7 @@ try:
             DatabaseManager = None
 
     # Import Theme for colors
-    from Theme import themed_style, COLORS, contrast_text
+    from Theme import COLORS, contrast_text, font_px, themed_style
 
 except ImportError as e:
     print(f"Warning: Could not import required Qt modules: {e}")
@@ -1772,7 +1772,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
 
         if not collage_images:
             no_images_label = QLabel("No images in collage")
-            themed_style(no_images_label, lambda: f"color: {COLORS['text_disabled']}; font-style: italic; padding: 10px; font-size: 14px;")
+            themed_style(no_images_label, lambda: f"color: {COLORS['text_disabled']}; font-style: italic; padding: 10px; font-size: {font_px(14)};")
             no_images_label.setAlignment(Qt.AlignCenter)
             self.images_layout.addWidget(no_images_label, 0, 0, 1, grid_width)
         else:
@@ -1799,7 +1799,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                         # Position and checkbox in one line
                         top_layout = QHBoxLayout()
                         pos_label = QLabel(f"[{row},{col}]")
-                        themed_style(pos_label, lambda: f"font-size: 10px; color: {COLORS['text_disabled']}; font-weight: bold;")
+                        themed_style(pos_label, lambda: f"font-size: {font_px(10)}; color: {COLORS['text_disabled']}; font-weight: bold;")
                         checkbox = QCheckBox()
                         checkbox.setProperty("collage_index", cell_index)
                         top_layout.addWidget(pos_label)
@@ -1812,7 +1812,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                         image_label.setAlignment(Qt.AlignCenter)
                         image_label.setMinimumSize(100, 80)
                         image_label.setMaximumSize(120, 100)
-                        themed_style(image_label, lambda: f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']}; color: {COLORS['text_disabled']}; font-size: 10px;")
+                        themed_style(image_label, lambda: f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']}; color: {COLORS['text_disabled']}; font-size: {font_px(10)};")
                         image_label.setText("Loading...")
 
                         # Store references for thumbnail updates and in-place drag preview
@@ -1828,7 +1828,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                         # DSO name - centered below the image
                         dso_label = QLabel(dso_name)
                         dso_label.setAlignment(Qt.AlignCenter)
-                        themed_style(dso_label, lambda: f"font-size: 11px; color: {COLORS['text']}; font-weight: bold;")
+                        themed_style(dso_label, lambda: f"font-size: {font_px(11)}; color: {COLORS['text']}; font-weight: bold;")
                         dso_label.setWordWrap(True)
                         dso_label.setToolTip(f"DSO: {dso_name}\nFile: {filename}\nPath: {image_path}")
                         cell_layout.addWidget(dso_label)
@@ -1854,12 +1854,12 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                         # Empty cell - simpler layout with dark theme colors
                         pos_label = QLabel(f"[{row},{col}]")
                         pos_label.setAlignment(Qt.AlignCenter)
-                        themed_style(pos_label, lambda: f"font-size: 11px; color: {COLORS['text_disabled']}; font-weight: bold;")
+                        themed_style(pos_label, lambda: f"font-size: {font_px(11)}; color: {COLORS['text_disabled']}; font-weight: bold;")
                         cell_layout.addWidget(pos_label)
 
                         empty_label = QLabel("Empty")
                         empty_label.setAlignment(Qt.AlignCenter)
-                        themed_style(empty_label, lambda: f"font-size: 14px; color: {COLORS['border_light']}; font-style: italic;")
+                        themed_style(empty_label, lambda: f"font-size: {font_px(14)}; color: {COLORS['border_light']}; font-style: italic;")
                         cell_layout.addWidget(empty_label)
 
                         cell_layout.addStretch()  # Push content to top
@@ -1923,7 +1923,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         if cell_key in self.thumbnail_labels:
             label = self.thumbnail_labels[cell_key]
             label.setText(error_message.replace(" ", "\n"))  # Add line break for better fit
-            themed_style(label, lambda: f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']}; color: {COLORS['text_secondary']}; font-size: 10px;")
+            themed_style(label, lambda: f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']}; color: {COLORS['text_secondary']}; font-size: {font_px(10)};")
 
     def _start_drag(self, source_index):
         """Save state before a drag operation so preview and cancellation work correctly"""
@@ -1985,7 +1985,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                     else:
                         img_label.clear()
                         img_label.setText("...")
-                        themed_style(img_label, lambda: f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']}; color: {COLORS['text_disabled']}; font-size: 10px;")
+                        themed_style(img_label, lambda: f"border: 1px solid {COLORS['border_light']}; background-color: {COLORS['background_lighter']}; color: {COLORS['text_disabled']}; font-size: {font_px(10)};")
                 dso_label = self._cell_dso_labels.get(cell_index)
                 if dso_label:
                     dso_name = self._get_dso_name_for_image(image_data)

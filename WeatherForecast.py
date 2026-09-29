@@ -38,7 +38,7 @@ from PySide6.QtGui import QColor
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import themed_style, COLORS, chart_background, sky_shade, theme_manager
+from Theme import COLORS, chart_background, chart_font_size, font_size, sky_shade, theme_manager, themed_style
 from TimeFormatHelper import format_time, format_datetime, get_time_format_24h
 from UrlOpener import open_url
 
@@ -1489,10 +1489,10 @@ class DayWeatherCard(QFrame):
                 border: 2px solid {get_rating_color(self.summary.astro_score)};
             }}
         """)
-        themed_style(self.date_label, lambda: f"color: {COLORS['text_secondary']}; font-size: 10pt;")
-        themed_style(self.rating_text, lambda self=self: f"color: {get_rating_color(self.summary.astro_score)}; font-weight: bold; font-size: 12pt;")
-        themed_style(self.score_label, lambda: f"color: {COLORS['text_secondary']}; font-size: 10pt;")
-        themed_style(self.cloud_text, lambda: f"color: {COLORS['text_secondary']}; font-size: 12pt;")
+        themed_style(self.date_label, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_size(10)};")
+        themed_style(self.rating_text, lambda self=self: f"color: {get_rating_color(self.summary.astro_score)}; font-weight: bold; font-size: {font_size(12)};")
+        themed_style(self.score_label, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_size(10)};")
+        themed_style(self.cloud_text, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_size(12)};")
 
     def _setup_ui(self):
         """Set up the card UI"""
@@ -1504,7 +1504,7 @@ class DayWeatherCard(QFrame):
         day_name = self.summary.date.strftime("%a")
         day_label = QLabel(day_name)
         day_label.setAlignment(Qt.AlignCenter)
-        day_label.setStyleSheet("font-weight: bold; font-size: 12pt;")
+        themed_style(day_label, lambda: f"font-weight: bold; font-size: {font_size(12)};")
         layout.addWidget(day_label)
 
         # Date
@@ -1537,7 +1537,7 @@ class DayWeatherCard(QFrame):
         # Cloud cover (tonight's average - dark hours only)
         cloud_label = QLabel(f"{self.summary.tonight_avg_cloud_cover:.0f}%")
         cloud_label.setAlignment(Qt.AlignCenter)
-        cloud_label.setStyleSheet("font-size: 10pt; font-weight: bold;")
+        themed_style(cloud_label, lambda: f"font-size: {font_size(10)}; font-weight: bold;")
         layout.addWidget(cloud_label)
 
         layout.addSpacing(5)
@@ -1637,28 +1637,28 @@ class HourlyAstroChart(FigureCanvas):
         if is_midnight_view:
             # "Tonight" starts on the evening date, even though the view stretches into the next morning
             night_date_str = self.hourly_data[0].time.strftime('%b %d')
-            self.ax.set_xlabel('Time (Evening → Morning)', color=COLORS['text'], fontsize=9)
-            self.ax.set_title(f'Astrophotography Conditions - Night of {night_date_str}', color=COLORS['text'], fontsize=10, fontweight='bold')
+            self.ax.set_xlabel('Time (Evening → Morning)', color=COLORS['text'], fontsize=chart_font_size(9))
+            self.ax.set_title(f'Astrophotography Conditions - Night of {night_date_str}', color=COLORS['text'], fontsize=chart_font_size(10), fontweight='bold')
         else:
             day_date_str = self.hourly_data[0].time.strftime('%b %d') if self.hourly_data else ''
-            self.ax.set_xlabel('Hour of Day', color=COLORS['text'], fontsize=9)
-            self.ax.set_title(f'Hourly Astrophotography Conditions - {day_date_str}', color=COLORS['text'], fontsize=10, fontweight='bold')
+            self.ax.set_xlabel('Hour of Day', color=COLORS['text'], fontsize=chart_font_size(9))
+            self.ax.set_title(f'Hourly Astrophotography Conditions - {day_date_str}', color=COLORS['text'], fontsize=chart_font_size(10), fontweight='bold')
 
         # Style the chart
         self.ax.set_xlim(-0.5, num_hours - 0.5)
         self.ax.set_ylim(0, 100)
-        self.ax.set_ylabel('Astro Score', color=COLORS['text'], fontsize=9)
+        self.ax.set_ylabel('Astro Score', color=COLORS['text'], fontsize=chart_font_size(9))
 
         # Set x-axis ticks - show every other label to avoid crowding
         tick_step = 2 if num_hours > 12 else 1
         tick_positions = list(range(0, num_hours, tick_step))
         tick_labels = [hour_labels[i] for i in tick_positions]
         self.ax.set_xticks(tick_positions)
-        self.ax.set_xticklabels(tick_labels, fontsize=8)
+        self.ax.set_xticklabels(tick_labels, fontsize=chart_font_size(8))
 
         # Style axes
         self.ax.set_facecolor(COLORS['background_light'])
-        self.ax.tick_params(colors=COLORS['text_secondary'], labelsize=8)
+        self.ax.tick_params(colors=COLORS['text_secondary'], labelsize=chart_font_size(8))
         self.ax.spines['bottom'].set_color(COLORS['border'])
         self.ax.spines['top'].set_color(COLORS['border'])
         self.ax.spines['left'].set_color(COLORS['border'])
@@ -1675,7 +1675,7 @@ class HourlyAstroChart(FigureCanvas):
             Patch(facecolor=COLORS['warning'], label='Moderate (40-59)'),
             Patch(facecolor=COLORS['error'], label='Poor (<40)'),
         ]
-        self.ax.legend(handles=legend_elements, loc='upper right', fontsize=7,
+        self.ax.legend(handles=legend_elements, loc='upper right', fontsize=chart_font_size(7),
                   facecolor=COLORS['background_lighter'], edgecolor=COLORS['border'], labelcolor=COLORS['text'])
 
         self.figure.tight_layout()
@@ -1833,7 +1833,7 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
 
         # Rating
         rating_label = QLabel(f"Astro Rating: {get_rating_label(self.summary.astro_score)} ({self.summary.astro_score})")
-        themed_style(rating_label, lambda self=self: f"color: {get_rating_color(self.summary.astro_score)}; font-weight: bold; font-size: 12pt;")
+        themed_style(rating_label, lambda self=self: f"color: {get_rating_color(self.summary.astro_score)}; font-weight: bold; font-size: {font_size(12)};")
         header_layout.addWidget(rating_label, 0, 0)
 
         # Seeing estimate
@@ -2252,7 +2252,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         # Header with location and refresh button
         header_layout = QHBoxLayout()
         self.location_label = QLabel("Location: Loading...")
-        self.location_label.setStyleSheet("font-size: 11pt;")
+        themed_style(self.location_label, lambda: f"font-size: {font_size(11)};")
         header_layout.addWidget(self.location_label)
         header_layout.addStretch()
 
@@ -2314,7 +2314,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self.attribution_label = QLabel()
         self._attribution_sources = ["openmeteo"]
         self._update_attribution()
-        themed_style(self.attribution_label, lambda: f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        themed_style(self.attribution_label, lambda: f"color: {COLORS['text_disabled']}; font-size: {font_size(9)};")
         self.attribution_label.setAlignment(Qt.AlignCenter)
         self.attribution_label.setOpenExternalLinks(False)
         self.attribution_label.linkActivated.connect(lambda url: open_url(url))

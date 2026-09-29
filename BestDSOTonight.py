@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS, adapt_color, theme_manager, themed_style, tint
+from Theme import COLORS, adapt_color, font_px, theme_manager, themed_style, tint
 from TimeFormatHelper import format_time, format_datetime
 from NINAIntegration import NINAIntegration
 
@@ -800,7 +800,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         # Header
         header_label = QLabel("Best Deep Sky Objects for Tonight")
         header_label.setAlignment(Qt.AlignCenter)
-        header_label.setStyleSheet("font-size: 18px; font-weight: bold; margin: 10px;")
+        themed_style(header_label, lambda: f"font-size: {font_px(18)}; font-weight: bold; margin: 10px;")
         main_layout.addWidget(header_label)
         
         # Location info

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QScrollArea, QFileDialog, QMessageBox, QCheckBox, QProgressBar
 )
 
-from Theme import themed_style, COLORS, adapt_color
+from Theme import COLORS, adapt_color, font_size, themed_style
 from WindowPositionManager import WindowPositionManager
 from ResourceManager import ResourceManager
 from TimeFormatHelper import format_datetime
@@ -145,13 +145,13 @@ class ImageViewerWindow(QDialog):
 
         # Add zoom controls
         zoom_out_button = QPushButton("-")
-        zoom_out_button.setStyleSheet("QPushButton { font-size: 12pt; }")
+        themed_style(zoom_out_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
         zoom_out_button.setToolTip("Zoom out")
         zoom_out_button.clicked.connect(self._zoom_out)
         toolbar.addWidget(zoom_out_button)
 
         zoom_in_button = QPushButton("+")
-        zoom_in_button.setStyleSheet("QPushButton { font-size: 12pt; }")
+        themed_style(zoom_in_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
         zoom_in_button.setToolTip("Zoom in")
         zoom_in_button.clicked.connect(self._zoom_in)
         toolbar.addWidget(zoom_in_button)
@@ -227,7 +227,7 @@ class ImageViewerWindow(QDialog):
             self.image_label.setPixmap(pixmap)
         else:
             self.image_label.setText(f"Loading {Path(file_path).name}..." if file_path else "No image")
-            themed_style(self.image_label, lambda: f"color: {adapt_color('#aaaaaa', on_dark=True)}; font-size: 12pt;")
+            themed_style(self.image_label, lambda: f"color: {adapt_color('#aaaaaa', on_dark=True)}; font-size: {font_size(12)};")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMouseTracking(True)
         self.image_label.installEventFilter(self)
@@ -245,7 +245,7 @@ class ImageViewerWindow(QDialog):
         themed_style(self.file_info_panel, lambda: f"""
             QGroupBox {{
                 font-weight: bold;
-                font-size: 12pt;
+                font-size: {font_size(12)};
                 color: {COLORS['text']};
                 background-color: {COLORS['background']};
                 border: 2px solid {COLORS['border']};
@@ -298,7 +298,7 @@ class ImageViewerWindow(QDialog):
         # Dark mode styling for the content label
         themed_style(self.file_info_content, lambda: f"""
             QLabel {{
-                font-size: 10pt;
+                font-size: {font_size(10)};
                 color: {COLORS['text_secondary']};
                 font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
                 padding: 10px;
@@ -323,7 +323,7 @@ class ImageViewerWindow(QDialog):
 
         # Add status bar
         self.status_bar = QLabel()
-        self.status_bar.setStyleSheet("font-size: 10pt;")
+        themed_style(self.status_bar, lambda: f"font-size: {font_size(10)};")
         main_layout.addWidget(self.status_bar)
 
         # Set stretch to ensure content takes most space and status bar stays at bottom

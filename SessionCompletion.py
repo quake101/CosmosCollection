@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, 
 import ProcessingHandoff as handoff
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import themed_style, COLORS
+from Theme import COLORS, font_size, themed_style
 from SessionManager import format_duration, _rollback, _retire_thread
 
 logger = logging.getLogger(__name__)
@@ -199,7 +199,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         name_and_date = f"<b>{self.session.get('dso_name', '')}</b> — {self.session.get('session_date', '')}"
         title = QLabel(f"Process {name_and_date} in {handoff.APP_LABELS[self._fixed_app]}." if self._fixed_app
                        else f"{name_and_date} is marked Completed.")
-        title.setStyleSheet("font-size: 11pt;")
+        themed_style(title, lambda: f"font-size: {font_size(11)};")
         layout.addWidget(title)
 
         self.summary_label = QLabel(self._summary_text())
@@ -693,7 +693,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         self.status_label = QLabel("Starting Siril...")
-        self.status_label.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        themed_style(self.status_label, lambda: f"font-weight: bold; font-size: {font_size(11)};")
         layout.addWidget(self.status_label)
 
         self.detail_label = QLabel("")
@@ -707,7 +707,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
         # Siril's latest message (or how long it's been quiet), so a long step
         # never looks frozen even before it reports a percentage.
         self.activity_label = QLabel("")
-        themed_style(self.activity_label, lambda: f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        themed_style(self.activity_label, lambda: f"color: {COLORS['text_disabled']}; font-size: {font_size(9)};")
         self.activity_label.setMinimumWidth(1)  # long messages mustn't widen the window
         layout.addWidget(self.activity_label)
 
@@ -1018,7 +1018,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
             self.detail_label.setText("")
         elif exit_code == 0 and results:
             self.status_label.setText(f"Done - {len(results)} stacked image(s).")
-            themed_style(self.status_label, lambda: f"font-weight: bold; font-size: 11pt; color: {COLORS['success']};")
+            themed_style(self.status_label, lambda: f"font-weight: bold; font-size: {font_size(11)}; color: {COLORS['success']};")
             self.detail_label.setText("")
             self.step_bar.setValue(1000)
             self.overall_bar.setValue(1000)
@@ -1026,7 +1026,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
                 self.stages_list.item(row).setText(f"{self.DONE_MARK}  {self.sections[row]}")
         else:
             self.status_label.setText("Siril reported a problem - see its output below.")
-            themed_style(self.status_label, lambda: f"font-weight: bold; font-size: 11pt; color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"font-weight: bold; font-size: {font_size(11)}; color: {COLORS['error']};")
             # Show the error without changing the saved show/hide preference.
             self.output_checkbox.blockSignals(True)
             self.output_checkbox.setChecked(True)

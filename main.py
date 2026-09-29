@@ -85,7 +85,10 @@ from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager, WindowPositionMixin
 from ResourceManager import ResourceManager
 from CollageBuilder import CollageBuilder, CollageBuilderWindow
-from Theme import themed_style, apply_theme, COLORS, theme_manager, tint, load_settings as load_theme_settings, save_settings as save_theme_settings
+from Theme import (
+    COLORS, apply_theme, font_size, load_settings as load_theme_settings,
+    save_settings as save_theme_settings, theme_manager, themed_style, tint,
+)
 from ThemeTab import ThemeSettingsTab
 from ImageViewer import ImageViewerWindow
 from DSODetail import DSODetailWindow
@@ -821,7 +824,7 @@ class SimbadLoadingDialog(QDialog):
         # Message label
         message = QLabel(f"Searching for '{search_term}' in SIMBAD database...\n\nPlease wait...")
         message.setAlignment(Qt.AlignCenter)
-        message.setStyleSheet("font-size: 12pt;")
+        themed_style(message, lambda: f"font-size: {font_size(12)};")
         layout.addWidget(message)
 
         self.setLayout(layout)
@@ -1180,7 +1183,7 @@ class SettingsDialog(QDialog):
         )
         cache_help.setWordWrap(True)
         cache_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        themed_style(cache_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 20px; }}")
+        themed_style(cache_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; margin-left: 20px; }}")
         perf_settings_layout.addWidget(cache_help)
 
         app_settings_layout.addWidget(perf_settings_group)
@@ -1220,7 +1223,7 @@ class SettingsDialog(QDialog):
         nina_layout = QVBoxLayout(nina_page)
 
         nina_title = QLabel("NINA Integration")
-        nina_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        themed_style(nina_title, lambda: f"font-weight: bold; font-size: {font_size(11)};")
         nina_layout.addWidget(nina_title)
 
         # Enable checkbox
@@ -1278,7 +1281,7 @@ class SettingsDialog(QDialog):
             "Requires the <b>Advanced API</b> plugin to be installed and enabled in NINA."
         )
         nina_help.setWordWrap(True)
-        themed_style(nina_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; }}")
+        themed_style(nina_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; }}")
         nina_layout.addWidget(nina_help)
 
         nina_layout.addStretch()
@@ -1289,7 +1292,7 @@ class SettingsDialog(QDialog):
         astap_page_layout = QVBoxLayout(astap_page)
 
         astap_title = QLabel("ASTAP")
-        astap_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        themed_style(astap_title, lambda: f"font-weight: bold; font-size: {font_size(11)};")
         astap_page_layout.addWidget(astap_title)
 
         # ASTAP path setting
@@ -1316,7 +1319,7 @@ class SettingsDialog(QDialog):
         astap_help.setOpenExternalLinks(True)
         astap_help.setWordWrap(True)
         astap_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        themed_style(astap_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        themed_style(astap_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; margin-left: 120px; }}")
         astap_page_layout.addWidget(astap_help)
 
         astap_page_layout.addStretch()
@@ -1327,7 +1330,7 @@ class SettingsDialog(QDialog):
         astrometry_page_layout = QVBoxLayout(astrometry_page)
 
         astrometry_title = QLabel("Astrometry.net")
-        astrometry_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        themed_style(astrometry_title, lambda: f"font-weight: bold; font-size: {font_size(11)};")
         astrometry_page_layout.addWidget(astrometry_title)
 
         # Astrometry.net API key setting
@@ -1370,7 +1373,7 @@ class SettingsDialog(QDialog):
         api_key_help.setOpenExternalLinks(True)
         api_key_help.setWordWrap(True)
         api_key_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        themed_style(api_key_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        themed_style(api_key_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; margin-left: 120px; }}")
         astrometry_page_layout.addWidget(api_key_help)
 
         astrometry_page_layout.addStretch()
@@ -1397,7 +1400,7 @@ class SettingsDialog(QDialog):
         openweather_page_layout = QVBoxLayout(openweather_page)
 
         openweather_title = QLabel("OpenWeather")
-        openweather_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        themed_style(openweather_title, lambda: f"font-weight: bold; font-size: {font_size(11)};")
         openweather_page_layout.addWidget(openweather_title)
 
         # Enable checkbox
@@ -1449,7 +1452,7 @@ class SettingsDialog(QDialog):
         openweather_help.setOpenExternalLinks(True)
         openweather_help.setWordWrap(True)
         openweather_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        themed_style(openweather_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        themed_style(openweather_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; margin-left: 120px; }}")
         openweather_page_layout.addWidget(openweather_help)
 
         openweather_page_layout.addStretch()
@@ -1460,7 +1463,7 @@ class SettingsDialog(QDialog):
         visualcrossing_page_layout = QVBoxLayout(visualcrossing_page)
 
         visualcrossing_title = QLabel("VisualCrossing")
-        visualcrossing_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        themed_style(visualcrossing_title, lambda: f"font-weight: bold; font-size: {font_size(11)};")
         visualcrossing_page_layout.addWidget(visualcrossing_title)
 
         # Enable checkbox
@@ -1514,7 +1517,7 @@ class SettingsDialog(QDialog):
         visualcrossing_help.setOpenExternalLinks(True)
         visualcrossing_help.setWordWrap(True)
         visualcrossing_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        themed_style(visualcrossing_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        themed_style(visualcrossing_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; margin-left: 120px; }}")
         visualcrossing_page_layout.addWidget(visualcrossing_help)
 
         visualcrossing_page_layout.addStretch()
@@ -1525,7 +1528,7 @@ class SettingsDialog(QDialog):
         weatherapi_page_layout = QVBoxLayout(weatherapi_page)
 
         weatherapi_title = QLabel("WeatherAPI")
-        weatherapi_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        themed_style(weatherapi_title, lambda: f"font-weight: bold; font-size: {font_size(11)};")
         weatherapi_page_layout.addWidget(weatherapi_title)
 
         # Enable checkbox
@@ -1579,7 +1582,7 @@ class SettingsDialog(QDialog):
         weatherapi_help.setOpenExternalLinks(True)
         weatherapi_help.setWordWrap(True)
         weatherapi_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        themed_style(weatherapi_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        themed_style(weatherapi_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; margin-left: 120px; }}")
         weatherapi_page_layout.addWidget(weatherapi_help)
 
         weatherapi_page_layout.addStretch()
@@ -2090,7 +2093,7 @@ class SettingsDialog(QDialog):
         page_layout = QVBoxLayout(page)
 
         title = QLabel(label)
-        title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        themed_style(title, lambda: f"font-weight: bold; font-size: {font_size(11)};")
         page_layout.addWidget(title)
 
         enabled_checkbox = QCheckBox(f"Enable {label} Integration")
@@ -2139,7 +2142,7 @@ class SettingsDialog(QDialog):
         help_label.setOpenExternalLinks(True)
         help_label.setWordWrap(True)
         help_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        themed_style(help_label, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; margin-left: 120px; }}")
+        themed_style(help_label, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; margin-left: 120px; }}")
         page_layout.addWidget(help_label)
 
         page_layout.addStretch()
@@ -3007,13 +3010,13 @@ class MapLocationPickerDialog(QDialog):
         # Coordinates display
         self.coords_label = QLabel("Click on the map to select a location")
         self.coords_label.setAlignment(Qt.AlignCenter)
-        self.coords_label.setStyleSheet("QLabel { font-size: 12pt; padding: 10px; }")
+        themed_style(self.coords_label, lambda: f"QLabel {{ font-size: {font_size(12)}; padding: 10px; }}")
         layout.addWidget(self.coords_label)
 
         # Help text
         help_text = QLabel("Tip: You can pan, zoom, and search for locations. Click anywhere on the map to select coordinates.")
         help_text.setWordWrap(True)
-        themed_style(help_text, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; padding: 5px; }}")
+        themed_style(help_text, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; padding: 5px; }}")
         help_text.setAlignment(Qt.AlignCenter)
         layout.addWidget(help_text)
 
@@ -3684,7 +3687,7 @@ class TelescopeDialog(QDialog):
         bottom_layout = QHBoxLayout()
         
         help_text = QLabel("Tip: Enable telescopes to make them available in the FOV Simulator. Multiple telescopes can be enabled.")
-        themed_style(help_text, lambda: f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        themed_style(help_text, lambda: f"color: {COLORS['text_disabled']}; font-size: {font_size(9)};")
         bottom_layout.addWidget(help_text)
         
         bottom_layout.addStretch()
@@ -4351,7 +4354,7 @@ class TelescopeDialog(QDialog):
 
         # Hint label
         hint_label = QLabel("Start typing to see suggestions from preset cameras")
-        themed_style(hint_label, lambda: f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        themed_style(hint_label, lambda: f"color: {COLORS['text_disabled']}; font-size: {font_size(9)};")
         layout.addWidget(hint_label)
 
         # Name field with autocomplete
@@ -4532,7 +4535,7 @@ class TelescopeDialog(QDialog):
 
         # Hint label
         hint_label = QLabel("Start typing to see suggestions from preset eyepieces")
-        themed_style(hint_label, lambda: f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        themed_style(hint_label, lambda: f"color: {COLORS['text_disabled']}; font-size: {font_size(9)};")
         layout.addWidget(hint_label)
 
         # Name field with autocomplete
@@ -4687,7 +4690,7 @@ class TelescopeDialog(QDialog):
 
         # Hint label
         hint_label = QLabel("Start typing to see suggestions from preset barlows/reducers")
-        themed_style(hint_label, lambda: f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        themed_style(hint_label, lambda: f"color: {COLORS['text_disabled']}; font-size: {font_size(9)};")
         layout.addWidget(hint_label)
 
         # Name field with autocomplete
@@ -5094,7 +5097,7 @@ class AboutDialog(QDialog):
         # Title
         title_label = QLabel("Cosmos Collection")
         title_label.setAlignment(Qt.AlignCenter)
-        themed_style(title_label, lambda: f"font-size: 18pt; font-weight: bold; color: {COLORS['text']};")
+        themed_style(title_label, lambda: f"font-size: {font_size(18)}; font-weight: bold; color: {COLORS['text']};")
         About_layout.addWidget(title_label)
 
         # Version information
@@ -5107,14 +5110,14 @@ class AboutDialog(QDialog):
         version_label = QLabel(version_text)
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setWordWrap(True)  # Allow text wrapping if needed
-        themed_style(version_label, lambda: f"font-size: 10pt; color: {COLORS['text_secondary']}; margin: 5px 0px; font-family: monospace;")
+        themed_style(version_label, lambda: f"font-size: {font_size(10)}; color: {COLORS['text_secondary']}; margin: 5px 0px; font-family: monospace;")
         About_layout.addWidget(version_label)
 
         # Description
         desc_label = QLabel("A personal astrophotography catalog and session planning tools for organizing and exploring your celestial images.")
         desc_label.setAlignment(Qt.AlignCenter)
         desc_label.setWordWrap(True)
-        themed_style(desc_label, lambda: f"font-size: 11pt; color: {COLORS['text_secondary']}; margin: 10px 0px;")
+        themed_style(desc_label, lambda: f"font-size: {font_size(11)}; color: {COLORS['text_secondary']}; margin: 10px 0px;")
         About_layout.addWidget(desc_label)
 
         # GitHub link
@@ -5122,7 +5125,7 @@ class AboutDialog(QDialog):
         link_label.setAlignment(Qt.AlignCenter)
         link_label.setOpenExternalLinks(True)
         link_label.setTextFormat(Qt.RichText)
-        link_label.setStyleSheet("font-size: 10pt;")
+        themed_style(link_label, lambda: f"font-size: {font_size(10)};")
         About_layout.addWidget(link_label)
 
         # Add fixed stretch to prevent layout jumping

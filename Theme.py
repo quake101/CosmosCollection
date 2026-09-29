@@ -280,6 +280,36 @@ def build_font(theme_settings):
     return font
 
 
+def font_scale_for(theme_settings):
+    """How much the chosen text size enlarges text relative to the platform
+    default (1.0 when the default size is used)."""
+    base = platform_font().pointSizeF()
+    chosen = build_font(theme_settings).pointSizeF()
+    return chosen / base if base > 0 and chosen > 0 else 1.0
+
+
+# Fixed font sizes in the code (style sheets, charts) were designed at the
+# platform's default size; they're scaled by this so the text size setting
+# reaches them too. Set by apply_theme().
+_font_scale = 1.0
+
+
+def font_size(points):
+    """A fixed style sheet font size in pt, scaled with the theme's text size,
+    e.g. f"font-size: {font_size(9)};" -> "font-size: 9pt;" at the default size."""
+    return f"{round(points * _font_scale * 2) / 2:g}pt"
+
+
+def font_px(pixels):
+    """Like font_size, for sizes given in px."""
+    return f"{round(pixels * _font_scale)}px"
+
+
+def chart_font_size(points):
+    """A fixed matplotlib font size (points), scaled with the theme's text size."""
+    return points * _font_scale
+
+
 def _arrow_image(direction, color):
     """Path to a small triangle PNG ('up' or 'down') in the given color.
 
@@ -649,13 +679,14 @@ def theme_manager():
 
 def apply_theme(app, theme_settings=None):
     """Apply the theme (the saved settings if none given) to the application."""
-    global _current_mode
+    global _current_mode, _font_scale
     if theme_settings is None:
         theme_settings = load_settings()
     colors = build_colors(theme_settings)
     COLORS.clear()
     COLORS.update(colors)
     _current_mode = resolve_mode(theme_settings)
+    _font_scale = font_scale_for(theme_settings)
 
     # Fusion renders palettes and style sheets consistently in every mode.
     # (Once a style sheet is set, app.style() is Qt's style sheet wrapper, so
@@ -886,6 +917,7 @@ def _apply_chart_theme():
     default_cycle = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
                      '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
     matplotlib.rcParams.update({
+        'font.size': chart_font_size(10),  # matplotlib's default, scaled with the text size
         'axes.prop_cycle': cycler(color=[chart_color(c) for c in default_cycle]),
         'figure.facecolor': COLORS['background'],
         'figure.edgecolor': COLORS['background'],

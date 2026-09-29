@@ -17,7 +17,7 @@ from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import themed_style, COLORS, contrast_text
+from Theme import COLORS, contrast_text, font_px, font_size, themed_style
 from UrlOpener import open_url
 from NINAIntegration import NINAIntegration
 
@@ -258,7 +258,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         # Create a placeholder widget for the web view
         self.web_placeholder = QLabel("Loading Aladin Lite...")
         self.web_placeholder.setAlignment(Qt.AlignCenter)
-        themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['text']}; font-size: 14px; }}")
+        themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['text']}; font-size: {font_px(14)}; }}")
         self.web_placeholder.setMinimumSize(400, 300)
 
         layout.addWidget(self.web_placeholder)
@@ -268,7 +268,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
         # Add FOV information display
         self.fov_info_label = QLabel()
-        self.fov_info_label.setStyleSheet("font-size: 10pt;")
+        themed_style(self.fov_info_label, lambda: f"font-size: {font_size(10)};")
         bottom_layout.addWidget(self.fov_info_label)
         bottom_layout.addStretch()
 
@@ -378,7 +378,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             # Update placeholder to show error and offer browser fallback
             if self.web_placeholder:
                 self.web_placeholder.setText(f"Failed to load Aladin Lite\nError: {str(e)}\n\nClick below to open in browser instead.")
-                themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: 12px; }}")
+                themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: {font_px(12)}; }}")
 
                 # Add a button to open in browser as fallback
                 self._add_browser_fallback_button()
@@ -985,7 +985,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             # Show error in placeholder
             if self.web_placeholder:
                 self.web_placeholder.setText(f"Error loading Aladin Lite\n{str(e)}\n\nClick below to open in browser instead.")
-                themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: 12px; }}")
+                themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: {font_px(12)}; }}")
             self._add_browser_fallback_button()
 
         # Add telescope FOV overlay using JavaScript injection if enabled
@@ -1889,7 +1889,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 "This is usually caused by a GPU driver incompatibility.\n"
                 "Click below to open in your browser instead."
             )
-            themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: 12px; }}")
+            themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: {font_px(12)}; }}")
             self.web_placeholder.show()
         self._add_browser_fallback_button()
         # Stop any in-progress load to break the automatic crash-and-retry cycle
@@ -1910,7 +1910,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             # accurate message — don't stomp it with the generic network-error text.
             if self.web_placeholder and not self._renderer_crashed:
                 self.web_placeholder.setText("Failed to load Aladin Lite\nCheck your internet connection\n\nClick below to open in browser instead.")
-                themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: 12px; }}")
+                themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: {font_px(12)}; }}")
             self._add_browser_fallback_button()
         else:
             logger.debug("Aladin Lite loaded successfully")
@@ -1976,7 +1976,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         logger.warning("Aladin Lite loading timed out after 30 seconds")
         if self.web_placeholder:
             self.web_placeholder.setText("Loading timed out\nAladin Lite may be slow to respond\n\nClick below to open in browser instead.")
-            themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['warning']}; font-size: 12px; }}")
+            themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['warning']}; font-size: {font_px(12)}; }}")
         self._add_browser_fallback_button()
 
     def _ensure_web_view_visible(self):

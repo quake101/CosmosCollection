@@ -38,8 +38,10 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-from Theme import (COLORS, adapt_color, chart_background, chart_color, contrast_text, sky_shade,
-                   theme_manager, themed_style, tint)
+from Theme import (
+    COLORS, adapt_color, chart_background, chart_color, chart_font_size, contrast_text, font_size,
+    sky_shade, theme_manager, themed_style, tint,
+)
 
 # Get the application directory
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -723,7 +725,7 @@ class VisibilityCalendar(QCalendarWidget):
                 border: 1px solid {COLORS['border_light']};
                 border-radius: 3px;
                 padding: 4px 8px;
-                font-size: 10pt;
+                font-size: {font_size(10)};
             }}
         """)
         self.tooltip_label.hide()
@@ -1271,7 +1273,7 @@ class VisibilityPlot(FigureCanvas):
                 border: 1px solid {COLORS['border_light']};
                 border-radius: 3px;
                 padding: 6px 10px;
-                font-size: 9pt;
+                font-size: {font_size(9)};
                 font-family: monospace;
             }}
         """)
@@ -1380,7 +1382,7 @@ class VisibilityPlot(FigureCanvas):
         # Get timezone abbreviation for display
         sample_time = local_times[0] if local_times else None
         tz_abbrev = sample_time.strftime('%Z') if sample_time else 'Local Time'
-        ax1.set_title(f'{dso_name} Visibility ({tz_abbrev})', fontsize=14)
+        ax1.set_title(f'{dso_name} Visibility ({tz_abbrev})', fontsize=chart_font_size(14))
         ax1.legend(loc='upper right')
         ax1.grid(True, alpha=0.3)
         ax1.set_ylim(-20, 90)
