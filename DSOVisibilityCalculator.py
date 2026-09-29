@@ -39,7 +39,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from Theme import (COLORS, adapt_color, chart_background, chart_color, contrast_text, sky_shade,
-                   theme_manager, tint)
+                   theme_manager, themed_style, tint)
 
 # Get the application directory
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -716,7 +716,7 @@ class VisibilityCalendar(QCalendarWidget):
 
         self.tooltip_label = QLabel(self)
         self.tooltip_label.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.tooltip_label.setStyleSheet(f"""
+        themed_style(self.tooltip_label, lambda: f"""
             QLabel {{
                 background-color: {COLORS['background_lighter']};
                 color: {COLORS['text']};
@@ -916,7 +916,7 @@ class MultiMonthVisibilityCalendar(QWidget):
         layout.addLayout(self.calendars_layout, 1)
 
         self.status_label = QLabel("Select a DSO and calculate to see monthly visibility")
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-style: italic;")
+        themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']}; font-style: italic;")
         layout.addWidget(self.status_label)
 
         self._rebuild_calendars()
@@ -942,13 +942,13 @@ class MultiMonthVisibilityCalendar(QWidget):
         row.addStretch()
 
         row.addWidget(QLabel("Weather (top stripe):"))
-        for label, color in (
-            ("Excellent", COLORS['success']), ("Good", COLORS['info']),
-            ("Moderate", COLORS['warning']), ("Poor", COLORS['error']),
+        for label, color_key in (
+            ("Excellent", 'success'), ("Good", 'info'),
+            ("Moderate", 'warning'), ("Poor", 'error'),
         ):
             swatch = QLabel()
             swatch.setFixedSize(12, 12)
-            swatch.setStyleSheet(f"background-color: {color}; border: 1px solid {COLORS['border']};")
+            themed_style(swatch, lambda color_key=color_key: f"background-color: {COLORS[color_key]}; border: 1px solid {COLORS['border']};")
             row.addWidget(swatch)
             row.addWidget(QLabel(label))
 
@@ -1262,9 +1262,9 @@ class VisibilityPlot(FigureCanvas):
         self.mpl_connect('axes_leave_event', self.on_mouse_leave)
 
     def _apply_widget_theme(self):
-        """Theme colors for the canvas and its Qt tooltip"""
-        self.setStyleSheet(f"background-color: {chart_background()};")
-        self.qt_tooltip.setStyleSheet(f"""
+        """Theme colors for the canvas and its Qt tooltip (rebuilt on theme changes)"""
+        themed_style(self, lambda: f"background-color: {chart_background()};")
+        themed_style(self.qt_tooltip, lambda: f"""
             QLabel {{
                 background-color: {COLORS['background_lighter']};
                 color: {COLORS['text']};
@@ -1277,8 +1277,8 @@ class VisibilityPlot(FigureCanvas):
         """)
 
     def _on_theme_changed(self):
-        """Redraw with the new theme colors"""
-        self._apply_widget_theme()
+        """Redraw the chart with the new theme colors (the widget styles
+        follow the theme on their own)"""
         if self._last_results is not None:
             self.plot_visibility(self._last_results)
 

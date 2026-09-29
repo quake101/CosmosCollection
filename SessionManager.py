@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from TimeFormatHelper import format_time
-from Theme import COLORS
+from Theme import themed_style, COLORS
 import SessionFileScanner
 import SessionObservations
 
@@ -728,7 +728,7 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
                 + self._already_attached_text()
             )
             already_label.setWordWrap(True)
-            already_label.setStyleSheet(f"color: {COLORS['warning']};")
+            themed_style(already_label, lambda: f"color: {COLORS['warning']};")
             form.addRow("Already Attached:", already_label)
         summary_group.setLayout(form)
         layout.addWidget(summary_group)
@@ -1078,7 +1078,7 @@ class ObservationDialog(WindowPositionMixin, QDialog):
         hint = QLabel("A night that runs past midnight is one observation. An end time earlier "
                       "than the start time moves to the next morning.")
         hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(hint, lambda: f"color: {COLORS['text_secondary']};")
         time_form.addRow(hint)
         time_group.setLayout(time_form)
         layout.addWidget(time_group)
@@ -1105,7 +1105,7 @@ class ObservationDialog(WindowPositionMixin, QDialog):
         logged_hint = QLabel("For subs you didn't import. Where these overlap scanned files with the same "
                              "filter and exposure, the larger count is used - they are never added together.")
         logged_hint.setWordWrap(True)
-        logged_hint.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(logged_hint, lambda: f"color: {COLORS['text_secondary']};")
         logged_layout.addWidget(logged_hint)
         self.logged_table = _make_table(["Filter", "Exposure (s)", "Subs", "Integration"])
         self.logged_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -1326,7 +1326,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         buttons = QHBoxLayout()
         note = QLabel("Drop FITS/XISF files or folders anywhere here to attach them. "
                       "Attaching or removing files is saved immediately.")
-        note.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(note, lambda: f"color: {COLORS['text_secondary']};")
         buttons.addWidget(note)
         buttons.addStretch()
         cancel_btn = QPushButton("Cancel")
@@ -1371,7 +1371,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
                       "observation. Hand-logged subs and scanned files with the same filter and exposure are the "
                       "same subs, so the larger count is used, never both.")
         hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(hint, lambda: f"color: {COLORS['text_secondary']};")
         layout.addWidget(hint)
 
         buttons = QHBoxLayout()
@@ -2162,7 +2162,7 @@ class SessionMonthCalendar(QCalendarWidget):
 
         self.tooltip_label = QLabel(self)
         self.tooltip_label.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.tooltip_label.setStyleSheet(f"""
+        themed_style(self.tooltip_label, lambda: f"""
             QLabel {{
                 background-color: {COLORS['background_lighter']};
                 color: {COLORS['text']};
@@ -2426,13 +2426,13 @@ class SessionCalendarWidget(QWidget):
         row.addStretch()
 
         row.addWidget(QLabel("Background: DSO visibility • Top stripe: weather • Dot: selected session's nights"))
-        for label, color in (
-            ("Excellent", COLORS['success']), ("Good", COLORS['info']),
-            ("Moderate", COLORS['warning']), ("Poor", COLORS['error']),
+        for label, color_key in (
+            ("Excellent", 'success'), ("Good", 'info'),
+            ("Moderate", 'warning'), ("Poor", 'error'),
         ):
             swatch = QLabel()
             swatch.setFixedSize(12, 12)
-            swatch.setStyleSheet(f"background-color: {color}; border: 1px solid {COLORS['border']};")
+            themed_style(swatch, lambda color_key=color_key: f"background-color: {COLORS[color_key]}; border: 1px solid {COLORS['border']};")
             row.addWidget(swatch)
             row.addWidget(QLabel(label))
 

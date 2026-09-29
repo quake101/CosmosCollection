@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, 
 import ProcessingHandoff as handoff
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS
+from Theme import themed_style, COLORS
 from SessionManager import format_duration, _rollback, _retire_thread
 
 logger = logging.getLogger(__name__)
@@ -203,13 +203,13 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         layout.addWidget(title)
 
         self.summary_label = QLabel(self._summary_text())
-        self.summary_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.summary_label, lambda: f"color: {COLORS['text_secondary']};")
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
 
         # Filled in by the background FrameCheckWorker once the dialog is showing.
         self.missing_label = QLabel()
-        self.missing_label.setStyleSheet(f"color: {COLORS['warning']};")
+        themed_style(self.missing_label, lambda: f"color: {COLORS['warning']};")
         self.missing_label.setWordWrap(True)
         self.missing_label.hide()
         layout.addWidget(self.missing_label)
@@ -697,7 +697,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
         layout.addWidget(self.status_label)
 
         self.detail_label = QLabel("")
-        self.detail_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.detail_label, lambda: f"color: {COLORS['text_secondary']};")
         layout.addWidget(self.detail_label)
         self.step_bar = QProgressBar()
         self.step_bar.setRange(0, 1000)
@@ -707,7 +707,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
         # Siril's latest message (or how long it's been quiet), so a long step
         # never looks frozen even before it reports a percentage.
         self.activity_label = QLabel("")
-        self.activity_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        themed_style(self.activity_label, lambda: f"color: {COLORS['text_disabled']}; font-size: 9pt;")
         self.activity_label.setMinimumWidth(1)  # long messages mustn't widen the window
         layout.addWidget(self.activity_label)
 
@@ -715,7 +715,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
             "Siril is setting up its Python environment. This happens occasionally (e.g. the first run "
             "after installing or updating Siril) and can take a few minutes - stacking continues when it's done.")
         self.python_label.setWordWrap(True)
-        self.python_label.setStyleSheet(f"color: {COLORS['info']};")
+        themed_style(self.python_label, lambda: f"color: {COLORS['info']};")
         self.python_label.hide()
         layout.addWidget(self.python_label)
 
@@ -727,13 +727,12 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
         overall_row.addWidget(self.overall_bar, 1)
         layout.addLayout(overall_row)
         self.time_label = QLabel("")
-        self.time_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.time_label, lambda: f"color: {COLORS['text_secondary']};")
         layout.addWidget(self.time_label)
 
         # Shown when Siril says it has to copy frames because it can't symlink them.
         self.symlink_hint = QWidget()
-        self.symlink_hint.setStyleSheet(
-            f"QWidget#symlinkHint {{ border: 1px solid {COLORS['warning']}; border-radius: 4px; }}")
+        themed_style(self.symlink_hint, lambda: f"QWidget#symlinkHint {{ border: 1px solid {COLORS['warning']}; border-radius: 4px; }}")
         self.symlink_hint.setObjectName("symlinkHint")
         hint_layout = QVBoxLayout(self.symlink_hint)
         self.symlink_hint_label = QLabel()
@@ -1019,7 +1018,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
             self.detail_label.setText("")
         elif exit_code == 0 and results:
             self.status_label.setText(f"Done - {len(results)} stacked image(s).")
-            self.status_label.setStyleSheet(f"font-weight: bold; font-size: 11pt; color: {COLORS['success']};")
+            themed_style(self.status_label, lambda: f"font-weight: bold; font-size: 11pt; color: {COLORS['success']};")
             self.detail_label.setText("")
             self.step_bar.setValue(1000)
             self.overall_bar.setValue(1000)
@@ -1027,7 +1026,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
                 self.stages_list.item(row).setText(f"{self.DONE_MARK}  {self.sections[row]}")
         else:
             self.status_label.setText("Siril reported a problem - see its output below.")
-            self.status_label.setStyleSheet(f"font-weight: bold; font-size: 11pt; color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"font-weight: bold; font-size: 11pt; color: {COLORS['error']};")
             # Show the error without changing the saved show/hide preference.
             self.output_checkbox.blockSignals(True)
             self.output_checkbox.setChecked(True)

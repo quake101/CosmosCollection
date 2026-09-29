@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QScrollArea, QFileDialog, QMessageBox, QCheckBox, QProgressBar
 )
 
-from Theme import COLORS, adapt_color
+from Theme import themed_style, COLORS, adapt_color
 from WindowPositionManager import WindowPositionManager
 from ResourceManager import ResourceManager
 from TimeFormatHelper import format_datetime
@@ -227,7 +227,7 @@ class ImageViewerWindow(QDialog):
             self.image_label.setPixmap(pixmap)
         else:
             self.image_label.setText(f"Loading {Path(file_path).name}..." if file_path else "No image")
-            self.image_label.setStyleSheet(f"color: {adapt_color('#aaaaaa', on_dark=True)}; font-size: 12pt;")
+            themed_style(self.image_label, lambda: f"color: {adapt_color('#aaaaaa', on_dark=True)}; font-size: 12pt;")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMouseTracking(True)
         self.image_label.installEventFilter(self)
@@ -242,7 +242,7 @@ class ImageViewerWindow(QDialog):
         self.file_info_panel.setFixedWidth(350)
 
         # Dark mode styling for the groupbox
-        self.file_info_panel.setStyleSheet(f"""
+        themed_style(self.file_info_panel, lambda: f"""
             QGroupBox {{
                 font-weight: bold;
                 font-size: 12pt;
@@ -273,7 +273,7 @@ class ImageViewerWindow(QDialog):
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         # Dark mode styling for scroll area
-        scroll_area.setStyleSheet(f"""
+        themed_style(scroll_area, lambda: f"""
             QScrollArea {{
                 background-color: {COLORS['background']};
                 border: 1px solid {COLORS['border']};
@@ -296,7 +296,7 @@ class ImageViewerWindow(QDialog):
 
         self.file_info_content = QLabel()
         # Dark mode styling for the content label
-        self.file_info_content.setStyleSheet(f"""
+        themed_style(self.file_info_content, lambda: f"""
             QLabel {{
                 font-size: 10pt;
                 color: {COLORS['text_secondary']};
@@ -1213,7 +1213,7 @@ class ImageViewerWindow(QDialog):
 
         # Status label
         self.annotation_status = QLabel("Ready to plate solve")
-        self.annotation_status.setStyleSheet(f"color: {COLORS['text_secondary']}; padding: 5px;")
+        themed_style(self.annotation_status, lambda: f"color: {COLORS['text_secondary']}; padding: 5px;")
         layout.addWidget(self.annotation_status)
 
         # Progress bar

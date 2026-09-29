@@ -39,7 +39,7 @@ from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, Q
 
 from NINAIntegration import NINAIntegration
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS, adapt_color, chart_background, chart_color, theme_manager
+from Theme import themed_style, COLORS, adapt_color, chart_background, chart_color, theme_manager
 from TimeFormatHelper import format_time
 
 # Set up logging
@@ -1051,7 +1051,7 @@ class SlewDialog(QDialog):
         layout.addWidget(search_group)
 
         self.search_status_label = QLabel("")
-        self.search_status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.search_status_label, lambda: f"color: {COLORS['text_secondary']};")
         layout.addWidget(self.search_status_label)
 
         # Form layout for coordinates
@@ -1168,11 +1168,11 @@ class SlewDialog(QDialog):
         object_name = self.search_input.text().strip()
         if not object_name:
             self.search_status_label.setText("Enter an object name to search")
-            self.search_status_label.setStyleSheet(f"color: {COLORS['warning']};")
+            themed_style(self.search_status_label, lambda: f"color: {COLORS['warning']};")
             return
 
         self.search_status_label.setText(f"Searching for '{object_name}'...")
-        self.search_status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.search_status_label, lambda: f"color: {COLORS['text_secondary']};")
         self.search_btn.setEnabled(False)
 
         # Force UI update
@@ -1221,7 +1221,7 @@ class SlewDialog(QDialog):
 
             if not rows:
                 self.search_status_label.setText(f"'{object_name}' not found in database")
-                self.search_status_label.setStyleSheet(f"color: {COLORS['error']};")
+                themed_style(self.search_status_label, lambda: f"color: {COLORS['error']};")
                 return
 
             row = rows[0]
@@ -1252,11 +1252,11 @@ class SlewDialog(QDialog):
             self.dec_s_spinbox.setValue(round(dec_s, 2))
 
             self.search_status_label.setText(f"Found: {found_name}")
-            self.search_status_label.setStyleSheet(f"color: {COLORS['success']};")
+            themed_style(self.search_status_label, lambda: f"color: {COLORS['success']};")
 
         except Exception as e:
             self.search_status_label.setText(f"Search failed: {str(e)}")
-            self.search_status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.search_status_label, lambda: f"color: {COLORS['error']};")
         finally:
             self.search_btn.setEnabled(True)
 
@@ -1292,6 +1292,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._image_fetch_done.connect(self._on_image_fetch_done)
 
         self._setup_ui()
+        # Widget styles follow theme changes on their own (Theme.themed_style);
+        # the event log's row colors are item data, so recolor those
+        theme_manager().theme_changed.connect(self._recolor_event_log)
         self._auto_connect()
         # Defer settings restore until after window is shown (dock widgets need visible geometry)
         QTimer.singleShot(100, self._restore_settings)
@@ -1313,7 +1316,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         header_layout.addWidget(self.reconnect_btn)
 
         self.connection_label = QLabel("Connection: Disconnected")
-        self.connection_label.setStyleSheet(f"color: {COLORS['warning']};")
+        themed_style(self.connection_label, lambda: f"color: {COLORS['warning']};")
         header_layout.addWidget(self.connection_label)
 
         header_layout.addStretch()
@@ -1326,11 +1329,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         # Status bar at bottom of central widget
         status_layout_h = QHBoxLayout()
         self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
         status_layout_h.addWidget(self.status_label)
         status_layout_h.addStretch()
         self.countdown_label = QLabel("")
-        self.countdown_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.countdown_label, lambda: f"color: {COLORS['text_secondary']};")
         status_layout_h.addWidget(self.countdown_label)
         main_layout.addLayout(status_layout_h)
 
@@ -1724,7 +1727,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         # Create tab widget instead of group box
         self.image_tabs = QTabWidget()
         self.image_tabs.setDocumentMode(False)
-        self.image_tabs.setStyleSheet(f"""
+        themed_style(self.image_tabs, lambda: f"""
             QTabBar::tab {{
                 border: 1px solid {COLORS['border']};
                 border-bottom: none;
@@ -1780,7 +1783,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.liveview_info_label = QLabel("")
         self.liveview_info_label.setAlignment(Qt.AlignCenter)
         self.liveview_info_label.setFixedHeight(20)
-        self.liveview_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.liveview_info_label, lambda: f"color: {COLORS['text_secondary']};")
         liveview_layout.addWidget(self.liveview_info_label, 0)
 
         self.image_tabs.addTab(liveview_widget, "Live View")
@@ -1823,7 +1826,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.image_info_label = QLabel("Target: -- | Exp: --")
         self.image_info_label.setAlignment(Qt.AlignCenter)
         self.image_info_label.setFixedHeight(20)
-        self.image_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.image_info_label, lambda: f"color: {COLORS['text_secondary']};")
         image_layout.addWidget(self.image_info_label, 0)
 
         self.image_tabs.addTab(image_widget, "Latest Image")
@@ -1891,7 +1894,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.livestack_info_label = QLabel("")
         self.livestack_info_label.setAlignment(Qt.AlignCenter)
         self.livestack_info_label.setFixedHeight(28)
-        self.livestack_info_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 16px;")
+        themed_style(self.livestack_info_label, lambda: f"color: {COLORS['text_secondary']}; font-size: 16px;")
         livestack_layout.addWidget(self.livestack_info_label, 0)
 
         self.image_tabs.addTab(livestack_widget, "Live Stack")
@@ -1975,7 +1978,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         autofocus_layout.addWidget(self.autofocus_graph)
 
         self.autofocus_info_label = QLabel("")
-        self.autofocus_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.autofocus_info_label, lambda: f"color: {COLORS['text_secondary']};")
         autofocus_layout.addWidget(self.autofocus_info_label)
 
         self.autofocus_dock.setWidget(autofocus_widget)
@@ -2238,7 +2241,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self._reconnect()
         else:
             self.connection_label.setText("Connection: NINA integration disabled")
-            self.connection_label.setStyleSheet(f"color: {COLORS['warning']};")
+            themed_style(self.connection_label, lambda: f"color: {COLORS['warning']};")
             self.status_label.setText("Enable NINA integration in Settings to use this dashboard")
 
     def _reconnect(self):
@@ -2250,7 +2253,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._autofocus_stale_timer.stop()
 
         self.connection_label.setText("Connection: Connecting...")
-        self.connection_label.setStyleSheet(f"color: {COLORS['info']};")
+        themed_style(self.connection_label, lambda: f"color: {COLORS['info']};")
 
         # Get settings
         host, port = NINAIntegration.get_settings()
@@ -2290,9 +2293,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         if connected:
             self.connection_label.setText(f"Connection: Connected to NINA {version} ({host}:{port})")
-            self.connection_label.setStyleSheet(f"color: {COLORS['success']};")
+            themed_style(self.connection_label, lambda: f"color: {COLORS['success']};")
             self.status_label.setText("Connected - adaptive polling active")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
             # Enable start buttons (stop/cancel remain disabled until active)
             self.imaging_start_btn.setEnabled(True)
             self.autofocus_start_btn.setEnabled(True)
@@ -2303,9 +2306,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.mount_slew_btn.setEnabled(True)
         else:
             self.connection_label.setText("Connection: Disconnected")
-            self.connection_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.connection_label, lambda: f"color: {COLORS['error']};")
             self.status_label.setText("NINA disconnected - click Reconnect to retry")
-            self.status_label.setStyleSheet(f"color: {COLORS['warning']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['warning']};")
             # Disable all action buttons when disconnected
             self.imaging_start_btn.setEnabled(False)
             self.imaging_stop_btn.setEnabled(False)
@@ -2350,7 +2353,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             connected = camera.get('Connected', False)
             if not connected:
                 self.camera_status_label.setText("Disconnected")
-                self.camera_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+                themed_style(self.camera_status_label, lambda: f"color: {COLORS['text_disabled']};")
                 self.camera_progress.setValue(0)
                 self.camera_temp_label.setText("--")
                 self._exposure_end_time = None
@@ -2373,10 +2376,10 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 # Determine camera state
                 if is_exposing:
                     self.camera_status_label.setText("Exposing")
-                    self.camera_status_label.setStyleSheet(f"color: {COLORS['success']};")
+                    themed_style(self.camera_status_label, lambda: f"color: {COLORS['success']};")
                 else:
                     self.camera_status_label.setText("Idle")
-                    self.camera_status_label.setStyleSheet(f"color: {COLORS['text']};")
+                    themed_style(self.camera_status_label, lambda: f"color: {COLORS['text']};")
 
                 # Exposure progress - calculate from ExposureEndTime
                 exposure_end_str = camera.get('ExposureEndTime')
@@ -2459,7 +2462,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             # No camera data from API - show as disconnected
             self.camera_name_label.setText("--")
             self.camera_status_label.setText("Disconnected")
-            self.camera_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+            themed_style(self.camera_status_label, lambda: f"color: {COLORS['text_disabled']};")
             self.camera_progress.setValue(0)
             self.camera_temp_label.setText("--")
             self.camera_cooling_checkbox.blockSignals(True)
@@ -2482,7 +2485,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             mount_connected = mount.get('Connected', False)
             if not mount_connected:
                 self.mount_status_label.setText("Disconnected")
-                self.mount_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+                themed_style(self.mount_status_label, lambda: f"color: {COLORS['text_disabled']};")
                 self.mount_coords_label.setText("--")
                 # Disable mount buttons when mount disconnected
                 self.mount_home_btn.setEnabled(False)
@@ -2496,16 +2499,16 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
                 if slewing:
                     self.mount_status_label.setText("Slewing")
-                    self.mount_status_label.setStyleSheet(f"color: {COLORS['info']};")
+                    themed_style(self.mount_status_label, lambda: f"color: {COLORS['info']};")
                 elif at_park:
                     self.mount_status_label.setText("Parked")
-                    self.mount_status_label.setStyleSheet(f"color: {COLORS['text']};")
+                    themed_style(self.mount_status_label, lambda: f"color: {COLORS['text']};")
                 elif tracking:
                     self.mount_status_label.setText("Tracking")
-                    self.mount_status_label.setStyleSheet(f"color: {COLORS['success']};")
+                    themed_style(self.mount_status_label, lambda: f"color: {COLORS['success']};")
                 else:
                     self.mount_status_label.setText("Idle")
-                    self.mount_status_label.setStyleSheet(f"color: {COLORS['text']};")
+                    themed_style(self.mount_status_label, lambda: f"color: {COLORS['text']};")
 
                 # Update mount button states based on park status
                 self.mount_home_btn.setEnabled(self._connected and not at_park and not slewing)
@@ -2533,7 +2536,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             # No mount data from API - show as disconnected
             self.mount_name_label.setText("--")
             self.mount_status_label.setText("Disconnected")
-            self.mount_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+            themed_style(self.mount_status_label, lambda: f"color: {COLORS['text_disabled']};")
             self.mount_coords_label.setText("--")
             # Disable mount buttons when no mount data
             self.mount_home_btn.setEnabled(False)
@@ -2550,7 +2553,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             guider_connected = guider.get('Connected', False)
             if not guider_connected:
                 self.guider_status_label.setText("Disconnected")
-                self.guider_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+                themed_style(self.guider_status_label, lambda: f"color: {COLORS['text_disabled']};")
                 self.guider_rms_label.setText("--")
                 # Disable guiding buttons when guider disconnected
                 self.guiding_start_btn.setEnabled(False)
@@ -2561,19 +2564,19 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 is_guiding = guider_state == 'Guiding'
                 if is_guiding:
                     self.guider_status_label.setText("Guiding")
-                    self.guider_status_label.setStyleSheet(f"color: {COLORS['success']};")
+                    themed_style(self.guider_status_label, lambda: f"color: {COLORS['success']};")
                 elif guider_state == 'Calibrating':
                     self.guider_status_label.setText("Calibrating")
-                    self.guider_status_label.setStyleSheet(f"color: {COLORS['warning']};")
+                    themed_style(self.guider_status_label, lambda: f"color: {COLORS['warning']};")
                 elif guider_state == 'Looping':
                     self.guider_status_label.setText("Looping")
-                    self.guider_status_label.setStyleSheet(f"color: {COLORS['text']};")
+                    themed_style(self.guider_status_label, lambda: f"color: {COLORS['text']};")
                 elif guider_state == 'LostLock':
                     self.guider_status_label.setText("Lost Lock")
-                    self.guider_status_label.setStyleSheet(f"color: {COLORS['error']};")
+                    themed_style(self.guider_status_label, lambda: f"color: {COLORS['error']};")
                 else:
                     self.guider_status_label.setText("Idle")
-                    self.guider_status_label.setStyleSheet(f"color: {COLORS['text']};")
+                    themed_style(self.guider_status_label, lambda: f"color: {COLORS['text']};")
 
                 # Update guiding button states
                 self.guiding_start_btn.setEnabled(self._connected and not is_guiding)
@@ -2598,7 +2601,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             # No guider data from API - show as disconnected
             self.guider_name_label.setText("--")
             self.guider_status_label.setText("Disconnected")
-            self.guider_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+            themed_style(self.guider_status_label, lambda: f"color: {COLORS['text_disabled']};")
             self.guider_rms_label.setText("--")
             # Disable guiding buttons when no guider data
             self.guiding_start_btn.setEnabled(False)
@@ -2615,7 +2618,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
             if not connected:
                 self.filterwheel_status_label.setText("Disconnected")
-                self.filterwheel_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+                themed_style(self.filterwheel_status_label, lambda: f"color: {COLORS['text_disabled']};")
                 self.filterwheel_combo.setEnabled(False)
                 self._updating_filterwheel = True
                 self.filterwheel_combo.clear()
@@ -2625,11 +2628,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             else:
                 if is_moving:
                     self.filterwheel_status_label.setText("Moving...")
-                    self.filterwheel_status_label.setStyleSheet(f"color: {COLORS['warning']};")
+                    themed_style(self.filterwheel_status_label, lambda: f"color: {COLORS['warning']};")
                     self.filterwheel_combo.setEnabled(False)
                 else:
                     self.filterwheel_status_label.setText("Connected")
-                    self.filterwheel_status_label.setStyleSheet(f"color: {COLORS['success']};")
+                    themed_style(self.filterwheel_status_label, lambda: f"color: {COLORS['success']};")
                     # Only enable if user isn't actively changing
                     if not self._user_changing_filter:
                         self.filterwheel_combo.setEnabled(True)
@@ -2666,7 +2669,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             # No filter wheel data from API - show as disconnected
             self.filterwheel_name_label.setText("--")
             self.filterwheel_status_label.setText("Disconnected")
-            self.filterwheel_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+            themed_style(self.filterwheel_status_label, lambda: f"color: {COLORS['text_disabled']};")
             self.filterwheel_combo.setEnabled(False)
             self._updating_filterwheel = True
             self.filterwheel_combo.clear()
@@ -2683,7 +2686,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             focuser_connected = focuser.get('Connected', False)
             if not focuser_connected:
                 self.focuser_status_label.setText("Disconnected")
-                self.focuser_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+                themed_style(self.focuser_status_label, lambda: f"color: {COLORS['text_disabled']};")
                 self.focuser_position_label.setText("--")
                 self.focuser_temp_label.setText("--")
                 # Disable autofocus buttons when focuser disconnected
@@ -2694,10 +2697,10 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 is_moving = focuser.get('IsMoving', False)
                 if is_moving:
                     self.focuser_status_label.setText("Moving")
-                    self.focuser_status_label.setStyleSheet(f"color: {COLORS['info']};")
+                    themed_style(self.focuser_status_label, lambda: f"color: {COLORS['info']};")
                 else:
                     self.focuser_status_label.setText("Connected")
-                    self.focuser_status_label.setStyleSheet(f"color: {COLORS['success']};")
+                    themed_style(self.focuser_status_label, lambda: f"color: {COLORS['success']};")
 
                 # Update autofocus button states. The focuser is idle while each AF frame
                 # exposes, so use the event-driven run state rather than focuser movement.
@@ -2722,7 +2725,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             # No focuser data from API - show as disconnected
             self.focuser_name_label.setText("--")
             self.focuser_status_label.setText("Disconnected")
-            self.focuser_status_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+            themed_style(self.focuser_status_label, lambda: f"color: {COLORS['text_disabled']};")
             self.focuser_position_label.setText("--")
             self.focuser_temp_label.setText("--")
             # Disable autofocus buttons when no focuser data
@@ -2769,14 +2772,14 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         if bytes_received == -1:
             # Fetch complete
             self.status_label.setText("Connected - adaptive polling active")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
         elif total_bytes > 0:
             pct = min(int(bytes_received * 100 / total_bytes), 100)
             self.status_label.setText(f"Fetching latest image... {pct}%")
-            self.status_label.setStyleSheet(f"color: {COLORS['info']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
         else:
             self.status_label.setText("Fetching latest image...")
-            self.status_label.setStyleSheet(f"color: {COLORS['info']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
 
     def _on_image_updated(self, image_data, image_meta):
         """Handle image update from worker."""
@@ -2933,16 +2936,16 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         if total_bytes > 0:
             pct = min(int(bytes_received * 100 / total_bytes), 100)
             self.status_label.setText(f"Fetching live stack image... {pct}%")
-            self.status_label.setStyleSheet(f"color: {COLORS['info']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
         elif bytes_received == 0 and total_bytes == -1:
             self.status_label.setText("Fetching live stack image...")
-            self.status_label.setStyleSheet(f"color: {COLORS['info']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
 
     def _on_livestack_updated(self, image_data, status, available_stacks):
         """Handle livestack update from worker."""
         # Clear fetching status
         self.status_label.setText("Connected - adaptive polling active")
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
 
         is_running = status.get('running', False)
         if is_running:
@@ -3162,9 +3165,10 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
     def _on_error(self, error_message):
         """Handle error from worker."""
         self.status_label.setText(f"Error: {error_message}")
-        self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
 
     EVENT_LOG_MAX_ROWS = 500
+    EVENT_COLOR_ROLE = Qt.UserRole + 1  # COLORS key of an event log row's text color
 
     def _on_event_occurred(self, event):
         """Handle NINA event from worker."""
@@ -3190,16 +3194,16 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.status_label.setStyleSheet(f"color: {color};")
         elif event_type == 'AUTOFOCUS-STARTING':
             self.status_label.setText("AutoFocus running...")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
         elif event_type == 'AUTOFOCUS-POINT-ADDED':
             count = len(self.autofocus_graph.points)
             hfr = event.get('HFR')
             hfr_text = f", HFR {hfr:.2f}" if isinstance(hfr, (int, float)) else ""
             self.status_label.setText(f"AutoFocus running... point {count} (position {event.get('Position')}{hfr_text})")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
         elif event_type.startswith('ERROR-'):
             self.status_label.setText(f"NINA error: {self._event_display_name(event_type)}")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
 
     def _on_events_loaded(self, events):
         """Backfill the event log on connect and pick up an autofocus run already in progress."""
@@ -3337,23 +3341,35 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         time_text = format_time(event_time.astimezone(), seconds=True) if event_time else ""
 
         if event_type.startswith('ERROR-'):
-            color = COLORS['error']
+            color_key = 'error'
         elif event_type.endswith('-DISCONNECTED'):
-            color = COLORS['warning']
+            color_key = 'warning'
         elif event_type.endswith(('-FINISHED', '-CONNECTED')):
-            color = COLORS['success']
+            color_key = 'success'
         else:
-            color = None
+            color_key = None
 
         self.event_log_table.insertRow(0)
         for col, text in enumerate((time_text, event_type, self._format_event_details(event))):
             item = QTableWidgetItem(str(text))
-            if color:
-                item.setForeground(QColor(color))
+            if color_key:
+                item.setForeground(QColor(COLORS[color_key]))
+                # Remembered so the row can be recolored when the theme changes
+                item.setData(self.EVENT_COLOR_ROLE, color_key)
             self.event_log_table.setItem(0, col, item)
 
         if self.event_log_table.rowCount() > self.EVENT_LOG_MAX_ROWS:
             self.event_log_table.setRowCount(self.EVENT_LOG_MAX_ROWS)
+
+    def _recolor_event_log(self):
+        """Apply the current theme's colors to the event log's colored rows."""
+        table = self.event_log_table
+        for row in range(table.rowCount()):
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                color_key = item.data(self.EVENT_COLOR_ROLE) if item else None
+                if color_key:
+                    item.setForeground(QColor(COLORS[color_key]))
 
     def _on_cooling_changed(self, state):
         """Handle cooling checkbox change."""
@@ -3389,11 +3405,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self._last_cooling_temp = temp
             logger.debug(f"[Cooling] Success - updated last_enabled={enabled}, last_temp={temp}")
             self.status_label.setText("Cooling " + ("enabled" if enabled else "disabled"))
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
         else:
             logger.debug(f"[Cooling] Failed - reverting checkbox")
             self.status_label.setText("Failed to change cooling - check console")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
             # Revert checkbox state
             self.camera_cooling_checkbox.blockSignals(True)
             self.camera_cooling_checkbox.setChecked(not enabled)
@@ -3440,11 +3456,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self._last_cooling_temp = temp
             logger.debug(f"[Cooling] Target temp success - last_temp={temp}")
             self.status_label.setText(f"Target temp set to {temp}°C")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
         else:
             logger.debug(f"[Cooling] Target temp failed")
             self.status_label.setText("Failed to set target temperature")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
 
     def _on_dewheater_changed(self, state):
         """Handle dew heater checkbox change."""
@@ -3466,11 +3482,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         if success:
             logger.debug(f"[DewHeater] Success")
             self.status_label.setText("Dew heater " + ("enabled" if enabled else "disabled"))
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
         else:
             logger.debug(f"[DewHeater] Failed - reverting checkbox")
             self.status_label.setText("Failed to change dew heater")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
             # Revert checkbox state
             self._updating_camera_controls = True
             self.camera_dewheater_checkbox.setChecked(not enabled)
@@ -3501,12 +3517,12 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         )
         if success:
             self.status_label.setText(f"Capture started ({settings['duration']}s)")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
             self.imaging_start_btn.setEnabled(False)
             self.imaging_stop_btn.setEnabled(True)
         else:
             self.status_label.setText("Failed to start capture")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
 
     def _on_imaging_stop(self):
         """Abort the current exposure."""
@@ -3514,12 +3530,12 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         success = NINAIntegration.abort_exposure(host, port)
         if success:
             self.status_label.setText("Exposure aborted")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
             self.imaging_start_btn.setEnabled(True)
             self.imaging_stop_btn.setEnabled(False)
         else:
             self.status_label.setText("Failed to abort exposure")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
 
     def _on_autofocus_start(self):
         """Start an autofocus run."""
@@ -3527,7 +3543,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         success = NINAIntegration.start_autofocus(host, port)
         if success:
             self.status_label.setText("AutoFocus started")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
             # Mark running now so the next status poll doesn't flip the buttons back
             # before AUTOFOCUS-STARTING arrives
             self._autofocus_running = True
@@ -3536,7 +3552,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.autofocus_cancel_btn.setEnabled(True)
         else:
             self.status_label.setText("Failed to start AutoFocus")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
 
     def _on_autofocus_cancel(self):
         """Cancel the running autofocus."""
@@ -3544,7 +3560,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         success = NINAIntegration.cancel_autofocus(host, port)
         if success:
             self.status_label.setText("AutoFocus cancelled")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
             if self._autofocus_running:
                 self._autofocus_running = False
                 self._autofocus_stale_timer.stop()
@@ -3553,7 +3569,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.autofocus_cancel_btn.setEnabled(False)
         else:
             self.status_label.setText("Failed to cancel AutoFocus")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
 
     def _on_guiding_start(self):
         """Start guiding."""
@@ -3561,12 +3577,12 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         success = NINAIntegration.start_guiding(host, port)
         if success:
             self.status_label.setText("Guiding started")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
             self.guiding_start_btn.setEnabled(False)
             self.guiding_stop_btn.setEnabled(True)
         else:
             self.status_label.setText("Failed to start guiding")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
 
     def _on_guiding_stop(self):
         """Stop guiding."""
@@ -3574,19 +3590,19 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         success = NINAIntegration.stop_guiding(host, port)
         if success:
             self.status_label.setText("Guiding stopped")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
             self.guiding_start_btn.setEnabled(True)
             self.guiding_stop_btn.setEnabled(False)
         else:
             self.status_label.setText("Failed to stop guiding")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
 
     def _on_mount_home(self):
         """Home the mount."""
         host, port = NINAIntegration.get_settings()
         self.mount_home_btn.setEnabled(False)
         self.status_label.setText("Homing mount...")
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
 
         def do_home():
             return NINAIntegration.home_mount(host, port)
@@ -3596,7 +3612,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.status_label.setText("Mount homing...")
             else:
                 self.status_label.setText("Failed to home mount")
-                self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
             # Button state will be updated by status polling
 
         self._run_in_background(do_home, on_home_complete)
@@ -3606,7 +3622,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         host, port = NINAIntegration.get_settings()
         self.mount_park_btn.setEnabled(False)
         self.status_label.setText("Parking mount...")
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
 
         def do_park():
             return NINAIntegration.park_mount(host, port)
@@ -3617,7 +3633,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.mount_unpark_btn.setEnabled(True)
             else:
                 self.status_label.setText("Failed to park mount")
-                self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
                 self.mount_park_btn.setEnabled(True)
 
         self._run_in_background(do_park, on_park_complete)
@@ -3627,7 +3643,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         host, port = NINAIntegration.get_settings()
         self.mount_unpark_btn.setEnabled(False)
         self.status_label.setText("Unparking mount...")
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
 
         def do_unpark():
             return NINAIntegration.unpark_mount(host, port)
@@ -3638,7 +3654,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.mount_park_btn.setEnabled(True)
             else:
                 self.status_label.setText("Failed to unpark mount")
-                self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
                 self.mount_unpark_btn.setEnabled(True)
 
         self._run_in_background(do_unpark, on_unpark_complete)
@@ -3653,7 +3669,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         host, port = NINAIntegration.get_settings()
 
         self.status_label.setText(f"Slewing to RA={ra_deg:.4f}° Dec={dec_deg:.4f}°...")
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
         self.mount_slew_btn.setEnabled(False)
 
         # Run slew in background thread to avoid blocking UI
@@ -3663,10 +3679,10 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         def on_slew_complete(success):
             if success:
                 self.status_label.setText("Slew started")
-                self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
             else:
                 self.status_label.setText("Failed to start slew")
-                self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
             # Button will be re-enabled by status updates when slew completes
 
         self._run_in_background(do_slew, on_slew_complete)
@@ -3694,7 +3710,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._user_changing_filter = True
         self.filterwheel_combo.setEnabled(False)
         self.status_label.setText(f"Changing to {filter_name}...")
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
 
         host, port = NINAIntegration.get_settings()
         success = NINAIntegration.change_filter(host, port, filter_id)
@@ -3703,11 +3719,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self._last_filter_id = filter_id
             logger.debug(f"[FilterWheel] Success - filter changed to {filter_name}")
             self.status_label.setText(f"Filter changed to {filter_name}")
-            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
         else:
             logger.debug(f"[FilterWheel] Failed - reverting selection")
             self.status_label.setText("Failed to change filter")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
             # Revert combo selection to last known good filter
             if self._last_filter_id is not None:
                 self._updating_filterwheel = True

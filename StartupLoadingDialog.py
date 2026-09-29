@@ -10,7 +10,7 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QProgressBar, QVBoxLayout
 
 from ResourceManager import ResourceManager
-from Theme import COLORS
+from Theme import themed_style, COLORS
 
 
 class StartupLoadingDialog(QDialog):
@@ -39,7 +39,7 @@ class StartupLoadingDialog(QDialog):
 
         self.status_label = QLabel("Starting CosmosCollection...")
         self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setStyleSheet(f"color: {COLORS['text']}; font-size: 11pt;")
+        themed_style(self.status_label, lambda: f"color: {COLORS['text']}; font-size: 11pt;")
         layout.addWidget(self.status_label)
 
         self.progress_bar = QProgressBar()
@@ -49,7 +49,7 @@ class StartupLoadingDialog(QDialog):
 
         self.setLayout(layout)
 
-        self.setStyleSheet(f"""
+        themed_style(self, lambda: f"""
             QDialog {{
                 background-color: {COLORS['background']};
             }}

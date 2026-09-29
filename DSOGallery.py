@@ -22,7 +22,7 @@ from PySide6.QtGui import QPixmap
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS
+from Theme import themed_style, COLORS
 from ImageLoader import load_astro_pixmap
 
 logger = logging.getLogger(__name__)
@@ -485,7 +485,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self.preview_label.setWordWrap(True)
         self.preview_label.setCursor(Qt.PointingHandCursor)
         self.preview_label.setToolTip("Click to browse, or drag & drop an image onto this dialog")
-        self.preview_label.setStyleSheet(f"""
+        themed_style(self.preview_label, lambda: f"""
             QLabel {{
                 background-color: {COLORS['background_light']};
                 border: 2px dashed {COLORS['border_light']};
@@ -536,7 +536,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         right_col.addWidget(self.dso_combo)
 
         self.detected_label = QLabel("")
-        self.detected_label.setStyleSheet(f"color: {COLORS['info']}; font-size: 9pt;")
+        themed_style(self.detected_label, lambda: f"color: {COLORS['info']}; font-size: 9pt;")
         self.detected_label.setWordWrap(True)
         self.detected_label.setMaximumWidth(260)
         self.detected_label.hide()
@@ -615,7 +615,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         # Inline validation feedback (shown instead of popping a dialog
         # for every missing field)
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
         self.status_label.setWordWrap(True)
         self.status_label.hide()
         layout.addWidget(self.status_label)
@@ -1021,7 +1021,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self.date_edit.setText(datetime.now().strftime('%Y-%m-%d'))
 
     def _mark_error(self, widget):
-        widget.setStyleSheet(f"border: 1px solid {COLORS['error']};")
+        themed_style(widget, lambda: f"border: 1px solid {COLORS['error']};")
 
     def _clear_error(self, widget):
         widget.setStyleSheet("")
@@ -1121,7 +1121,7 @@ class GalleryCard(QFrame):
         self.thumbnail_label = QLabel()
         self.thumbnail_label.setFixedSize(self.thumbnail_size, self.thumbnail_size)
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
-        self.thumbnail_label.setStyleSheet(f"""
+        themed_style(self.thumbnail_label, lambda: f"""
             QLabel {{
                 background-color: {COLORS['background_light']};
                 border: 1px solid {COLORS['border']};
@@ -1142,7 +1142,7 @@ class GalleryCard(QFrame):
 
         # DSO type label
         type_label = QLabel(self.item_data.get('friendly_type', 'Unknown'))
-        type_label.setStyleSheet(f"font-size: 10px; color: {COLORS['text_secondary']};")
+        themed_style(type_label, lambda: f"font-size: 10px; color: {COLORS['text_secondary']};")
         type_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(type_label)
 
@@ -1159,7 +1159,7 @@ class GalleryCard(QFrame):
         # Card styling - card width is thumbnail size + padding (20px for margins and borders)
         card_width = self.thumbnail_size + 20
         self.setFixedWidth(card_width)
-        self.setStyleSheet(f"""
+        themed_style(self, lambda: f"""
             GalleryCard {{
                 background-color: {COLORS['background_lighter']};
                 border: 1px solid {COLORS['border']};
@@ -1183,7 +1183,7 @@ class GalleryCard(QFrame):
     def set_error(self, error_message):
         """Display error on card"""
         self.thumbnail_label.setText(f"Error:\n{error_message[:30]}")
-        self.thumbnail_label.setStyleSheet(f"""
+        themed_style(self.thumbnail_label, lambda: f"""
             QLabel {{
                 background-color: {COLORS['error_bg']};
                 border: 1px solid {COLORS['error']};
@@ -1561,15 +1561,15 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             if not self.data_loaded:
                 # Still loading initial data
                 loading_label = QLabel("Loading DSO images from database...")
-                loading_label.setStyleSheet(f"font-size: 14px; color: {COLORS['text_secondary']}; padding: 50px;")
+                themed_style(loading_label, lambda: f"font-size: 14px; color: {COLORS['text_secondary']}; padding: 50px;")
             elif len(self.all_items) == 0:
                 # Data loaded but database has no images
                 loading_label = QLabel("No images in your database.\n\nAdd images to DSO objects to see them here.")
-                loading_label.setStyleSheet(f"font-size: 14px; color: {COLORS['text_disabled']}; padding: 50px;")
+                themed_style(loading_label, lambda: f"font-size: 14px; color: {COLORS['text_disabled']}; padding: 50px;")
             else:
                 # Data loaded but no matches for current filters
                 loading_label = QLabel("No DSO images found matching your filters")
-                loading_label.setStyleSheet(f"font-size: 14px; color: {COLORS['text_disabled']}; padding: 50px;")
+                themed_style(loading_label, lambda: f"font-size: 14px; color: {COLORS['text_disabled']}; padding: 50px;")
             loading_label.setAlignment(Qt.AlignCenter)
             self.grid_layout.addWidget(loading_label, 0, 0)
 
@@ -2213,7 +2213,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self._push_wait_cursor()
             old_status = self.status_label.text()
             self.status_label.setText("Reorganizing gallery layout...")
-            self.status_label.setStyleSheet(f"padding: 5px; color: {COLORS['warning']};")
+            themed_style(self.status_label, lambda: f"padding: 5px; color: {COLORS['warning']};")
 
             # Schedule grid rebuild after UI update
             QTimer.singleShot(10, lambda: self._rebuild_grid_for_resize(new_cols, old_status))
@@ -2257,7 +2257,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                 self.status_label.setText(f"Columns: {current_cols} | +{pixels_needed}px wider for next column")
             else:
                 self.status_label.setText(f"Columns: {current_cols}")
-            self.status_label.setStyleSheet(f"padding: 5px; color: {COLORS['info']};")
+            themed_style(self.status_label, lambda: f"padding: 5px; color: {COLORS['info']};")
 
         # Restart timer to debounce resize events (300ms delay reduces rebuild frequency)
         self.resize_timer.start(300)

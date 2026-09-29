@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager
-from Theme import COLORS, adapt_color
+from Theme import COLORS, adapt_color, themed_style, themed_text
 from NINAIntegration import NINAIntegration
 from UrlOpener import open_url
 
@@ -481,7 +481,7 @@ class DSODetailWindow(QDialog):
             dso_type = self.data.get('dso_type', '')
             if dso_type not in ['BRTNB', 'CL+NB', 'PLNNB', 'SNREM']:
                 self.emission_label.setText("Not applicable (not an emission nebula)")
-                self.emission_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+                themed_style(self.emission_label, lambda: f"color: {COLORS['text_disabled']};")
                 return
 
             object_name = self.data.get('name', '')
@@ -489,7 +489,7 @@ class DSODetailWindow(QDialog):
             dec_deg = self.data.get('dec_deg')
 
             self.emission_label.setText("Querying SIMBAD...")
-            self.emission_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+            themed_style(self.emission_label, lambda: f"color: {COLORS['text_disabled']};")
 
             if self.simbad_query_thread and self.simbad_query_thread.isRunning():
                 self.simbad_query_thread.quit()
@@ -505,7 +505,7 @@ class DSODetailWindow(QDialog):
         except Exception as e:
             logger.error(f"Error initiating SIMBAD query: {str(e)}", exc_info=True)
             self.emission_label.setText(f"Error querying SIMBAD (check internet connection)")
-            self.emission_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.emission_label, lambda: f"color: {COLORS['error']};")
 
     def _on_simbad_query_complete(self, result, object_name, ra_deg, dec_deg):
         """Handle SIMBAD query completion"""
@@ -514,22 +514,24 @@ class DSODetailWindow(QDialog):
             emission_info = self._parse_emission_info(dso_type, result)
 
             if emission_info:
-                self.emission_label.setText(emission_info)
-                self.emission_label.setStyleSheet(f"color: {COLORS['text']};")
+                # The emission lines are colored per theme, so rebuild on theme changes
+                themed_text(self.emission_label,
+                            lambda dso_type=dso_type, result=result: self._parse_emission_info(dso_type, result))
+                themed_style(self.emission_label, lambda: f"color: {COLORS['text']};")
             else:
                 self.emission_label.setText("No specific emission line data available")
-                self.emission_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
+                themed_style(self.emission_label, lambda: f"color: {COLORS['text_disabled']};")
 
         except Exception as e:
             logger.error(f"Error processing SIMBAD result: {str(e)}", exc_info=True)
             self.emission_label.setText("Error processing SIMBAD data")
-            self.emission_label.setStyleSheet(f"color: {COLORS['error']};")
+            themed_style(self.emission_label, lambda: f"color: {COLORS['error']};")
 
     def _on_simbad_query_failed(self, object_name, error_message):
         """Handle SIMBAD query failure"""
         logger.warning(f"SIMBAD query failed for {object_name}: {error_message}")
         self.emission_label.setText(f"SIMBAD query failed (check internet connection)")
-        self.emission_label.setStyleSheet(f"color: {COLORS['error']};")
+        themed_style(self.emission_label, lambda: f"color: {COLORS['error']};")
 
     @staticmethod
     def _emission_line_color(line):
@@ -752,7 +754,7 @@ class DSODetailWindow(QDialog):
 
             # Add image navigation controls
             nav_separator = QLabel("|")
-            nav_separator.setStyleSheet(f"font-size: 12pt; color: {COLORS['border_light']}; padding: 0 5px;")
+            themed_style(nav_separator, lambda: f"font-size: 12pt; color: {COLORS['border_light']}; padding: 0 5px;")
             zoom_layout.addWidget(nav_separator)
 
             self.prev_image_button = QPushButton("<-")
@@ -762,7 +764,7 @@ class DSODetailWindow(QDialog):
             zoom_layout.addWidget(self.prev_image_button)
 
             self.image_counter_label = QLabel("1/1")
-            self.image_counter_label.setStyleSheet(f"font-size: 10pt; color: {COLORS['border_light']}; padding: 0 5px;")
+            themed_style(self.image_counter_label, lambda: f"font-size: 10pt; color: {COLORS['border_light']}; padding: 0 5px;")
             self.image_counter_label.setMinimumWidth(40)
             self.image_counter_label.setAlignment(Qt.AlignCenter)
             zoom_layout.addWidget(self.image_counter_label)
@@ -775,20 +777,20 @@ class DSODetailWindow(QDialog):
 
             # Add image button
             add_separator = QLabel("|")
-            add_separator.setStyleSheet(f"font-size: 12pt; color: {COLORS['border_light']}; padding: 0 5px;")
+            themed_style(add_separator, lambda: f"font-size: 12pt; color: {COLORS['border_light']}; padding: 0 5px;")
             zoom_layout.addWidget(add_separator)
 
             self.add_image_button = QPushButton("+")
             self.add_image_button.clicked.connect(self._add_user_image)
             self.add_image_button.setToolTip("Add new image")
-            self.add_image_button.setStyleSheet(f"QPushButton {{ color: {COLORS['success']}; font-size: 12pt; }}")
+            themed_style(self.add_image_button, lambda: f"QPushButton {{ color: {COLORS['success']}; font-size: 12pt; }}")
             zoom_layout.addWidget(self.add_image_button)
 
             # Delete image button
             self.delete_image_button = QPushButton("X")
             self.delete_image_button.clicked.connect(self._delete_current_image)
             self.delete_image_button.setToolTip("Delete current image")
-            self.delete_image_button.setStyleSheet(f"QPushButton {{ color: {COLORS['error']}; font-size: 12pt; }}")
+            themed_style(self.delete_image_button, lambda: f"QPushButton {{ color: {COLORS['error']}; font-size: 12pt; }}")
             zoom_layout.addWidget(self.delete_image_button)
 
             # Favorite image button
@@ -804,7 +806,7 @@ class DSODetailWindow(QDialog):
             # Image label
             self.image_label = QLabel("Loading...")
             self.image_label.setAlignment(Qt.AlignCenter)
-            self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
+            themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
             self.image_label.setMinimumSize(600, 400)  # Increased minimum size
             self.image_label.installEventFilter(self)  # Install event filter for mouse events
             self.image_label.setMouseTracking(True)  # Enable mouse tracking
@@ -958,7 +960,7 @@ class DSODetailWindow(QDialog):
             self.emission_label = QLabel("Loading emission data from SIMBAD...")
             self.emission_label.setAlignment(Qt.AlignLeft)
             self.emission_label.setWordWrap(True)
-            self.emission_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-style: italic;")
+            themed_style(self.emission_label, lambda: f"color: {COLORS['text_disabled']}; font-style: italic;")
             emission_layout.addWidget(self.emission_label)
 
             # Add SIMBAD link using coordinates
@@ -1308,7 +1310,7 @@ class DSODetailWindow(QDialog):
                                 if img['id'] == new_image_id:
                                     # Show loading state
                                     self.image_label.setText("Loading image...")
-                                    self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                                    themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
 
                                     self.current_image_index = i
                                     self._load_user_image(img['image_path'])
@@ -1651,7 +1653,7 @@ class DSODetailWindow(QDialog):
 
                     if self.user_images:
                         self.image_label.setText("Loading image...")
-                        self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                        themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
 
                         self.current_image_index = 0
                         current_image = self.user_images[self.current_image_index]
@@ -1660,18 +1662,18 @@ class DSODetailWindow(QDialog):
                         self.info_form_container.setVisible(True)
                     else:
                         self.image_label.setText("No image attached to this DSO.")
-                        self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                        themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
                         self.info_form_container.setVisible(False)
                 else:
                     logger.error(f"Could not find dsodetailid for {self.data['name']}")
                     self.image_label.setText("No image attached to this DSO.")
-                    self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                    themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
                     self.info_form_container.setVisible(False)
 
         except Exception as e:
             logger.error(f"Error loading user images: {str(e)}", exc_info=True)
             self.image_label.setText("Error loading images.")
-            self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['error']};")
+            themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['error']};")
             self.info_form_container.setVisible(False)
 
     def _update_image_navigation(self):
@@ -1698,7 +1700,7 @@ class DSODetailWindow(QDialog):
         """Navigate to the previous image"""
         if self.user_images and self.current_image_index > 0:
             self.image_label.setText("Loading image...")
-            self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
+            themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
 
             self.current_image_index -= 1
             current_image = self.user_images[self.current_image_index]
@@ -1711,7 +1713,7 @@ class DSODetailWindow(QDialog):
         """Navigate to the next image"""
         if self.user_images and self.current_image_index < len(self.user_images) - 1:
             self.image_label.setText("Loading image...")
-            self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
+            themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
 
             self.current_image_index += 1
             current_image = self.user_images[self.current_image_index]
@@ -1732,11 +1734,11 @@ class DSODetailWindow(QDialog):
             is_favorite = current_image.get('is_favorite', 0)
             if is_favorite:
                 self.favorite_button.setText("*")
-                self.favorite_button.setStyleSheet(f"QPushButton {{ color: {COLORS['favorite']}; font-size: 12pt; }}")
+                themed_style(self.favorite_button, lambda: f"QPushButton {{ color: {COLORS['favorite']}; font-size: 12pt; }}")
                 self.favorite_button.setToolTip("Unmark as favorite")
             else:
                 self.favorite_button.setText("*")
-                self.favorite_button.setStyleSheet(f"QPushButton {{ color: {COLORS['text_disabled']}; font-size: 12pt; }}")
+                themed_style(self.favorite_button, lambda: f"QPushButton {{ color: {COLORS['text_disabled']}; font-size: 12pt; }}")
                 self.favorite_button.setToolTip("Mark as favorite")
 
     def _toggle_favorite(self):
@@ -1833,7 +1835,7 @@ class DSODetailWindow(QDialog):
 
                     self.relocate_button.setVisible(False)
                     self.image_label.setText("Loading image...")
-                    self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                    themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
                     self._load_user_image(new_image_path)
 
                     QMessageBox.information(self, "Success", f"Image location updated successfully!")
@@ -1894,7 +1896,7 @@ class DSODetailWindow(QDialog):
                 else:
                     self.current_image_index = 0
                     self.image_label.setText("No Image Loaded")
-                    self.image_label.setStyleSheet(f"font-size: 14pt; color: {COLORS['text_disabled']};")
+                    themed_style(self.image_label, lambda: f"font-size: 14pt; color: {COLORS['text_disabled']};")
                     self._clear_image_info()
 
                 self._update_image_navigation()

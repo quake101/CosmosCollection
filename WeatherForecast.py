@@ -38,7 +38,7 @@ from PySide6.QtGui import QColor
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS, chart_background, sky_shade, theme_manager
+from Theme import themed_style, COLORS, chart_background, sky_shade, theme_manager
 from TimeFormatHelper import format_time, format_datetime, get_time_format_24h
 from UrlOpener import open_url
 
@@ -1473,27 +1473,26 @@ class DayWeatherCard(QFrame):
         self.setMaximumWidth(130)
 
         self._setup_ui()
-        self.apply_theme()
+        self._apply_styles()
 
-    def apply_theme(self):
-        """Apply theme colors - on creation and again when the theme changes"""
-        rating_color = get_rating_color(self.summary.astro_score)
-        self.setStyleSheet(f"""
+    def _apply_styles(self):
+        """Theme-colored styles (rebuilt automatically when the theme changes)"""
+        themed_style(self, lambda self=self: f"""
             DayWeatherCard {{
                 background-color: {COLORS['background_light']};
-                border: 2px solid {rating_color};
+                border: 2px solid {get_rating_color(self.summary.astro_score)};
                 border-radius: 8px;
                 padding: 5px;
             }}
             DayWeatherCard:hover {{
                 background-color: {COLORS['background_hover']};
-                border: 2px solid {rating_color};
+                border: 2px solid {get_rating_color(self.summary.astro_score)};
             }}
         """)
-        self.date_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10pt;")
-        self.rating_text.setStyleSheet(f"color: {rating_color}; font-weight: bold; font-size: 12pt;")
-        self.score_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10pt;")
-        self.cloud_text.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12pt;")
+        themed_style(self.date_label, lambda: f"color: {COLORS['text_secondary']}; font-size: 10pt;")
+        themed_style(self.rating_text, lambda self=self: f"color: {get_rating_color(self.summary.astro_score)}; font-weight: bold; font-size: 12pt;")
+        themed_style(self.score_label, lambda: f"color: {COLORS['text_secondary']}; font-size: 10pt;")
+        themed_style(self.cloud_text, lambda: f"color: {COLORS['text_secondary']}; font-size: 12pt;")
 
     def _setup_ui(self):
         """Set up the card UI"""
@@ -1787,6 +1786,12 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
         self.precip_unit = settings.value("precip_visibility_unit", "Metric (mm, km)", type=str)
 
         self._setup_ui()
+        # The table's cell colors are item data, so refill it when the theme
+        # changes (the chart and widget styles follow on their own)
+        theme_manager().theme_changed.connect(self._on_theme_changed)
+
+    def _on_theme_changed(self):
+        self._populate_table(self._get_display_hours())
 
     def _get_sun_altitudes(self, hours: List[HourlyWeatherData]) -> Optional[List[float]]:
         """Calculate sun altitudes for the given hours"""
@@ -1827,9 +1832,8 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
         header_layout = QGridLayout(header_group)
 
         # Rating
-        rating_color = get_rating_color(self.summary.astro_score)
         rating_label = QLabel(f"Astro Rating: {get_rating_label(self.summary.astro_score)} ({self.summary.astro_score})")
-        rating_label.setStyleSheet(f"color: {rating_color}; font-weight: bold; font-size: 12pt;")
+        themed_style(rating_label, lambda self=self: f"color: {get_rating_color(self.summary.astro_score)}; font-weight: bold; font-size: 12pt;")
         header_layout.addWidget(rating_label, 0, 0)
 
         # Seeing estimate
@@ -2204,23 +2208,13 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self._restore_auto_refresh_settings()
         self._load_location()
 
-        # This window usually stays open, so restyle it when the theme changes
-        theme_manager().theme_changed.connect(self._on_theme_changed)
-
-    def _on_theme_changed(self):
-        """Re-apply the colors this window sets on its own widgets"""
-        for card in self.day_cards:
-            card.apply_theme()
-        for legend_item, color_key in self.legend_items:
-            legend_item.setStyleSheet(f"color: {COLORS[color_key]}; font-weight: bold;")
-        self.attribution_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
-        self._update_attribution()  # link colors are part of the text
-        self._set_status_color(self._status_color_key)
+        # Styles follow theme changes on their own (Theme.themed_style), but the
+        # attribution's link colors are part of its text, so rebuild that
+        theme_manager().theme_changed.connect(self._update_attribution)
 
     def _set_status_color(self, color_key):
         """Color the status line with a COLORS key (None for the default text color)"""
-        self._status_color_key = color_key
-        self.status_label.setStyleSheet(f"color: {COLORS[color_key]};" if color_key else "")
+        themed_style(self.status_label, lambda color_key=color_key: f"color: {COLORS[color_key]};" if color_key else "")
 
     def _update_attribution(self):
         """Show which weather sources the current forecast came from"""
@@ -2320,7 +2314,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self.attribution_label = QLabel()
         self._attribution_sources = ["openmeteo"]
         self._update_attribution()
-        self.attribution_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        themed_style(self.attribution_label, lambda: f"color: {COLORS['text_disabled']}; font-size: 9pt;")
         self.attribution_label.setAlignment(Qt.AlignCenter)
         self.attribution_label.setOpenExternalLinks(False)
         self.attribution_label.linkActivated.connect(lambda url: open_url(url))
@@ -2333,7 +2327,6 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         legend_layout = QHBoxLayout(legend_group)
         legend_layout.addStretch()
 
-        self.legend_items = []  # (label, COLORS key), restyled on theme changes
         for label, color_key in [
             ("Excellent (80-100)", 'success'),
             ("Good (60-79)", 'info'),
@@ -2341,9 +2334,8 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
             ("Poor (0-39)", 'error')
         ]:
             legend_item = QLabel(f"  {label}  ")
-            legend_item.setStyleSheet(f"color: {COLORS[color_key]}; font-weight: bold;")
+            themed_style(legend_item, lambda color_key=color_key: f"color: {COLORS[color_key]}; font-weight: bold;")
             legend_layout.addWidget(legend_item)
-            self.legend_items.append((legend_item, color_key))
 
         legend_layout.addStretch()
         main_layout.addWidget(legend_group)

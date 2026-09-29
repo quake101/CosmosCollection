@@ -8,12 +8,16 @@ Other modules read colors from the shared COLORS dict. apply_theme() refreshes
 it in place, so windows opened after a theme change pick up the new colors.
 """
 
+import logging
 import os
 import tempfile
+import weakref
 from dataclasses import dataclass, asdict
 
 from PySide6.QtCore import QObject, QPointF, QSettings, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPalette
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------
 # 1. Theme settings
@@ -664,6 +668,7 @@ def apply_theme(app, theme_settings=None):
     app.setFont(build_font(theme_settings))
     app.setStyleSheet(build_stylesheet(colors, theme_settings))
     _apply_chart_theme()
+    _refresh_themed_styles()
 
     manager = theme_manager()
     manager.settings = theme_settings
@@ -673,6 +678,65 @@ def apply_theme(app, theme_settings=None):
 def get_color(color_name):
     """Return a hex string from COLORS dict or None if missing."""
     return COLORS.get(color_name)
+
+
+# Widgets with a style sheet or text built from theme colors. Each keeps its own
+# bindings in widget._theme_bindings ({setter: (getter, build, applied)}):
+# build functions often bind the window that owns the widget, and holding them
+# here instead would keep closed windows alive. This way the set is weak and
+# they're collected normally.
+_themed_widgets = weakref.WeakSet()
+
+
+def _bind(widget, setter, getter, build):
+    value = build()
+    getattr(widget, setter)(value)
+    bindings = widget.__dict__.setdefault('_theme_bindings', {})
+    bindings[setter] = (getter, build, value)
+    _themed_widgets.add(widget)
+
+
+def themed_style(widget, build):
+    """Set a style sheet built from theme colors, and rebuild it on theme changes.
+
+    build is a callable returning the style sheet, e.g.
+        themed_style(label, lambda: f"color: {COLORS['text_secondary']};")
+    It's called now and again after each theme change, so windows that stay
+    open follow the theme. If the widget's style sheet is later set some other
+    way, that newer style wins and the widget stops being rebuilt.
+    """
+    _bind(widget, 'setStyleSheet', 'styleSheet', build)
+
+
+def themed_text(label, build):
+    """Like themed_style, for label text (rich text) that embeds theme colors."""
+    _bind(label, 'setText', 'text', build)
+
+
+def _refresh_themed_styles():
+    """Rebuild every registered style sheet and text with the current colors."""
+    for widget in list(_themed_widgets):
+        try:
+            bindings = widget._theme_bindings
+            for setter, (getter, build, applied) in list(bindings.items()):
+                if getattr(widget, getter)() != applied:
+                    # Set since by other code - that value is the current one
+                    del bindings[setter]
+                    continue
+                value = build()
+                getattr(widget, setter)(value)
+                bindings[setter] = (getter, build, value)
+        except RuntimeError:
+            # The Qt widget was deleted while its Python wrapper lingered
+            _themed_widgets.discard(widget)
+            continue
+        except Exception as e:
+            # A failing rebuild must not stop the rest of the theme change
+            logger.warning(f"Could not restyle {type(widget).__name__} for the new theme: {e}")
+            _themed_widgets.discard(widget)
+            continue
+        if not bindings:
+            _themed_widgets.discard(widget)
 
 
 # --------------------------------------------------------------------

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from Theme import (
     ACCENT_PRESETS, COLORS, FONT_SIZE_MAX, FONT_SIZE_MIN, MODES, ThemeSettings,
     build_colors, build_font, build_stylesheet, platform_color_scheme, platform_font,
+    themed_style,
 )
 
 SWATCH_SIZE = 26
@@ -108,7 +109,7 @@ class ThemeSettingsTab(QWidget):
 
         self.night_accent_note = QLabel("Night Vision uses a fixed deep-red accent.")
         self.night_accent_note.setWordWrap(True)
-        self.night_accent_note.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; }}")
+        themed_style(self.night_accent_note, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; }}")
         self.night_accent_note.hide()
         accent_layout.addWidget(self.night_accent_note)
         controls_layout.addWidget(accent_group)
@@ -151,7 +152,7 @@ class ThemeSettingsTab(QWidget):
             "that are already open update the next time they're opened."
         )
         reopen_note.setWordWrap(True)
-        reopen_note.setStyleSheet(f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; }}")
+        themed_style(reopen_note, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: 9pt; }}")
         controls_layout.addWidget(reopen_note)
         controls_layout.addStretch()
         return scroll
@@ -168,7 +169,7 @@ class ThemeSettingsTab(QWidget):
 
     def _set_swatch_color(self, swatch, color):
         radius = SWATCH_SIZE // 2
-        swatch.setStyleSheet(f"""
+        themed_style(swatch, lambda color=color, radius=radius: f"""
             QToolButton {{
                 background-color: {color};
                 border: 2px solid {COLORS['background']};

@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS, adapt_color, tint
+from Theme import COLORS, adapt_color, theme_manager, themed_style, tint
 from TimeFormatHelper import format_time, format_datetime
 from NINAIntegration import NINAIntegration
 
@@ -714,6 +714,9 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.available_catalogs = []
         self.visible_dsos_data = []  # Store DSO data for detail window
         self.init_ui()
+        # The moon column's colors are item data, so recolor them on theme changes
+        # (widget styles follow on their own)
+        theme_manager().theme_changed.connect(self._recolor_moon_column)
         self.load_location_info()
 
         # Set time frame defaults based on twilight calculation
@@ -725,7 +728,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         calculation in a background thread so the window stays responsive
         (this astropy calculation can also trigger an IERS data fetch)."""
         self.status_label.setText("Loading astronomical ephemeris data...")
-        self.status_label.setStyleSheet(f"color: {COLORS['info']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
 
         self.twilight_thread = TwilightCalculationThread()
         self.twilight_thread.result_ready.connect(self._on_twilight_calculated)
@@ -989,7 +992,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         
         # Status label
         self.status_label = QLabel("Initializing astronomical calculations...")
-        self.status_label.setStyleSheet(f"color: {COLORS['info']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
         main_layout.addWidget(self.status_label)
 
     def load_location_info(self):
@@ -1166,7 +1169,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             type_text = "all types" if not selected_dso_types else f"{selected_dso_type} objects"
             self.status_label.setText(f"Calculating visibility for {type_text} from {catalog_text}... (may download ephemeris data on first run)")
 
-        self.status_label.setStyleSheet(f"color: {COLORS['info']};")
+        themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
 
         # Get time frame settings from UI
         start_hour = self.start_hour_spin.value()
@@ -1178,6 +1181,38 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.calc_thread.result_ready.connect(self.display_results)
         self.calc_thread.error_occurred.connect(self.handle_error)
         self.calc_thread.start()
+
+    @staticmethod
+    def _color_moon_item(moon_item, moon_sep):
+        """Color a moon separation cell green-to-red by how far the object is from the moon"""
+        from PySide6.QtGui import QColor
+        if moon_sep is None:
+            moon_item.setBackground(QColor(COLORS['background']))
+            moon_item.setForeground(QColor(COLORS['text_disabled']))
+            return
+        # rank keeps the green-to-red order in Night Vision
+        if moon_sep > 45:
+            moon_color, rank = "#66cc66", 1.0
+        elif moon_sep > 20:
+            moon_color, rank = "#cccc44", 0.66
+        elif moon_sep > 8:
+            moon_color, rank = "#cc8844", 0.33
+        else:
+            moon_color, rank = "#cc4444", 0.0
+        moon_bg = tint(moon_color, 0.25, rank=rank)
+        moon_item.setBackground(QColor(moon_bg))
+        moon_item.setForeground(QColor(adapt_color(moon_color, background=moon_bg, rank=rank)))
+
+    def _recolor_moon_column(self):
+        """Apply the current theme's colors to the moon separation cells"""
+        moon_col = getattr(self, '_moon_col', None)
+        if moon_col is None:
+            return
+        for row in range(self.results_table.rowCount()):
+            item = self.results_table.item(row, moon_col)
+            if item is not None:
+                moon_sep = item.data(Qt.UserRole)
+                self._color_moon_item(item, None if moon_sep is None or moon_sep < 0 else moon_sep)
 
     def display_results(self, visible_dsos):
         """Display the calculation results in the table"""
@@ -1232,6 +1267,8 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             header.setSectionResizeMode(8, QHeaderView.Interactive)
             self.results_table.setColumnWidth(8, 90)
             moon_col = 8
+
+        self._moon_col = moon_col  # for recoloring on theme changes
 
         # Populate table
         self.results_table.setRowCount(len(visible_dsos))
@@ -1309,23 +1346,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                 moon_item.setData(Qt.DisplayRole, "N/A")
                 moon_item.setData(Qt.UserRole, -1.0)  # sorts to bottom
             moon_item.setTextAlignment(Qt.AlignCenter)
-            from PySide6.QtGui import QColor
-            if moon_sep is None:
-                moon_item.setBackground(QColor(COLORS['background']))
-                moon_item.setForeground(QColor(COLORS['text_disabled']))
-            else:
-                # rank keeps the green-to-red order in Night Vision
-                if moon_sep > 45:
-                    moon_color, rank = "#66cc66", 1.0
-                elif moon_sep > 20:
-                    moon_color, rank = "#cccc44", 0.66
-                elif moon_sep > 8:
-                    moon_color, rank = "#cc8844", 0.33
-                else:
-                    moon_color, rank = "#cc4444", 0.0
-                moon_bg = tint(moon_color, 0.25, rank=rank)
-                moon_item.setBackground(QColor(moon_bg))
-                moon_item.setForeground(QColor(adapt_color(moon_color, background=moon_bg, rank=rank)))
+            self._color_moon_item(moon_item, moon_sep)
             if moon_sep is None:
                 moon_item.setToolTip("Moon separation unavailable.")
             else:
@@ -1470,7 +1491,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.calculate_btn.setEnabled(True)
         self.calculate_btn.setText("Calculate Best DSOs Tonight")
         self.status_label.setText(f"Error: {error_msg}")
-        self.status_label.setStyleSheet(f"color: {COLORS['error']};")  # Red for errors
+        themed_style(self.status_label, lambda: f"color: {COLORS['error']};")  # Red for errors
         QMessageBox.warning(self, "Calculation Error", error_msg)
 
     def _show_context_menu(self, position):
