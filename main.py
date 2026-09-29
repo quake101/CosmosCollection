@@ -85,7 +85,8 @@ from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager, WindowPositionMixin
 from ResourceManager import ResourceManager
 from CollageBuilder import CollageBuilder, CollageBuilderWindow
-from Theme import apply_theme, COLORS
+from Theme import apply_theme, COLORS, theme_manager, load_settings as load_theme_settings, save_settings as save_theme_settings
+from ThemeTab import ThemeSettingsTab
 from ImageViewer import ImageViewerWindow
 from DSODetail import DSODetailWindow
 from FOVSimulator import AladinLiteWindow
@@ -358,9 +359,19 @@ class DSOTableModel(QAbstractTableModel):
         self._sort_order = Qt.AscendingOrder
         self._cached_formatted_data = {}  # (row, col) -> display text
         self._search_key_cache = {}  # designations string -> [(designation, normalized)]
-        self._brush_no_images = QBrush(QColor(233, 94, 70, 128))
-        self._brush_odd_row = QBrush(QColor(61, 61, 61))
-        self._brush_even_row = QBrush(QColor(45, 45, 45))
+        # Row colors come from the theme (alternating rows on the view); only the
+        # "no images" highlight is painted here, so rebuild it when the theme changes.
+        self._brush_no_images = None
+        self._update_theme_brushes()
+        theme_manager().theme_changed.connect(self._update_theme_brushes)
+
+    def _update_theme_brushes(self):
+        color = QColor(COLORS['error'])
+        color.setAlpha(110)
+        self._brush_no_images = QBrush(color)
+        if self.highlight_no_images and self.rowCount() > 0:
+            self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1),
+                                  [Qt.ItemDataRole.BackgroundRole])
 
     def rowCount(self, index=QModelIndex()):
         return len(self.filtered_data)
@@ -377,7 +388,7 @@ class DSOTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.BackgroundRole:
             if self.highlight_no_images and entry["image_count"] == 0:
                 return self._brush_no_images
-            return self._brush_odd_row if row % 2 == 1 else self._brush_even_row
+            return None
         elif role == Qt.ItemDataRole.DisplayRole:
             cache_key = (row, index.column())
             result = self._cached_formatted_data.get(cache_key)
@@ -886,7 +897,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings - Cosmos Collection")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setModal(True)
-        self.resize(750, 500)
+        self.resize(800, 560)
 
         self.db_manager = DatabaseManager()
         self._setup_ui()
@@ -1640,8 +1651,12 @@ class SettingsDialog(QDialog):
         backup_restore_layout.addWidget(restore_group)
         backup_restore_layout.addStretch()
 
+        # Theme tab
+        self.theme_tab = ThemeSettingsTab()
+
         # Add tabs
         tab_widget.addTab(app_settings_scroll, "Application Settings")
+        tab_widget.addTab(self.theme_tab, "Theme")
         tab_widget.addTab(integrations_tab, "Integrations")
         tab_widget.addTab(location_tab, "Location Manager")
         tab_widget.addTab(backup_restore_tab, "Backup && Restore")
@@ -1760,6 +1775,9 @@ class SettingsDialog(QDialog):
             self.weatherapi_enabled_checkbox.setChecked(weatherapi_enabled)
             weatherapi_api_key = settings.value("weatherapi_api_key", "", type=str)
             self.weatherapi_api_key_input.setText(weatherapi_api_key)
+
+            # Load theme settings
+            self.theme_tab.load(load_theme_settings())
 
         except Exception as e:
             logger.error(f"Error loading settings: {str(e)}")
@@ -2022,6 +2040,12 @@ class SettingsDialog(QDialog):
             # Save WeatherAPI settings
             settings.setValue("weatherapi_integration_enabled", self.weatherapi_enabled_checkbox.isChecked())
             settings.setValue("weatherapi_api_key", self.weatherapi_api_key_input.text().strip())
+
+            # Save and apply the theme only if it changed, to avoid restyling the app needlessly
+            theme_settings = self.theme_tab.theme_settings()
+            if theme_settings != load_theme_settings():
+                save_theme_settings(theme_settings)
+                apply_theme(QApplication.instance(), theme_settings)
 
             self.accept()
 
@@ -5316,6 +5340,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.table_view.doubleClicked.connect(self._on_double_click)
         self.table_view.setSelectionBehavior(QTableView.SelectRows)
         self.table_view.setSelectionMode(QTableView.SingleSelection)
+        self.table_view.setAlternatingRowColors(True)
         self.table_view.setSortingEnabled(True)
 
         # Set default sort by catalog (column 0) in ascending order
@@ -5325,26 +5350,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_view.customContextMenuRequested.connect(self._show_context_menu)
 
-        # Set up the table view's style
-        self.table_view.setStyleSheet("""
-            QTableView {
-                /* background-color: #2d2d2d; */
-                /* alternate-background-color: #3d3d3d; */
-                gridline-color: #4d4d4d;
-                color: #ffffff;
-            }
-            QTableView::item:selected {
-                background-color: #0078d7;
-                color: white;
-            }
-            QHeaderView::section {
-                background-color: #1d1d1d;
-                padding: 4px;
-                border: 1px solid #4d4d4d;
-                color: #ffffff;
-            }
-        """)
-
+        # The table's colors come from the global theme (Theme.py), so they
+        # follow theme changes without a widget-level style sheet here.
         main_layout.addWidget(self.table_view)
 
         # Set the layout
