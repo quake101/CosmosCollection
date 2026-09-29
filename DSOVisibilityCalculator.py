@@ -30,8 +30,6 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
-# Set dark theme for matplotlib
-plt.style.use('dark_background')
 from astropy import units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz, get_sun
@@ -40,7 +38,8 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-from Theme import COLORS
+from Theme import (COLORS, adapt_color, chart_background, chart_color, contrast_text, sky_shade,
+                   theme_manager, tint)
 
 # Get the application directory
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -605,20 +604,30 @@ def visibility_hours_to_color(hours):
     """Map a day's visibility hours to (background, foreground) QColor pair.
     Shared by VisibilityCalendar and SessionManager's calendar view so both use
     the same 7-tier green->red scale rather than duplicating the thresholds."""
+    # Tier colors are adapted to the current theme (see Theme.tint); rank keeps
+    # the tiers in order in Night Vision, where the green-to-red hue is lost.
     if hours >= 8:
-        return QColor(0, 150, 0), QColor(255, 255, 255)
+        base, rank = '#009600', 6
     elif hours >= 6:
-        return QColor(0, 120, 0), QColor(255, 255, 255)
+        base, rank = '#007800', 5
     elif hours >= 4:
-        return QColor(100, 120, 0), QColor(255, 255, 255)
+        base, rank = '#647800', 4
     elif hours >= 2:
-        return QColor(150, 100, 0), QColor(255, 255, 255)
+        base, rank = '#966400', 3
     elif hours >= 1:
-        return QColor(150, 60, 0), QColor(255, 255, 255)
+        base, rank = '#963c00', 2
     elif hours > 0:
-        return QColor(120, 40, 0), QColor(255, 255, 255)
+        base, rank = '#782800', 1
     else:
-        return QColor(80, 0, 0), QColor(180, 180, 180)
+        base, rank = '#500000', 0
+    background = tint(base, 0.8, rank=rank / 6)
+    return QColor(background), QColor(contrast_text(background))
+
+
+def no_visibility_data_colors():
+    """(background, foreground) for calendar days without visibility data."""
+    background = COLORS['background_lighter']
+    return QColor(background), QColor(adapt_color(COLORS['text_secondary'], background=background))
 
 
 class MonthlyVisibilityThread(QThread):
@@ -808,9 +817,7 @@ class VisibilityCalendar(QCalendarWidget):
         if py_date in self.visibility_hours:
             bg_color, fg_color = self.get_color_for_hours(self.visibility_hours[py_date])
         else:
-            # Default gray for dates without visibility data
-            bg_color = QColor(64, 64, 64)
-            fg_color = QColor(200, 200, 200)
+            bg_color, fg_color = no_visibility_data_colors()
 
         # Fill background
         painter.fillRect(rect, QBrush(bg_color))
@@ -827,10 +834,10 @@ class VisibilityCalendar(QCalendarWidget):
 
         # Draw selection/today highlight
         if date == self.selectedDate():
-            painter.setPen(QPen(QColor(255, 255, 0), 2))
+            painter.setPen(QPen(QColor(COLORS['warning']), 2))
             painter.drawRect(rect.adjusted(1, 1, -1, -1))
         elif py_date == date_cls.today():
-            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.setPen(QPen(QColor(COLORS['text']), 1))
             painter.drawRect(rect.adjusted(1, 1, -1, -1))
 
     def leaveEvent(self, event):
@@ -949,19 +956,16 @@ class MultiMonthVisibilityCalendar(QWidget):
 
     def _build_hours_legend(self):
         row = QHBoxLayout()
+        # (label, representative hours) - colors come from the calendar's scale
         legend_labels = [
-            ("8+ hrs", QColor(0, 150, 0)),
-            ("6-8 hrs", QColor(0, 120, 0)),
-            ("4-6 hrs", QColor(100, 120, 0)),
-            ("2-4 hrs", QColor(150, 100, 0)),
-            ("1-2 hrs", QColor(150, 60, 0)),
-            ("<1 hr", QColor(120, 40, 0)),
-            ("None", QColor(80, 0, 0)),
+            ("8+ hrs", 8), ("6-8 hrs", 6), ("4-6 hrs", 4), ("2-4 hrs", 2),
+            ("1-2 hrs", 1), ("<1 hr", 0.5), ("None", 0),
         ]
-        for text, color in legend_labels:
+        for text, hours in legend_labels:
+            bg_color, fg_color = visibility_hours_to_color(hours)
             legend_label = QLabel(text)
             legend_label.setStyleSheet(
-                f"background-color: rgb({color.red()}, {color.green()}, {color.blue()}); "
+                f"background-color: {bg_color.name()}; color: {fg_color.name()}; "
                 "padding: 3px; border-radius: 2px;")
             row.addWidget(legend_label)
         row.addStretch()
@@ -1222,11 +1226,10 @@ class VisibilityPlot(FigureCanvas):
     """Custom matplotlib canvas for PySide6"""
 
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(12, 8), facecolor='#2e2e2e')
+        self.figure = Figure(figsize=(12, 8))
         super().__init__(self.figure)
         self.setParent(parent)
-        # Set dark background for the canvas
-        self.setStyleSheet(f"background-color: {COLORS['background']};")
+        self._last_results = None  # redrawn with new colors when the theme changes
 
         # Initialize hover data storage
         self.hover_data = None
@@ -1249,6 +1252,18 @@ class VisibilityPlot(FigureCanvas):
         self.qt_tooltip = QLabel(parent if parent else self)
         self.qt_tooltip.setWindowFlags(QtCore.ToolTip | QtCore.FramelessWindowHint | QtCore.WindowStaysOnTopHint)
         self.qt_tooltip.setAttribute(QtCore.WA_TranslucentBackground, False)  # Reduce flicker
+        self.qt_tooltip.hide()
+        self._apply_widget_theme()
+        theme_manager().theme_changed.connect(self._on_theme_changed)
+
+        # Connect mouse motion event
+        self.mpl_connect('motion_notify_event', self.on_mouse_move)
+        # Connect mouse leave event
+        self.mpl_connect('axes_leave_event', self.on_mouse_leave)
+
+    def _apply_widget_theme(self):
+        """Theme colors for the canvas and its Qt tooltip"""
+        self.setStyleSheet(f"background-color: {chart_background()};")
         self.qt_tooltip.setStyleSheet(f"""
             QLabel {{
                 background-color: {COLORS['background_lighter']};
@@ -1260,12 +1275,12 @@ class VisibilityPlot(FigureCanvas):
                 font-family: monospace;
             }}
         """)
-        self.qt_tooltip.hide()
 
-        # Connect mouse motion event
-        self.mpl_connect('motion_notify_event', self.on_mouse_move)
-        # Connect mouse leave event
-        self.mpl_connect('axes_leave_event', self.on_mouse_leave)
+    def _on_theme_changed(self):
+        """Redraw with the new theme colors"""
+        self._apply_widget_theme()
+        if self._last_results is not None:
+            self.plot_visibility(self._last_results)
 
     def _add_darkness_shading(self, ax, hours_from_start, sun_altitudes):
         """Add background shading to show darkness levels based on sun altitude.
@@ -1277,17 +1292,17 @@ class VisibilityPlot(FigureCanvas):
         - Astronomical twilight (-12° to -18°): Dark shade
         - Night (< -18°): Darkest shade
         """
-        # Define darkness thresholds and colors (from lightest to darkest)
-        # Format: (sun_max, sun_min, color, alpha)
+        # Darkness thresholds and theme shades (from lightest to darkest)
+        # Format: (sun_max, sun_min, (color, alpha))
         darkness_levels = [
-            (0, -6, '#2a3a4a', 0.6),      # Civil twilight - light blue-gray
-            (-6, -12, '#1a2535', 0.7),    # Nautical twilight - medium blue
-            (-12, -18, '#101520', 0.8),   # Astronomical twilight - dark blue
-            (-18, -90, '#080a10', 0.9),   # Night - very dark blue/black
+            (0, -6, sky_shade('civil')),
+            (-6, -12, sky_shade('nautical')),
+            (-12, -18, sky_shade('astronomical')),
+            (-18, -90, sky_shade('night')),
         ]
 
         # For each darkness level, find and shade the regions
-        for sun_max, sun_min, color, alpha in darkness_levels:
+        for sun_max, sun_min, (color, alpha) in darkness_levels:
             # Find indices where sun is in this range
             in_range = (sun_altitudes <= sun_max) & (sun_altitudes > sun_min)
 
@@ -1307,7 +1322,9 @@ class VisibilityPlot(FigureCanvas):
 
     def plot_visibility(self, results):
         """Create visibility plot with altitude and azimuth"""
+        self._last_results = results
         self.figure.clear()
+        self.figure.set_facecolor(chart_background())
         # Reset subplot parameters to defaults so tight_layout() doesn't
         # progressively shrink the plots on repeated calculations
         self.figure.subplots_adjust(
@@ -1346,30 +1363,27 @@ class VisibilityPlot(FigureCanvas):
         sun_altitudes = sun_altaz.alt.deg
 
         # Create three subplots: altitude, azimuth, and sun
-        ax1 = self.figure.add_subplot(3, 1, 1, facecolor='#2e2e2e')
+        ax1 = self.figure.add_subplot(3, 1, 1)
 
         # Add darkness shading first (so it appears behind the data)
         self._add_darkness_shading(ax1, hours_from_start, sun_altitudes)
 
-        ax1.plot(hours_from_start, dso_altaz.alt.deg, '#00aaff', linewidth=2, label=f'{dso_name} Altitude')
-        ax1.axhline(y=30, color='#00ff88', linestyle='--', alpha=0.8, label='Min Altitude (30°)')
-        ax1.axhline(y=0, color='#888888', linestyle='-', alpha=0.6, label='Horizon')
+        ax1.plot(hours_from_start, dso_altaz.alt.deg, color=chart_color('#00aaff'), linewidth=2, label=f'{dso_name} Altitude')
+        ax1.axhline(y=30, color=chart_color('#00ff88'), linestyle='--', alpha=0.8, label='Min Altitude (30°)')
+        ax1.axhline(y=0, color=chart_color('#888888'), linestyle='-', alpha=0.6, label='Horizon')
 
         # Highlight optimal viewing times
         optimal_alt = np.where(optimal_times, dso_altaz.alt.deg, np.nan)
-        ax1.plot(hours_from_start, optimal_alt, '#ff4444', linewidth=4, alpha=0.8, label='Optimal Viewing')
+        ax1.plot(hours_from_start, optimal_alt, color=chart_color('#ff4444'), linewidth=4, alpha=0.8, label='Optimal Viewing')
 
-        ax1.set_ylabel('Altitude (°)', color='white')
+        ax1.set_ylabel('Altitude (°)')
         # Get timezone abbreviation for display
         sample_time = local_times[0] if local_times else None
         tz_abbrev = sample_time.strftime('%Z') if sample_time else 'Local Time'
-        ax1.set_title(f'{dso_name} Visibility ({tz_abbrev})', color='white', fontsize=14)
-        ax1.legend(facecolor='#404040', edgecolor='#666666', loc='upper right')
-        ax1.grid(True, alpha=0.3, color='#666666')
+        ax1.set_title(f'{dso_name} Visibility ({tz_abbrev})', fontsize=14)
+        ax1.legend(loc='upper right')
+        ax1.grid(True, alpha=0.3)
         ax1.set_ylim(-20, 90)
-        ax1.tick_params(colors='white')
-        for spine in ax1.spines.values():
-            spine.set_color('#666666')
 
         # Add time labels at key points
         time_ticks = []
@@ -1381,57 +1395,51 @@ class VisibilityPlot(FigureCanvas):
         ax1.set_xticklabels(time_labels)
 
         # DSO azimuth subplot
-        ax2 = self.figure.add_subplot(3, 1, 2, facecolor='#2e2e2e')
+        ax2 = self.figure.add_subplot(3, 1, 2)
 
         # Add darkness shading
         self._add_darkness_shading(ax2, hours_from_start, sun_altitudes)
 
-        ax2.plot(hours_from_start, dso_altaz.az.deg, '#ff8800', linewidth=2, label=f'{dso_name} Azimuth')
+        ax2.plot(hours_from_start, dso_altaz.az.deg, color=chart_color('#ff8800'), linewidth=2, label=f'{dso_name} Azimuth')
 
         # Add cardinal direction lines
-        ax2.axhline(y=0, color='#ff4444', linestyle=':', alpha=0.7, label='N')
-        ax2.axhline(y=90, color='#44ff44', linestyle=':', alpha=0.7, label='E')
-        ax2.axhline(y=180, color='#ffff44', linestyle=':', alpha=0.7, label='S')
-        ax2.axhline(y=270, color='#4444ff', linestyle=':', alpha=0.7, label='W')
+        ax2.axhline(y=0, color=chart_color('#ff4444'), linestyle=':', alpha=0.7, label='N')
+        ax2.axhline(y=90, color=chart_color('#44ff44'), linestyle=':', alpha=0.7, label='E')
+        ax2.axhline(y=180, color=chart_color('#ffff44'), linestyle=':', alpha=0.7, label='S')
+        ax2.axhline(y=270, color=chart_color('#4444ff'), linestyle=':', alpha=0.7, label='W')
 
         # Highlight optimal viewing times for azimuth too
         optimal_az = np.where(optimal_times, dso_altaz.az.deg, np.nan)
-        ax2.plot(hours_from_start, optimal_az, '#ff4444', linewidth=4, alpha=0.8, label='Optimal Viewing')
+        ax2.plot(hours_from_start, optimal_az, color=chart_color('#ff4444'), linewidth=4, alpha=0.8, label='Optimal Viewing')
 
-        ax2.set_ylabel('Azimuth (°)', color='white')
-        ax2.legend(facecolor='#404040', edgecolor='#666666', loc='upper right')
-        ax2.grid(True, alpha=0.3, color='#666666')
+        ax2.set_ylabel('Azimuth (°)')
+        ax2.legend(loc='upper right')
+        ax2.grid(True, alpha=0.3)
         ax2.set_ylim(0, 360)
         ax2.set_yticks([0, 90, 180, 270, 360])
         ax2.set_yticklabels(['N (0°)', 'E (90°)', 'S (180°)', 'W (270°)', 'N (360°)'])
-        ax2.tick_params(colors='white')
-        for spine in ax2.spines.values():
-            spine.set_color('#666666')
         ax2.set_xticks(time_ticks)
         ax2.set_xticklabels(time_labels)
 
         # Sun altitude subplot
-        ax3 = self.figure.add_subplot(3, 1, 3, facecolor='#2e2e2e')
+        ax3 = self.figure.add_subplot(3, 1, 3)
 
         # Add darkness shading
         self._add_darkness_shading(ax3, hours_from_start, sun_altitudes)
 
-        ax3.plot(hours_from_start, sun_altaz.alt.deg, '#ffaa00', linewidth=2, label='Sun Altitude')
-        ax3.axhline(y=0, color='#888888', linestyle='-', alpha=0.6, label='Horizon')
-        ax3.axhline(y=-12, color='#4488ff', linestyle='--', alpha=0.8, label='Astronomical Twilight')
-        ax3.axhline(y=-18, color='#aa44ff', linestyle='--', alpha=0.8, label='Night')
+        ax3.plot(hours_from_start, sun_altaz.alt.deg, color=chart_color('#ffaa00'), linewidth=2, label='Sun Altitude')
+        ax3.axhline(y=0, color=chart_color('#888888'), linestyle='-', alpha=0.6, label='Horizon')
+        ax3.axhline(y=-12, color=chart_color('#4488ff'), linestyle='--', alpha=0.8, label='Astronomical Twilight')
+        ax3.axhline(y=-18, color=chart_color('#aa44ff'), linestyle='--', alpha=0.8, label='Night')
 
         # Use the same timezone abbreviation as in title
         sample_time = local_times[0] if local_times else None
         tz_abbrev = sample_time.strftime('%Z') if sample_time else 'Local Time'
-        ax3.set_xlabel(f'Time ({tz_abbrev})', color='white')
-        ax3.set_ylabel('Sun Alt. (°)', color='white')
-        ax3.legend(facecolor='#404040', edgecolor='#666666', loc='upper right')
-        ax3.grid(True, alpha=0.3, color='#666666')
+        ax3.set_xlabel(f'Time ({tz_abbrev})')
+        ax3.set_ylabel('Sun Alt. (°)')
+        ax3.legend(loc='upper right')
+        ax3.grid(True, alpha=0.3)
         ax3.set_ylim(-25, 50)
-        ax3.tick_params(colors='white')
-        for spine in ax3.spines.values():
-            spine.set_color('#666666')
         ax3.set_xticks(time_ticks)
         ax3.set_xticklabels(time_labels)
 
@@ -1503,13 +1511,13 @@ class VisibilityPlot(FigureCanvas):
             axes = self.hover_data.get('axes', [])
             # Draw vertical line on all three subplots
             for ax in axes:
-                line = ax.axvline(x=current_hours_from_start, color='#00ff00', linestyle='--',
+                line = ax.axvline(x=current_hours_from_start, color=chart_color('#00ff00'), linestyle='--',
                           linewidth=2.5, alpha=0.9, label='Current Time', zorder=100)
                 self.current_time_lines.append(line)
 
             # Update legend on first subplot to include current time (only if lines were drawn)
             if axes and self.current_time_lines:
-                axes[0].legend(facecolor='#404040', edgecolor='#666666', loc='upper right')
+                axes[0].legend(loc='upper right')
 
             # Redraw the canvas
             self.draw_idle()
@@ -1588,7 +1596,7 @@ class VisibilityPlot(FigureCanvas):
         # Add vertical cursor line to all subplots
         axes = self.hover_data.get('axes', [])
         for ax in axes:
-            line = ax.axvline(x=x_pos, color='#ffcc00', linestyle='-', alpha=0.7, linewidth=1.5)
+            line = ax.axvline(x=x_pos, color=chart_color('#ffcc00'), linestyle='-', alpha=0.7, linewidth=1.5)
             self.cursor_lines.append(line)
 
         # Get data for this point

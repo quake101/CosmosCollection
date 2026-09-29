@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager
-from Theme import COLORS
+from Theme import COLORS, adapt_color
 from NINAIntegration import NINAIntegration
 from UrlOpener import open_url
 
@@ -515,7 +515,7 @@ class DSODetailWindow(QDialog):
 
             if emission_info:
                 self.emission_label.setText(emission_info)
-                self.emission_label.setStyleSheet("color: white;")
+                self.emission_label.setStyleSheet(f"color: {COLORS['text']};")
             else:
                 self.emission_label.setText("No specific emission line data available")
                 self.emission_label.setStyleSheet(f"color: {COLORS['text_disabled']};")
@@ -530,6 +530,19 @@ class DSODetailWindow(QDialog):
         logger.warning(f"SIMBAD query failed for {object_name}: {error_message}")
         self.emission_label.setText(f"SIMBAD query failed (check internet connection)")
         self.emission_label.setStyleSheet(f"color: {COLORS['error']};")
+
+    @staticmethod
+    def _emission_line_color(line):
+        """Display color for an emission line, hinting at its wavelength"""
+        if 'Hα' in line or 'Hβ' in line:
+            return adapt_color('#ff6b6b')
+        elif 'OIII' in line:
+            return adapt_color('#6bcdff')
+        elif 'SII' in line:
+            return adapt_color('#ff9966')
+        elif 'NII' in line:
+            return adapt_color('#ff8888')
+        return COLORS['text']
 
     def _parse_emission_info(self, dso_type, simbad_result):
         """Parse emission line information based on DSO type and SIMBAD data"""
@@ -605,30 +618,12 @@ class DSODetailWindow(QDialog):
         text += f"<b>{info['description']}</b><br><br>"
         text += "<b>Primary Emission Lines:</b><br>"
         for line in info['primary']:
-            if 'Hα' in line or 'Hβ' in line:
-                color = '#ff6b6b'
-            elif 'OIII' in line:
-                color = '#6bcdff'
-            elif 'SII' in line:
-                color = '#ff9966'
-            elif 'NII' in line:
-                color = '#ff8888'
-            else:
-                color = 'white'
+            color = self._emission_line_color(line)
             text += f"<span style='color: {color};'>• {line}</span><br>"
 
         text += "<br><b>Secondary Lines:</b><br>"
         for line in info['secondary']:
-            if 'Hα' in line or 'Hβ' in line:
-                color = '#ff6b6b'
-            elif 'OIII' in line:
-                color = '#6bcdff'
-            elif 'SII' in line:
-                color = '#ff9966'
-            elif 'NII' in line:
-                color = '#ff8888'
-            else:
-                color = 'white'
+            color = self._emission_line_color(line)
             text += f"<span style='color: {color};'>• {line}</span><br>"
 
         text += "<br><i>Useful for Hα, OIII, and SII narrowband imaging</i>"

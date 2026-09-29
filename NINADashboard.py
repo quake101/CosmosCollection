@@ -26,9 +26,6 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
-# Set dark theme for matplotlib
-plt.style.use('dark_background')
-
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings, QByteArray, QPointF, QRectF, QSize
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
@@ -42,7 +39,7 @@ from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, Q
 
 from NINAIntegration import NINAIntegration
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS
+from Theme import COLORS, adapt_color, chart_background, chart_color, theme_manager
 from TimeFormatHelper import format_time
 
 # Set up logging
@@ -120,7 +117,7 @@ class ZoomableImageWidget(QWidget):
 
         if not self._pixmap or self._pixmap.isNull():
             # Draw placeholder text
-            painter.setPen(Qt.gray)
+            painter.setPen(QColor(adapt_color('#a0a0a0', on_dark=True)))
             painter.drawText(self.rect(), Qt.AlignCenter, self._placeholder_text)
             return
 
@@ -144,7 +141,7 @@ class ZoomableImageWidget(QWidget):
         # Draw zoom indicator if zoomed
         if self._zoom != 1.0:
             zoom_text = f"{self._zoom * 100:.0f}%"
-            painter.setPen(Qt.white)
+            painter.setPen(QColor(adapt_color('#ffffff', on_dark=True)))
             painter.drawText(10, 20, zoom_text)
 
     def wheelEvent(self, event: QWheelEvent):
@@ -662,9 +659,10 @@ class GuidingGraph(FigureCanvas):
     """Matplotlib canvas for RA/Dec guiding deviation plot."""
 
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(10, 2.5), facecolor='#2b2b2b')
+        self.figure = Figure(figsize=(10, 2.5))
         super().__init__(self.figure)
         self.setParent(parent)
+        theme_manager().theme_changed.connect(self._on_theme_changed)
 
         # Circular buffer for last 5 minutes of data (at ~1 point/sec = 300 points)
         self.max_points = 300
@@ -675,9 +673,17 @@ class GuidingGraph(FigureCanvas):
         self.ax = None
         self._create_empty_chart()
 
+    def _on_theme_changed(self):
+        """Redraw with the new theme colors."""
+        if self.ra_data:
+            self._redraw_chart()
+        else:
+            self._create_empty_chart()
+
     def _create_empty_chart(self):
         """Create an empty chart placeholder."""
         self.figure.clear()
+        self.figure.set_facecolor(chart_background())
         self.ax = self.figure.add_subplot(111)
 
         self.ax.set_xlim(0, self.max_points)
@@ -692,7 +698,7 @@ class GuidingGraph(FigureCanvas):
         self.ax.axhline(y=0, color=COLORS['text_secondary'], linestyle='-', alpha=0.3, linewidth=1)
 
         # Style
-        self.ax.set_facecolor('#2b2b2b')
+        self.ax.set_facecolor(COLORS['background_light'])
         self.ax.tick_params(colors=COLORS['text_secondary'], labelsize=8)
         self.ax.spines['bottom'].set_color(COLORS['border'])
         self.ax.spines['top'].set_color(COLORS['border'])
@@ -703,11 +709,11 @@ class GuidingGraph(FigureCanvas):
         # Legend
         from matplotlib.lines import Line2D
         legend_elements = [
-            Line2D([0], [0], color='#4488ff', linewidth=2, label='RA'),
-            Line2D([0], [0], color='#ff8844', linewidth=2, label='Dec'),
+            Line2D([0], [0], color=chart_color('#4488ff'), linewidth=2, label='RA'),
+            Line2D([0], [0], color=chart_color('#ff8844'), linewidth=2, label='Dec'),
         ]
         self.ax.legend(handles=legend_elements, loc='upper right', fontsize=8,
-                       facecolor='#353535', edgecolor=COLORS['border'], labelcolor=COLORS['text'])
+                       facecolor=COLORS['background_lighter'], edgecolor=COLORS['border'], labelcolor=COLORS['text'])
 
         self.figure.tight_layout()
         self.draw()
@@ -734,13 +740,14 @@ class GuidingGraph(FigureCanvas):
             return
 
         self.figure.clear()
+        self.figure.set_facecolor(chart_background())
         self.ax = self.figure.add_subplot(111)
 
         x_data = list(range(len(self.ra_data)))
 
         # Plot RA and Dec
-        self.ax.plot(x_data, list(self.ra_data), color='#4488ff', linewidth=1.5, label='RA')
-        self.ax.plot(x_data, list(self.dec_data), color='#ff8844', linewidth=1.5, label='Dec')
+        self.ax.plot(x_data, list(self.ra_data), color=chart_color('#4488ff'), linewidth=1.5, label='RA')
+        self.ax.plot(x_data, list(self.dec_data), color=chart_color('#ff8844'), linewidth=1.5, label='Dec')
 
         # Add threshold lines
         self.ax.axhline(y=1, color=COLORS['warning'], linestyle='--', alpha=0.5, linewidth=1)
@@ -768,7 +775,7 @@ class GuidingGraph(FigureCanvas):
         self.ax.set_xlabel('Samples', color=COLORS['text'], fontsize=9)
 
         # Style
-        self.ax.set_facecolor('#2b2b2b')
+        self.ax.set_facecolor(COLORS['background_light'])
         self.ax.tick_params(colors=COLORS['text_secondary'], labelsize=8)
         self.ax.spines['bottom'].set_color(COLORS['border'])
         self.ax.spines['top'].set_color(COLORS['border'])
@@ -778,7 +785,7 @@ class GuidingGraph(FigureCanvas):
 
         # Legend
         self.ax.legend(loc='upper right', fontsize=8,
-                       facecolor='#353535', edgecolor=COLORS['border'], labelcolor=COLORS['text'])
+                       facecolor=COLORS['background_lighter'], edgecolor=COLORS['border'], labelcolor=COLORS['text'])
 
         self.figure.tight_layout()
         self.draw()
@@ -805,10 +812,11 @@ class AutofocusGraph(FigureCanvas):
 
     def __init__(self, parent=None):
         # Constrained layout re-fits margins on every draw, including dock resizes
-        self.figure = Figure(figsize=(6, 3.5), facecolor='#2b2b2b', layout='constrained')
+        self.figure = Figure(figsize=(6, 3.5), layout='constrained')
         self.figure.get_layout_engine().set(h_pad=0.04, w_pad=0.04)
         super().__init__(self.figure)
         self.setParent(parent)
+        theme_manager().theme_changed.connect(self._redraw_chart)
 
         self.points = []  # [(position, hfr, error)]
         self.report = None  # last-af report for the completed run, None while running
@@ -887,6 +895,7 @@ class AutofocusGraph(FigureCanvas):
     def _redraw_chart(self):
         """Redraw the chart with current data."""
         self.figure.clear()
+        self.figure.set_facecolor(chart_background())
         self.ax = self.figure.add_subplot(111)
         ax = self.ax
 
@@ -898,9 +907,9 @@ class AutofocusGraph(FigureCanvas):
 
             if self.report:
                 for label, xs, ys, color, style in self._fit_curves(x_min - pad, x_max + pad):
-                    ax.plot(xs, ys, color=color, linestyle=style, linewidth=1.2, label=label, alpha=0.9)
+                    ax.plot(xs, ys, color=chart_color(color), linestyle=style, linewidth=1.2, label=label, alpha=0.9)
                 ax.errorbar(positions, hfrs, yerr=[p[2] for p in self.points], fmt='o',
-                            color=self.POINT_COLOR, ecolor=self.POINT_COLOR, elinewidth=1,
+                            color=chart_color(self.POINT_COLOR), ecolor=chart_color(self.POINT_COLOR), elinewidth=1,
                             capsize=2, markersize=5, label='Measured', alpha=0.9)
                 focus = self.report.get('CalculatedFocusPoint') or {}
                 if isinstance(focus.get('Position'), (int, float)) and isinstance(focus.get('Value'), (int, float)):
@@ -908,7 +917,7 @@ class AutofocusGraph(FigureCanvas):
                     ax.plot([focus['Position']], [focus['Value']], marker='*', markersize=12,
                             color=COLORS['success'], linestyle='none', label='Focus')
             else:
-                ax.plot(positions, hfrs, 'o', color=self.POINT_COLOR, markersize=6, label='Measured')
+                ax.plot(positions, hfrs, 'o', color=chart_color(self.POINT_COLOR), markersize=6, label='Measured')
                 best = min(self.points, key=lambda p: p[1])
                 ax.plot([best[0]], [best[1]], 'o', markersize=10, markerfacecolor='none',
                         markeredgecolor=COLORS['success'], linestyle='none', label='Best so far')
@@ -917,7 +926,7 @@ class AutofocusGraph(FigureCanvas):
             y_max = max(h + e for _, h, e in self.points)
             ax.set_ylim(0, y_max * 1.3)  # Headroom for the legend
             ax.legend(loc='upper center', fontsize=8, ncol=4,
-                      facecolor='#353535', edgecolor=COLORS['border'], labelcolor=COLORS['text'])
+                      facecolor=COLORS['background_lighter'], edgecolor=COLORS['border'], labelcolor=COLORS['text'])
         else:
             ax.text(0.5, 0.5, 'No autofocus data', transform=ax.transAxes, ha='center', va='center',
                     color=COLORS['text_secondary'], fontsize=10)
@@ -929,7 +938,7 @@ class AutofocusGraph(FigureCanvas):
         ax.set_ylabel('HFR', color=COLORS['text'], fontsize=9)
 
         # Style
-        ax.set_facecolor('#2b2b2b')
+        ax.set_facecolor(COLORS['background_light'])
         ax.tick_params(colors=COLORS['text_secondary'], labelsize=8)
         for spine in ax.spines.values():
             spine.set_color(COLORS['border'])

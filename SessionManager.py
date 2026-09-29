@@ -2238,7 +2238,7 @@ class SessionMonthCalendar(QCalendarWidget):
 
     def paintCell(self, painter, rect, date):
         from PySide6.QtGui import QPen, QBrush
-        from DSOVisibilityCalculator import visibility_hours_to_color
+        from DSOVisibilityCalculator import no_visibility_data_colors, visibility_hours_to_color
         from WeatherForecast import get_rating_color
 
         if date.month() != self.monthShown() or date.year() != self.yearShown():
@@ -2250,7 +2250,7 @@ class SessionMonthCalendar(QCalendarWidget):
         if py_date in self.visibility_hours:
             bg_color, fg_color = visibility_hours_to_color(self.visibility_hours[py_date])
         else:
-            bg_color, fg_color = QColor(64, 64, 64), QColor(200, 200, 200)
+            bg_color, fg_color = no_visibility_data_colors()
 
         painter.fillRect(rect, QBrush(bg_color))
 
@@ -2276,10 +2276,10 @@ class SessionMonthCalendar(QCalendarWidget):
                 painter.drawEllipse(QPoint(start_x + i * spacing, dot_y), dot_radius, dot_radius)
 
         if date == self.selectedDate():
-            painter.setPen(QPen(QColor(255, 255, 0), 2))
+            painter.setPen(QPen(QColor(COLORS['warning']), 2))
             painter.drawRect(rect.adjusted(1, 1, -1, -1))
         elif py_date == date_cls.today():
-            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.setPen(QPen(QColor(COLORS['text']), 1))
             painter.drawRect(rect.adjusted(1, 1, -1, -1))
 
     def leaveEvent(self, event):

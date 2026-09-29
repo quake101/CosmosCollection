@@ -23,9 +23,6 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
-# Set dark theme for matplotlib
-plt.style.use('dark_background')
-
 import requests
 from astropy import units as u
 from astropy.time import Time
@@ -41,7 +38,7 @@ from PySide6.QtGui import QColor
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS
+from Theme import COLORS, chart_background, sky_shade, theme_manager
 from TimeFormatHelper import format_time, format_datetime, get_time_format_24h
 from UrlOpener import open_url
 
@@ -1475,8 +1472,12 @@ class DayWeatherCard(QFrame):
         self.setMinimumWidth(100)
         self.setMaximumWidth(130)
 
-        # Set background and border
-        rating_color = get_rating_color(summary.astro_score)
+        self._setup_ui()
+        self.apply_theme()
+
+    def apply_theme(self):
+        """Apply theme colors - on creation and again when the theme changes"""
+        rating_color = get_rating_color(self.summary.astro_score)
         self.setStyleSheet(f"""
             DayWeatherCard {{
                 background-color: {COLORS['background_light']};
@@ -1489,8 +1490,10 @@ class DayWeatherCard(QFrame):
                 border: 2px solid {rating_color};
             }}
         """)
-
-        self._setup_ui()
+        self.date_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10pt;")
+        self.rating_text.setStyleSheet(f"color: {rating_color}; font-weight: bold; font-size: 12pt;")
+        self.score_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10pt;")
+        self.cloud_text.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12pt;")
 
     def _setup_ui(self):
         """Set up the card UI"""
@@ -1507,35 +1510,30 @@ class DayWeatherCard(QFrame):
 
         # Date
         date_str = self.summary.date.strftime("%m/%d")
-        date_label = QLabel(date_str)
-        date_label.setAlignment(Qt.AlignCenter)
-        date_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10pt;")
-        layout.addWidget(date_label)
+        self.date_label = QLabel(date_str)
+        self.date_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.date_label)
 
         layout.addSpacing(5)
 
         # Rating
-        rating_color = get_rating_color(self.summary.astro_score)
         rating_label = get_rating_label(self.summary.astro_score)
-        rating_text = QLabel(rating_label)
-        rating_text.setAlignment(Qt.AlignCenter)
-        rating_text.setStyleSheet(f"color: {rating_color}; font-weight: bold; font-size: 12pt;")
-        layout.addWidget(rating_text)
+        self.rating_text = QLabel(rating_label)
+        self.rating_text.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.rating_text)
 
         # Score
-        score_label = QLabel(f"({self.summary.astro_score})")
-        score_label.setAlignment(Qt.AlignCenter)
-        score_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10pt;")
-        score_label.setToolTip("Astro Score")
-        layout.addWidget(score_label)
+        self.score_label = QLabel(f"({self.summary.astro_score})")
+        self.score_label.setAlignment(Qt.AlignCenter)
+        self.score_label.setToolTip("Astro Score")
+        layout.addWidget(self.score_label)
 
         layout.addSpacing(5)
 
-        cloud_text = QLabel("Clouds")
-        cloud_text.setAlignment(Qt.AlignCenter)
-        cloud_text.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12pt;")
-        cloud_text.setToolTip("Average cloud cover for dark hours (sun altitude < -12°)")
-        layout.addWidget(cloud_text)
+        self.cloud_text = QLabel("Clouds")
+        self.cloud_text.setAlignment(Qt.AlignCenter)
+        self.cloud_text.setToolTip("Average cloud cover for dark hours (sun altitude < -12°)")
+        layout.addWidget(self.cloud_text)
 
         # Cloud cover (tonight's average - dark hours only)
         cloud_label = QLabel(f"{self.summary.tonight_avg_cloud_cover:.0f}%")
@@ -1565,7 +1563,7 @@ class HourlyAstroChart(FigureCanvas):
     hour_hovered = Signal(int)  # Emits the row index when hovering over a bar
 
     def __init__(self, hourly_data: List[HourlyWeatherData], sun_altitudes: List[float] = None, parent=None):
-        self.figure = Figure(figsize=(10, 3), facecolor='#2b2b2b')
+        self.figure = Figure(figsize=(10, 3))
         super().__init__(self.figure)
         self.setParent(parent)
 
@@ -1575,6 +1573,7 @@ class HourlyAstroChart(FigureCanvas):
         self.ax = None
         self._last_hovered_index = -1
         self._create_chart()
+        theme_manager().theme_changed.connect(self._create_chart)
 
         # Connect mouse motion event
         self.mpl_connect('motion_notify_event', self._on_mouse_move)
@@ -1589,6 +1588,7 @@ class HourlyAstroChart(FigureCanvas):
     def _create_chart(self):
         """Create the hourly astro score chart"""
         self.figure.clear()
+        self.figure.set_facecolor(chart_background())
         self.ax = self.figure.add_subplot(111)
 
         # Detect if this is a midnight-centered view (hours not sequential 0-23)
@@ -1658,7 +1658,7 @@ class HourlyAstroChart(FigureCanvas):
         self.ax.set_xticklabels(tick_labels, fontsize=8)
 
         # Style axes
-        self.ax.set_facecolor('#2b2b2b')
+        self.ax.set_facecolor(COLORS['background_light'])
         self.ax.tick_params(colors=COLORS['text_secondary'], labelsize=8)
         self.ax.spines['bottom'].set_color(COLORS['border'])
         self.ax.spines['top'].set_color(COLORS['border'])
@@ -1677,7 +1677,7 @@ class HourlyAstroChart(FigureCanvas):
             Patch(facecolor=COLORS['error'], label='Poor (<40)'),
         ]
         self.ax.legend(handles=legend_elements, loc='upper right', fontsize=7,
-                  facecolor='#353535', edgecolor=COLORS['border'], labelcolor=COLORS['text'])
+                  facecolor=COLORS['background_lighter'], edgecolor=COLORS['border'], labelcolor=COLORS['text'])
 
         self.figure.tight_layout()
         self.draw()
@@ -1695,19 +1695,19 @@ class HourlyAstroChart(FigureCanvas):
         if not self.sun_altitudes or len(self.sun_altitudes) != num_hours:
             return
 
-        # Define sun altitude thresholds and colors
-        # Format: (sun_max, sun_min, color, alpha)
+        # Sun altitude thresholds and theme shades
+        # Format: (sun_max, sun_min, (color, alpha))
         darkness_levels = [
-            (90, 0, '#4a4a3a', 0.5),      # Daylight - warm tint
-            (0, -6, '#2a3a4a', 0.6),      # Civil twilight - light blue-gray
-            (-6, -12, '#1a2535', 0.7),    # Nautical twilight - medium blue
-            (-12, -18, '#101520', 0.8),   # Astronomical twilight - dark blue
-            (-18, -90, '#080a10', 0.9),   # Night - very dark blue/black
+            (90, 0, sky_shade('day')),
+            (0, -6, sky_shade('civil')),
+            (-6, -12, sky_shade('nautical')),
+            (-12, -18, sky_shade('astronomical')),
+            (-18, -90, sky_shade('night')),
         ]
 
         # For each hour, shade based on its sun altitude
         for i, sun_alt in enumerate(self.sun_altitudes):
-            for sun_max, sun_min, color, alpha in darkness_levels:
+            for sun_max, sun_min, (color, alpha) in darkness_levels:
                 if sun_alt <= sun_max and sun_alt > sun_min:
                     # Shade this bar's column
                     self.ax.axvspan(i - 0.5, i + 0.5, facecolor=color, alpha=alpha, zorder=0)
@@ -1741,7 +1741,7 @@ class HourlyAstroChart(FigureCanvas):
 
         for i, bar in enumerate(self.bars):
             if i == index:
-                bar.set_edgecolor('white')
+                bar.set_edgecolor(COLORS['text'])
                 bar.set_linewidth(2)
             else:
                 bar.set_edgecolor('none')
@@ -2204,6 +2204,50 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self._restore_auto_refresh_settings()
         self._load_location()
 
+        # This window usually stays open, so restyle it when the theme changes
+        theme_manager().theme_changed.connect(self._on_theme_changed)
+
+    def _on_theme_changed(self):
+        """Re-apply the colors this window sets on its own widgets"""
+        for card in self.day_cards:
+            card.apply_theme()
+        for legend_item, color_key in self.legend_items:
+            legend_item.setStyleSheet(f"color: {COLORS[color_key]}; font-weight: bold;")
+        self.attribution_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
+        self._update_attribution()  # link colors are part of the text
+        self._set_status_color(self._status_color_key)
+
+    def _set_status_color(self, color_key):
+        """Color the status line with a COLORS key (None for the default text color)"""
+        self._status_color_key = color_key
+        self.status_label.setStyleSheet(f"color: {COLORS[color_key]};" if color_key else "")
+
+    def _update_attribution(self):
+        """Show which weather sources the current forecast came from"""
+        source_links = {
+            "openmeteo": ("https://open-meteo.com/", "Open-Meteo"),
+            "openweather": ("https://openweathermap.org/", "OpenWeather"),
+            "visualcrossing": ("https://www.visualcrossing.com/", "VisualCrossing"),
+            "weatherapi": ("https://www.weatherapi.com/", "WeatherAPI"),
+        }
+        sources = [f'<a href="{source_links[key][0]}" style="color: {COLORS["link"]};">{source_links[key][1]}</a>'
+                   for key in self._attribution_sources]
+        if len(sources) == 1:
+            self.attribution_label.setText(
+                'Double-click a day card for detailed hourly forecast. '
+                f'Weather data provided by {sources[0]}.'
+            )
+        else:
+            # "A and B" for two sources, "A, B, and C" (and so on) for more
+            source_list = (
+                f"{sources[0]} and {sources[1]}" if len(sources) == 2
+                else f"{', '.join(sources[:-1])}, and {sources[-1]}"
+            )
+            self.attribution_label.setText(
+                'Double-click a day card for detailed hourly forecast. '
+                f'Weather data blended from {source_list}.'
+            )
+
     def _setup_ui(self):
         """Set up the main window UI"""
         central_widget = QWidget()
@@ -2273,10 +2317,9 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
 
         # Help text with attribution (text updated in _on_weather_loaded to
         # reflect whether OpenWeather, VisualCrossing, and/or WeatherAPI data was blended in)
-        self.attribution_label = QLabel(
-            'Double-click a day card for detailed hourly forecast. '
-            'Weather data provided by <a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a>.'
-        )
+        self.attribution_label = QLabel()
+        self._attribution_sources = ["openmeteo"]
+        self._update_attribution()
         self.attribution_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 9pt;")
         self.attribution_label.setAlignment(Qt.AlignCenter)
         self.attribution_label.setOpenExternalLinks(False)
@@ -2290,22 +2333,24 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         legend_layout = QHBoxLayout(legend_group)
         legend_layout.addStretch()
 
-        for label, color in [
-            ("Excellent (80-100)", COLORS['success']),
-            ("Good (60-79)", COLORS['info']),
-            ("Moderate (40-59)", COLORS['warning']),
-            ("Poor (0-39)", COLORS['error'])
+        self.legend_items = []  # (label, COLORS key), restyled on theme changes
+        for label, color_key in [
+            ("Excellent (80-100)", 'success'),
+            ("Good (60-79)", 'info'),
+            ("Moderate (40-59)", 'warning'),
+            ("Poor (0-39)", 'error')
         ]:
             legend_item = QLabel(f"  {label}  ")
-            legend_item.setStyleSheet(f"color: {color}; font-weight: bold;")
+            legend_item.setStyleSheet(f"color: {COLORS[color_key]}; font-weight: bold;")
             legend_layout.addWidget(legend_item)
+            self.legend_items.append((legend_item, color_key))
 
         legend_layout.addStretch()
         main_layout.addWidget(legend_group)
 
         # Status bar
         self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self._set_status_color('text_secondary')
         self.status_label.setWordWrap(True)
         self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         main_layout.addWidget(self.status_label)
@@ -2388,13 +2433,13 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
             self.timezone = None
             self.location_label.setText("Location: Not configured")
             self.status_label.setText("Please configure your location in Settings to view weather forecast.")
-            self.status_label.setStyleSheet(f"color: {COLORS['warning']};")
+            self._set_status_color('warning')
             self.refresh_btn.setEnabled(False)
 
         except Exception as e:
             logger.error(f"Error loading location: {str(e)}")
             self.status_label.setText(f"Error loading location: {str(e)}")
-            self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+            self._set_status_color('error')
 
     def _refresh_forecast(self, force: bool = False):
         """Fetch weather forecast data, using cache if available"""
@@ -2418,7 +2463,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self.progress_bar.setVisible(True)
         self.refresh_btn.setEnabled(False)
         self.status_label.setText("Fetching weather data...")
-        self.status_label.setStyleSheet("")
+        self._set_status_color(None)
 
         # Start worker thread
         self.worker = WeatherWorker(self.lat, self.lon, self.timezone)
@@ -2441,38 +2486,18 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         # supplemental source if Open-Meteo itself failed on this fetch - see
         # WeatherWorker.baseline_source) plus which other source(s), if any, were
         # blended into it.
-        source_links = {
-            "openmeteo": '<a href="https://open-meteo.com/" style="color: #6ea8fe;">Open-Meteo</a>',
-            "openweather": '<a href="https://openweathermap.org/" style="color: #6ea8fe;">OpenWeather</a>',
-            "visualcrossing": '<a href="https://www.visualcrossing.com/" style="color: #6ea8fe;">VisualCrossing</a>',
-            "weatherapi": '<a href="https://www.weatherapi.com/" style="color: #6ea8fe;">WeatherAPI</a>',
-        }
         baseline_source = "openmeteo"
         if not from_cache and self.worker is not None:
             baseline_source = getattr(self.worker, "baseline_source", "openmeteo")
-        sources = [source_links[baseline_source]]
+        sources = [baseline_source]
         if baseline_source != "openweather" and any(s.openweather_blended for s in summaries):
-            sources.append(source_links["openweather"])
+            sources.append("openweather")
         if baseline_source != "visualcrossing" and any(s.visualcrossing_blended for s in summaries):
-            sources.append(source_links["visualcrossing"])
+            sources.append("visualcrossing")
         if baseline_source != "weatherapi" and any(s.weatherapi_blended for s in summaries):
-            sources.append(source_links["weatherapi"])
-
-        if len(sources) == 1:
-            self.attribution_label.setText(
-                'Double-click a day card for detailed hourly forecast. '
-                f'Weather data provided by {sources[0]}.'
-            )
-        else:
-            # "A and B" for two sources, "A, B, and C" (and so on) for more
-            source_list = (
-                f"{sources[0]} and {sources[1]}" if len(sources) == 2
-                else f"{', '.join(sources[:-1])}, and {sources[-1]}"
-            )
-            self.attribution_label.setText(
-                'Double-click a day card for detailed hourly forecast. '
-                f'Weather data blended from {source_list}.'
-            )
+            sources.append("weatherapi")
+        self._attribution_sources = sources
+        self._update_attribution()
 
         # Store in cache if this is fresh data
         if not from_cache and self.lat is not None and self.lon is not None:
@@ -2531,14 +2556,14 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
             status_text += f" | Next refresh: {format_time(self.next_refresh_time)}"
 
         self.status_label.setText(status_text)
-        self.status_label.setStyleSheet(f"color: {COLORS['warning']};" if integration_note else "")
+        self._set_status_color('warning' if integration_note else None)
 
     def _on_error(self, error_message: str):
         """Handle errors from worker"""
         self.progress_bar.setVisible(False)
         self.refresh_btn.setEnabled(True)
         self.status_label.setText(f"Error: {error_message}")
-        self.status_label.setStyleSheet(f"color: {COLORS['error']};")
+        self._set_status_color('error')
         logger.error(f"Weather Fetch Error: {str(error_message)}")
 
     def _show_day_detail(self, summary: DailyWeatherSummary):

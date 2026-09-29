@@ -104,6 +104,7 @@ _BASE_PALETTES = {
         'success': '#44ff44',
         'info': '#88ccff',
         'favorite': '#FFD700',
+        'link': '#6ea8fe',
         'overlay': (255, 255, 255),
     },
     'light': {
@@ -118,10 +119,11 @@ _BASE_PALETTES = {
         'text_disabled': '#8a8a8a',
         'error': '#c62828',
         'error_bg': '#fde4e4',
-        'warning': '#a86400',
+        'warning': '#945800',
         'success': '#2e7d32',
         'info': '#0b62a8',
-        'favorite': '#b8860b',
+        'favorite': '#7e5c08',
+        'link': '#0b62a8',
         'overlay': (0, 0, 0),
     },
     # Red-only, low-brightness palette that preserves dark-adapted vision.
@@ -133,18 +135,21 @@ _BASE_PALETTES = {
         'background_hover': '#2a0000',
         'border': '#3a0000',
         'border_light': '#520000',
-        'text': '#c41e1e',
-        'text_secondary': '#961616',
-        'text_disabled': '#5c0e0e',
-        'error': '#ff3b3b',
+        # Pure red tops out near 5:1 contrast on black, so readable text stays
+        # in the ~180-255 red range; disabled text is deliberately dimmer.
+        'text': '#d22020',
+        'text_secondary': '#b41c1c',
+        'text_disabled': '#701212',
+        'error': '#ff2a2a',
         'error_bg': '#330000',
-        'warning': '#e03030',
-        'success': '#a81c1c',
-        'info': '#8a1414',
-        'favorite': '#d02828',
+        'warning': '#e62424',
+        'success': '#c81e1e',
+        'info': '#b41c1c',
+        'favorite': '#dc2424',
+        'link': '#e02626',
         'accent': '#7a0000',
-        'text_on_accent': '#ff4a4a',
-        'overlay': (196, 30, 30),
+        'text_on_accent': '#ff3030',
+        'overlay': (210, 32, 32),
     },
 }
 
@@ -164,11 +169,31 @@ def resolve_mode(theme_settings):
     return theme_settings.mode if theme_settings.mode in _BASE_PALETTES else 'dark'
 
 
-def _text_on(color):
-    """Black or white, whichever reads better on the given background."""
+def _luminance(color):
+    """WCAG relative luminance of a color (0 = black, 1 = white)."""
+    def linear(v):
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
     c = QColor(color)
-    luminance = 0.2126 * c.redF() + 0.7152 * c.greenF() + 0.0722 * c.blueF()
-    return '#000000' if luminance > 0.55 else '#ffffff'
+    return 0.2126 * linear(c.redF()) + 0.7152 * linear(c.greenF()) + 0.0722 * linear(c.blueF())
+
+
+def _contrast(a, b):
+    """WCAG contrast ratio between two colors (1 to 21)."""
+    high, low = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+def _pick_text(background, preferred, alternative, minimum):
+    """preferred if it reaches the minimum contrast on background, otherwise
+    whichever of the two contrasts more."""
+    if _contrast(preferred, background) >= minimum:
+        return preferred
+    return max((preferred, alternative), key=lambda c: _contrast(c, background))
+
+
+def _text_on(color):
+    """White or black text for the given background (white when it reads well)."""
+    return _pick_text(color, '#ffffff', '#000000', 4.5)
 
 
 def _rgba(color, alpha):
@@ -214,8 +239,8 @@ def build_palette(colors):
         QPalette.HighlightedText: colors['text_on_accent'],
         QPalette.ToolTipBase: colors['background_light'],
         QPalette.ToolTipText: colors['text'],
-        QPalette.Link: colors['accent'],
-        QPalette.LinkVisited: colors['accent_pressed'],
+        QPalette.Link: colors['link'],
+        QPalette.LinkVisited: colors['link'],
         QPalette.Light: colors['background_hover'],
         QPalette.Midlight: colors['background_lighter'],
         QPalette.Mid: colors['border'],
@@ -607,6 +632,7 @@ class ThemeManager(QObject):
 
 _manager = None
 _fusion_set = False
+_current_mode = 'dark'  # resolved palette name of the applied theme
 
 
 def theme_manager():
@@ -619,11 +645,13 @@ def theme_manager():
 
 def apply_theme(app, theme_settings=None):
     """Apply the theme (the saved settings if none given) to the application."""
+    global _current_mode
     if theme_settings is None:
         theme_settings = load_settings()
     colors = build_colors(theme_settings)
     COLORS.clear()
     COLORS.update(colors)
+    _current_mode = resolve_mode(theme_settings)
 
     # Fusion renders palettes and style sheets consistently in every mode.
     # (Once a style sheet is set, app.style() is Qt's style sheet wrapper, so
@@ -635,6 +663,7 @@ def apply_theme(app, theme_settings=None):
     app.setPalette(build_palette(colors))
     app.setFont(build_font(theme_settings))
     app.setStyleSheet(build_stylesheet(colors, theme_settings))
+    _apply_chart_theme()
 
     manager = theme_manager()
     manager.settings = theme_settings
@@ -644,3 +673,170 @@ def apply_theme(app, theme_settings=None):
 def get_color(color_name):
     """Return a hex string from COLORS dict or None if missing."""
     return COLORS.get(color_name)
+
+
+# --------------------------------------------------------------------
+# 5. Adapting fixed colors to the current theme
+# --------------------------------------------------------------------
+# Some colors carry meaning through their hue (emission lines, green-to-red
+# scales, chart series), so they can't simply become COLORS keys. These helpers
+# keep that meaning while staying readable in light mode and red-only in
+# Night Vision. They read the applied theme, so call them when building UI.
+
+def current_mode():
+    """Resolved palette name of the applied theme: 'dark', 'light' or 'night'."""
+    return _current_mode
+
+
+def _themed_hue(color, rank=None):
+    """The color for the current mode before any contrast adjustment: unchanged,
+    except Night Vision maps it to red. The red's brightness follows the
+    color's brightness, or rank (0-1) for colors on an ordered scale whose
+    order is carried by hue (such as green-to-red), since hue is lost."""
+    c = QColor(color)
+    if _current_mode == 'night':
+        if rank is None:
+            rank = 0.2126 * c.redF() + 0.7152 * c.greenF() + 0.0722 * c.blueF()
+        red = int(70 + 185 * rank)
+        c = QColor(red, int(red * 0.12), int(red * 0.12))
+    return c
+
+
+def adapt_color(color, on_dark=False, background=None, rank=None, minimum=None):
+    """Hex color adjusted to read on its background, keeping its hue meaning.
+
+    The background defaults to the window background, or black when on_dark
+    says the color sits on a fixed dark surface such as an image view. The
+    color's lightness is shifted only as far as needed to reach 4.5:1 contrast
+    (3:1 in Night Vision, which maps colors to red first), so colors that
+    already read well are returned unchanged. rank: see _themed_hue. minimum
+    overrides the target contrast (e.g. 3.0 for chart lines, which aren't text).
+    """
+    c = _themed_hue(color, rank)
+    if background is None:
+        background = '#000000' if on_dark else COLORS['background']
+    night = _current_mode == 'night'
+    if minimum is None:
+        minimum = 3.0 if night else 4.5
+    lighten = _luminance(background) < 0.18
+    hue, saturation, lightness, _alpha = c.getHslF()
+    # Past 0.5 lightness, red starts turning pink - stay red in Night Vision.
+    max_lightness = 0.5 if night else 1.0
+    for _ in range(40):
+        # Small margin so rounding to a hex color can't dip below the minimum.
+        if _contrast(c, background) >= minimum + 0.05:
+            break
+        lightness = min(max_lightness, lightness + 0.02) if lighten else max(0.0, lightness - 0.02)
+        c.setHslF(hue, saturation, lightness)
+    return c.name()
+
+
+def tint(color, amount, rank=None):
+    """Hex color blending the color into the panel background, for colored
+    table cells and highlights. amount 0 = background, 1 = color.
+    rank: see _themed_hue."""
+    if _current_mode == 'night':
+        # Red-only text only reads on dim backgrounds, so keep tints dim.
+        amount *= 0.55
+    base = QColor(COLORS['background_light'])
+    top = _themed_hue(color, rank)
+    return QColor(
+        round(base.red() + (top.red() - base.red()) * amount),
+        round(base.green() + (top.green() - base.green()) * amount),
+        round(base.blue() + (top.blue() - base.blue()) * amount),
+    ).name()
+
+
+def contrast_text(background):
+    """Hex text color that reads on the given background color."""
+    if _current_mode == 'night':
+        return _pick_text(background, COLORS['text_on_accent'], '#000000', 3.0)
+    return _text_on(background)
+
+
+# --------------------------------------------------------------------
+# 6. Charts (matplotlib)
+# --------------------------------------------------------------------
+# apply_theme() sets matplotlib's defaults (backgrounds, text, ticks, grid,
+# legend), so charts only choose their data colors - through chart_color().
+# Charts are drawn with the colors current at draw time, so a chart that stays
+# open should redraw on theme_manager().theme_changed.
+
+# Sky shading behind time-of-night charts, (color, alpha) from day to night.
+_SKY_SHADES = {
+    'dark': {
+        'day': ('#4a4a3a', 0.5),            # warm tint
+        'civil': ('#2a3a4a', 0.6),          # light blue-gray
+        'nautical': ('#1a2535', 0.7),       # medium blue
+        'astronomical': ('#101520', 0.8),   # dark blue
+        'night': ('#080a10', 0.9),          # very dark blue/black
+    },
+    'light': {
+        'day': ('#f7f1dc', 1.0),
+        'civil': ('#e3e9f2', 1.0),
+        'nautical': ('#d2dbe9', 1.0),
+        'astronomical': ('#c1cddf', 1.0),
+        'night': ('#b0bfd6', 1.0),
+    },
+    'night': {
+        'day': ('#1c0000', 1.0),
+        'civil': ('#140000', 1.0),
+        'nautical': ('#0e0000', 1.0),
+        'astronomical': ('#080000', 1.0),
+        'night': ('#030000', 1.0),
+    },
+}
+
+# The background a chart line must stand out against in the worst case:
+# the lightest plot background in dark palettes, the darkest in light.
+_CHART_LINE_REFERENCE = {'dark': '#404040', 'light': '#b0bfd6', 'night': '#1c0000'}
+
+
+def sky_shade(level):
+    """(color, alpha) for sky shading: 'day', 'civil', 'nautical',
+    'astronomical' or 'night'."""
+    return _SKY_SHADES[_current_mode][level]
+
+
+def chart_color(color, rank=None):
+    """Hex color for chart data (lines, markers), adapted to the current theme
+    so it stands out from the plot background, including sky shading.
+    rank: see _themed_hue."""
+    return adapt_color(color, background=_CHART_LINE_REFERENCE[_current_mode],
+                       rank=rank, minimum=3.0)
+
+
+def chart_background():
+    """Figure (outer) background color for charts."""
+    return COLORS['background']
+
+
+def _apply_chart_theme():
+    """Point matplotlib's defaults at the current theme colors."""
+    try:
+        import matplotlib
+        from cycler import cycler
+    except ImportError:
+        return
+    # Series drawn without an explicit color use matplotlib's default cycle
+    default_cycle = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+                     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    matplotlib.rcParams.update({
+        'axes.prop_cycle': cycler(color=[chart_color(c) for c in default_cycle]),
+        'figure.facecolor': COLORS['background'],
+        'figure.edgecolor': COLORS['background'],
+        'savefig.facecolor': COLORS['background'],
+        'savefig.edgecolor': COLORS['background'],
+        'axes.facecolor': COLORS['background_light'],
+        'axes.edgecolor': COLORS['border_light'],
+        'axes.labelcolor': COLORS['text'],
+        'axes.titlecolor': COLORS['text'],
+        'text.color': COLORS['text'],
+        'xtick.color': COLORS['text_secondary'],
+        'ytick.color': COLORS['text_secondary'],
+        'grid.color': COLORS['border_light'],
+        'legend.facecolor': COLORS['background_lighter'],
+        'legend.edgecolor': COLORS['border_light'],
+        'legend.labelcolor': COLORS['text'],
+        'patch.edgecolor': COLORS['border_light'],
+    })

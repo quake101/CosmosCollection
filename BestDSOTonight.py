@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS
+from Theme import COLORS, adapt_color, tint
 from TimeFormatHelper import format_time, format_datetime
 from NINAIntegration import NINAIntegration
 
@@ -1311,20 +1311,21 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             moon_item.setTextAlignment(Qt.AlignCenter)
             from PySide6.QtGui import QColor
             if moon_sep is None:
-                moon_item.setBackground(QColor("#2a2a2a"))
-                moon_item.setForeground(QColor("#888888"))
-            elif moon_sep > 45:
-                moon_item.setBackground(QColor("#1a3a1a"))
-                moon_item.setForeground(QColor("#66cc66"))
-            elif moon_sep > 20:
-                moon_item.setBackground(QColor("#3a3a00"))
-                moon_item.setForeground(QColor("#cccc44"))
-            elif moon_sep > 8:
-                moon_item.setBackground(QColor("#3a1e00"))
-                moon_item.setForeground(QColor("#cc8844"))
+                moon_item.setBackground(QColor(COLORS['background']))
+                moon_item.setForeground(QColor(COLORS['text_disabled']))
             else:
-                moon_item.setBackground(QColor("#3a0000"))
-                moon_item.setForeground(QColor("#cc4444"))
+                # rank keeps the green-to-red order in Night Vision
+                if moon_sep > 45:
+                    moon_color, rank = "#66cc66", 1.0
+                elif moon_sep > 20:
+                    moon_color, rank = "#cccc44", 0.66
+                elif moon_sep > 8:
+                    moon_color, rank = "#cc8844", 0.33
+                else:
+                    moon_color, rank = "#cc4444", 0.0
+                moon_bg = tint(moon_color, 0.25, rank=rank)
+                moon_item.setBackground(QColor(moon_bg))
+                moon_item.setForeground(QColor(adapt_color(moon_color, background=moon_bg, rank=rank)))
             if moon_sep is None:
                 moon_item.setToolTip("Moon separation unavailable.")
             else:

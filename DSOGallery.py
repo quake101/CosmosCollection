@@ -1561,15 +1561,15 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             if not self.data_loaded:
                 # Still loading initial data
                 loading_label = QLabel("Loading DSO images from database...")
-                loading_label.setStyleSheet("font-size: 14px; color: #cccccc; padding: 50px;")
+                loading_label.setStyleSheet(f"font-size: 14px; color: {COLORS['text_secondary']}; padding: 50px;")
             elif len(self.all_items) == 0:
                 # Data loaded but database has no images
                 loading_label = QLabel("No images in your database.\n\nAdd images to DSO objects to see them here.")
-                loading_label.setStyleSheet("font-size: 14px; color: #888888; padding: 50px;")
+                loading_label.setStyleSheet(f"font-size: 14px; color: {COLORS['text_disabled']}; padding: 50px;")
             else:
                 # Data loaded but no matches for current filters
                 loading_label = QLabel("No DSO images found matching your filters")
-                loading_label.setStyleSheet("font-size: 14px; color: #888888; padding: 50px;")
+                loading_label.setStyleSheet(f"font-size: 14px; color: {COLORS['text_disabled']}; padding: 50px;")
             loading_label.setAlignment(Qt.AlignCenter)
             self.grid_layout.addWidget(loading_label, 0, 0)
 
@@ -2213,7 +2213,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self._push_wait_cursor()
             old_status = self.status_label.text()
             self.status_label.setText("Reorganizing gallery layout...")
-            self.status_label.setStyleSheet("padding: 5px; color: #ffcc00;")
+            self.status_label.setStyleSheet(f"padding: 5px; color: {COLORS['warning']};")
 
             # Schedule grid rebuild after UI update
             QTimer.singleShot(10, lambda: self._rebuild_grid_for_resize(new_cols, old_status))
@@ -2257,7 +2257,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                 self.status_label.setText(f"Columns: {current_cols} | +{pixels_needed}px wider for next column")
             else:
                 self.status_label.setText(f"Columns: {current_cols}")
-            self.status_label.setStyleSheet("padding: 5px; color: #88ccff;")
+            self.status_label.setStyleSheet(f"padding: 5px; color: {COLORS['info']};")
 
         # Restart timer to debounce resize events (300ms delay reduces rebuild frequency)
         self.resize_timer.start(300)

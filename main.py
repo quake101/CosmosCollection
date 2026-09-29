@@ -85,7 +85,7 @@ from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager, WindowPositionMixin
 from ResourceManager import ResourceManager
 from CollageBuilder import CollageBuilder, CollageBuilderWindow
-from Theme import apply_theme, COLORS, theme_manager, load_settings as load_theme_settings, save_settings as save_theme_settings
+from Theme import apply_theme, COLORS, theme_manager, tint, load_settings as load_theme_settings, save_settings as save_theme_settings
 from ThemeTab import ThemeSettingsTab
 from ImageViewer import ImageViewerWindow
 from DSODetail import DSODetailWindow
@@ -821,17 +821,10 @@ class SimbadLoadingDialog(QDialog):
         # Message label
         message = QLabel(f"Searching for '{search_term}' in SIMBAD database...\n\nPlease wait...")
         message.setAlignment(Qt.AlignCenter)
-        message.setStyleSheet("font-size: 12pt; color: white;")
+        message.setStyleSheet("font-size: 12pt;")
         layout.addWidget(message)
 
         self.setLayout(layout)
-
-        # Apply dark theme
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #2d2d2d;
-            }
-        """)
 
 
 # --- Custom Visibility Window Class ---
@@ -1316,7 +1309,7 @@ class SettingsDialog(QDialog):
         # ASTAP help text
         astap_help = QLabel(
             "ASTAP is a free, fast local plate solver. Download from: "
-            "<a href='https://www.hnsky.org/astap.htm' style='color: #0078d7;'>hnsky.org/astap.htm</a><br>"
+            f"<a href='https://www.hnsky.org/astap.htm' style='color: {COLORS['link']};'>hnsky.org/astap.htm</a><br>"
             "Point to <b>astap_cli.exe</b> (command-line version), not astap.exe (GUI). "
             "Leave empty to auto-detect."
         )
@@ -1370,7 +1363,7 @@ class SettingsDialog(QDialog):
         # API key help text
         api_key_help = QLabel(
             "Get a free API key: Register at "
-            "<a href='https://nova.astrometry.net/' style='color: #0078d7;'>nova.astrometry.net</a>, "
+            f"<a href='https://nova.astrometry.net/' style='color: {COLORS['link']};'>nova.astrometry.net</a>, "
             "then find your key in My Account > API.<br>"
             "An API key is required for online plate solving (used when ASTAP fails or is unavailable)."
         )
@@ -1397,7 +1390,7 @@ class SettingsDialog(QDialog):
             "When a session in the Session Manager is marked Completed, you can stack it in Siril: "
             "the subs are linked into a workspace folder and a generated script calibrates, registers and "
             "stacks them per filter. Requires Siril 1.3.4 or newer (1.4+ for XISF subs). Download from "
-            "<a href='https://siril.org/download/' style='color: #0078d7;'>siril.org</a>."))
+            f"<a href='https://siril.org/download/' style='color: {COLORS['link']};'>siril.org</a>."))
 
         # OpenWeather page
         openweather_page = QWidget()
@@ -1448,7 +1441,7 @@ class SettingsDialog(QDialog):
         # OpenWeather help text
         openweather_help = QLabel(
             "Get a free API key: Register at "
-            "<a href='https://openweathermap.org/api' style='color: #0078d7;'>openweathermap.org/api</a>, "
+            f"<a href='https://openweathermap.org/api' style='color: {COLORS['link']};'>openweathermap.org/api</a>, "
             "then find your key under My API Keys.<br>"
             "When enabled, OpenWeather's forecast is averaged with Open-Meteo's data "
             "(cloud cover, temperature, humidity, wind, precipitation chance) to reduce single-source forecast bias."
@@ -1512,7 +1505,7 @@ class SettingsDialog(QDialog):
         # VisualCrossing help text
         visualcrossing_help = QLabel(
             "Get a free API key: Register at "
-            "<a href='https://www.visualcrossing.com/sign-up' style='color: #0078d7;'>visualcrossing.com/sign-up</a>, "
+            f"<a href='https://www.visualcrossing.com/sign-up' style='color: {COLORS['link']};'>visualcrossing.com/sign-up</a>, "
             "then find your key on your Account page.<br>"
             "When enabled, VisualCrossing's forecast is averaged with Open-Meteo's data "
             "(cloud cover, temperature, humidity, wind, precipitation chance) to reduce single-source forecast bias. "
@@ -1577,7 +1570,7 @@ class SettingsDialog(QDialog):
         # WeatherAPI help text
         weatherapi_help = QLabel(
             "Get a free API key: Register at "
-            "<a href='https://www.weatherapi.com/signup.aspx' style='color: #0078d7;'>weatherapi.com/signup.aspx</a>, "
+            f"<a href='https://www.weatherapi.com/signup.aspx' style='color: {COLORS['link']};'>weatherapi.com/signup.aspx</a>, "
             "then find your key on your Account page.<br>"
             "When enabled, WeatherAPI's forecast is averaged with Open-Meteo's data "
             "(cloud cover, temperature, humidity, wind, precipitation chance) to reduce single-source forecast bias. "
@@ -1804,7 +1797,7 @@ class SettingsDialog(QDialog):
                     item = QListWidgetItem(display)
                     item.setData(Qt.UserRole, loc_id)
                     if is_active:
-                        item.setBackground(QColor(COLORS.get('accent', '#0078d7')).darker(300))
+                        item.setBackground(QColor(tint(COLORS['accent'], 0.35)))
                         active_item = item
                     self.location_list.addItem(item)
             if active_item:
@@ -3720,7 +3713,7 @@ class TelescopeDialog(QDialog):
                 if aperture > 0:
                     fratio = focal_length / aperture
                     self.fratio_display.setText(f"f/{fratio:.1f}")
-                    self.fratio_display.setStyleSheet("color: #ffffff; font-weight: bold;")
+                    self.fratio_display.setStyleSheet(f"color: {COLORS['text']}; font-weight: bold;")
                 else:
                     self.fratio_display.setText("N/A")
                     self.fratio_display.setStyleSheet(f"color: {COLORS['text_disabled']};")
@@ -3799,7 +3792,7 @@ class TelescopeDialog(QDialog):
 
                     # Highlight enabled telescope
                     if is_active:
-                        item.setBackground(QColor(0, 120, 212, 50))  # Light blue background
+                        item.setBackground(QColor(tint(COLORS['accent'], 0.25)))
 
                     self.telescope_list.addItem(item)
 
@@ -5101,7 +5094,7 @@ class AboutDialog(QDialog):
         # Title
         title_label = QLabel("Cosmos Collection")
         title_label.setAlignment(Qt.AlignCenter)
-        title_label.setStyleSheet("font-size: 18pt; font-weight: bold; color: #ffffff;")
+        title_label.setStyleSheet(f"font-size: 18pt; font-weight: bold; color: {COLORS['text']};")
         About_layout.addWidget(title_label)
 
         # Version information
@@ -5114,7 +5107,7 @@ class AboutDialog(QDialog):
         version_label = QLabel(version_text)
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setWordWrap(True)  # Allow text wrapping if needed
-        version_label.setStyleSheet("font-size: 10pt; color: #bbbbbb; margin: 5px 0px; font-family: monospace;")
+        version_label.setStyleSheet(f"font-size: 10pt; color: {COLORS['text_secondary']}; margin: 5px 0px; font-family: monospace;")
         About_layout.addWidget(version_label)
 
         # Description
@@ -5125,7 +5118,7 @@ class AboutDialog(QDialog):
         About_layout.addWidget(desc_label)
 
         # GitHub link
-        link_label = QLabel('<a href="https://github.com/quake101/CosmosCollection" style="color: #0078d7;">Visit GitHub Repository</a>')
+        link_label = QLabel(f'<a href="https://github.com/quake101/CosmosCollection" style="color: {COLORS["link"]};">Visit GitHub Repository</a>')
         link_label.setAlignment(Qt.AlignCenter)
         link_label.setOpenExternalLinks(True)
         link_label.setTextFormat(Qt.RichText)

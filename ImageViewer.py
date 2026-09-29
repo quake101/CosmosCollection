@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QScrollArea, QFileDialog, QMessageBox, QCheckBox, QProgressBar
 )
 
-from Theme import COLORS
+from Theme import COLORS, adapt_color
 from WindowPositionManager import WindowPositionManager
 from ResourceManager import ResourceManager
 from TimeFormatHelper import format_datetime
@@ -227,7 +227,7 @@ class ImageViewerWindow(QDialog):
             self.image_label.setPixmap(pixmap)
         else:
             self.image_label.setText(f"Loading {Path(file_path).name}..." if file_path else "No image")
-            self.image_label.setStyleSheet("color: #aaaaaa; font-size: 12pt;")
+            self.image_label.setStyleSheet(f"color: {adapt_color('#aaaaaa', on_dark=True)}; font-size: 12pt;")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMouseTracking(True)
         self.image_label.installEventFilter(self)
@@ -246,7 +246,7 @@ class ImageViewerWindow(QDialog):
             QGroupBox {{
                 font-weight: bold;
                 font-size: 12pt;
-                color: #e0e0e0;
+                color: {COLORS['text']};
                 background-color: {COLORS['background']};
                 border: 2px solid {COLORS['border']};
                 border-radius: 8px;
@@ -296,15 +296,15 @@ class ImageViewerWindow(QDialog):
 
         self.file_info_content = QLabel()
         # Dark mode styling for the content label
-        self.file_info_content.setStyleSheet("""
-            QLabel {
+        self.file_info_content.setStyleSheet(f"""
+            QLabel {{
                 font-size: 10pt;
-                color: #d0d0d0;
+                color: {COLORS['text_secondary']};
                 font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
                 padding: 10px;
-                background-color: #1e1e1e;
+                background-color: {COLORS['background_light']};
                 border: none;
-            }
+            }}
         """)
         self.file_info_content.setWordWrap(True)
         self.file_info_content.setAlignment(Qt.AlignTop)

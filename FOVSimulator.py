@@ -17,7 +17,7 @@ from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS
+from Theme import COLORS, contrast_text
 from UrlOpener import open_url
 from NINAIntegration import NINAIntegration
 
@@ -258,7 +258,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         # Create a placeholder widget for the web view
         self.web_placeholder = QLabel("Loading Aladin Lite...")
         self.web_placeholder.setAlignment(Qt.AlignCenter)
-        self.web_placeholder.setStyleSheet(f"QLabel {{ background-color: {COLORS['background']}; color: white; font-size: 14px; }}")
+        self.web_placeholder.setStyleSheet(f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['text']}; font-size: 14px; }}")
         self.web_placeholder.setMinimumSize(400, 300)
 
         layout.addWidget(self.web_placeholder)
@@ -397,7 +397,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
                 # Create a fallback button
                 self.fallback_button = QPushButton("Open Aladin Lite in Browser")
-                self.fallback_button.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: white; font-weight: bold; margin: 10px; padding: 8px; }}")
+                self.fallback_button.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: {contrast_text(COLORS['success'])}; font-weight: bold; margin: 10px; padding: 8px; }}")
                 self.fallback_button.clicked.connect(self._open_in_browser)
 
                 # Insert before the bottom controls (last item should be the bottom layout)

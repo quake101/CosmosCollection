@@ -660,7 +660,7 @@ try:
             DatabaseManager = None
 
     # Import Theme for colors
-    from Theme import COLORS
+    from Theme import COLORS, contrast_text
 
 except ImportError as e:
     print(f"Warning: Could not import required Qt modules: {e}")
@@ -1356,7 +1356,7 @@ class ImageSelectionDialog(QDialog):
 
         ok_btn = QPushButton("Add Selected")
         ok_btn.clicked.connect(self._accept_selection)
-        ok_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: white; }}")
+        ok_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: {contrast_text(COLORS['success'])}; }}")
         button_layout.addWidget(ok_btn)
 
         cancel_btn = QPushButton("Cancel")
@@ -1582,7 +1582,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         toolbar.addWidget(self.merge_cells_checkbox)
 
         generate_collage_btn = QPushButton("Generate Collage")
-        generate_collage_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['accent']}; color: white; font-weight: bold; }}")
+        generate_collage_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['accent']}; color: {COLORS['text_on_accent']}; font-weight: bold; }}")
         generate_collage_btn.clicked.connect(self._generate_collage)
         generate_collage_btn.setToolTip("Create and save the collage image file")
         toolbar.addWidget(generate_collage_btn)
@@ -1687,7 +1687,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
 
         # Save Project button
         save_project_btn = QPushButton("Save Project")
-        save_project_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: white; font-weight: bold; }}")
+        save_project_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: {contrast_text(COLORS['success'])}; font-weight: bold; }}")
         save_project_btn.clicked.connect(self._save_current_collage)
         save_project_btn.setToolTip("Save collage project to database")
         left_layout.addWidget(save_project_btn)
@@ -1717,13 +1717,13 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         add_images_btn = QPushButton("Add Images...")
         add_images_btn.clicked.connect(self._add_images_from_database)
         add_images_btn.setToolTip("Add images from database to this collage")
-        add_images_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: white; }}")
+        add_images_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: {contrast_text(COLORS['success'])}; }}")
         img_buttons.addWidget(add_images_btn)
 
         remove_selected_btn = QPushButton("Remove Selected")
         remove_selected_btn.clicked.connect(self._remove_selected_images)
         remove_selected_btn.setToolTip("Remove selected images from collage")
-        remove_selected_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['error']}; color: white; }}")
+        remove_selected_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['error']}; color: {contrast_text(COLORS['error'])}; }}")
         img_buttons.addWidget(remove_selected_btn)
 
         clear_all_btn = QPushButton("Clear All")
@@ -2858,7 +2858,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         """Add debug button to show all collages (temporary)"""
         debug_btn = QPushButton("Debug: Show All Collages")
         debug_btn.clicked.connect(self._debug_show_all_collages)
-        debug_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['warning']}; color: white; }}")
+        debug_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['warning']}; color: {contrast_text(COLORS['warning'])}; }}")
 
         # Find the toolbar layout and add the button
         if hasattr(self, 'layout'):
