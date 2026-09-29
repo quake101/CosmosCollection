@@ -2,6 +2,7 @@ import argparse
 import faulthandler
 import logging
 import os
+import re
 import sys
 import threading
 import urllib.request
@@ -507,6 +508,58 @@ class ParallelDataLoadManager(QObject):
         self.results = {}
 
 
+# --- Search matching helpers ---
+SEARCH_RANK_EXACT = 0
+SEARCH_RANK_PREFIX = 1
+SEARCH_RANK_SUBSTRING = 2
+
+_SEARCH_SEPARATORS_RE = re.compile(r"[\s\-_]+")
+# A separator only carries meaning between two numbers ("M 3-1" is not "M 31")
+_NON_NUMERIC_SEPARATOR_RE = re.compile(r"(?<!\d)-|-(?!\d)")
+# Queries that look like RA ("00h42m") or Dec ("41°16'", "+41") coordinates
+_COORDINATE_QUERY_RE = re.compile(r"\d\s*h|°|^[+-]\s*\d")
+
+
+def normalize_search_text(text):
+    """Normalize a designation for comparison.
+
+    "M31", "M 31" and "M-31" all become "m31"; "Sh2 129" and "sh2-129" both
+    become "sh2-129", while "M 3-1" stays distinct as "m3-1".
+    """
+    text = _SEARCH_SEPARATORS_RE.sub("-", text.strip().lower())
+    return _NON_NUMERIC_SEPARATOR_RE.sub("", text)
+
+
+def _rank_search_key(key, query_norm):
+    """Rank how well a normalized designation matches a normalized query, or None"""
+    if key == query_norm:
+        return SEARCH_RANK_EXACT
+    if key.startswith(query_norm):
+        return SEARCH_RANK_PREFIX
+    if query_norm in key:
+        return SEARCH_RANK_SUBSTRING
+    return None
+
+
+def prepare_search_query(search_text, selected_catalog=None):
+    """Precompute the query forms used by DSOTableModel._match_item, or None for no search"""
+    raw = (search_text or "").strip().lower()
+    norm = normalize_search_text(raw)
+    is_coordinate = bool(_COORDINATE_QUERY_RE.search(raw))
+    if not norm and not is_coordinate:
+        return None
+
+    catalog = selected_catalog if selected_catalog and selected_catalog != "All Catalogs" else None
+    return {
+        "raw": raw,
+        "norm": norm,
+        # With a catalog filter, "31" should match "M 31" exactly
+        "catalog_prefix": f"{catalog.lower()} " if catalog else None,
+        "catalog_norm": normalize_search_text(f"{catalog} {raw}") if catalog else None,
+        "is_coordinate": is_coordinate,
+    }
+
+
 # --- Model for displaying DSO data in table ---
 class DSOTableModel(QAbstractTableModel):
     def __init__(self, dso_data, parent=None, db_manager=None, total_count=None):
@@ -517,6 +570,7 @@ class DSOTableModel(QAbstractTableModel):
         self.selected_catalog = None
         self.highlight_no_images = False
         self._cached_formatted_data = {}  # Cache for formatted data
+        self._search_key_cache = {}  # designations string -> [(designation, normalized)]
 
         # Lazy loading support
         self.db_manager = db_manager
@@ -704,84 +758,108 @@ class DSOTableModel(QAbstractTableModel):
             self.layoutChanged.emit()
             return
 
-        if not search_text and not selected_catalog and not show_images_only and not selected_type and not show_no_images_only:
-            self.filtered_data = self.dso_data.copy()
-        else:
-            search_text = search_text.lower() if search_text else ""
-
-            # Improved search logic with priority for exact catalog matches
-            matches = []
-            for item in self.dso_data:
-                # Apply catalog and type filters
-                if selected_catalog and selected_catalog != "All Catalogs":
-                    if not any(designation.startswith(selected_catalog + " ")
-                             for designation in item["designations"].split(", ")):
-                        continue
-
-                if selected_type and selected_type != "All Types":
-                    if item.get("dso_type", "") != selected_type:
-                        continue
-
-                if show_images_only and item["image_count"] == 0:
-                    continue
-
-                if show_no_images_only and item["image_count"] > 0:
-                    continue
-
-                # Apply search text filter
-                if search_text:
-                    matched_designation = None
-
-                    # If we have a catalog filter, prioritize exact catalog+designation matches
-                    if selected_catalog and selected_catalog != "All Catalogs":
-                        # Check for exact match: catalog filter + search text = designation
-                        designations = item["designations"].split(", ")
-                        for designation in designations:
-                            if designation.lower() == f"{selected_catalog.lower()} {search_text}":
-                                matched_designation = designation
-                                break
-
-                        # Also check if the item's ID matches the search
-                        id_match = search_text in item["id"].lower()
-
-                        if matched_designation or id_match:
-                            item_copy = item.copy()
-                            if matched_designation:
-                                item_copy["matched_designation"] = matched_designation
-                            matches.append((item_copy, 0))  # Priority 0 = exact match
-                            continue
-
-                    # Otherwise do regular substring matching and find which designation matched
-                    designations = item["designations"].split(", ")
-
-                    # Check each designation for a match
-                    for designation in designations:
-                        if search_text in designation.lower():
-                            matched_designation = designation
-                            break
-
-                    # Check other fields
-                    if (search_text in item["catalogue"].lower() or
-                        search_text in item["id"].lower() or
-                        self._format_ra(item["ra_deg"]).lower() in search_text or
-                        self._format_dec(item["dec_deg"]).lower() in search_text or
-                        matched_designation):
-
-                        item_copy = item.copy()
-                        if matched_designation:
-                            item_copy["matched_designation"] = matched_designation
-                        matches.append((item_copy, 1))  # Priority 1 = substring match
-                else:
-                    matches.append((item, 1))
-
-            # Sort by priority (exact matches first) and extract items
-            matches.sort(key=lambda x: x[1])
-            self.filtered_data = [item for item, priority in matches]
+        self.filtered_data = self._build_filtered_data(
+            search_text, selected_catalog, show_images_only, selected_type, show_no_images_only
+        )
 
         # Clear the cache when data changes
         self._cached_formatted_data.clear()
 
         self.layoutChanged.emit()
+
+    def _build_filtered_data(self, search_text, selected_catalog=None, show_images_only=False,
+                             selected_type=None, show_no_images_only=False):
+        """Apply all filters to the loaded data, returning best search matches first"""
+        catalog = selected_catalog if selected_catalog and selected_catalog != "All Catalogs" else None
+        type_code = selected_type if selected_type and selected_type != "All Types" else None
+        query = prepare_search_query(search_text, catalog)
+
+        if not (query or catalog or type_code or show_images_only or show_no_images_only):
+            return self.dso_data.copy()
+
+        catalog_prefix = f"{catalog} " if catalog else None
+        matches = []
+        for item in self.dso_data:
+            if catalog_prefix and not any(designation.startswith(catalog_prefix)
+                                          for designation, _ in self._search_keys(item["designations"])):
+                continue
+
+            if type_code and item.get("dso_type", "") != type_code:
+                continue
+
+            if show_images_only and item["image_count"] == 0:
+                continue
+
+            if show_no_images_only and item["image_count"] > 0:
+                continue
+
+            if query is None:
+                matches.append((SEARCH_RANK_EXACT, item))
+                continue
+
+            match = self._match_item(item, query)
+            if match is None:
+                continue
+
+            rank, matched_designation = match
+            item_copy = item.copy()
+            item_copy["search_rank"] = rank
+            if matched_designation:
+                item_copy["matched_designation"] = matched_designation
+            matches.append((rank, item_copy))
+
+        # Stable sort keeps load order within each rank
+        if query:
+            matches.sort(key=lambda match: match[0])
+        return [item for _, item in matches]
+
+    def _search_keys(self, designations):
+        """Return [(designation, normalized designation)], cached by designations string"""
+        keys = self._search_key_cache.get(designations)
+        if keys is None:
+            keys = [(designation, normalize_search_text(designation))
+                    for designation in designations.split(", ")]
+            self._search_key_cache[designations] = keys
+        return keys
+
+    def _match_item(self, item, query):
+        """Match an item against a prepared search query.
+
+        Returns (rank, matched_designation) or None. On equal rank, a designation
+        from the selected catalog is preferred so it is the one displayed.
+        """
+        best = None  # (rank, outside_catalog, designation)
+        for designation, key in self._search_keys(item["designations"]):
+            in_catalog = bool(query["catalog_prefix"]) and designation.lower().startswith(query["catalog_prefix"])
+
+            ranks = []
+            if query["norm"]:
+                ranks.append(_rank_search_key(key, query["norm"]))
+            if in_catalog:
+                ranks.append(_rank_search_key(key, query["catalog_norm"]))
+            ranks = [rank for rank in ranks if rank is not None]
+            if not ranks:
+                continue
+
+            candidate = (min(ranks), not in_catalog, designation)
+            if best is None or candidate[:2] < best[:2]:
+                best = candidate
+
+        if best is not None:
+            return best[0], best[2]
+
+        # Coordinate search: typed fragment of an RA/Dec, or a pasted full RA/Dec string
+        if query["is_coordinate"] and item.get("ra_deg") is not None and item.get("dec_deg") is not None:
+            raw = query["raw"]
+            for formatted in (self._format_ra(item["ra_deg"]).lower(), self._format_dec(item["dec_deg"]).lower()):
+                if raw in formatted or formatted in raw:
+                    return SEARCH_RANK_SUBSTRING, None
+
+        return None
+
+    def has_exact_search_match(self):
+        """Whether the current search found an exact designation match"""
+        return any(item.get("search_rank") == SEARCH_RANK_EXACT for item in self.filtered_data)
 
     def _format_ra(self, ra_deg):
         """Convert RA in degrees to hms format"""
@@ -1017,59 +1095,23 @@ class DSOTableModel(QAbstractTableModel):
             self.dso_data.extend(new_data)
             self.endInsertRows()
 
-            # Re-apply current filters to include new data
-            # Catalog and type filters are already applied at SQL level, so we only need to filter by:
-            # - search text
-            # - show_images_only
+            # Re-apply current filters to include new data, using the same
+            # matching and ranking as filter_data
             old_filtered_len = len(self.filtered_data)
-
-            search_text = getattr(self, '_current_search', '').lower() if hasattr(self, '_current_search') else ""
-            show_images_only = getattr(self, '_current_show_images_only', False)
-            show_no_images_only = getattr(self, '_current_show_no_images_only', False)
 
             # Notify view that data is about to change
             self.layoutAboutToBeChanged.emit()
 
-            # Rebuild filtered data from all loaded data
-            if search_text or show_images_only or show_no_images_only:
-                filtered_items = []
-                for item in self.dso_data:
-                    # Apply show_images_only filter
-                    if show_images_only and item["image_count"] == 0:
-                        continue
-
-                    if show_no_images_only and item["image_count"] > 0:
-                        continue
-
-                    # Apply search text filter
-                    if search_text:
-                        matched_designation = None
-
-                        # Check each designation for a match
-                        designations = item["designations"].split(", ")
-                        for designation in designations:
-                            if search_text in designation.lower():
-                                matched_designation = designation
-                                break
-
-                        # Check if any field matches
-                        if (search_text in item["catalogue"].lower() or
-                            search_text in item["id"].lower() or
-                            matched_designation):
-
-                            item_copy = item.copy()
-                            if matched_designation:
-                                item_copy["matched_designation"] = matched_designation
-                            filtered_items.append(item_copy)
-                    else:
-                        filtered_items.append(item)
-
-                self.filtered_data = filtered_items
-                logger.debug(f"Applied search/image filters: filtered data is now {len(self.filtered_data)} items from {len(self.dso_data)} loaded")
-            else:
-                # No additional filters, so all loaded data is visible
-                self.filtered_data = self.dso_data.copy()
-                logger.debug(f"No additional filters: showing all {len(self.filtered_data)} loaded items")
+            self.filtered_data = self._build_filtered_data(
+                getattr(self, '_current_search', ''),
+                self.selected_catalog,
+                getattr(self, '_current_show_images_only', False),
+                getattr(self, '_current_selected_type', None),
+                getattr(self, '_current_show_no_images_only', False)
+            )
+            # Rows may have been re-ranked, so row-keyed cell cache is stale
+            self._cached_formatted_data.clear()
+            logger.debug(f"Re-applied filters: filtered data is now {len(self.filtered_data)} items from {len(self.dso_data)} loaded")
 
             new_filtered_len = len(self.filtered_data)
             new_matches = new_filtered_len - old_filtered_len
@@ -1095,59 +1137,23 @@ class DSOTableModel(QAbstractTableModel):
             self.dso_data.extend(new_data)
             self.endInsertRows()
 
-            # Re-apply current filters to include new data
-            # Catalog and type filters are already applied at SQL level, so we only need to filter by:
-            # - search text
-            # - show_images_only
+            # Re-apply current filters to include new data, using the same
+            # matching and ranking as filter_data
             old_filtered_len = len(self.filtered_data)
-
-            search_text = getattr(self, '_current_search', '').lower() if hasattr(self, '_current_search') else ""
-            show_images_only = getattr(self, '_current_show_images_only', False)
-            show_no_images_only = getattr(self, '_current_show_no_images_only', False)
 
             # Notify view that data is about to change
             self.layoutAboutToBeChanged.emit()
 
-            # Rebuild filtered data from all loaded data
-            if search_text or show_images_only or show_no_images_only:
-                filtered_items = []
-                for item in self.dso_data:
-                    # Apply show_images_only filter
-                    if show_images_only and item["image_count"] == 0:
-                        continue
-
-                    if show_no_images_only and item["image_count"] > 0:
-                        continue
-
-                    # Apply search text filter
-                    if search_text:
-                        matched_designation = None
-
-                        # Check each designation for a match
-                        designations = item["designations"].split(", ")
-                        for designation in designations:
-                            if search_text in designation.lower():
-                                matched_designation = designation
-                                break
-
-                        # Check if any field matches
-                        if (search_text in item["catalogue"].lower() or
-                            search_text in item["id"].lower() or
-                            matched_designation):
-
-                            item_copy = item.copy()
-                            if matched_designation:
-                                item_copy["matched_designation"] = matched_designation
-                            filtered_items.append(item_copy)
-                    else:
-                        filtered_items.append(item)
-
-                self.filtered_data = filtered_items
-                logger.debug(f"Applied search/image filters: filtered data is now {len(self.filtered_data)} items from {len(self.dso_data)} loaded")
-            else:
-                # No additional filters, so all loaded data is visible
-                self.filtered_data = self.dso_data.copy()
-                logger.debug(f"No additional filters: showing all {len(self.filtered_data)} loaded items")
+            self.filtered_data = self._build_filtered_data(
+                getattr(self, '_current_search', ''),
+                self.selected_catalog,
+                getattr(self, '_current_show_images_only', False),
+                getattr(self, '_current_selected_type', None),
+                getattr(self, '_current_show_no_images_only', False)
+            )
+            # Rows may have been re-ranked, so row-keyed cell cache is stale
+            self._cached_formatted_data.clear()
+            logger.debug(f"Re-applied filters: filtered data is now {len(self.filtered_data)} items from {len(self.dso_data)} loaded")
 
             new_filtered_len = len(self.filtered_data)
             new_matches = new_filtered_len - old_filtered_len
@@ -6001,7 +6007,12 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         search_label = QLabel("Search:")
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Enter designation, RA, or Dec")
-        self.search_input.textChanged.connect(self._on_search)
+        # Debounce so the full filter pass runs once typing pauses, not per keystroke
+        self._search_debounce_timer = QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.setInterval(200)
+        self._search_debounce_timer.timeout.connect(lambda: self._on_search(self.search_input.text()))
+        self.search_input.textChanged.connect(lambda _text: self._search_debounce_timer.start())
         search_layout.addWidget(search_label)
         search_layout.addWidget(self.search_input)
         controls_layout.addLayout(search_layout)
@@ -6531,6 +6542,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         logger.debug(f"Current data: dso_data={len(self.model.dso_data)}, filtered_data={len(self.model.filtered_data)}")
 
         # Block signals to prevent multiple filter triggers
+        self._search_debounce_timer.stop()
         self.search_input.blockSignals(True)
         self.catalog_combo.blockSignals(True)
         self.action_show_images_only.blockSignals(True)
@@ -6579,17 +6591,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
         # If searching for a specific designation with a catalog filter, keep loading until we find it or run out of data
         if text and selected_catalog and self.model.load_offset < self.model.total_count:
-            # Check if we found an exact match
-            found_exact_match = False
-            search_lower = text.lower()
-            for item in self.model.filtered_data:
-                designations = item["designations"].split(", ")
-                if any(designation.lower() == f"{selected_catalog.lower()} {search_lower}" for designation in designations):
-                    found_exact_match = True
-                    break
-
             # If no exact match and more data available, trigger loading
-            if not found_exact_match:
+            if not self.model.has_exact_search_match():
                 logger.debug(f"No exact match for {selected_catalog} {text} yet, continuing to load data...")
                 self._check_filter_needs_more_data()
         else:
@@ -6752,15 +6755,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             return
 
         # Check if we found the object
-        found_exact_match = False
-        search_lower = search_text.lower()
-        for item in self.model.filtered_data:
-            designations = item["designations"].split(", ")
-            if any(designation.lower() == f"{catalog.lower()} {search_lower}" for designation in designations):
-                found_exact_match = True
-                logger.debug(f"Found exact match for {catalog} {search_text}!")
-                self._active_catalog_search = None
-                break
+        found_exact_match = self.model.has_exact_search_match()
+        if found_exact_match:
+            logger.debug(f"Found exact match for {catalog} {search_text}!")
 
         # If found or no more data, stop
         if found_exact_match or self.model.load_offset >= self.model.total_count:
@@ -6790,13 +6787,10 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             return False
 
         # Check if we found it
-        search_lower = search_text.lower()
-        for item in self.model.filtered_data:
-            designations = item["designations"].split(", ")
-            if any(designation.lower() == f"{catalog.lower()} {search_lower}" for designation in designations):
-                logger.debug(f"Found exact match for {catalog} {search_text}!")
-                self._active_catalog_search = None
-                return False
+        if self.model.has_exact_search_match():
+            logger.debug(f"Found exact match for {catalog} {search_text}!")
+            self._active_catalog_search = None
+            return False
 
         # Still need more data
         return self.model.load_offset < self.model.total_count
