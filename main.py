@@ -3,6 +3,7 @@ import faulthandler
 import logging
 import os
 import re
+import sqlite3
 import sys
 import threading
 import urllib.request
@@ -68,7 +69,7 @@ os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
 )
 
 # Core PySide6 imports (always needed)
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings, Slot
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings, Slot, QCoreApplication
 from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
@@ -107,8 +108,9 @@ except ImportError as e:
 # - astroplan/astropy (only loaded when visibility calculations are needed)
 # - DSOVisibilityApp (only loaded when visibility calculator is used)
 
-# Set up logging
-logging.basicConfig(level=logging.DEBUG)
+# Set up logging: DEBUG when running from source; packaged builds log INFO unless
+# the "Enable log file" setting raises it to DEBUG (see the entry point below)
+logging.basicConfig(level=logging.INFO if getattr(sys, 'frozen', False) else logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Get the application directory
@@ -141,371 +143,130 @@ except ImportError:
     logging.warning("DSOVisibilityCalculator.py not found. Visibility calculator will be disabled.")
 
 
-# --- Initial Startup Data Loader Thread ---
+# --- DSO data loading ---
+# One row per catalogued object. Designations and the first user image come from
+# subqueries rather than joins, so an object with several images doesn't repeat
+# every designation once per image.
+DSO_QUERY = """
+    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
+           CAST(d.sizemin/60.0 AS REAL) as sizemin,
+           CAST(d.sizemax/60.0 AS REAL) as sizemax,
+           d.constellation, d.dsotype, d.dsoclass,
+           (SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
+                       CASE c.catalogue
+                           WHEN 'M' THEN 1
+                           WHEN 'NGC' THEN 2
+                           WHEN 'IC' THEN 3
+                           ELSE 4
+                       END, c.designation)
+            FROM cataloguenr c
+            WHERE c.dsodetailid = d.id) as designations,
+           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+           COALESCE(img.image_count, 0) as image_count
+    FROM dsodetail d
+    LEFT JOIN (SELECT dsodetailid, MIN(id) AS first_id, COUNT(*) AS image_count
+               FROM userimages
+               GROUP BY dsodetailid) img ON img.dsodetailid = d.id
+    LEFT JOIN userimages ui ON ui.id = img.first_id
+    WHERE EXISTS (SELECT 1 FROM cataloguenr c WHERE c.dsodetailid = d.id)
+"""
+
+
+def format_ra(ra_deg):
+    """Convert RA in degrees to hms format"""
+    if ra_deg is None:
+        return ""
+    ra_hours = ra_deg / 15.0
+    ra_h = int(ra_hours)
+    ra_remaining = (ra_hours - ra_h) * 60
+    ra_m = int(ra_remaining)
+    ra_s = (ra_remaining - ra_m) * 60
+    return f"{ra_h:02d}h{ra_m:02d}m{ra_s:05.2f}s"
+
+
+def format_dec(dec_deg):
+    """Convert Dec in degrees to dms format"""
+    if dec_deg is None:
+        return ""
+    dec_sign = '-' if dec_deg < 0 else '+'
+    dec_abs = abs(dec_deg)
+    dec_d = int(dec_abs)
+    dec_remaining = (dec_abs - dec_d) * 60
+    dec_m = int(dec_remaining)
+    dec_s = (dec_remaining - dec_m) * 60
+    return f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
+
+
+def dso_row_to_dict(row):
+    """Convert a DSO_QUERY row into the dict used by the table model and detail window"""
+    obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
+        constellation, dso_type, dso_class, designations, image_path, integration_time, \
+        equipment, date_taken, notes, image_count = row
+
+    designations = designations or ""
+    # Primary designation, e.g. "M 31"; a few objects have no number ("Coalsack")
+    catalogue, _, designation = designations.split(", ")[0].strip().partition(" ")
+
+    return {
+        "dsodetailid": obj_id,
+        "id": designation,
+        "ra_deg": ra,
+        "dec_deg": dec,
+        "catalogue": catalogue,
+        "name": f"{catalogue} {designation}",
+        "magnitude": magnitude,
+        "surface_brightness": surface_brightness,
+        "size_min": float(size_min) if size_min is not None else 0.0,
+        "size_max": float(size_max) if size_max is not None else 0.0,
+        "constellation": constellation,
+        "dso_type": dso_type,
+        "dso_class": dso_class,
+        "designations": designations,
+        "image_path": image_path,
+        "integration_time": integration_time,
+        "equipment": equipment,
+        "date_taken": date_taken,
+        "notes": notes,
+        "image_count": image_count
+    }
+
+
+def load_all_dso_data(conn):
+    """Load every catalogued DSO in a single query. Returns (dso_data, catalogs)."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT catalogue FROM cataloguenr ORDER BY catalogue")
+    catalogs = [row[0] for row in cursor.fetchall()]
+    cursor.execute(DSO_QUERY)
+    return [dso_row_to_dict(row) for row in cursor.fetchall()], catalogs
+
+
+# --- Startup Data Loader Thread ---
 class InitialDataLoadWorker(QThread):
-    """Worker thread for loading initial DSO data on startup without blocking UI"""
-    data_loaded = Signal(list, list, int)  # dso_data, catalogs, total_count
+    """Loads the whole DSO catalog on startup without blocking the UI.
+
+    A single query takes well under a second for the full catalog, so everything
+    is loaded up front and filtering/sorting happen in memory."""
+    data_loaded = Signal(list, list)  # dso_data, catalogs
     load_failed = Signal(str)  # error message
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-
     def run(self):
-        """Load initial data batch in background thread"""
+        conn = None
         try:
             import sqlite3
-            from ResourceManager import ResourceManager
-
-            db_path = ResourceManager.get_database_path()
-            conn = sqlite3.connect(str(db_path))
-            conn.row_factory = sqlite3.Row
             from ResourceManager import attach_update_catalogs
+
+            conn = sqlite3.connect(str(ResourceManager.get_database_path()))
             attach_update_catalogs(conn)
-            cursor = conn.cursor()
-
-            # Get list of available catalogs
-            cursor.execute("""
-                SELECT DISTINCT catalogue
-                FROM cataloguenr
-                ORDER BY catalogue
-            """)
-            catalogs = [row[0] for row in cursor.fetchall()]
-
-            # Get total count for progress indication
-            cursor.execute("SELECT COUNT(DISTINCT d.id) FROM dsodetail d JOIN cataloguenr c ON d.id = c.dsodetailid")
-            total_count = cursor.fetchone()[0]
-            logger.debug(f"Total DSO count: {total_count}")
-
-            # Load initial batch of objects (first 2000 for faster startup)
-            cursor.execute("""
-                SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
-                       CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                       CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                       d.constellation, d.dsotype, d.dsoclass,
-                       GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ') as designations,
-                       ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
-                       (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-                FROM dsodetail d
-                JOIN cataloguenr c ON d.id = c.dsodetailid
-                LEFT JOIN userimages ui ON d.id = ui.dsodetailid
-                GROUP BY d.id
-                ORDER BY c.catalogue, CAST(c.designation AS INTEGER)
-                LIMIT 2000
-            """)
-
-            dso_data = []
-            for row in cursor.fetchall():
-                obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
-                    constellation, dso_type, dso_class, designations, image_path, integration_time, \
-                    equipment, date_taken, notes, image_count = row
-
-                # Get the primary designation
-                primary_designation = designations.split(',')[0]
-                catalogue, designation = primary_designation.split(' ', 1)
-
-                # Handle size values
-                size_min_arcmin = float(size_min) if size_min is not None else 0.0
-                size_max_arcmin = float(size_max) if size_max is not None else 0.0
-
-                dso_data.append({
-                    "id": designation,
-                    "ra_deg": ra,
-                    "dec_deg": dec,
-                    "catalogue": catalogue,
-                    "name": f"{catalogue} {designation}",
-                    "magnitude": magnitude,
-                    "surface_brightness": surface_brightness,
-                    "size_min": size_min_arcmin,
-                    "size_max": size_max_arcmin,
-                    "constellation": constellation,
-                    "dso_type": dso_type,
-                    "dso_class": dso_class,
-                    "designations": designations,
-                    "image_path": image_path,
-                    "integration_time": integration_time,
-                    "equipment": equipment,
-                    "date_taken": date_taken,
-                    "notes": notes,
-                    "image_count": image_count
-                })
-
-            logger.debug(f"Loaded initial batch: {len(dso_data)} of {total_count} DSOs in background thread")
-
-            conn.close()
-
-            # Emit the loaded data
-            self.data_loaded.emit(dso_data, catalogs, total_count)
+            dso_data, catalogs = load_all_dso_data(conn)
+            logger.debug(f"Loaded {len(dso_data)} DSOs in background thread")
+            self.data_loaded.emit(dso_data, catalogs)
 
         except Exception as e:
             logger.error(f"Error loading initial data in background: {e}", exc_info=True)
             self.load_failed.emit(str(e))
-
-
-# --- Lazy Loading Worker Thread ---
-class DataLoadWorker(QThread):
-    """Worker thread for loading additional DSO data in background"""
-    data_loaded = Signal(list)  # Signal with new data batch
-    progress_updated = Signal(int, int)  # loaded count, total count
-
-    def __init__(self, offset, limit, catalog_filter=None, type_filter=None, parent=None):
-        super().__init__(parent)
-        self.offset = offset
-        self.limit = limit
-        self.catalog_filter = catalog_filter
-        self.type_filter = type_filter
-
-    def run(self):
-        """Load data batch in background thread"""
-        try:
-            # Create a direct SQLite connection for this thread (avoiding singleton DatabaseManager)
-            import sqlite3
-            from ResourceManager import ResourceManager
-
-            # Use the same database path logic as DatabaseManager
-            # ResourceManager is a global instance, not a class
-            db_path = ResourceManager.get_database_path()
-
-            conn = sqlite3.connect(str(db_path))
-            conn.row_factory = sqlite3.Row
-            from ResourceManager import attach_update_catalogs
-            attach_update_catalogs(conn)
-            cursor = conn.cursor()
-
-            # Build query with optional catalog and type filters
-            if self.catalog_filter:
-                # When catalog filter is active, filter DSOs that have that catalog
-                # Special handling for Messier catalog - only numeric designations (M 1 - M 110)
-                if self.catalog_filter == 'M':
-                    query = """
-                        SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
-                               CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                               CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                               d.constellation, d.dsotype, d.dsoclass,
-                               GROUP_CONCAT(c2.catalogue || ' ' || c2.designation, ', ' ORDER BY
-                                   CASE c2.catalogue
-                                       WHEN 'M' THEN 1
-                                       WHEN 'NGC' THEN 2
-                                       WHEN 'IC' THEN 3
-                                       ELSE 4
-                                   END, c2.designation) as designations,
-                               ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
-                               (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-                        FROM dsodetail d
-                        JOIN cataloguenr c ON d.id = c.dsodetailid
-                            AND c.catalogue = ?
-                            AND c.designation NOT LIKE '%-%'
-                            AND c.designation NOT LIKE '% %'
-                            AND LENGTH(TRIM(c.designation)) <= 3
-                            AND CAST(c.designation AS INTEGER) > 0
-                            AND CAST(c.designation AS INTEGER) <= 110
-                        JOIN cataloguenr c2 ON d.id = c2.dsodetailid
-                        LEFT JOIN userimages ui ON d.id = ui.dsodetailid
-                    """
-                else:
-                    query = """
-                        SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
-                               CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                               CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                               d.constellation, d.dsotype, d.dsoclass,
-                               GROUP_CONCAT(c2.catalogue || ' ' || c2.designation, ', ' ORDER BY
-                                   CASE c2.catalogue
-                                       WHEN 'M' THEN 1
-                                       WHEN 'NGC' THEN 2
-                                       WHEN 'IC' THEN 3
-                                       ELSE 4
-                                   END, c2.designation) as designations,
-                               ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
-                               (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-                        FROM dsodetail d
-                        JOIN cataloguenr c ON d.id = c.dsodetailid AND c.catalogue = ?
-                        JOIN cataloguenr c2 ON d.id = c2.dsodetailid
-                        LEFT JOIN userimages ui ON d.id = ui.dsodetailid
-                    """
-                params = [self.catalog_filter]
-
-                if self.type_filter:
-                    query += " WHERE d.dsotype = ?"
-                    params.append(self.type_filter)
-
-            else:
-                # No catalog filter - get all objects
-                query = """
-                    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
-                           CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                           CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                           d.constellation, d.dsotype, d.dsoclass,
-                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-                               CASE c.catalogue
-                                   WHEN 'M' THEN 1
-                                   WHEN 'NGC' THEN 2
-                                   WHEN 'IC' THEN 3
-                                   ELSE 4
-                               END, c.designation) as designations,
-                           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
-                           (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-                    FROM dsodetail d
-                    JOIN cataloguenr c ON d.id = c.dsodetailid
-                    LEFT JOIN userimages ui ON d.id = ui.dsodetailid
-                """
-                params = []
-
-                if self.type_filter:
-                    query += " WHERE d.dsotype = ?"
-                    params.append(self.type_filter)
-
-            query += """
-                    GROUP BY d.id
-                    ORDER BY c.catalogue, CAST(c.designation AS INTEGER)
-                    LIMIT ? OFFSET ?
-            """
-
-            params.extend([self.limit, self.offset])
-
-            # Debug: log query and params when catalog filter is active
-            if self.catalog_filter:
-                logger.debug(f"SQL Query with catalog_filter='{self.catalog_filter}'")
-                logger.debug(f"Params: {params}")
-
-            cursor.execute(query, params)
-
-            dso_data = []
-            for row in cursor.fetchall():
-                obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
-                    constellation, dso_type, dso_class, designations, image_path, integration_time, \
-                    equipment, date_taken, notes, image_count = row
-
-                # Get the primary designation
-                primary_designation = designations.split(',')[0].strip()
-
-                # Handle cases where designation might not have a space
-                if ' ' in primary_designation:
-                    catalogue, designation = primary_designation.split(' ', 1)
-                else:
-                    # No space in designation, use entire string as catalogue
-                    catalogue = primary_designation
-                    designation = ""
-
-                # Debug: log first few entries when catalog filter is active
-                if self.catalog_filter and len(dso_data) < 5:
-                    logger.debug(f"Loaded DSO: {primary_designation} (all: {designations})")
-
-                # Handle size values
-                size_min_arcmin = float(size_min) if size_min is not None else 0.0
-                size_max_arcmin = float(size_max) if size_max is not None else 0.0
-
-                dso_data.append({
-                    "id": designation,
-                    "ra_deg": ra,
-                    "dec_deg": dec,
-                    "catalogue": catalogue,
-                    "name": f"{catalogue} {designation}",
-                    "magnitude": magnitude,
-                    "surface_brightness": surface_brightness,
-                    "size_min": size_min_arcmin,
-                    "size_max": size_max_arcmin,
-                    "constellation": constellation,
-                    "dso_type": dso_type,
-                    "dso_class": dso_class,
-                    "designations": designations,
-                    "image_path": image_path,
-                    "integration_time": integration_time,
-                    "equipment": equipment,
-                    "date_taken": date_taken,
-                    "notes": notes,
-                    "image_count": image_count
-                })
-
-            self.data_loaded.emit(dso_data)
-            logger.debug(f"Loaded {len(dso_data)} DSOs from offset {self.offset}")
-
-            # Clean up the direct connection
-            conn.close()
-
-        except Exception as e:
-            logger.error(f"Error loading data batch: {e}")
-            # Clean up on error too
-            try:
+        finally:
+            if conn is not None:
                 conn.close()
-            except:
-                pass
-
-
-# --- Parallel Loading Manager ---
-class ParallelDataLoadManager(QObject):
-    """Manages multiple DataLoadWorker threads for parallel data loading"""
-    all_data_loaded = Signal(list)  # Signal with all combined data
-    progress_updated = Signal(int, int)  # loaded count, total count
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.workers = []
-        self.results = {}  # Dictionary to store results by offset
-        self.expected_batches = 0
-        self.completed_batches = 0
-        self.total_records = 0
-
-    def load_batches_parallel(self, start_offset, total_to_load, batch_size, max_threads, catalog_filter=None, type_filter=None):
-        """Load multiple batches in parallel using worker threads"""
-        # Calculate how many batches we need
-        num_batches = (total_to_load + batch_size - 1) // batch_size  # Ceiling division
-        num_batches = min(num_batches, max_threads)  # Don't create more threads than needed
-
-        self.expected_batches = num_batches
-        self.completed_batches = 0
-        self.results = {}
-        self.workers = []
-        self.total_records = 0
-
-        logger.debug(f"Starting parallel load: {num_batches} batches, {max_threads} max threads, offset={start_offset}, total_to_load={total_to_load}")
-
-        # Create and start worker threads for each batch
-        for i in range(num_batches):
-            offset = start_offset + (i * batch_size)
-            # Last batch might be smaller
-            limit = min(batch_size, total_to_load - (i * batch_size))
-
-            if limit <= 0:
-                break
-
-            worker = DataLoadWorker(offset, limit, catalog_filter, type_filter)
-            worker.data_loaded.connect(lambda data, offset=offset: self._on_batch_loaded(data, offset))
-            self.workers.append(worker)
-            worker.start()
-
-    def _on_batch_loaded(self, data, offset):
-        """Handle a batch being loaded"""
-        self.results[offset] = data
-        self.completed_batches += 1
-        self.total_records += len(data)
-
-        logger.debug(f"Batch loaded: offset={offset}, records={len(data)}, completed={self.completed_batches}/{self.expected_batches}")
-
-        # Emit progress
-        self.progress_updated.emit(self.total_records, self.expected_batches)
-
-        # Check if all batches are complete
-        if self.completed_batches >= self.expected_batches:
-            self._combine_and_emit_results()
-
-    def _combine_and_emit_results(self):
-        """Combine all batch results in order and emit"""
-        # Sort by offset to maintain correct order
-        sorted_offsets = sorted(self.results.keys())
-        combined_data = []
-
-        for offset in sorted_offsets:
-            combined_data.extend(self.results[offset])
-
-        logger.debug(f"All batches loaded: {len(combined_data)} total records from {self.expected_batches} batches")
-        self.all_data_loaded.emit(combined_data)
-
-        # Clean up workers
-        for worker in self.workers:
-            if worker.isRunning():
-                worker.quit()
-                worker.wait()
-        self.workers = []
-        self.results = {}
 
 
 # --- Search matching helpers ---
@@ -560,32 +321,46 @@ def prepare_search_query(search_text, selected_catalog=None):
     }
 
 
+def designation_in_catalog(designation, catalog):
+    """Whether a "CATALOG DESIGNATION" string belongs to catalog.
+
+    The M catalogue entries also hold Minkowski planetaries ("M 1-65"), so only
+    M 1 - M 110 count as Messier objects."""
+    if not designation.startswith(catalog + " "):
+        return False
+    if catalog == "M":
+        number = designation[2:].strip()
+        return number.isdecimal() and 1 <= int(number) <= 110
+    return True
+
+
+_NATURAL_SPLIT_RE = re.compile(r"(\d+)")
+
+
+def _natural_key(text):
+    """Sort key that orders embedded numbers numerically ("M 2" before "M 10")"""
+    return tuple((0, int(part)) if part.isdecimal() else (1, part.lower())
+                 for part in _NATURAL_SPLIT_RE.split(text or "") if part)
+
+
 # --- Model for displaying DSO data in table ---
 class DSOTableModel(QAbstractTableModel):
-    def __init__(self, dso_data, parent=None, db_manager=None, total_count=None):
+    def __init__(self, dso_data, parent=None):
         super().__init__(parent)
         self.dso_data = dso_data
-        self.filtered_data = dso_data.copy()  # For filtering
+        self.filtered_data = list(dso_data)
         self.headers = ["Catalog", "Designation", "RA (hms)", "Dec (dms)", "Images"]
         self.selected_catalog = None
         self.highlight_no_images = False
-        self._cached_formatted_data = {}  # Cache for formatted data
+        # (search text, catalog, images only, type code, no images only)
+        self._filters = ("", None, False, None, False)
+        self._sort_column = None
+        self._sort_order = Qt.AscendingOrder
+        self._cached_formatted_data = {}  # (row, col) -> display text
         self._search_key_cache = {}  # designations string -> [(designation, normalized)]
-
-        # Lazy loading support
-        self.db_manager = db_manager
-        self.total_count = total_count or len(dso_data)
-        self.load_offset = len(dso_data)
-        self.loading = False
-        self.load_worker = None
-        self.load_batch_size = 2000
-        self.startup_mode = True  # Prevent sort-triggered loading during startup
-
-        # Parallel loading support
-        self.parallel_loader = ParallelDataLoadManager(self)
-        self.parallel_loader.all_data_loaded.connect(self._on_parallel_data_loaded)
-        self.max_threads = self._get_max_threads()
-        logger.debug(f"DSOTableModel initialized with max_threads={self.max_threads}")
+        self._brush_no_images = QBrush(QColor(233, 94, 70, 128))
+        self._brush_odd_row = QBrush(QColor(61, 61, 61))
+        self._brush_even_row = QBrush(QColor(45, 45, 45))
 
     def rowCount(self, index=QModelIndex()):
         return len(self.filtered_data)
@@ -597,55 +372,44 @@ class DSOTableModel(QAbstractTableModel):
         if not index.isValid():
             return None
         row = index.row()
-        col = index.column()
-
         entry = self.filtered_data[row]
 
         if role == Qt.ItemDataRole.BackgroundRole:
             if self.highlight_no_images and entry["image_count"] == 0:
-                return QBrush(QColor(233, 94, 70, 128))
-            elif row % 2 == 1:
-                return QBrush(QColor(61, 61, 61))
-            return QBrush(QColor(45, 45, 45))
+                return self._brush_no_images
+            return self._brush_odd_row if row % 2 == 1 else self._brush_even_row
         elif role == Qt.ItemDataRole.DisplayRole:
-            cache_key = f"{row}_{col}"
-            if cache_key in self._cached_formatted_data:
-                return self._cached_formatted_data[cache_key]
-
-            result = self._format_cell_data(entry, col)
-            self._cached_formatted_data[cache_key] = result
+            cache_key = (row, index.column())
+            result = self._cached_formatted_data.get(cache_key)
+            if result is None:
+                result = self._format_cell_data(entry, index.column())
+                self._cached_formatted_data[cache_key] = result
             return result
         return None
 
-    def _format_cell_data(self, entry, col):
-        """Format cell data with caching"""
-        # Check if we have a matched designation from search
+    def _display_designation(self, entry):
+        """(catalog, designation) shown for an entry: the search match if any, else
+        its designation in the selected catalog, else its primary designation"""
         matched_designation = entry.get("matched_designation")
+        if matched_designation:
+            catalog, sep, designation = matched_designation.partition(" ")
+            return catalog, designation if sep else matched_designation
 
-        if col == 0:
-            # Show catalog from matched designation if available
-            if matched_designation:
-                parts = matched_designation.split(" ", 1)
-                return parts[0] if parts else entry["catalogue"]
-            elif self.selected_catalog and self.selected_catalog != "All Catalogs":
-                return self.selected_catalog
-            return entry["catalogue"]
-        elif col == 1:
-            # Show designation from matched designation if available
-            if matched_designation:
-                parts = matched_designation.split(" ", 1)
-                return parts[1] if len(parts) > 1 else matched_designation
+        if self.selected_catalog:
+            for designation, _ in self._search_keys(entry["designations"]):
+                if designation_in_catalog(designation, self.selected_catalog):
+                    return self.selected_catalog, designation.split(" ", 1)[1]
+            return self.selected_catalog, entry["id"]
+        return entry["catalogue"], entry["id"]
 
-            designations = entry["designations"].split(", ")
-            if self.selected_catalog and self.selected_catalog != "All Catalogs":
-                for designation in designations:
-                    if designation.startswith(self.selected_catalog + " "):
-                        return designation.split(" ", 1)[1]
-            return entry["id"]
+    def _format_cell_data(self, entry, col):
+        """Format cell data for display"""
+        if col in (0, 1):
+            return self._display_designation(entry)[col]
         elif col == 2:
-            return self._format_ra(entry["ra_deg"])
+            return format_ra(entry["ra_deg"])
         elif col == 3:
-            return self._format_dec(entry["dec_deg"])
+            return format_dec(entry["dec_deg"])
         elif col == 4:
             return str(entry["image_count"])
         return None
@@ -655,121 +419,81 @@ class DSOTableModel(QAbstractTableModel):
             return None
         return self.headers[index]
 
-    def sort(self, column, order):
-        """Sort the data by the specified column"""
-        logger.debug(f"Sort requested: column={column}, order={order}, loaded={len(self.dso_data)}, offset={self.load_offset}, total={self.total_count}, startup_mode={getattr(self, 'startup_mode', False)}")
+    def sort(self, column, order=Qt.AscendingOrder):
+        """Sort the filtered rows by the specified column, keeping selections on the same objects"""
+        self._sort_column = column
+        self._sort_order = order
 
-        # During startup, only sort loaded data to maintain lazy loading performance
-        if getattr(self, 'startup_mode', False):
-            logger.debug("Startup mode: sorting only currently loaded data")
-            # Continue with normal sort of loaded data
-        # Check if we need to load all data for proper sorting (only after startup)
-        elif self.load_offset < self.total_count:
-            logger.debug(f"Sorting requested with partial data ({len(self.dso_data)}/{self.total_count}). Loading all data first...")
-            self._load_all_data_for_sort(column, order)
-            return
-
-        logger.debug(f"All data loaded, proceeding with sort on {len(self.filtered_data)} items")
         self.layoutAboutToBeChanged.emit()
+        old_indexes = self.persistentIndexList()
+        old_ids = [self.filtered_data[index.row()]["dsodetailid"] for index in old_indexes]
 
-        # Get the sort key function based on the column
-        if column == 0:  # Catalog
-            key_func = lambda x: x["catalogue"]
-        elif column == 1:  # Designation
-            key_func = lambda x: x["id"]
-        elif column == 2:  # RA
-            key_func = lambda x: x["ra_deg"]
-        elif column == 3:  # Dec
-            key_func = lambda x: x["dec_deg"]
-        elif column == 4:  # Images
-            key_func = lambda x: x["image_count"]
-        else:
-            return
-
-        # Sort the data
-        self.filtered_data.sort(key=key_func, reverse=(order == Qt.DescendingOrder))
-
-        # Clear the cache when data changes
+        self._sort_filtered_data()
         self._cached_formatted_data.clear()
 
+        new_rows = {entry["dsodetailid"]: row for row, entry in enumerate(self.filtered_data)}
+        self.changePersistentIndexList(
+            old_indexes,
+            [self.index(new_rows[dso_id], index.column()) for dso_id, index in zip(old_ids, old_indexes)]
+        )
         self.layoutChanged.emit()
-        logger.debug(f"Sorted {len(self.filtered_data)} items by column {column}")
 
-    def _load_all_data_for_sort(self, column, order):
-        """Load all remaining data before sorting"""
-        if self.loading:
-            logger.debug("Already loading data, sort will be applied when complete")
-            # Store the sort request to apply after loading
-            self._pending_sort = (column, order)
-            return
+    def _sort_filtered_data(self):
+        """Apply the current column sort to filtered_data, best search matches first"""
+        column = self._sort_column
+        if column in (0, 1):
+            # Sort on what's displayed, so a catalog filter sorts by that catalog's numbers
+            def key(entry):
+                catalog, designation = self._display_designation(entry)
+                keys = (_natural_key(catalog), _natural_key(designation))
+                return keys if column == 0 else keys[::-1]
+        elif column in (2, 3):
+            field = "ra_deg" if column == 2 else "dec_deg"
 
-        # Prevent recursive calls by checking if we already have a pending sort
-        if hasattr(self, '_pending_sort') and self._pending_sort:
-            logger.debug(f"Sort already pending: {self._pending_sort}, ignoring new request")
-            return
-
-        logger.debug(f"Loading all remaining data for sort by column {column}")
-        self._pending_sort = (column, order)
-
-        # Load remaining data in larger batches for faster completion
-        remaining = self.total_count - self.load_offset
-        if remaining > 0:
-            # Temporarily increase batch size for faster loading
-            old_batch_size = self.load_batch_size
-            self.load_batch_size = min(remaining, 5000)  # Load up to 5000 at a time
-            logger.debug(f"Starting to load {remaining} remaining items for sort")
-            self.load_more_data()
-            self.load_batch_size = old_batch_size
+            def key(entry):
+                value = entry[field]
+                return value if value is not None else float("-inf")
+        elif column == 4:
+            def key(entry):
+                return entry["image_count"]
         else:
-            logger.debug("No remaining data to load, applying sort immediately")
-            self._apply_pending_sort()
+            key = None
 
-    def _apply_pending_sort(self):
-        """Apply any pending sort after data loading completes"""
-        if hasattr(self, '_pending_sort') and self._pending_sort:
-            column, order = self._pending_sort
-            self._pending_sort = None
-            logger.debug(f"Applying pending sort by column {column}")
-            self.sort(column, order)
+        if key is not None:
+            self.filtered_data.sort(key=key, reverse=(self._sort_order == Qt.DescendingOrder))
+
+        # Stable sort keeps the column order within each search rank
+        if self._filters[0].strip():
+            self.filtered_data.sort(key=lambda entry: entry.get("search_rank", SEARCH_RANK_EXACT))
 
     def filter_data(self, search_text, selected_catalog=None, show_images_only=False, selected_type=None, show_no_images_only=False):
         """Filter the data based on search text, catalog, image presence, and DSO type"""
-        self.layoutAboutToBeChanged.emit()
+        catalog = selected_catalog if selected_catalog and selected_catalog != "All Catalogs" else None
+        self.selected_catalog = catalog
+        self._filters = (search_text or "", catalog, show_images_only, selected_type, show_no_images_only)
+        self._apply_filters()
 
-        # Check if catalog or type filter changed - if so, reset lazy loading
-        catalog_changed = self.selected_catalog != selected_catalog
-        type_changed = getattr(self, '_current_selected_type', None) != selected_type
+    def set_data(self, dso_data):
+        """Replace all rows, e.g. after objects were added to the database"""
+        self.dso_data = dso_data
+        self._apply_filters()
 
-        # Store the selected catalog for use in data() method
-        self.selected_catalog = selected_catalog
-        # Track current search for lazy loading
-        self._current_search = search_text or ''
-        self._current_show_images_only = show_images_only
-        self._current_show_no_images_only = show_no_images_only
-        self._current_selected_type = selected_type
+    def refresh_image_counts(self, counts):
+        """Update image counts from {str(dsodetailid): count} and re-apply filters"""
+        for entry in self.dso_data:
+            entry["image_count"] = counts.get(str(entry["dsodetailid"]), 0)
+        self._apply_filters()
 
-        if catalog_changed or type_changed:
-            # Reset lazy loading state for new filter
-            self._reset_lazy_loading_for_filter(selected_catalog, selected_type)
-            # Trigger immediate load of data for the new filter
-            self.load_more_data()
-            # Data will be empty until load completes, so set filtered_data to empty
-            self.filtered_data = []
-            self.layoutChanged.emit()
-            return
-
-        self.filtered_data = self._build_filtered_data(
-            search_text, selected_catalog, show_images_only, selected_type, show_no_images_only
-        )
-
-        # Clear the cache when data changes
+    def _apply_filters(self):
+        self.beginResetModel()
+        self.filtered_data = self._build_filtered_data(*self._filters)
+        self._sort_filtered_data()
         self._cached_formatted_data.clear()
-
-        self.layoutChanged.emit()
+        self.endResetModel()
 
     def _build_filtered_data(self, search_text, selected_catalog=None, show_images_only=False,
                              selected_type=None, show_no_images_only=False):
-        """Apply all filters to the loaded data, returning best search matches first"""
+        """Apply all filters to the data, tagging search matches with their rank"""
         catalog = selected_catalog if selected_catalog and selected_catalog != "All Catalogs" else None
         type_code = selected_type if selected_type and selected_type != "All Types" else None
         query = prepare_search_query(search_text, catalog)
@@ -777,11 +501,10 @@ class DSOTableModel(QAbstractTableModel):
         if not (query or catalog or type_code or show_images_only or show_no_images_only):
             return self.dso_data.copy()
 
-        catalog_prefix = f"{catalog} " if catalog else None
         matches = []
         for item in self.dso_data:
-            if catalog_prefix and not any(designation.startswith(catalog_prefix)
-                                          for designation, _ in self._search_keys(item["designations"])):
+            if catalog and not any(designation_in_catalog(designation, catalog)
+                                   for designation, _ in self._search_keys(item["designations"])):
                 continue
 
             if type_code and item.get("dso_type", "") != type_code:
@@ -794,7 +517,7 @@ class DSOTableModel(QAbstractTableModel):
                 continue
 
             if query is None:
-                matches.append((SEARCH_RANK_EXACT, item))
+                matches.append(item)
                 continue
 
             match = self._match_item(item, query)
@@ -806,12 +529,9 @@ class DSOTableModel(QAbstractTableModel):
             item_copy["search_rank"] = rank
             if matched_designation:
                 item_copy["matched_designation"] = matched_designation
-            matches.append((rank, item_copy))
+            matches.append(item_copy)
 
-        # Stable sort keeps load order within each rank
-        if query:
-            matches.sort(key=lambda match: match[0])
-        return [item for _, item in matches]
+        return matches
 
     def _search_keys(self, designations):
         """Return [(designation, normalized designation)], cached by designations string"""
@@ -851,7 +571,7 @@ class DSOTableModel(QAbstractTableModel):
         # Coordinate search: typed fragment of an RA/Dec, or a pasted full RA/Dec string
         if query["is_coordinate"] and item.get("ra_deg") is not None and item.get("dec_deg") is not None:
             raw = query["raw"]
-            for formatted in (self._format_ra(item["ra_deg"]).lower(), self._format_dec(item["dec_deg"]).lower()):
+            for formatted in (format_ra(item["ra_deg"]).lower(), format_dec(item["dec_deg"]).lower()):
                 if raw in formatted or formatted in raw:
                     return SEARCH_RANK_SUBSTRING, None
 
@@ -861,370 +581,12 @@ class DSOTableModel(QAbstractTableModel):
         """Whether the current search found an exact designation match"""
         return any(item.get("search_rank") == SEARCH_RANK_EXACT for item in self.filtered_data)
 
-    def _format_ra(self, ra_deg):
-        """Convert RA in degrees to hms format"""
-        ra_hours = ra_deg / 15.0
-        ra_h = int(ra_hours)
-        ra_remaining = (ra_hours - ra_h) * 60
-        ra_m = int(ra_remaining)
-        ra_s = (ra_remaining - ra_m) * 60
-        return f"{ra_h:02d}h{ra_m:02d}m{ra_s:05.2f}s"
-
-    def _format_dec(self, dec_deg):
-        """Convert Dec in degrees to dms format"""
-        dec_sign = '-' if dec_deg < 0 else '+'
-        dec_abs = abs(dec_deg)
-        dec_d = int(dec_abs)
-        dec_remaining = (dec_abs - dec_d) * 60
-        dec_m = int(dec_remaining)
-        dec_s = (dec_remaining - dec_m) * 60
-        return f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
-
-    def _reset_lazy_loading_for_filter(self, catalog_filter, type_filter):
-        """Reset lazy loading state when filter changes and query filtered count"""
-        if not self.db_manager:
-            return
-
-        try:
-            import sqlite3
-            from ResourceManager import ResourceManager, attach_update_catalogs
-
-            # Query the total count for this specific filter
-            db_path = ResourceManager.get_database_path()
-            conn = sqlite3.connect(str(db_path))
-            attach_update_catalogs(conn)
-            cursor = conn.cursor()
-
-            # Build count query with filters - must match the data loading query logic
-            if catalog_filter == 'M':
-                # Special handling for Messier catalog - only numeric designations
-                query = """
-                    SELECT COUNT(DISTINCT d.id)
-                    FROM dsodetail d
-                    JOIN cataloguenr c ON d.id = c.dsodetailid
-                        AND c.catalogue = ?
-                        AND c.designation NOT LIKE '%-%'
-                        AND c.designation NOT LIKE '% %'
-                        AND LENGTH(TRIM(c.designation)) <= 3
-                        AND CAST(c.designation AS INTEGER) > 0
-                        AND CAST(c.designation AS INTEGER) <= 110
-                """
-                params = [catalog_filter]
-
-                if type_filter:
-                    query += " WHERE d.dsotype = ?"
-                    params.append(type_filter)
-
-            elif catalog_filter:
-                # Other catalog filters
-                query = """
-                    SELECT COUNT(DISTINCT d.id)
-                    FROM dsodetail d
-                    JOIN cataloguenr c ON d.id = c.dsodetailid
-                    WHERE c.catalogue = ?
-                """
-                params = [catalog_filter]
-
-                if type_filter:
-                    query += " AND d.dsotype = ?"
-                    params.append(type_filter)
-
-            else:
-                # No catalog filter
-                query = """
-                    SELECT COUNT(DISTINCT d.id)
-                    FROM dsodetail d
-                    JOIN cataloguenr c ON d.id = c.dsodetailid
-                """
-                params = []
-
-                if type_filter:
-                    query += " WHERE d.dsotype = ?"
-                    params.append(type_filter)
-
-            cursor.execute(query, params)
-            filtered_total = cursor.fetchone()[0]
-            conn.close()
-
-            # Cancel any pending load worker
-            if hasattr(self, 'load_worker') and self.load_worker:
-                try:
-                    self.load_worker.disconnect()
-                    self.load_worker.terminate()
-                    self.load_worker.wait(1000)  # Wait up to 1 second
-                    self.load_worker.deleteLater()
-                except:
-                    pass
-                self.load_worker = None
-
-            # Clear existing data and reset offset
-            self.loading = False
-
-            # Notify view that we're about to clear all data
-            self.beginResetModel()
-            self.dso_data = []
-            self.filtered_data = []
-            self.load_offset = 0
-            self.total_count = filtered_total
-            self._cached_formatted_data.clear()
-            self.endResetModel()
-
-            logger.debug(f"Reset lazy loading for filter: catalog={catalog_filter}, type={type_filter}, total={filtered_total}")
-
-        except Exception as e:
-            logger.error(f"Error resetting lazy loading for filter: {e}")
-
     def setHighlightNoImages(self, highlight):
         """Set whether to highlight objects without images"""
         self.highlight_no_images = highlight
-        self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1))
-
-    def check_and_load_more_data(self, view_bottom_row):
-        """Check if we need to load more data and trigger loading if needed"""
-        filtered_len = len(self.filtered_data)
-        loaded_len = len(self.dso_data)
-
-        # FILTER-AWARE LOADING: If we have active filters and very few results, keep loading
-        has_active_filters = (hasattr(self, '_current_search') and
-                            (self._current_search or self.selected_catalog or
-                             getattr(self, '_current_show_images_only', False) or
-                             getattr(self, '_current_show_no_images_only', False) or
-                             getattr(self, '_current_selected_type', None)))
-
-        # If filters are active and we have very few results, keep loading more aggressively
-        # For sparse results (like "show images only"), we need to load much more data
-        if has_active_filters and loaded_len < self.total_count:
-            if filtered_len < 100:  # Very few results - load aggressively
-                filter_needs_more_data = True
-            elif filtered_len < 500:  # Moderate results - load when nearing end
-                # Load more if we're showing most of what we found
-                filter_needs_more_data = view_bottom_row > filtered_len * 0.7
-            else:
-                # Normal threshold for larger result sets
-                filter_needs_more_data = False
-        else:
-            filter_needs_more_data = False
-
-        # MAJOR FIX: If view_bottom_row seems capped (~2000), use the actual visible rows as reference
-        max_visible_rows = max(view_bottom_row + 1, 2000)
-
-        # Use much more aggressive triggering when we hit apparent view limits
-        if view_bottom_row >= 1900:  # Near the apparent view limit
-            trigger_point = max_visible_rows - 100  # Very aggressive
-        else:
-            # Normal triggering logic
-            trigger_point_rows = filtered_len - 200
-            trigger_point_percent = int(filtered_len * 0.8)
-            trigger_point = min(trigger_point_rows, trigger_point_percent)
-
-        # Multiple trigger conditions
-        near_end_of_visible = view_bottom_row > trigger_point
-        displayed_most_data = view_bottom_row > len(self.dso_data) * 0.75
-        near_view_limit = view_bottom_row >= 1950  # Emergency trigger when hitting view limits
-
-        if (self.db_manager and
-            not self.loading and
-            self.load_offset < self.total_count and
-            (near_end_of_visible or displayed_most_data or near_view_limit or filter_needs_more_data)):
-
-            # Log only when loading is actually triggered
-            trigger_reason = []
-            if near_end_of_visible: trigger_reason.append("near end of visible")
-            if displayed_most_data: trigger_reason.append("75% of loaded data")
-            if near_view_limit: trigger_reason.append("emergency trigger")
-            if filter_needs_more_data:
-                if filtered_len < 100:
-                    trigger_reason.append("sparse filter results - loading more")
-                else:
-                    trigger_reason.append("filter needs more data")
-            logger.debug(f"Triggering lazy load: {', '.join(trigger_reason)} (filtered: {filtered_len}, loaded: {loaded_len}, total: {self.total_count})")
-            self.load_more_data()
-        else:
-            # Reduced debug logging for non-trigger cases
-            pass
-
-    def _get_max_threads(self):
-        """Get max_threads setting from QSettings"""
-        try:
-            settings = QSettings("AstroAssist", "CosmosCollection")
-            default_threads = max(1, (os.cpu_count() or 4) - 2)
-            max_threads = settings.value("max_threads", default_threads, type=int)
-            return max(1, min(max_threads, 128))  # Ensure reasonable bounds
-        except Exception as e:
-            logger.error(f"Error reading max_threads setting: {e}")
-            return max(1, (os.cpu_count() or 4) - 2)
-
-    def load_more_data(self):
-        """Load the next batches of data in parallel background threads"""
-        if self.loading or self.load_offset >= self.total_count:
-            logger.debug(f"Load blocked: loading={self.loading}, offset={self.load_offset}, total={self.total_count}")
-            return
-
-        # Get current filters
-        catalog_filter = self.selected_catalog if self.selected_catalog else None
-        type_filter = getattr(self, '_current_selected_type', None)
-
-        # Calculate how much data remains to load
-        remaining = self.total_count - self.load_offset
-
-        # Load up to max_threads * batch_size in this batch (parallel loading)
-        total_to_load = min(remaining, self.max_threads * self.load_batch_size)
-
-        logger.debug(f"Starting parallel load from offset {self.load_offset}, loading {total_to_load} records using {self.max_threads} threads, catalog={catalog_filter}, type={type_filter}")
-        self.loading = True
-
-        # Emit signal to update UI loading state
-        if hasattr(self.parent(), '_on_loading_started'):
-            self.parent()._on_loading_started()
-
-        # Use parallel loader
-        self.parallel_loader.load_batches_parallel(
-            self.load_offset,
-            total_to_load,
-            self.load_batch_size,
-            self.max_threads,
-            catalog_filter,
-            type_filter
-        )
-
-    def _on_data_loaded(self, new_data):
-        """Handle new data batch loaded from background thread"""
-        if new_data:
-            # Add new data to existing data
-            self.beginInsertRows(QModelIndex(), len(self.dso_data), len(self.dso_data) + len(new_data) - 1)
-            self.dso_data.extend(new_data)
-            self.endInsertRows()
-
-            # Re-apply current filters to include new data, using the same
-            # matching and ranking as filter_data
-            old_filtered_len = len(self.filtered_data)
-
-            # Notify view that data is about to change
-            self.layoutAboutToBeChanged.emit()
-
-            self.filtered_data = self._build_filtered_data(
-                getattr(self, '_current_search', ''),
-                self.selected_catalog,
-                getattr(self, '_current_show_images_only', False),
-                getattr(self, '_current_selected_type', None),
-                getattr(self, '_current_show_no_images_only', False)
-            )
-            # Rows may have been re-ranked, so row-keyed cell cache is stale
-            self._cached_formatted_data.clear()
-            logger.debug(f"Re-applied filters: filtered data is now {len(self.filtered_data)} items from {len(self.dso_data)} loaded")
-
-            new_filtered_len = len(self.filtered_data)
-            new_matches = new_filtered_len - old_filtered_len
-            logger.debug(f"After filtering: filtered data grew from {old_filtered_len} to {new_filtered_len} (+{new_matches} new matches from {len(new_data)} loaded)")
-
-            # Notify view that layout has changed
-            self.layoutChanged.emit()
-
-            self.load_offset += len(new_data)
-            logger.debug(f"Added {len(new_data)} DSOs, total now: {len(self.dso_data)}")
-
-        self.loading = False
-
-        # Emit signal to update UI loading state
-        if hasattr(self.parent(), '_on_loading_finished'):
-            self.parent()._on_loading_finished()
-
-    def _on_parallel_data_loaded(self, new_data):
-        """Handle parallel data batches loaded from background threads"""
-        if new_data:
-            # Add new data to existing data
-            self.beginInsertRows(QModelIndex(), len(self.dso_data), len(self.dso_data) + len(new_data) - 1)
-            self.dso_data.extend(new_data)
-            self.endInsertRows()
-
-            # Re-apply current filters to include new data, using the same
-            # matching and ranking as filter_data
-            old_filtered_len = len(self.filtered_data)
-
-            # Notify view that data is about to change
-            self.layoutAboutToBeChanged.emit()
-
-            self.filtered_data = self._build_filtered_data(
-                getattr(self, '_current_search', ''),
-                self.selected_catalog,
-                getattr(self, '_current_show_images_only', False),
-                getattr(self, '_current_selected_type', None),
-                getattr(self, '_current_show_no_images_only', False)
-            )
-            # Rows may have been re-ranked, so row-keyed cell cache is stale
-            self._cached_formatted_data.clear()
-            logger.debug(f"Re-applied filters: filtered data is now {len(self.filtered_data)} items from {len(self.dso_data)} loaded")
-
-            new_filtered_len = len(self.filtered_data)
-            new_matches = new_filtered_len - old_filtered_len
-            logger.debug(f"After filtering: filtered data grew from {old_filtered_len} to {new_filtered_len} (+{new_matches} new matches from {len(new_data)} loaded)")
-
-            # Notify view that layout has changed
-            self.layoutChanged.emit()
-
-            self.load_offset += len(new_data)
-            logger.debug(f"Added {len(new_data)} DSOs from parallel loading, total now: {len(self.dso_data)}")
-
-        self.loading = False
-
-        # Emit signal to update UI loading state
-        if hasattr(self.parent(), '_on_loading_finished'):
-            self.parent()._on_loading_finished()
-
-        # Clean up worker
-        if self.load_worker:
-            self.load_worker.deleteLater()
-            self.load_worker = None
-
-        # Apply pending sort if all data is now loaded
-        if (self.load_offset >= self.total_count and
-            hasattr(self, '_pending_sort') and self._pending_sort):
-            logger.debug("All data loaded, applying pending sort")
-            # Import QTimer locally to avoid circular imports
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(100, self._apply_pending_sort)
-            return  # Don't trigger more loading if we're done
-
-        # Check if parent is doing a specific catalog search and needs more data
-        if hasattr(self.parent(), '_check_search_needs_continue'):
-            if self.parent()._check_search_needs_continue():
-                logger.debug("Continuing load for specific search...")
-                from PySide6.QtCore import QTimer
-                QTimer.singleShot(100, self.load_more_data)
-                return
-
-        # Check if we need to load more data immediately (for sparse filter results)
-        filtered_len = len(self.filtered_data)
-        if (filtered_len < 100 and
-            self.load_offset < self.total_count and
-            (hasattr(self, '_current_show_images_only') and getattr(self, '_current_show_images_only', False) or
-             hasattr(self, '_current_show_no_images_only') and getattr(self, '_current_show_no_images_only', False))):
-
-            logger.debug(f"Auto-triggering next load: only {filtered_len} images found, continuing search...")
-            # Use a timer to avoid recursive loading
-            if hasattr(self.parent(), '_schedule_next_load'):
-                self.parent()._schedule_next_load()
-        # Continue loading if we have a pending sort
-        elif (hasattr(self, '_pending_sort') and self._pending_sort and
-              self.load_offset < self.total_count):
-            logger.debug(f"Continuing to load data for pending sort ({self.load_offset}/{self.total_count})")
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(50, self.load_more_data)
-        # Continue loading all data in background until complete
-        elif self.load_offset < self.total_count:
-            logger.debug(f"Background loading: {self.load_offset}/{self.total_count} objects loaded, continuing...")
-            from PySide6.QtCore import QTimer
-            # Use longer delay (200ms) for background loading to not impact UI performance
-            QTimer.singleShot(200, self.load_more_data)
-
-    def get_load_progress(self):
-        """Get current loading progress for status display"""
-        return len(self.dso_data), self.total_count
-
-    def exit_startup_mode(self):
-        """Exit startup mode to enable full sorting functionality"""
-        logger.debug("Exiting startup mode - full sorting now available")
-        self.startup_mode = False
+        if self.rowCount() > 0:
+            self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1),
+                                  [Qt.ItemDataRole.BackgroundRole])
 
 
 # --- SIMBAD Query Worker Thread ---
@@ -1241,20 +603,6 @@ class SimbadQueryWorker(QThread):
     def run(self):
         """Query SIMBAD in background thread"""
         try:
-            # Configure SSL for PyInstaller bundle before imports
-            if getattr(sys, 'frozen', False):
-                try:
-                    # Disable SSL verification for astroquery in PyInstaller (workaround for cert issues)
-                    import requests
-                    original_request = requests.Session.request
-                    def patched_request(self, *args, **kwargs):
-                        kwargs['verify'] = False
-                        return original_request(self, *args, **kwargs)
-                    requests.Session.request = patched_request
-                    logger.info("Disabled SSL verification for astroquery in worker thread (PyInstaller workaround)")
-                except Exception as ssl_config_error:
-                    logger.warning(f"Could not configure SSL for astroquery in worker: {ssl_config_error}")
-
             from astroquery.simbad import Simbad
             from astropy.coordinates import SkyCoord
             import astropy.units as u
@@ -1271,7 +619,17 @@ class SimbadQueryWorker(QThread):
             )
 
             # Try to query by identifier
-            result = custom_simbad.query_object(self.search_term)
+            try:
+                result = custom_simbad.query_object(self.search_term)
+            except Exception as query_error:
+                # PyInstaller builds have hit certificate-chain failures here. Retry
+                # unverified on this Simbad instance's session only - never patch
+                # requests globally, which would disable verification app-wide.
+                if not (getattr(sys, 'frozen', False) and self._is_ssl_error(query_error)):
+                    raise
+                logger.warning(f"SIMBAD SSL verification failed ({query_error}); retrying without verification")
+                self._disable_session_verification(custom_simbad._session)
+                result = custom_simbad.query_object(self.search_term)
 
             if result is None or len(result) == 0:
                 logger.debug(f"No SIMBAD data found for {self.search_term}")
@@ -1376,37 +734,62 @@ class SimbadQueryWorker(QThread):
             logger.error(f"Error querying SIMBAD: {str(e)}", exc_info=True)
             self.error_occurred.emit(f"Error querying SIMBAD: {str(e)}")
 
+    @staticmethod
+    def _is_ssl_error(error):
+        """Whether an exception (or anything it wraps - pyvo wraps requests errors) is an SSL failure"""
+        seen = set()
+        while error is not None and id(error) not in seen:
+            seen.add(id(error))
+            if "SSLError" in type(error).__name__ or "CERTIFICATE_VERIFY_FAILED" in str(error):
+                return True
+            error = error.__cause__ or error.__context__ or getattr(error, 'cause', None)
+        return False
+
+    @staticmethod
+    def _disable_session_verification(session):
+        """Force verify=False on every request made through this one session.
+
+        Setting session.verify = False isn't enough: requests lets the
+        REQUESTS_CA_BUNDLE environment variable (set at startup for PyInstaller
+        builds) override a session-level verify setting."""
+        original_request = session.request
+
+        def unverified_request(method, url, *args, **kwargs):
+            kwargs['verify'] = False
+            return original_request(method, url, *args, **kwargs)
+
+        session.request = unverified_request
+
+    # SIMBAD object type codes (current short codes and legacy long forms) -> DSO type
+    _SIMBAD_TYPE_MAP = {
+        **dict.fromkeys(['g', 'gig', 'gic', 'bic', 'gip', 'hzg', 'agn', 'syg', 'sy1', 'sy2', 'lin',
+                         'liner', 'seyfert', 'qso', 'bla', 'bll', 'rg', 'h2g', 'lsb', 'emg', 'sbg',
+                         'bcg', 'ig', 'pag', 'galaxy'], 'GALXY'),
+        **dict.fromkeys(['clg', 'grg', 'cgg', 'scg', 'pcg'], 'GALCL'),
+        **dict.fromkeys(['pn', 'plnnb'], 'PLNNB'),
+        **dict.fromkeys(['snr', 'snrem'], 'SNREM'),
+        **dict.fromkeys(['hii', 'gne', 'brtnb', 'emobj'], 'BRTNB'),
+        **dict.fromkeys(['rne', 'refnb'], 'REFNB'),
+        **dict.fromkeys(['dne', 'drknb'], 'DRKNB'),
+        **dict.fromkeys(['opc', 'opcl', 'cl*', 'opncl'], 'OPNCL'),
+        **dict.fromkeys(['glc', 'glcl', 'globc', 'glocl'], 'GLOCL'),
+        **dict.fromkeys(['as*', 'assoc', 'assc'], 'ASSC'),
+    }
+
     def _map_simbad_type(self, simbad_type):
-        """Map SIMBAD object type to DSO type used in database"""
+        """Map SIMBAD object type to DSO type used in database.
+
+        Matches whole type codes: substring checks misfire on SIMBAD's short
+        codes (e.g. 'G' would match GlC globular clusters and GNe nebulae)."""
         if not simbad_type:
             return None
 
-        simbad_type = simbad_type.upper()
-
-        # Galaxy types
-        if any(t in simbad_type for t in ['G', 'GAL', 'SEYFERT', 'LINER', 'AGN', 'QSO']):
-            return 'GALXY'
-        # Nebula types
-        elif any(t in simbad_type for t in ['PN', 'PLNNB']):
-            return 'PLNNB'
-        elif any(t in simbad_type for t in ['SNREM', 'SNR']):
-            return 'SNREM'
-        elif any(t in simbad_type for t in ['HII', 'BRTNB', 'EMOBJ']):
-            return 'BRTNB'
-        elif any(t in simbad_type for t in ['RNE', 'REFNB']):
-            return 'REFNB'
-        # Cluster types
-        elif any(t in simbad_type for t in ['OPNCL', 'CL*']):
-            return 'OPNCL'
-        elif any(t in simbad_type for t in ['GLOBC', 'GLOCL']):
-            return 'GLOCL'
-        elif any(t in simbad_type for t in ['ASSC', 'ASSOC']):
-            return 'ASSC'
-        # Combined types
-        elif 'NEB' in simbad_type and 'CL' in simbad_type:
-            return 'CL+NB'
-        else:
-            return None
+        # Candidates are suffixed with '?' (e.g. "PN?")
+        code = simbad_type.strip().rstrip('?').lower()
+        dso_type = self._SIMBAD_TYPE_MAP.get(code)
+        if dso_type is None and 'neb' in code and 'cl' in code:
+            dso_type = 'CL+NB'
+        return dso_type
 
 
 # --- Loading Dialog ---
@@ -1486,43 +869,12 @@ class CustomDSOVisibilityWindow(QDialog):
         event.accept()
 
 
-class CustomTableView(QTableView):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.model = None
-
-    def setModel(self, model):
-        super().setModel(model)
-        self.model = model
-        # Connect the header's sort indicator change to the model's sort method
-        self.horizontalHeader().sortIndicatorChanged.connect(self._on_sort_indicator_changed)
-        # Connect scroll events for lazy loading
-        self.verticalScrollBar().valueChanged.connect(self._on_scroll)
-
-    def _on_sort_indicator_changed(self, logical_index, order):
-        """Handle sort indicator changes by calling the model's sort method"""
-        if self.model:
-            self.model.sort(logical_index, order)
-
-    def _on_scroll(self, value):
-        """Handle scroll events to trigger lazy loading"""
-        if hasattr(self.model, 'check_and_load_more_data'):
-            # Calculate which row is at the bottom of the visible area
-            viewport_height = self.viewport().height()
-            row_height = self.rowHeight(0) if self.model.rowCount() > 0 else 25
-            visible_rows = viewport_height // row_height if row_height > 0 else 0
-            current_top_row = self.rowAt(0)
-            bottom_visible_row = current_top_row + visible_rows
-
-            # Get the actual last visible row from viewport
-            last_visible_index = self.indexAt(self.viewport().rect().bottomLeft())
-            actual_last_visible_row = last_visible_index.row() if last_visible_index.isValid() else -1
-
-            # Use the actual visible row for better accuracy
-            effective_bottom_row = max(bottom_visible_row, actual_last_visible_row)
-
-            # Trigger lazy loading if needed
-            self.model.check_and_load_more_data(effective_bottom_row)
+# User tables included in backups, in restore order (parents before children)
+BACKUP_TABLES = [
+    "usersettings", "usertelescopes", "userequipment", "telescope_equipment",
+    "userimages", "usertargetlist", "usercollages", "usercollageimages",
+    "usersessions", "usersessionobservations", "usersessionobservationfilters", "usersessionfiles",
+]
 
 
 # --- Settings Dialog ---
@@ -2246,6 +1598,7 @@ class SettingsDialog(QDialog):
             "• Telescope profiles\n"
             "• Equipment (cameras, eyepieces, barlows)\n"
             "• Collage projects\n"
+            "• Observing sessions\n"
             "• Application settings (location, timezone)"
         )
         backup_description.setWordWrap(True)
@@ -2978,89 +2331,15 @@ class SettingsDialog(QDialog):
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
 
-                # Backup usersettings
-                cursor.execute("SELECT * FROM usersettings")
-                columns = [description[0] for description in cursor.description]
-                rows = cursor.fetchall()
-                backup_data['tables']['usersettings'] = {
-                    'columns': columns,
-                    'rows': [list(row) for row in rows]
-                }
-
-                # Backup usertelescopes
-                cursor.execute("SELECT * FROM usertelescopes")
-                columns = [description[0] for description in cursor.description]
-                rows = cursor.fetchall()
-                backup_data['tables']['usertelescopes'] = {
-                    'columns': columns,
-                    'rows': [list(row) for row in rows]
-                }
-
-                # Backup userequipment (cameras, eyepieces, barlows)
-                try:
-                    cursor.execute("SELECT * FROM userequipment")
-                    columns = [description[0] for description in cursor.description]
-                    rows = cursor.fetchall()
-                    backup_data['tables']['userequipment'] = {
-                        'columns': columns,
-                        'rows': [list(row) for row in rows]
+                for table in BACKUP_TABLES:
+                    try:
+                        cursor.execute(f"SELECT * FROM {table}")
+                    except sqlite3.OperationalError:
+                        continue  # Table not created yet on this install
+                    backup_data['tables'][table] = {
+                        'columns': [description[0] for description in cursor.description],
+                        'rows': [list(row) for row in cursor.fetchall()]
                     }
-                except Exception:
-                    pass  # Table might not exist
-
-                # Backup telescope_equipment (links equipment to telescopes)
-                try:
-                    cursor.execute("SELECT * FROM telescope_equipment")
-                    columns = [description[0] for description in cursor.description]
-                    rows = cursor.fetchall()
-                    backup_data['tables']['telescope_equipment'] = {
-                        'columns': columns,
-                        'rows': [list(row) for row in rows]
-                    }
-                except Exception:
-                    pass  # Table might not exist
-
-                # Backup userimages
-                cursor.execute("SELECT * FROM userimages")
-                columns = [description[0] for description in cursor.description]
-                rows = cursor.fetchall()
-                backup_data['tables']['userimages'] = {
-                    'columns': columns,
-                    'rows': [list(row) for row in rows]
-                }
-
-                # Backup usertargetlist
-                cursor.execute("SELECT * FROM usertargetlist")
-                columns = [description[0] for description in cursor.description]
-                rows = cursor.fetchall()
-                backup_data['tables']['usertargetlist'] = {
-                    'columns': columns,
-                    'rows': [list(row) for row in rows]
-                }
-
-                # Backup usercollages
-                try:
-                    cursor.execute("SELECT * FROM usercollages")
-                    columns = [description[0] for description in cursor.description]
-                    rows = cursor.fetchall()
-                    backup_data['tables']['usercollages'] = {
-                        'columns': columns,
-                        'rows': [list(row) for row in rows]
-                    }
-                except Exception:
-                    pass  # Table might not exist
-
-                # Backup usercollageimages
-                try:
-                    cursor.execute("SELECT * FROM usercollageimages")
-                    columns = [description[0] for description in cursor.description]
-                    rows = cursor.fetchall()
-                    backup_data['tables']['usercollageimages'] = {
-                        'columns': columns,
-                        'rows': [list(row) for row in rows]
-                    }
-                except Exception:
-                    pass  # Table might not exist
 
             # Backup QSettings (only JSON-serializable values)
             settings = QSettings("CosmosCollection", "CosmosCollection")
@@ -3139,91 +2418,15 @@ class SettingsDialog(QDialog):
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
 
-                # Restore usersettings (clear and insert)
-                if 'usersettings' in backup_data['tables']:
-                    cursor.execute("DELETE FROM usersettings")
-                    table_data = backup_data['tables']['usersettings']
-                    columns = table_data['columns']
-                    for row in table_data['rows']:
-                        placeholders = ', '.join(['?' for _ in columns])
-                        cursor.execute(f"INSERT INTO usersettings ({', '.join(columns)}) VALUES ({placeholders})", row)
-
-                # Restore usertelescopes
-                if 'usertelescopes' in backup_data['tables']:
-                    cursor.execute("DELETE FROM usertelescopes")
-                    table_data = backup_data['tables']['usertelescopes']
-                    columns = table_data['columns']
-                    for row in table_data['rows']:
-                        placeholders = ', '.join(['?' for _ in columns])
-                        cursor.execute(f"INSERT INTO usertelescopes ({', '.join(columns)}) VALUES ({placeholders})", row)
-
-                # Restore userequipment (cameras, eyepieces, barlows)
-                if 'userequipment' in backup_data['tables']:
-                    try:
-                        cursor.execute("DELETE FROM userequipment")
-                        table_data = backup_data['tables']['userequipment']
-                        columns = table_data['columns']
-                        for row in table_data['rows']:
-                            placeholders = ', '.join(['?' for _ in columns])
-                            cursor.execute(f"INSERT INTO userequipment ({', '.join(columns)}) VALUES ({placeholders})", row)
-                    except Exception:
-                        pass  # Table might not exist
-
-                # Restore telescope_equipment (links equipment to telescopes)
-                if 'telescope_equipment' in backup_data['tables']:
-                    try:
-                        cursor.execute("DELETE FROM telescope_equipment")
-                        table_data = backup_data['tables']['telescope_equipment']
-                        columns = table_data['columns']
-                        for row in table_data['rows']:
-                            placeholders = ', '.join(['?' for _ in columns])
-                            cursor.execute(f"INSERT INTO telescope_equipment ({', '.join(columns)}) VALUES ({placeholders})", row)
-                    except Exception:
-                        pass  # Table might not exist
-
-                # Restore userimages
-                if 'userimages' in backup_data['tables']:
-                    cursor.execute("DELETE FROM userimages")
-                    table_data = backup_data['tables']['userimages']
-                    columns = table_data['columns']
-                    for row in table_data['rows']:
-                        placeholders = ', '.join(['?' for _ in columns])
-                        cursor.execute(f"INSERT INTO userimages ({', '.join(columns)}) VALUES ({placeholders})", row)
-
-                # Restore usertargetlist
-                if 'usertargetlist' in backup_data['tables']:
-                    cursor.execute("DELETE FROM usertargetlist")
-                    table_data = backup_data['tables']['usertargetlist']
-                    columns = table_data['columns']
-                    for row in table_data['rows']:
-                        placeholders = ', '.join(['?' for _ in columns])
-                        cursor.execute(f"INSERT INTO usertargetlist ({', '.join(columns)}) VALUES ({placeholders})", row)
-
-                # Restore usercollages
-                if 'usercollages' in backup_data['tables']:
-                    try:
-                        cursor.execute("DELETE FROM usercollages")
-                        table_data = backup_data['tables']['usercollages']
-                        columns = table_data['columns']
-                        for row in table_data['rows']:
-                            placeholders = ', '.join(['?' for _ in columns])
-                            cursor.execute(f"INSERT INTO usercollages ({', '.join(columns)}) VALUES ({placeholders})", row)
-                    except Exception:
-                        pass  # Table might not exist
-
-                # Restore usercollageimages
-                if 'usercollageimages' in backup_data['tables']:
-                    try:
-                        cursor.execute("DELETE FROM usercollageimages")
-                        table_data = backup_data['tables']['usercollageimages']
-                        columns = table_data['columns']
-                        for row in table_data['rows']:
-                            placeholders = ', '.join(['?' for _ in columns])
-                            cursor.execute(f"INSERT INTO usercollageimages ({', '.join(columns)}) VALUES ({placeholders})", row)
-                    except Exception:
-                        pass  # Table might not exist
-
-                conn.commit()
+                try:
+                    for table in BACKUP_TABLES:
+                        if table in backup_data['tables']:
+                            self._restore_table(cursor, table, backup_data['tables'][table])
+                    conn.commit()
+                except Exception:
+                    # Leave the current data intact rather than half-restored
+                    conn.rollback()
+                    raise
 
             # Restore QSettings if present
             if 'qsettings' in backup_data:
@@ -3254,6 +2457,35 @@ class SettingsDialog(QDialog):
         except Exception as e:
             logger.error(f"Error restoring backup: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Restore Error", f"Failed to restore backup: {str(e)}")
+
+    @staticmethod
+    def _restore_table(cursor, table, table_data):
+        """Replace a table's rows with those from a backup.
+
+        Only columns that exist in the current schema are restored, so backups
+        from other versions still load and column names from the file are never
+        interpolated into SQL unchecked."""
+        cursor.execute(f"PRAGMA table_info({table})")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if not existing_columns:
+            logger.warning(f"Skipping restore of {table}: table does not exist")
+            return
+
+        columns = table_data['columns']
+        keep = [i for i, column in enumerate(columns) if column in existing_columns]
+        skipped = [column for column in columns if column not in existing_columns]
+        if skipped:
+            logger.warning(f"Restoring {table} without unknown columns: {skipped}")
+
+        cursor.execute(f"DELETE FROM {table}")
+        if not keep:
+            return
+        column_list = ", ".join(f'"{columns[i]}"' for i in keep)
+        placeholders = ", ".join("?" for _ in keep)
+        cursor.executemany(
+            f"INSERT INTO {table} ({column_list}) VALUES ({placeholders})",
+            ([row[i] for i in keep] for row in table_data['rows'])
+        )
 
     def _find_invalid_images(self):
         """Return restored userimages rows whose image_path no longer exists on disk.
@@ -3671,17 +2903,27 @@ class MapBridge(QObject):
     def searchLocationFromPython(self, query):
         """Search for location using Python (to avoid CORS issues)"""
         logger.debug(f"MapBridge.searchLocationFromPython called: query={query}")
-        result = self.dialog._search_location_python(query)
-        logger.debug(f"Emitting search result: {result}")
-        self.searchCompleted.emit(result)
+        self._run_in_background(self.searchCompleted, self.dialog._search_location_python, query)
 
     @Slot(float, float)
     def reverseGeocodeFromPython(self, lat, lon):
         """Reverse geocode using Python (to avoid CORS issues)"""
         logger.debug(f"MapBridge.reverseGeocodeFromPython called: lat={lat}, lon={lon}")
-        result = self.dialog._reverse_geocode_python(lat, lon)
-        logger.debug(f"Emitting geocode result: {result}")
-        self.geocodeCompleted.emit(result)
+        self._run_in_background(self.geocodeCompleted, self.dialog._reverse_geocode_python, lat, lon)
+
+    @staticmethod
+    def _run_in_background(result_signal, lookup, *args):
+        """Run a Nominatim lookup off the UI thread (it can take up to its 10s timeout);
+        the result signal is delivered back to the web channel on the UI thread."""
+        def worker():
+            result = lookup(*args)
+            logger.debug(f"Emitting lookup result: {result}")
+            try:
+                result_signal.emit(result)
+            except RuntimeError:
+                pass  # Dialog closed while the lookup was running
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 class MapLocationPickerDialog(QDialog):
@@ -3708,6 +2950,7 @@ class MapLocationPickerDialog(QDialog):
         self.bridge = None
         self.channel = None
         self._renderer_crashed = False  # Set by _on_render_process_terminated; suppresses the generic load-failed message
+        self._init_failed = False  # Set when the map can't be created at all; exec() then returns immediately
 
         self._setup_ui()
 
@@ -4026,7 +3269,7 @@ class MapLocationPickerDialog(QDialog):
                     "Map picker requires QtWebEngine which is not available.\n\n"
                     "You can still enter coordinates manually.")
                 logger.error(f"QtWebEngine not available: {ie}")
-                self.reject()
+                self._init_failed = True
                 return
 
             # Create web view
@@ -4078,8 +3321,14 @@ class MapLocationPickerDialog(QDialog):
             QMessageBox.critical(self, "Error",
                 f"Failed to load map picker: {str(e)}\n\n"
                 "Please enter coordinates manually.")
-            logger.debug("About to call self.reject() due to exception")
-            self.reject()
+            self._init_failed = True
+
+    def exec(self):
+        # _load_map runs from __init__, before the caller's exec(); reject() there
+        # would be undone by exec() showing the dialog anyway
+        if self._init_failed:
+            return QDialog.Rejected
+        return super().exec()
 
     def _on_map_loaded(self, success):
         """Called when the map page finishes loading"""
@@ -4231,7 +3480,7 @@ class MapLocationPickerDialog(QDialog):
         query = self.search_input.text().strip()
         if query and self.web_view:
             # Call JavaScript function which will call back to Python for the actual search
-            self.web_view.page().runJavaScript(f"searchLocation({repr(query)})")
+            self.web_view.page().runJavaScript(f"searchLocation({json.dumps(query)})")
 
     def _on_select_clicked(self):
         """Handle Select Location button click"""
@@ -4679,19 +3928,22 @@ class TelescopeDialog(QDialog):
                         SET name = ?, aperture = ?, focal_length = ?, mount_type = ?, notes = ?
                         WHERE id = ?
                     """, (name, aperture, focal_length, mount_type, notes, self.current_telescope_id))
-                    
-                    QMessageBox.information(self, "Success", f"Telescope '{name}' has been updated successfully!")
+
+                    success_message = f"Telescope '{name}' has been updated successfully!"
                 else:
                     # Insert new telescope
                     cursor.execute("""
-                        INSERT INTO usertelescopes (name, aperture, focal_length, mount_type, notes) 
+                        INSERT INTO usertelescopes (name, aperture, focal_length, mount_type, notes)
                         VALUES (?, ?, ?, ?, ?)
                     """, (name, aperture, focal_length, mount_type, notes))
-                    
-                    QMessageBox.information(self, "Success", f"Telescope '{name}' has been added successfully!")
-                
+
+                    success_message = f"Telescope '{name}' has been added successfully!"
+
                 conn.commit()
-                
+
+            # Shown after the commit so the write isn't held open while the dialog is up
+            QMessageBox.information(self, "Success", success_message)
+
             # Reload telescopes and clear form
             self._load_telescopes()
             self._clear_form()
@@ -4713,7 +3965,10 @@ class TelescopeDialog(QDialog):
         reply = QMessageBox.question(
             self, 
             "Confirm Deletion",
-            f"Are you sure you want to delete telescope '{telescope_name}'?\n\nThis action cannot be undone.",
+            f"Are you sure you want to delete telescope '{telescope_name}'?\n\n"
+            f"Its equipment (cameras, eyepieces, barlows/reducers) will be kept and can be "
+            f"assigned to other telescopes.\n\n"
+            f"This action cannot be undone.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -4723,6 +3978,13 @@ class TelescopeDialog(QDialog):
                 with self.db_manager.get_connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute("DELETE FROM usertelescopes WHERE id = ?", (telescope_id,))
+                    # telescope_equipment's ON DELETE CASCADE never fires (foreign keys
+                    # aren't enabled on this connection), so remove the links here - including
+                    # any left orphaned by earlier deletes
+                    cursor.execute("""
+                        DELETE FROM telescope_equipment
+                        WHERE telescope_id NOT IN (SELECT id FROM usertelescopes)
+                    """)
                     conn.commit()
                 
                 QMessageBox.information(self, "Success", f"Telescope '{telescope_name}' has been deleted.")
@@ -5912,13 +5174,9 @@ class StayOpenMenu(QMenu):
 # --- Main App Window ---
 class MainWindow(WindowPositionMixin, QMainWindow):
     WINDOW_POSITION_KEY = "MainWindow"
-    def __init__(self, dso_data, catalogs, total_count=None):
+    def __init__(self, dso_data, catalogs):
         super().__init__()
         logger.debug("Initializing MainWindow")
-
-        self.total_dso_count = total_count or len(dso_data)
-        self.loaded_count = len(dso_data)
-        self.load_offset = self.loaded_count
 
         # Set window title with version
         try:
@@ -5933,11 +5191,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.setup_window_position()
         self.setAcceptDrops(True)
         self.db_manager = DatabaseManager()
-        self._showed_dso_data = None
-        self._cached_catalogs = None
-
-        # Store original data for lazy loading
-        self.initial_dso_data = dso_data
         self.all_catalogs = catalogs
 
         # Create toolbar
@@ -6056,8 +5309,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         main_layout.addWidget(self.status_label)
 
         # Setup model and table
-        self.model = DSOTableModel(dso_data, parent=self, db_manager=self.db_manager, total_count=self.total_dso_count)
-        self.table_view = CustomTableView()
+        self.model = DSOTableModel(dso_data, parent=self)
+        self.table_view = QTableView()
         self.table_view.setModel(self.model)
         self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_view.doubleClicked.connect(self._on_double_click)
@@ -6100,12 +5353,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
         # Update status
         self._update_status()
-
-        # Exit startup mode after initialization to enable full sorting
-        QTimer.singleShot(1000, self._exit_startup_mode)  # Small delay to ensure everything is loaded
-
-        # Start background loading of all objects after a short delay
-        QTimer.singleShot(1500, self._start_background_loading)
 
         # Check for updates on startup if enabled
         QTimer.singleShot(2000, self._check_updates_on_startup)
@@ -6374,11 +5621,22 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             user_images = []
             with DatabaseManager().get_connection() as conn:
                 cursor = conn.cursor()
+                # One row per image, named by its primary designation ("M 31") -
+                # joining cataloguenr directly listed each image once per designation
                 cursor.execute("""
-                    SELECT ui.id, ui.image_path, ui.integration_time, ui.equipment, 
-                           ui.date_taken, ui.notes, c.designation as dso_name
+                    SELECT ui.id, ui.image_path, ui.integration_time, ui.equipment,
+                           ui.date_taken, ui.notes,
+                           (SELECT c.catalogue || ' ' || c.designation
+                            FROM cataloguenr c
+                            WHERE c.dsodetailid = ui.dsodetailid
+                            ORDER BY CASE c.catalogue
+                                         WHEN 'M' THEN 1
+                                         WHEN 'NGC' THEN 2
+                                         WHEN 'IC' THEN 3
+                                         ELSE 4
+                                     END, c.designation
+                            LIMIT 1) as dso_name
                     FROM userimages ui
-                    LEFT JOIN cataloguenr c ON ui.dsodetailid = c.dsodetailid
                     ORDER BY ui.id DESC
                 """)
                 rows = cursor.fetchall()
@@ -6471,48 +5729,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         )
         self._update_status()
 
-        # Check if we need to load more data due to filter reducing visible results
-        self._check_filter_needs_more_data()
-
-    def _check_filter_needs_more_data(self):
-        """Check if current filter results are too sparse and trigger loading more data"""
-        if hasattr(self.model, 'check_and_load_more_data'):
-            # For sparse results, keep loading until we have enough or reach the end
-            filtered_len = len(self.model.filtered_data)
-            loaded_len = len(self.model.dso_data)
-
-            logger.debug(f"Filter check: {filtered_len} filtered, {loaded_len} loaded, {self.model.total_count} total")
-
-            # Check if we're searching for a specific object with catalog filter
-            search_text = self.search_input.text()
-            catalog = self.catalog_combo.currentText()
-            is_specific_search = (search_text and
-                                 catalog != "All Catalogs" and
-                                 len(self.model.filtered_data) == 0)
-
-            # If searching for a specific object and found nothing, be very aggressive about loading
-            if (is_specific_search and
-                loaded_len < self.model.total_count and
-                not getattr(self.model, 'loading', False)):
-
-                logger.debug(f"Specific search for {catalog} {search_text} - loading all data...")
-                # Mark this as an active catalog search
-                self._active_catalog_search = (search_text, catalog)
-                # Start loading - the model's _on_data_loaded will check _check_search_needs_continue
-                self.model.load_more_data()
-                return
-
-            # If we have very few results and more data available, trigger loading immediately
-            if (filtered_len < 100 and
-                loaded_len < self.model.total_count and
-                not getattr(self.model, 'loading', False)):
-
-                logger.debug(f"Triggering immediate load due to sparse filter results ({filtered_len} < 100)")
-                self.model.load_more_data()
-            else:
-                # Normal check with any view position to evaluate all trigger conditions
-                self.model.check_and_load_more_data(0)
-
     def _on_show_no_images_changed(self, state):
         """Handle show no images only checkbox state change"""
         checked = self.action_show_no_images_only.isChecked()
@@ -6530,7 +5746,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             checked
         )
         self._update_status()
-        self._check_filter_needs_more_data()
 
     def _on_highlight_no_images_changed(self, state):
         self.model.setHighlightNoImages(state != 0)
@@ -6589,28 +5804,16 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         )
         self._update_status()
 
-        # If searching for a specific designation with a catalog filter, keep loading until we find it or run out of data
-        if text and selected_catalog and self.model.load_offset < self.model.total_count:
-            # If no exact match and more data available, trigger loading
-            if not self.model.has_exact_search_match():
-                logger.debug(f"No exact match for {selected_catalog} {text} yet, continuing to load data...")
-                self._check_filter_needs_more_data()
-        else:
-            # Check if we need more data for this filter
-            self._check_filter_needs_more_data()
-
         # Check if we should query SIMBAD for this object
         # Only trigger if:
         # 1. Search text is not empty and looks like an object designation
         # 2. No results found in local database
-        # 3. All data has been loaded (not still in lazy loading)
-        # 4. No other filters are active (catalog/type filters should be "All")
-        # 5. SIMBAD lookup on search failure is enabled in settings
+        # 3. No other filters are active (catalog/type filters should be "All")
+        # 4. SIMBAD lookup on search failure is enabled in settings
         if (text and
             QSettings("CosmosCollection", "CosmosCollection").value(
                 "simbad_lookup_on_search_failure", True, type=bool) and
             len(self.model.filtered_data) == 0 and
-            self.model.load_offset >= self.model.total_count and
             self.catalog_combo.currentText() == "All Catalogs" and
             self._get_selected_type() is None and
             not self.action_show_images_only.isChecked() and
@@ -6665,21 +5868,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         if reply == QMessageBox.Yes:
             self._query_simbad_for_object(search_term)
 
-    def _show_simbad_search_dialog(self):
-        """Show dialog to manually search SIMBAD for an object"""
-        from PySide6.QtWidgets import QInputDialog
-
-        text, ok = QInputDialog.getText(
-            self,
-            "Search SIMBAD",
-            "Enter object designation to search in SIMBAD\n(e.g., M 31, NGC 7789, Andromeda Galaxy):",
-            QLineEdit.Normal,
-            self.search_input.text()  # Pre-populate with current search text
-        )
-
-        if ok and text.strip():
-            self._query_simbad_for_object(text.strip())
-
     def _on_catalog_changed(self, catalog):
         """Handle catalog selection changes"""
         self.model.filter_data(
@@ -6690,8 +5878,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self.action_show_no_images_only.isChecked()
         )
         self._update_status()
-        # Check if we need more data for this filter
-        self._check_filter_needs_more_data()
 
     def _on_type_changed(self, type_text):
         """Handle DSO type selection changes"""
@@ -6703,8 +5889,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self.action_show_no_images_only.isChecked()
         )
         self._update_status()
-        # Check if we need more data for this filter
-        self._check_filter_needs_more_data()
 
     def _get_selected_type(self):
         """Get the currently selected DSO type code"""
@@ -6715,99 +5899,13 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _update_status(self):
         """Update the status label"""
-        loaded, total_available = self.model.get_load_progress()
+        total = len(self.model.dso_data)
         filtered = len(self.model.filtered_data)
 
-        if filtered == loaded:
-            if loaded < total_available:
-                self.status_label.setText(f"Showing all {loaded} loaded objects ({total_available} total available)")
-            else:
-                self.status_label.setText(f"Showing all {loaded} objects")
+        if filtered == total:
+            self.status_label.setText(f"Showing all {total} objects")
         else:
-            if loaded < total_available:
-                self.status_label.setText(f"Showing {filtered} of {loaded} loaded objects ({total_available} total available)")
-            else:
-                self.status_label.setText(f"Showing {filtered} of {loaded} objects")
-
-    def _on_loading_started(self):
-        """Handle when background data loading starts"""
-        # Update status to show loading
-        current_text = self.status_label.text()
-        self.status_label.setText(f"{current_text} - Loading more data...")
-
-    def _on_loading_finished(self):
-        """Handle when background data loading finishes"""
-        # Refresh status display
-        self._update_status()
-
-    def _schedule_next_load(self):
-        """Schedule the next load after a short delay to avoid recursive loading"""
-        # Use a timer to schedule the next load check
-        QTimer.singleShot(100, self._check_filter_needs_more_data)
-
-    def _continue_loading_for_search(self, search_text, catalog):
-        """Continue loading data until we find a specific object or run out of data"""
-        # Check if the search parameters are still the same
-        if (self.search_input.text() != search_text or
-            self.catalog_combo.currentText() != catalog):
-            logger.debug("Search changed, stopping continuous load")
-            self._active_catalog_search = None
-            return
-
-        # Check if we found the object
-        found_exact_match = self.model.has_exact_search_match()
-        if found_exact_match:
-            logger.debug(f"Found exact match for {catalog} {search_text}!")
-
-        # If found or no more data, stop
-        if found_exact_match or self.model.load_offset >= self.model.total_count:
-            if not found_exact_match:
-                logger.debug(f"Reached end of data without finding {catalog} {search_text}")
-            self._active_catalog_search = None
-            return
-
-        # Otherwise, continue loading
-        if not getattr(self.model, 'loading', False):
-            logger.debug(f"Continuing to load for {catalog} {search_text}...")
-            self.model.load_more_data()
-            # Schedule next check
-            QTimer.singleShot(200, lambda: self._continue_loading_for_search(search_text, catalog))
-
-    def _check_search_needs_continue(self):
-        """Check if we need to continue loading for an active catalog search"""
-        if not hasattr(self, '_active_catalog_search') or not self._active_catalog_search:
-            return False
-
-        search_text, catalog = self._active_catalog_search
-
-        # Check if search still matches
-        if (self.search_input.text() != search_text or
-            self.catalog_combo.currentText() != catalog):
-            self._active_catalog_search = None
-            return False
-
-        # Check if we found it
-        if self.model.has_exact_search_match():
-            logger.debug(f"Found exact match for {catalog} {search_text}!")
-            self._active_catalog_search = None
-            return False
-
-        # Still need more data
-        return self.model.load_offset < self.model.total_count
-
-    def _exit_startup_mode(self):
-        """Exit startup mode for the model to enable full sorting"""
-        if hasattr(self.model, 'exit_startup_mode'):
-            self.model.exit_startup_mode()
-
-    def _start_background_loading(self):
-        """Start background loading of all objects in chunks"""
-        if hasattr(self.model, 'load_offset') and hasattr(self.model, 'total_count'):
-            if self.model.load_offset < self.model.total_count:
-                logger.info(f"Starting background loading: {self.model.load_offset}/{self.model.total_count} objects loaded")
-                self.model.load_more_data()
-            else:
-                logger.info(f"All {self.model.total_count} objects already loaded")
+            self.status_label.setText(f"Showing {filtered} of {total} objects")
 
     def _cleanup_stale_updates(self):
         """Kick off background cleanup of leftover updates\\staged-* dirs
@@ -6859,7 +5957,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             logger.error(f"Error checking for updates on startup: {str(e)}")
 
     def _save_simbad_object_to_database(self, object_data):
-        """Save SIMBAD object data to the database"""
+        """Save SIMBAD object data to the database.
+
+        Returns (dsodetailid, created) - created is False when the object was already there."""
         try:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
@@ -6900,31 +6000,43 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
                 logger.debug(f"Generated database ID: {dso_id} for {main_id}")
 
-                # Check if object already exists
+                # Check if object already exists. Catalog objects are keyed by their
+                # own ID scheme (M 31 is "NGC224"), so also look the designation up
+                # in cataloguenr rather than relying on the generated ID alone.
                 cursor.execute("SELECT id FROM dsodetail WHERE id = ?", (dso_id,))
                 existing = cursor.fetchone()
+                if not existing:
+                    catalog, designation = catalog_entries[0]
+                    cursor.execute("""
+                        SELECT dsodetailid FROM cataloguenr
+                        WHERE UPPER(catalogue) = UPPER(?) AND designation = ?
+                        LIMIT 1
+                    """, (catalog, designation))
+                    existing = cursor.fetchone()
+
                 if existing:
-                    logger.info(f"Object {dso_id} already exists in database")
+                    logger.info(f"Object {main_id_clean} already exists in database as {existing[0]}")
 
                     # Extract catalog and designation for searching
-                    catalog, designation = catalog_entries[0] if catalog_entries else (None, None)
+                    catalog, designation = catalog_entries[0]
 
                     # Show message and offer to search for it
                     reply = QMessageBox.question(
                         self,
                         "Object Already Exists",
-                        f"'{main_id_clean}' (ID: {dso_id}) already exists in the database.\n\n"
+                        f"'{main_id_clean}' already exists in the database.\n\n"
                         f"Would you like to search for it and display it?",
                         QMessageBox.Yes | QMessageBox.No,
                         QMessageBox.Yes
                     )
 
-                    if reply == QMessageBox.Yes and catalog:
-                        # Clear filters and search for the object
-                        self.catalog_combo.setCurrentText(catalog)
-                        self.search_input.setText(designation)
+                    if reply == QMessageBox.Yes:
+                        # Search all catalogs: the SIMBAD catalog name may not be one
+                        # of the catalog filter entries
+                        self.catalog_combo.setCurrentIndex(0)
+                        self.search_input.setText(f"{catalog} {designation}")
 
-                    return dso_id
+                    return existing[0], False
 
                 # Get constellation from coordinates using astropy
                 try:
@@ -6977,7 +6089,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
                 conn.commit()
                 logger.info(f"Successfully saved SIMBAD object: {main_id} with ID {dso_id}")
-                return dso_id
+                return dso_id, True
 
         except Exception as e:
             logger.error(f"Error saving SIMBAD object to database: {str(e)}", exc_info=True)
@@ -7003,19 +6115,19 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             if hasattr(self, 'simbad_loading_dialog'):
                 self.simbad_loading_dialog.close()
 
-            # Save to database
-            self._save_simbad_object_to_database(object_data)
+            # Save to database (an existing object was already offered to the user there)
+            _, created = self._save_simbad_object_to_database(object_data)
 
-            # Show success message
-            QMessageBox.information(
-                self,
-                "Object Added",
-                f"Found '{object_data['main_id']}' in SIMBAD and added it to the database.\n\n"
-                f"The object will now appear in your search results."
-            )
+            if created:
+                QMessageBox.information(
+                    self,
+                    "Object Added",
+                    f"Found '{object_data['main_id']}' in SIMBAD and added it to the database.\n\n"
+                    f"The object will now appear in your search results."
+                )
 
-            # Reload data to show the new object
-            self._reload_data()
+                # Reload data to show the new object
+                self._reload_data()
 
         except Exception as e:
             logger.error(f"Error handling SIMBAD object: {str(e)}", exc_info=True)
@@ -7067,15 +6179,23 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self.simbad_worker = None
 
     def _reload_data(self):
-        """Reload all data from database"""
-        # Reset the model's data
-        self.model.dso_data.clear()
-        self.model.filtered_data.clear()
-        self.model.load_offset = 0
+        """Reload all data from database (e.g. after an object was added)"""
+        with self.db_manager.get_connection() as conn:
+            dso_data, catalogs = load_all_dso_data(conn)
 
-        # Reload first batch
-        self.model.load_more_data()
+        # A new object can bring a new catalog; rebuild the filter list, keeping the selection
+        if catalogs != self.all_catalogs:
+            self.all_catalogs = catalogs
+            current = self.catalog_combo.currentText()
+            self.catalog_combo.blockSignals(True)
+            self.catalog_combo.clear()
+            self.catalog_combo.addItem("All Catalogs")
+            self.catalog_combo.addItems(catalogs)
+            self.catalog_combo.setCurrentText(current)
+            self.catalog_combo.blockSignals(False)
 
+        self.model.set_data(dso_data)
+        self._update_status()
 
     def _on_double_click(self, index):
         try:
@@ -7089,32 +6209,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 cursor = conn.cursor()
 
                 # Query the object with its user image
-                cursor.execute("""
-                    WITH object_dsodetailid AS (
-                        SELECT d.id 
-                        FROM dsodetail d
-                        JOIN cataloguenr c ON d.id = c.dsodetailid
-                        WHERE c.catalogue = ? AND c.designation = ?
-                    )
-                    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
-                           CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                           CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                           d.constellation, d.dsotype, d.dsoclass,
-                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-                               CASE c.catalogue
-                                   WHEN 'M' THEN 1
-                                   WHEN 'NGC' THEN 2
-                                   WHEN 'IC' THEN 3
-                                   ELSE 4
-                               END, c.designation) as designations,
-                           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
-                           (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-                    FROM dsodetail d
-                    JOIN cataloguenr c ON d.id = c.dsodetailid
-                    LEFT JOIN userimages ui ON d.id = ui.dsodetailid
-                    WHERE d.id = (SELECT id FROM object_dsodetailid)
-                    GROUP BY d.id
-                """, (entry["catalogue"], entry["id"]))
+                cursor.execute(DSO_QUERY + " AND d.id = ?", (entry["dsodetailid"],))
 
                 result = cursor.fetchone()
                 logger.debug(f"Database result: {result}")
@@ -7133,46 +6228,12 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _create_detail_window(self, result, entry):
         """Create and show the detail window with the given data"""
-        obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
-            constellation, dso_type, dso_class, designations, image_path, integration_time, \
-            equipment, date_taken, notes, image_count = result
-
-        # Get the primary designation
-        primary_designation = designations.split(',')[0]
-        catalogue, designation = primary_designation.split(' ', 1)
-
-        # Handle size values
-        size_min_arcmin = float(size_min) if size_min is not None else 0.0
-        size_max_arcmin = float(size_max) if size_max is not None else 0.0
-
-        # Convert coordinates for display
-        ra_str = self._format_ra(ra)
-        dec_str = self._format_dec(dec)
-
-        data = {
-            "name": entry["name"],  # Use the name from the table entry instead of reconstructing it
-            "ra": ra_str,
-            "dec": dec_str,
-            "ra_deg": ra,
-            "dec_deg": dec,
-            "magnitude": magnitude,
-            "surface_brightness": surface_brightness,
-            "size_min": size_min_arcmin,
-            "size_max": size_max_arcmin,
-            "constellation": constellation,
-            "dso_type": dso_type,
-            "dso_class": dso_class,
-            "designations": designations,
-            "catalogue": catalogue,
-            "id": designation,
-            "dsodetailid": obj_id,
-            "image_path": image_path,
-            "integration_time": integration_time,
-            "equipment": equipment,
-            "date_taken": date_taken,
-            "notes": notes,
-            "image_count": image_count
-        }
+        data = dso_row_to_dict(result)
+        # Use the name from the table entry instead of reconstructing it
+        data["name"] = entry["name"]
+        # Coordinates formatted for display
+        data["ra"] = format_ra(data["ra_deg"])
+        data["dec"] = format_dec(data["dec_deg"])
 
         logger.debug(f"Data dictionary: {data}")
 
@@ -7184,103 +6245,19 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         logger.debug("Detail window shown")
 
     def _refresh_data(self):
-        """Refresh the data in the main window"""
+        """Pick up image count changes after images are added"""
         try:
-            # Get fresh data from database using the connection manager
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
+                cursor.execute("SELECT dsodetailid, COUNT(*) FROM userimages GROUP BY dsodetailid")
+                counts = {str(dsodetailid): count for dsodetailid, count in cursor.fetchall()}
 
-                # Get major catalogs (with at least 50 objects to filter out minor catalogs)
-                cursor.execute("""
-                    SELECT catalogue, COUNT(DISTINCT dsodetailid) as count
-                    FROM cataloguenr
-                    GROUP BY catalogue
-                    HAVING count >= 50
-                    ORDER BY catalogue
-                """)
-                self._cached_catalogs = [row[0] for row in cursor.fetchall()]
-
-                # Query all objects from the database with additional fields
-                cursor.execute("""
-                    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness, 
-                           CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                           CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                           d.constellation, d.dsotype, d.dsoclass,
-                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY 
-                               CASE c.catalogue 
-                                   WHEN 'M' THEN 1
-                                   WHEN 'NGC' THEN 2
-                                   WHEN 'IC' THEN 3
-                                   ELSE 4
-                               END, c.designation) as designations,
-                           NULL as image_path, NULL as integration_time, NULL as equipment, 
-                           NULL as date_taken, NULL as notes,
-                           (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-                    FROM dsodetail d
-                    JOIN cataloguenr c ON d.id = c.dsodetailid
-                    GROUP BY d.id
-                    ORDER BY c.catalogue, CAST(c.designation AS INTEGER)
-                """)
-
-                self._cached_dso_data = []
-                for row in cursor.fetchall():
-                    # Process each row and add to cached data
-                    self._cached_dso_data.append(self._process_dso_row(row))
-
-            # Update the model with new data
-            self.model.dso_data = self._cached_dso_data
-
-            # Reapply current filters
-            self.model.filter_data(
-                self.search_input.text(),
-                None if self.catalog_combo.currentText() == "All Catalogs" else self.catalog_combo.currentText(),
-                self.action_show_images_only.isChecked(),
-                self._get_selected_type(),
-                self.action_show_no_images_only.isChecked()
-            )
-
-            # Update status
+            self.model.refresh_image_counts(counts)
             self._update_status()
 
             logger.debug("Main window data refreshed")
         except Exception as e:
             logger.error(f"Error refreshing data: {str(e)}", exc_info=True)
-
-    def _process_dso_row(self, row):
-        """Process a single row from the DSO query into a dictionary"""
-        obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
-            constellation, dso_type, dso_class, designations, image_path, integration_time, \
-            equipment, date_taken, notes, image_count = row
-
-        # Get the primary designation
-        primary_designation = designations.split(',')[0]
-        catalogue, designation = primary_designation.split(' ', 1)
-
-        # Handle size values
-        size_min_arcmin = float(size_min) if size_min is not None else 0.0
-        size_max_arcmin = float(size_max) if size_max is not None else 0.0
-
-        return {
-            "id": designation,
-            "ra_deg": ra,
-            "dec_deg": dec,
-            "catalogue": catalogue,
-            "name": f"{catalogue} {designation}",
-            "magnitude": magnitude,
-            "surface_brightness": surface_brightness,
-            "size_min": size_min_arcmin,
-            "size_max": size_max_arcmin,
-            "constellation": constellation,
-            "dso_type": dso_type,
-            "dso_class": dso_class,
-            "designations": designations,
-            "image_path": image_path,
-            "integration_time": integration_time,
-            "equipment": equipment,
-            "date_taken": date_taken,
-            "notes": notes,
-            "image_count": image_count
-        }
 
     def _show_context_menu(self, position):
         """Show context menu when right-clicking on the DSO table"""
@@ -7391,7 +6368,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 'dec_deg': entry.get('dec_deg', 0),
                 'size_min': entry.get('size_min', 30),
                 'size_max': entry.get('size_max', 30),
-                'dsodetailid': entry.get('id', '')
+                'dsodetailid': entry.get('dsodetailid', '')
             }
 
             # Import and open Aladin Lite window
@@ -7490,25 +6467,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             entry.get("ra_deg"), entry.get("dec_deg"),
             entry.get("name", "Unknown"), self
         )
-
-    def _format_ra(self, ra_deg):
-        """Convert RA in degrees to hms format"""
-        ra_hours = ra_deg / 15.0
-        ra_h = int(ra_hours)
-        ra_remaining = (ra_hours - ra_h) * 60
-        ra_m = int(ra_remaining)
-        ra_s = (ra_remaining - ra_m) * 60
-        return f"{ra_h:02d}h{ra_m:02d}m{ra_s:05.2f}s"
-
-    def _format_dec(self, dec_deg):
-        """Convert Dec in degrees to dms format"""
-        dec_sign = '-' if dec_deg < 0 else '+'
-        dec_abs = abs(dec_deg)
-        dec_d = int(dec_abs)
-        dec_remaining = (dec_abs - dec_d) * 60
-        dec_m = int(dec_remaining)
-        dec_s = (dec_remaining - dec_m) * 60
-        return f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
 
     def closeEvent(self, event):
         """Handle window close event"""
@@ -8219,13 +7177,16 @@ if __name__ == "__main__":
     # No CLI command - continue with GUI startup
     # (QTWEBENGINE_CHROMIUM_FLAGS is already set at module load time, above.)
 
-    # Initialize QtWebEngine BEFORE QApplication to ensure WebGL settings are applied
+    # Initialize QtWebEngine BEFORE QApplication: it needs shared OpenGL contexts, which
+    # can only be enabled before the application object exists. (This used to import a
+    # nonexistent QtWebEngineCore.QtWebEngineCore name, so it always failed silently and
+    # QtWebEngine was first loaded later, from a dialog, after QApplication.)
     try:
-        from PySide6.QtWebEngineCore import QtWebEngineCore, QWebEngineProfile
-        # This ensures QtWebEngine is initialized with the command-line arguments
-        logger.debug("QtWebEngine initialized with WebGL support")
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+        from PySide6 import QtWebEngineWidgets  # noqa: F401
+        logger.debug("QtWebEngine initialized with shared OpenGL contexts")
     except ImportError:
-        logger.warning("QtWebEngineCore not available - WebGL may not work")
+        logger.warning("QtWebEngineWidgets not available - WebGL may not work")
 
     app = QApplication(sys.argv)
 
@@ -8283,6 +7244,8 @@ if __name__ == "__main__":
                 '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
             ))
             logging.getLogger().addHandler(file_handler)
+            # The log file is for troubleshooting, so capture debug detail in it
+            logging.getLogger().setLevel(logging.DEBUG)
             logger.info(f"File logging enabled: {log_file_path}")
     except Exception as e:
         logger.warning(f"Could not configure file logging: {e}")
@@ -8351,14 +7314,14 @@ if __name__ == "__main__":
     initial_loader = None
     window = None
 
-    def on_initial_data_loaded(dso_data, catalogs, total_count):
+    def on_initial_data_loaded(dso_data, catalogs):
         """Handle initial data loaded from background thread"""
         global window
         try:
             logger.debug(f"Initial data loaded in background: {len(dso_data)} DSOs")
 
             # Create and show the main window with loaded data
-            window = MainWindow(dso_data, catalogs, total_count)
+            window = MainWindow(dso_data, catalogs)
             window.show()
             splash.close()
 
@@ -8370,7 +7333,8 @@ if __name__ == "__main__":
             splash.close()
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(None, "Error", f"Failed to initialize application: {str(e)}")
-            sys.exit(1)
+            # Stop the event loop; sys.exit() raised inside a Qt slot doesn't reliably exit
+            app.exit(1)
 
     def on_initial_load_failed(error_msg):
         """Handle initial data load failure"""
@@ -8378,7 +7342,7 @@ if __name__ == "__main__":
         logger.error(f"Failed to load initial data: {error_msg}")
         splash.close()
         QMessageBox.critical(None, "Error", f"Failed to load DSO data from database:\n{error_msg}")
-        sys.exit(1)
+        app.exit(1)
 
     try:
         # Check if catalogs directory exists, create if needed
