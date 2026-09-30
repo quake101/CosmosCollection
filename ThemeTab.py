@@ -16,8 +16,9 @@ from PySide6.QtWidgets import (
 )
 
 from Theme import (
-    COLORS, ACCENT_PRESETS, build_colors, build_font, build_stylesheet, font_size, FONT_SIZE_MAX,
-    FONT_SIZE_MIN, MODES, platform_color_scheme, platform_font, themed_style, ThemeSettings,
+    COLORS, ACCENT_PRESETS, build_colors, build_font, build_stylesheet, CHECKBOX_STYLES, font_size,
+    FONT_SIZE_MAX, FONT_SIZE_MIN, MODES, platform_color_scheme, platform_font, themed_style,
+    ThemeSettings,
 )
 
 SWATCH_SIZE = 26
@@ -136,6 +137,20 @@ class ThemeSettingsTab(QWidget):
         text_layout.addRow(self.bold_headings_checkbox)
         controls_layout.addWidget(text_group)
 
+        # Controls
+        widgets_group = QGroupBox("Controls")
+        widgets_layout = QFormLayout(widgets_group)
+        self.checkbox_style_combo = QComboBox()
+        for style, label in CHECKBOX_STYLES.items():
+            self.checkbox_style_combo.addItem(label, style)
+        self.checkbox_style_combo.setToolTip(
+            "Checkmark: checked boxes show a checkmark (and radio buttons a dot)\n"
+            "Filled: checked boxes are filled with the accent color"
+        )
+        self.checkbox_style_combo.currentIndexChanged.connect(self._schedule_preview)
+        widgets_layout.addRow("Checkboxes:", self.checkbox_style_combo)
+        controls_layout.addWidget(widgets_group)
+
         # Reset + note
         reset_layout = QHBoxLayout()
         reset_btn = QPushButton("Reset to Defaults")
@@ -229,6 +244,8 @@ class ThemeSettingsTab(QWidget):
         size = theme_settings.font_size or default_size
         self.font_size_spin.setValue(min(max(size, FONT_SIZE_MIN), FONT_SIZE_MAX))
         self.bold_headings_checkbox.setChecked(theme_settings.bold_headings)
+        index = self.checkbox_style_combo.findData(theme_settings.checkbox_style)
+        self.checkbox_style_combo.setCurrentIndex(max(index, 0))
         self._update_preview()
 
     def theme_settings(self):
@@ -245,6 +262,7 @@ class ThemeSettingsTab(QWidget):
             font_family=font_family,
             font_size=0 if size == platform_font().pointSize() else size,
             bold_headings=self.bold_headings_checkbox.isChecked(),
+            checkbox_style=self.checkbox_style_combo.currentData(),
         )
 
     # ----------------------------------------------------------------

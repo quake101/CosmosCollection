@@ -14,8 +14,8 @@ import tempfile
 import weakref
 from dataclasses import dataclass, asdict
 
-from PySide6.QtCore import QObject, QPointF, QSettings, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPalette
+from PySide6.QtCore import QObject, QPointF, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPalette, QPen
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,11 @@ ACCENT_PRESETS = {
 FONT_SIZE_MIN = 8
 FONT_SIZE_MAX = 16
 
+CHECKBOX_STYLES = {
+    'check': 'Checkmark',
+    'filled': 'Filled',
+}
+
 _SETTINGS_ORG = "CosmosCollection"
 _SETTINGS_APP = "CosmosCollection"
 
@@ -60,6 +65,7 @@ class ThemeSettings:
     font_family: str = ''
     font_size: int = 0
     bold_headings: bool = False
+    checkbox_style: str = 'check'  # a key of CHECKBOX_STYLES
 
 
 def load_settings():
@@ -69,12 +75,14 @@ def load_settings():
     mode = settings.value("theme/mode", defaults.mode, type=str)
     accent = settings.value("theme/accent", defaults.accent, type=str)
     font_size = settings.value("theme/font_size", defaults.font_size, type=int)
+    checkbox_style = settings.value("theme/checkbox_style", defaults.checkbox_style, type=str)
     return ThemeSettings(
         mode=mode if mode in MODES else defaults.mode,
         accent=accent if QColor.isValidColorName(accent) else defaults.accent,
         font_family=settings.value("theme/font_family", defaults.font_family, type=str),
         font_size=font_size if font_size == 0 or FONT_SIZE_MIN <= font_size <= FONT_SIZE_MAX else 0,
         bold_headings=settings.value("theme/bold_headings", defaults.bold_headings, type=bool),
+        checkbox_style=checkbox_style if checkbox_style in CHECKBOX_STYLES else defaults.checkbox_style,
     )
 
 
@@ -310,26 +318,42 @@ def chart_font_size(points):
     return points * _font_scale
 
 
-def _arrow_image(direction, color):
-    """Path to a small triangle PNG ('up' or 'down') in the given color.
+def _theme_image(kind, color):
+    """Path to a small PNG of a style sheet glyph in the given color.
 
-    Style sheets can only draw arrow subcontrols from image files, so these
-    are rendered once per color into a temp folder and reused.
+    kind: 'up' / 'down' (arrows, drawn 16x10 for 8x5), or 'check' / 'dot' /
+    'dash' (check box and radio button marks, drawn 32x32 for a 16px box).
+    Style sheets can only draw these subcontrols from image files, so they're
+    rendered once per color into a temp folder and reused. Everything is drawn
+    at 2x the size it's shown at, so it stays sharp on HiDPI screens.
     """
     folder = os.path.join(tempfile.gettempdir(), "CosmosCollection", "theme")
-    path = os.path.join(folder, f"arrow_{direction}_{QColor(color).name()[1:]}.png")
+    prefix = f"arrow_{kind}" if kind in ('up', 'down') else kind
+    path = os.path.join(folder, f"{prefix}_{QColor(color).name()[1:]}.png")
     if not os.path.exists(path):
         os.makedirs(folder, exist_ok=True)
-        # Drawn at 2x the size used in the style sheet so it stays sharp on HiDPI screens.
-        image = QImage(16, 10, QImage.Format_ARGB32)
+        size = (16, 10) if kind in ('up', 'down') else (32, 32)
+        image = QImage(*size, QImage.Format_ARGB32)
         image.fill(Qt.transparent)
-        points = [QPointF(0, 10), QPointF(16, 10), QPointF(8, 0)] if direction == 'up' \
-            else [QPointF(0, 0), QPointF(16, 0), QPointF(8, 10)]
         painter = QPainter(image)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(color))
-        painter.drawPolygon(points)
+        if kind in ('up', 'down'):
+            points = [QPointF(0, 10), QPointF(16, 10), QPointF(8, 0)] if kind == 'up' \
+                else [QPointF(0, 0), QPointF(16, 0), QPointF(8, 10)]
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(color))
+            painter.drawPolygon(points)
+        elif kind == 'dot':
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(color))
+            painter.drawEllipse(QPointF(16, 16), 6.5, 6.5)
+        else:
+            pen = QPen(QColor(color), 4.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            painter.setPen(pen)
+            if kind == 'check':
+                painter.drawPolyline([QPointF(8, 16.5), QPointF(13.5, 22), QPointF(24, 10)])
+            else:  # dash
+                painter.drawLine(QPointF(9, 16), QPointF(23, 16))
         painter.end()
         image.save(path)
     return path.replace("\\", "/")
@@ -430,12 +454,12 @@ QComboBox::drop-down {{
     border: none;
 }}
 QComboBox::down-arrow {{
-    image: url("{_arrow_image('down', c['text'])}");
+    image: url("{_theme_image('down', c['text'])}");
     width: 8px; height: 5px;
     margin-right: 5px;
 }}
 QComboBox::down-arrow:disabled {{
-    image: url("{_arrow_image('down', c['text_disabled'])}");
+    image: url("{_theme_image('down', c['text_disabled'])}");
 }}
 
 /* Spin box buttons --------------------------------------------- */
@@ -454,18 +478,18 @@ QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {{
     background: {hover_bg};
 }}
 QAbstractSpinBox::up-arrow {{
-    image: url("{_arrow_image('up', c['text'])}");
+    image: url("{_theme_image('up', c['text'])}");
     width: 8px; height: 5px;
 }}
 QAbstractSpinBox::down-arrow {{
-    image: url("{_arrow_image('down', c['text'])}");
+    image: url("{_theme_image('down', c['text'])}");
     width: 8px; height: 5px;
 }}
 QAbstractSpinBox::up-arrow:disabled, QAbstractSpinBox::up-arrow:off {{
-    image: url("{_arrow_image('up', c['text_disabled'])}");
+    image: url("{_theme_image('up', c['text_disabled'])}");
 }}
 QAbstractSpinBox::down-arrow:disabled, QAbstractSpinBox::down-arrow:off {{
-    image: url("{_arrow_image('down', c['text_disabled'])}");
+    image: url("{_theme_image('down', c['text_disabled'])}");
 }}
 QComboBox QAbstractItemView {{
     background-color: {c['background_light']};
@@ -554,13 +578,28 @@ QCheckBox::indicator, QRadioButton::indicator {{
 }}
 QCheckBox::indicator {{ border-radius: 3px; }}
 QRadioButton::indicator {{ border-radius: 9px; }}
-QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+QCheckBox::indicator:hover, QRadioButton::indicator:hover {{
+    border-color: {c['accent']};
+}}
+QCheckBox::indicator:checked, QCheckBox::indicator:indeterminate,
+QRadioButton::indicator:checked {{
     background-color: {c['accent']};
     border-color: {c['accent']};
+}}
+QCheckBox::indicator:indeterminate {{
+    image: url("{_theme_image('dash', c['text_on_accent'])}");
 }}
 QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
     border-color: {c['border']};
     background-color: {c['background']};
+}}
+QCheckBox::indicator:checked:disabled, QCheckBox::indicator:indeterminate:disabled,
+QRadioButton::indicator:checked:disabled {{
+    border-color: {c['border']};
+    background-color: {c['border']};
+}}
+QCheckBox::indicator:indeterminate:disabled {{
+    image: url("{_theme_image('dash', c['text_disabled'])}");
 }}
 
 /* Tables & lists ----------------------------------------------- */
@@ -628,6 +667,31 @@ QDockWidget::close-button:hover, QDockWidget::float-button:hover {{
     background: {pressed_bg};
 }}
 """
+    # Check box style: 'filled' marks a checked box by its accent fill alone;
+    # 'check' adds a checkmark (and a dot in radio buttons). Filled resets the
+    # image explicitly so a widget-level preview overrides the app style sheet.
+    if theme_settings.checkbox_style == 'check':
+        qss += f"""
+/* Check box marks ---------------------------------------------- */
+QCheckBox::indicator:checked {{
+    image: url("{_theme_image('check', c['text_on_accent'])}");
+}}
+QRadioButton::indicator:checked {{
+    image: url("{_theme_image('dot', c['text_on_accent'])}");
+}}
+QCheckBox::indicator:checked:disabled {{
+    image: url("{_theme_image('check', c['text_disabled'])}");
+}}
+QRadioButton::indicator:checked:disabled {{
+    image: url("{_theme_image('dot', c['text_disabled'])}");
+}}
+"""
+    else:
+        qss += """
+QCheckBox::indicator:checked, QRadioButton::indicator:checked,
+QCheckBox::indicator:checked:disabled, QRadioButton::indicator:checked:disabled { image: none; }
+"""
+
     # Headings are set explicitly either way, so a widget-level preview of
     # this style sheet overrides whatever the application style sheet uses.
     heading_weight = 'bold' if theme_settings.bold_headings else 'normal'
@@ -648,9 +712,77 @@ QGroupBox, QDockWidget, QHeaderView::section {{ font-weight: {heading_weight}; }
 COLORS = build_colors(ThemeSettings())
 
 
+# --------------------------------------------------------------------
+# Window title bars (Windows)
+# --------------------------------------------------------------------
+# The title bar is drawn by Windows, not Qt. Windows 11 lets an app set each
+# window's title bar colors (DwmSetWindowAttribute); older versions ignore the
+# color attributes, and other platforms skip this entirely.
+_DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+_DWMWA_BORDER_COLOR = 34
+_DWMWA_CAPTION_COLOR = 35
+_DWMWA_TEXT_COLOR = 36
+_DWMWA_COLOR_DEFAULT = 0xFFFFFFFF  # let Windows choose the color
+
+# Bumped whenever title bars need restyling, so windows styled for an older
+# theme are redone (see style_title_bar).
+_title_bar_generation = 0
+
+
+def _colorref(color):
+    """A color as a Windows COLORREF (0x00BBGGRR)."""
+    c = QColor(color)
+    return c.red() | (c.green() << 8) | (c.blue() << 16)
+
+
+def style_title_bar(window):
+    """Match a top-level window's title bar to the theme: dark or light to
+    follow the app mode, and fully colored in Night Vision so no bright strip
+    spoils dark adaptation. window is a QWindow (widget.windowHandle())."""
+    # Only for real Windows windows - other Qt platforms (e.g. offscreen) have
+    # no native title bar, and their window ids aren't Windows handles
+    if QGuiApplication.platformName() != 'windows' or window is None \
+            or window.type() not in (Qt.Window, Qt.Dialog):
+        return
+    hwnd = int(window.winId())
+    stamp = f"{_title_bar_generation}:{hwnd}"
+    if window.property('_theme_title_bar') == stamp:
+        return  # already styled for this theme (and this native window)
+    if _current_mode == 'night':
+        colors = (_colorref(COLORS['background']), _colorref(COLORS['text']), _colorref(COLORS['border']))
+    else:
+        colors = (_DWMWA_COLOR_DEFAULT,) * 3
+    values = zip((_DWMWA_USE_IMMERSIVE_DARK_MODE, _DWMWA_CAPTION_COLOR, _DWMWA_TEXT_COLOR, _DWMWA_BORDER_COLOR),
+                 (int(_current_mode != 'light'),) + colors)
+    try:
+        import ctypes
+        dwmapi, user32 = ctypes.windll.dwmapi, ctypes.windll.user32
+        for attribute, value in values:
+            data = ctypes.c_uint32(value)
+            # Unsupported attributes (older Windows) just return an error code
+            dwmapi.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), attribute, ctypes.byref(data), ctypes.sizeof(data))
+        # Redraw the frame so an already-visible title bar picks up the change
+        swp_flags = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020  # NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
+        user32.SetWindowPos(ctypes.c_void_p(hwnd), None, 0, 0, 0, 0, swp_flags)
+    except (AttributeError, OSError) as e:
+        logger.debug(f"Could not style window title bar: {e}")
+        return
+    window.setProperty('_theme_title_bar', stamp)
+
+
+def _restyle_title_bars():
+    """Restyle the title bars of all visible windows for the current theme."""
+    global _title_bar_generation
+    _title_bar_generation += 1
+    for window in QGuiApplication.topLevelWindows():
+        if window.isVisible():
+            style_title_bar(window)
+
+
 class ThemeManager(QObject):
-    """Emits theme_changed after a theme is applied, and follows the OS
-    color scheme while the 'system' mode is selected."""
+    """Emits theme_changed after a theme is applied, follows the OS color
+    scheme while the 'system' mode is selected, and keeps window title bars
+    styled."""
 
     theme_changed = Signal()
 
@@ -658,10 +790,17 @@ class ThemeManager(QObject):
         super().__init__(app)
         self.settings = ThemeSettings()
         app.styleHints().colorSchemeChanged.connect(self._on_color_scheme_changed)
+        # New windows get their title bar styled when first activated (a
+        # per-window hook, rather than an app-wide event filter that would run
+        # for every event)
+        app.focusWindowChanged.connect(style_title_bar)
 
     def _on_color_scheme_changed(self, _scheme):
         if self.settings.mode == 'system':
             apply_theme(QGuiApplication.instance(), self.settings)
+        else:
+            # Qt resets title bars to the OS scheme; put the theme's back after it
+            QTimer.singleShot(0, _restyle_title_bars)
 
 
 _manager = None
@@ -700,6 +839,7 @@ def apply_theme(app, theme_settings=None):
     app.setStyleSheet(build_stylesheet(colors, theme_settings))
     _apply_chart_theme()
     _refresh_themed_styles()
+    _restyle_title_bars()
 
     manager = theme_manager()
     manager.settings = theme_settings
