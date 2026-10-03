@@ -92,7 +92,7 @@ class DSOCalculationThread(QThread):
     # Altitude during dark sky but never rises above the custom horizon
     BLOCKED_BY_HORIZON = object()
 
-    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None, use_target_list=False, start_hour=18, duration_hours=12, use_horizon=False):
+    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None, use_target_list=False, start_hour=18, duration_hours=12, use_horizon=False, hide_completed=False):
         super().__init__()
         self.min_altitude = min_altitude
         self.max_magnitude = max_magnitude
@@ -100,6 +100,8 @@ class DSOCalculationThread(QThread):
         self.selected_dso_types = selected_dso_types or []
         self.dso_limit = dso_limit
         self.use_target_list = use_target_list
+        # Skip target list entries whose status is "Completed"
+        self.hide_completed = hide_completed
         self.start_hour = start_hour
         self.duration_hours = duration_hours
         # Number of DSOs that would be visible but are entirely below the
@@ -350,8 +352,10 @@ class DSOCalculationThread(QThread):
                 LEFT JOIN usertelescopes tel ON t.telescope_id = tel.id
                 WHERE t.ra_deg IS NOT NULL
                     AND t.dec_deg IS NOT NULL
-                ORDER BY t.magnitude ASC
             """
+            if self.hide_completed:
+                query += " AND COALESCE(t.status, '') != 'Completed'"
+            query += " ORDER BY t.magnitude ASC"
 
             cursor.execute(query)
 
@@ -547,7 +551,10 @@ class DSOCalculationThread(QThread):
                 dso_catalog = self.load_dsos_from_database()
 
             if not dso_catalog:
-                self.error_occurred.emit("No DSOs found in database")
+                if self.use_target_list and self.hide_completed:
+                    self.error_occurred.emit("No targets in your target list that aren't Completed")
+                else:
+                    self.error_occurred.emit("No DSOs found in database")
                 return
             
             visible_dsos = []
@@ -938,12 +945,25 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             "• Catalog, Type, Max Magnitude, and DSO Limit settings are ignored"
         )
         self.use_target_list_checkbox.toggled.connect(self._on_target_list_checkbox_changed)
-        # Restore saved checkbox state
+
+        # Don't Show Completed checkbox - only applies to the target list, so
+        # it's enabled by _on_target_list_checkbox_changed() alongside it
         settings = QSettings("CosmosCollection", "CosmosCollection")
+        self.hide_completed_checkbox = QCheckBox("Don't Show Completed")
+        self.hide_completed_checkbox.setToolTip(
+            "Skip target list entries whose status is \"Completed\".\n\n"
+            "Only applies when Use My Target List is checked."
+        )
+        self.hide_completed_checkbox.setChecked(
+            settings.value("BestDSOTonight/hide_completed", False, type=bool))
+        self.hide_completed_checkbox.setEnabled(False)
+
+        # Restore saved checkbox state
         saved_use_target_list = settings.value("BestDSOTonight/use_target_list", False, type=bool)
         if saved_use_target_list:
             self.use_target_list_checkbox.setChecked(True)
         action_layout.addWidget(self.use_target_list_checkbox)
+        action_layout.addWidget(self.hide_completed_checkbox)
 
         # Use Custom Horizon checkbox - enabled by _refresh_horizon_state()
         # only when the active location has a custom horizon
@@ -1153,6 +1173,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         """Save settings and window position when closing"""
         settings = QSettings("CosmosCollection", "CosmosCollection")
         settings.setValue("BestDSOTonight/use_target_list", self.use_target_list_checkbox.isChecked())
+        settings.setValue("BestDSOTonight/hide_completed", self.hide_completed_checkbox.isChecked())
         settings.setValue("BestDSOTonight/auto_calculate", self.auto_calculate_checkbox.isChecked())
         settings.setValue("BestDSOTonight/use_custom_horizon", self.use_horizon_checkbox.isChecked())
         super().closeEvent(event)
@@ -1169,6 +1190,9 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         # DSO limit doesn't apply when using target list (uses all targets)
         self.dso_limit_spin.setEnabled(not checked)
+
+        # Don't Show Completed only applies to the target list
+        self.hide_completed_checkbox.setEnabled(checked)
 
         # The global stylesheet's :disabled state will automatically
         # grey out the disabled widgets
@@ -1200,6 +1224,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         max_magnitude = float(self.max_magnitude_combo.currentText())
         dso_limit = self.dso_limit_spin.value()
         use_target_list = self.use_target_list_checkbox.isChecked()
+        hide_completed = use_target_list and self.hide_completed_checkbox.isChecked()
 
         # Store whether we're using target list for display_results
         self._using_target_list = use_target_list
@@ -1243,7 +1268,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         use_horizon = self.use_horizon_checkbox.isEnabled() and self.use_horizon_checkbox.isChecked()
 
         # Start calculation thread
-        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit, selected_dso_types, use_target_list, start_hour, duration_hours, use_horizon)
+        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit, selected_dso_types, use_target_list, start_hour, duration_hours, use_horizon, hide_completed)
         self.calc_thread.progress.connect(self.progress_bar.setValue)
         self.calc_thread.result_ready.connect(self.display_results)
         self.calc_thread.error_occurred.connect(self.handle_error)
