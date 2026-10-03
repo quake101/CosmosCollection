@@ -127,6 +127,15 @@ class DatabaseManager:
                     # Column already exists, ignore
                     pass
 
+                # Add custom horizon columns to usersettings (per-location horizon profile,
+                # stored as JSON [[az, alt], ...] - see HorizonProfile.py)
+                for column in ("horizon_points", "horizon_name"):
+                    try:
+                        cursor.execute(f"ALTER TABLE usersettings ADD COLUMN {column} TEXT")
+                        logger.debug(f"Added {column} column to usersettings table")
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+
                 # Create usertargetlist table for user's observing target list
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS usertargetlist (

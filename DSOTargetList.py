@@ -1216,16 +1216,19 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
                 
                 lat, lon = location_row
                 logger.debug(f"Using user location: lat={lat}, lon={lon}")
-                
+
+                from HorizonProfile import load_active_horizon
+                horizon = load_active_horizon(conn)
+
                 # Update status
                 self.status_label.setText("Calculating best months for all targets...")
-                
+
                 # Calculate best months for each target
                 targets_updated = 0
                 for target in self.targets_data:
                     if target.get("ra_deg") and target.get("dec_deg"):
                         best_months = self._calculate_best_months_for_target(
-                            target["ra_deg"], target["dec_deg"], lat, lon
+                            target["ra_deg"], target["dec_deg"], lat, lon, horizon
                         )
                         
                         if best_months:
@@ -1240,8 +1243,9 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
                 # Reload the table to show updated months
                 self._load_targets()
                 
-                QMessageBox.information(self, "Calculation Complete", 
-                    f"Best viewing months calculated for {targets_updated} targets based on your location.")
+                horizon_text = " and its custom horizon" if horizon else ""
+                QMessageBox.information(self, "Calculation Complete",
+                    f"Best viewing months calculated for {targets_updated} targets based on your location{horizon_text}.")
                 
         except Exception as e:
             logger.error(f"Error calculating best months: {str(e)}")
@@ -1249,8 +1253,12 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         finally:
             self.status_label.setText(f"Loaded {len(self.targets_data)} targets")
     
-    def _calculate_best_months_for_target(self, ra_deg, dec_deg, lat, lon):
-        """Calculate best viewing months for a single target using centralized calculator"""
+    def _calculate_best_months_for_target(self, ra_deg, dec_deg, lat, lon, horizon=None):
+        """Calculate best viewing months for a single target using centralized calculator
+
+        Args:
+            horizon: Optional HorizonProfile for the location (custom horizon)
+        """
         # Import required modules at the very top, outside any try blocks
         import numpy as np
         from datetime import datetime, timedelta
@@ -1285,7 +1293,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
                     
                     # Find optimal viewing times using same criteria
                     optimal_times = calculator.find_optimal_viewing_times(
-                        dso_altaz, sun_altaz, min_altitude)
+                        dso_altaz, sun_altaz, min_altitude, horizon=horizon)
                     
                     results = {"optimal_times": optimal_times}
                     

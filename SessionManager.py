@@ -2011,18 +2011,24 @@ class VisibilityCalcThread(QThread):
             from astropy import units as u
             import pytz
 
+            from HorizonProfile import load_horizon_for_coordinates
+
             calc = DSOVisibilityCalculator(
                 location_lat=self.location_lat,
                 location_lon=self.location_lon,
                 timezone=self.location_timezone,
             )
+            # Custom horizon of the saved location this session uses (active or
+            # not); None for a custom location
+            horizon = load_horizon_for_coordinates(self.location_lat, self.location_lon)
 
             coord = None
             if self.ra_deg is not None and self.dec_deg is not None:
                 coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
-                result = calc.calculate_visibility_for_coordinates(coord, self.visibility_date, dso_name=self.dso_name)
+                result = calc.calculate_visibility_for_coordinates(coord, self.visibility_date, dso_name=self.dso_name,
+                                                                   horizon=horizon)
             elif self.dso_name:
-                result = calc.calculate_visibility_for_date(self.dso_name, self.visibility_date)
+                result = calc.calculate_visibility_for_date(self.dso_name, self.visibility_date, horizon=horizon)
             else:
                 self.result_ready.emit({"error": "No coordinates or name available."})
                 return
@@ -2034,6 +2040,7 @@ class VisibilityCalcThread(QThread):
             max_alt_time_local = result["max_alt_time"].to_datetime(timezone=pytz.UTC).astimezone(calc.timezone)
             lines = [f"Max altitude: {result['max_altitude']:.1f}° at {format_time(max_alt_time_local)}"]
 
+            above = "above 30° and custom horizon" if horizon else "above 30°"
             windows = result.get("viewing_windows", [])
             if windows:
                 best_window = max(windows, key=lambda w: w["duration_hours"])
@@ -2041,10 +2048,10 @@ class VisibilityCalcThread(QThread):
                 end_local = best_window["end_time"].to_datetime(timezone=pytz.UTC).astimezone(calc.timezone)
                 lines.append(
                     f"Best window: {format_time(start_local)} - {format_time(end_local)} "
-                    f"({best_window['duration_hours']:.1f}h above 30°, dark sky)"
+                    f"({best_window['duration_hours']:.1f}h {above}, dark sky)"
                 )
             else:
-                lines.append("No window above 30° during dark sky on this date.")
+                lines.append(f"No window {above} during dark sky on this date.")
 
             obs_time = result["max_alt_time"]
             illumination = DSOVisibilityCalculator.get_moon_illumination(obs_time)
@@ -2097,6 +2104,8 @@ class SessionMonthlyVisibilityThread(QThread):
             from astropy import units as u
             from datetime import timedelta
 
+            from HorizonProfile import load_horizon_for_coordinates
+
             calc = DSOVisibilityCalculator(
                 location_lat=self.location_lat,
                 location_lon=self.location_lon,
@@ -2105,6 +2114,9 @@ class SessionMonthlyVisibilityThread(QThread):
             if calc.location is None:
                 self.error.emit("Observer location not configured.")
                 return
+            # Custom horizon of the saved location this session uses (active or
+            # not); None for a custom location
+            horizon = load_horizon_for_coordinates(self.location_lat, self.location_lon)
 
             if self.ra_deg is not None and self.dec_deg is not None:
                 coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
@@ -2122,7 +2134,8 @@ class SessionMonthlyVisibilityThread(QThread):
             current = self.start_date
             completed = 0
             while current <= self.end_date:
-                hours = calc.calculate_visibility_hours_for_day(coord, current.strftime("%Y-%m-%d"), self.min_altitude)
+                hours = calc.calculate_visibility_hours_for_day(coord, current.strftime("%Y-%m-%d"), self.min_altitude,
+                                                                horizon=horizon)
                 results[current] = hours
                 completed += 1
                 self.progress.emit(completed, total_days)

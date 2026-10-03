@@ -88,7 +88,11 @@ class DSOCalculationThread(QThread):
     result_ready = Signal(object)
     error_occurred = Signal(str)
 
-    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None, use_target_list=False, start_hour=18, duration_hours=12):
+    # Returned by calculate_tonight_visibility for a DSO that clears Min
+    # Altitude during dark sky but never rises above the custom horizon
+    BLOCKED_BY_HORIZON = object()
+
+    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None, use_target_list=False, start_hour=18, duration_hours=12, use_horizon=False):
         super().__init__()
         self.min_altitude = min_altitude
         self.max_magnitude = max_magnitude
@@ -98,7 +102,10 @@ class DSOCalculationThread(QThread):
         self.use_target_list = use_target_list
         self.start_hour = start_hour
         self.duration_hours = duration_hours
-        
+        # Number of DSOs that would be visible but are entirely below the
+        # custom horizon - set by run() before result_ready is emitted
+        self.blocked_by_horizon = 0
+
         # Use centralized calculator
         try:
             from DSOVisibilityCalculator import DSOVisibilityCalculator
@@ -106,11 +113,14 @@ class DSOCalculationThread(QThread):
             self.calculator = DSOVisibilityCalculator()
             self.location = self.calculator.location
             self.local_tz = self.calculator.timezone
+            self.horizon = self.calculator.horizon if use_horizon else None
         except (ImportError, Exception) as e:
             print(f"Warning: Could not initialize DSOVisibilityCalculator: {e}")
             self.calculator = None
             self.location = self.setup_location()
             self.local_tz = self.setup_timezone()
+            from HorizonProfile import load_active_horizon
+            self.horizon = load_active_horizon() if use_horizon else None
 
     def setup_location(self):
         """Set up the observer location from database"""
@@ -179,8 +189,13 @@ class DSOCalculationThread(QThread):
             
             # Find optimal viewing times using same criteria
             optimal_times = self.calculator.find_optimal_viewing_times(
-                dso_altaz, sun_altaz, self.min_altitude)
-            
+                dso_altaz, sun_altaz, self.min_altitude, horizon=self.horizon)
+
+            # Note DSOs hidden only by the custom horizon, for the status line
+            if self.horizon is not None and not np.any(optimal_times):
+                if np.any(self.calculator.find_optimal_viewing_times(dso_altaz, sun_altaz, self.min_altitude)):
+                    return self.BLOCKED_BY_HORIZON
+
             # Create results structure compatible with existing code
             results = {
                 "optimal_times": optimal_times,
@@ -239,10 +254,10 @@ class DSOCalculationThread(QThread):
             num_intervals = int(self.duration_hours * 4)
             time_range = start_time + np.linspace(0, self.duration_hours, num_intervals) * u.hour
             
-            # Get DSO coordinates from database data (coordinate-based for reliability)
+            # Get DSO coordinates from database data (coordinate-based for reliability).
+            # SkyCoord/u come from the module imports - importing them here would make
+            # u a local for the whole function and break the time_range line above
             try:
-                from astropy.coordinates import SkyCoord
-                import astropy.units as u
                 dso_coord = SkyCoord(ra=dso_info["ra_deg"] * u.deg, dec=dso_info["dec_deg"] * u.deg)
             except Exception:
                 return None
@@ -255,12 +270,18 @@ class DSOCalculationThread(QThread):
             sun = get_sun(time_range)
             sun_altaz = sun.transform_to(altaz_frame)
             
-            # Find when object is visible (above minimum altitude and sun is down)
-            dso_visible = dso_altaz.alt.deg > self.min_altitude
+            # Find when object is visible (above minimum altitude and custom
+            # horizon, and sun is down)
+            threshold = self.min_altitude
+            if self.horizon is not None:
+                threshold = np.maximum(self.min_altitude, self.horizon.altitude_at(dso_altaz.az.deg))
+            dso_visible = dso_altaz.alt.deg > threshold
             dark_sky = sun_altaz.alt.deg < -12  # Astronomical twilight
             optimal_times = dso_visible & dark_sky
-            
+
             if not np.any(optimal_times):
+                if self.horizon is not None and np.any((dso_altaz.alt.deg > self.min_altitude) & dark_sky):
+                    return self.BLOCKED_BY_HORIZON
                 return None
                 
             # Calculate visibility metrics
@@ -496,14 +517,21 @@ class DSOCalculationThread(QThread):
             return []
     
     def calculate_dso_batch(self, dso_batch):
-        """Calculate visibility for a batch of DSOs"""
+        """Calculate visibility for a batch of DSOs
+
+        Returns:
+            tuple: (visible DSO results, number blocked by the custom horizon)
+        """
         batch_results = []
+        blocked = 0
         for dso_info in dso_batch:
             result = self.calculate_tonight_visibility(dso_info)
-            if result:
+            if result is self.BLOCKED_BY_HORIZON:
+                blocked += 1
+            elif result:
                 result["direction"] = self.azimuth_to_direction(result["optimal_azimuth"])
                 batch_results.append(result)
-        return batch_results
+        return batch_results, blocked
 
     def run(self):
         """Main calculation thread with parallel processing"""
@@ -546,8 +574,9 @@ class DSOCalculationThread(QThread):
                 # Collect results as they complete
                 for future in as_completed(future_to_batch):
                     try:
-                        batch_results = future.result()
+                        batch_results, blocked = future.result()
                         visible_dsos.extend(batch_results)
+                        self.blocked_by_horizon += blocked
                         
                         # Update progress based on completed batches
                         completed_count += len(future_to_batch[future])
@@ -916,6 +945,14 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self.use_target_list_checkbox.setChecked(True)
         action_layout.addWidget(self.use_target_list_checkbox)
 
+        # Use Custom Horizon checkbox - enabled by _refresh_horizon_state()
+        # only when the active location has a custom horizon
+        self.active_horizon = None
+        self.use_horizon_checkbox = QCheckBox("Use Custom Horizon")
+        self.use_horizon_checkbox.setChecked(
+            settings.value("BestDSOTonight/use_custom_horizon", True, type=bool))
+        action_layout.addWidget(self.use_horizon_checkbox)
+
         # Auto Calculate checkbox
         self.auto_calculate_checkbox = QCheckBox("Auto Calculate")
         self.auto_calculate_checkbox.setToolTip(
@@ -995,8 +1032,30 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
         main_layout.addWidget(self.status_label)
 
+    def _refresh_horizon_state(self):
+        """Load the active location's custom horizon and enable the Use Custom
+        Horizon checkbox only when there is one"""
+        from HorizonProfile import load_active_horizon
+        self.active_horizon = load_active_horizon()
+        if self.active_horizon is not None:
+            self.use_horizon_checkbox.setEnabled(True)
+            self.use_horizon_checkbox.setToolTip(
+                "Treat objects as blocked while they're below the active location's\n"
+                f"custom horizon ({self.active_horizon.summary()}).\n\n"
+                "Min Altitude still applies: an object must clear both."
+            )
+        else:
+            self.use_horizon_checkbox.setEnabled(False)
+            self.use_horizon_checkbox.setToolTip(
+                "The active location has no custom horizon.\n\n"
+                "Import a NINA or Stellarium horizon file in\n"
+                "Settings > Location Manager."
+            )
+
     def load_location_info(self):
         """Load and display location information"""
+        self._refresh_horizon_state()
+
         # Check if observer location should be shown
         from PySide6.QtCore import QSettings
         settings = QSettings("CosmosCollection", "CosmosCollection")
@@ -1036,7 +1095,9 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                                 location_text += f" ({tz_abbrev})"
                             except Exception:
                                 pass
-                        
+                        if self.active_horizon is not None:
+                            location_text += f" · Horizon: {self.active_horizon.name or 'custom'}"
+
                         self.location_label.setText(location_text)
                         self.calculate_btn.setEnabled(True)
                         return
@@ -1093,6 +1154,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         settings = QSettings("CosmosCollection", "CosmosCollection")
         settings.setValue("BestDSOTonight/use_target_list", self.use_target_list_checkbox.isChecked())
         settings.setValue("BestDSOTonight/auto_calculate", self.auto_calculate_checkbox.isChecked())
+        settings.setValue("BestDSOTonight/use_custom_horizon", self.use_horizon_checkbox.isChecked())
         super().closeEvent(event)
 
     def _on_target_list_checkbox_changed(self, checked):
@@ -1175,8 +1237,13 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         start_hour = self.start_hour_spin.value()
         duration_hours = self.duration_hours_spin.value()
 
+        # Re-check the active location's horizon - it may have been imported
+        # or cleared in Settings while this window was open
+        self._refresh_horizon_state()
+        use_horizon = self.use_horizon_checkbox.isEnabled() and self.use_horizon_checkbox.isChecked()
+
         # Start calculation thread
-        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit, selected_dso_types, use_target_list, start_hour, duration_hours)
+        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit, selected_dso_types, use_target_list, start_hour, duration_hours, use_horizon)
         self.calc_thread.progress.connect(self.progress_bar.setValue)
         self.calc_thread.result_ready.connect(self.display_results)
         self.calc_thread.error_occurred.connect(self.handle_error)
@@ -1228,13 +1295,16 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         settings = QSettings("CosmosCollection", "CosmosCollection")
         settings.setValue("BestDSOTonight/last_calculated_date", now.strftime("%Y-%m-%d"))
 
+        blocked = self.calc_thread.blocked_by_horizon if self.calc_thread else 0
+        blocked_text = f" ({blocked} blocked by custom horizon)" if blocked else ""
+
         if not visible_dsos:
-            self.status_label.setText(f"No DSOs meet the visibility criteria for tonight. Last calculated: {last_calculated}")
+            self.status_label.setText(f"No DSOs meet the visibility criteria for tonight{blocked_text}. Last calculated: {last_calculated}")
             self.status_label.setStyleSheet("")  # Reset to default color
             self.results_table.setRowCount(0)
             return
 
-        self.status_label.setText(f"Found {len(visible_dsos)} visible DSOs for tonight. Last calculated: {last_calculated}")
+        self.status_label.setText(f"Found {len(visible_dsos)} visible DSOs for tonight{blocked_text}. Last calculated: {last_calculated}")
         self.status_label.setStyleSheet("")  # Reset to default color
         
         # Disable sorting temporarily while populating

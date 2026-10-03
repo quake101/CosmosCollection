@@ -69,7 +69,7 @@ os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
 )
 
 # Core PySide6 imports (always needed)
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings, Slot, QCoreApplication
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings, Slot, QCoreApplication, QPointF, QRectF, QSize
 from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
@@ -77,7 +77,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QPushButton, QHBoxLayout, QLineEdit, QComboBox, QTextEdit, QCheckBox, QGroupBox,
     QToolBar, QMessageBox, QMenu, QScrollArea, QGridLayout, QSpinBox, QFileDialog, QSizePolicy,
     QListWidget, QListWidgetItem, QCompleter, QSplitter, QSystemTrayIcon,
-    QTableWidget, QTableWidgetItem, QProgressDialog
+    QTableWidget, QTableWidgetItem, QProgressDialog, QToolTip
 )
 
 # Local imports (always needed)
@@ -884,6 +884,102 @@ BACKUP_TABLES = [
 ]
 
 
+class HorizonPreview(QWidget):
+    """Small altitude-vs-azimuth plot of a custom horizon for the Location Manager.
+
+    Painted with QPainter rather than matplotlib so opening Settings stays cheap.
+    Hovering shows the horizon altitude at that azimuth."""
+
+    MAX_ALT = 90.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.profile = None
+        self._altitudes = []  # horizon altitude at each whole degree of azimuth, 0-360
+        self.setMinimumHeight(110)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMouseTracking(True)
+        theme_manager().theme_changed.connect(self.update)
+
+    def set_profile(self, profile):
+        self.profile = profile
+        self._altitudes = [float(alt) for alt in profile.altitude_at(list(range(361)))] if profile else []
+        self.update()
+
+    def sizeHint(self):
+        return QSize(300, 110)
+
+    def _plot_rect(self):
+        """Plot area inside the axis labels"""
+        metrics = self.fontMetrics()
+        left = metrics.horizontalAdvance("90°") + 6
+        top = metrics.ascent() / 2 + 2  # room for the 90° label centered on the top gridline
+        bottom = metrics.height() + 4
+        return QRectF(left, top, max(1, self.width() - left - 6), max(1, self.height() - bottom - top))
+
+    def _to_point(self, rect, az, alt):
+        return QPointF(rect.left() + rect.width() * az / 360.0,
+                       rect.bottom() - rect.height() * max(0.0, min(alt, self.MAX_ALT)) / self.MAX_ALT)
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPen, QPolygonF
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self._plot_rect()
+        painter.fillRect(rect, QColor(COLORS['background_lighter']))
+
+        # Altitude gridlines and labels
+        text_color = QColor(COLORS['text_secondary'])
+        grid_pen = QPen(QColor(COLORS['border_light']))
+        grid_pen.setStyle(Qt.DotLine)
+        metrics = self.fontMetrics()
+        for alt in (0, 30, 60, 90):
+            y = self._to_point(rect, 0, alt).y()
+            painter.setPen(grid_pen)
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            painter.setPen(text_color)
+            label = f"{alt}°"
+            painter.drawText(QPointF(rect.left() - metrics.horizontalAdvance(label) - 4,
+                                     y + metrics.ascent() / 2 - 1), label)
+
+        # Cardinal direction gridlines and labels
+        for az, label in ((0, "N"), (90, "E"), (180, "S"), (270, "W"), (360, "N")):
+            x = self._to_point(rect, az, 0).x()
+            painter.setPen(grid_pen)
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            painter.setPen(text_color)
+            label_x = min(max(x - metrics.horizontalAdvance(label) / 2, rect.left()),
+                          rect.right() - metrics.horizontalAdvance(label))
+            painter.drawText(QPointF(label_x, rect.bottom() + metrics.ascent() + 2), label)
+
+        # Horizon profile, filled down to 0°
+        if self._altitudes:
+            accent = QColor(COLORS['accent'])
+            outline = [self._to_point(rect, az, alt) for az, alt in enumerate(self._altitudes)]
+            fill = QColor(accent)
+            fill.setAlpha(110)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(fill)
+            painter.drawPolygon(QPolygonF([self._to_point(rect, 0, 0)] + outline + [self._to_point(rect, 360, 0)]))
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(accent, 1.5))
+            painter.drawPolyline(QPolygonF(outline))
+        painter.end()
+
+    def mouseMoveEvent(self, event):
+        rect = self._plot_rect()
+        pos = event.position()
+        if not self._altitudes or not rect.contains(pos):
+            QToolTip.hideText()
+            return
+        az = round((pos.x() - rect.left()) / rect.width() * 360.0) % 360
+        directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+                      'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
+        direction = directions[int((az + 11.25) / 22.5) % 16]
+        QToolTip.showText(event.globalPosition().toPoint(),
+                          f"Azimuth {az}° ({direction}): horizon {self._altitudes[az]:.1f}°", self)
+
+
 # --- Settings Dialog ---
 class SettingsDialog(QDialog):
     """Settings dialog for configuring application preferences"""
@@ -945,40 +1041,33 @@ class SettingsDialog(QDialog):
         right_panel = QGroupBox("Location Details")
         right_layout = QVBoxLayout(right_panel)
 
+        # Labels in column 0; fields span columns 1-2, and the button rows
+        # split columns 1-2 evenly so every field and button shares the same
+        # left and right edges
+        form_grid = QGridLayout()
+        form_grid.setColumnStretch(1, 1)
+        form_grid.setColumnStretch(2, 1)
+        right_layout.addLayout(form_grid)
+
         # Latitude input
-        lat_layout = QHBoxLayout()
-        lat_label = QLabel("Latitude:")
-        lat_label.setMinimumWidth(100)
         self.latitude_input = QLineEdit()
         self.latitude_input.setPlaceholderText("e.g., 40.7128")
-        lat_layout.addWidget(lat_label)
-        lat_layout.addWidget(self.latitude_input)
-        right_layout.addLayout(lat_layout)
+        form_grid.addWidget(QLabel("Latitude:"), 0, 0)
+        form_grid.addWidget(self.latitude_input, 0, 1, 1, 2)
 
         # Longitude input
-        lon_layout = QHBoxLayout()
-        lon_label = QLabel("Longitude:")
-        lon_label.setMinimumWidth(100)
         self.longitude_input = QLineEdit()
         self.longitude_input.setPlaceholderText("e.g., -74.0060")
-        lon_layout.addWidget(lon_label)
-        lon_layout.addWidget(self.longitude_input)
-        right_layout.addLayout(lon_layout)
+        form_grid.addWidget(QLabel("Longitude:"), 1, 0)
+        form_grid.addWidget(self.longitude_input, 1, 1, 1, 2)
 
         # Location name
-        name_layout = QHBoxLayout()
-        name_label = QLabel("Name:")
-        name_label.setMinimumWidth(100)
         self.location_name_input = QLineEdit()
         self.location_name_input.setPlaceholderText("e.g., Home Observatory (optional)")
-        name_layout.addWidget(name_label)
-        name_layout.addWidget(self.location_name_input)
-        right_layout.addLayout(name_layout)
+        form_grid.addWidget(QLabel("Name:"), 2, 0)
+        form_grid.addWidget(self.location_name_input, 2, 1, 1, 2)
 
         # Timezone
-        tz_layout = QHBoxLayout()
-        tz_label = QLabel("Time Zone:")
-        tz_label.setMinimumWidth(100)
         self.timezone_combo = QComboBox()
         self.timezone_combo.setEditable(True)
         common_timezones = [
@@ -997,30 +1086,50 @@ class SettingsDialog(QDialog):
             "Australia/Sydney"
         ]
         self.timezone_combo.addItems(common_timezones)
-        tz_layout.addWidget(tz_label)
-        tz_layout.addWidget(self.timezone_combo)
-        right_layout.addLayout(tz_layout)
+        form_grid.addWidget(QLabel("Time Zone:"), 3, 0)
+        form_grid.addWidget(self.timezone_combo, 3, 1, 1, 2)
+
+        # Custom horizon - saved immediately for an existing location, or held
+        # until Save Location for a new one
+        self.pending_horizon = None
+        self.horizon_status_label = QLabel()
+        # Take whatever width is left rather than widening the dialog for a
+        # long file name - the full text is also in the tooltip
+        self.horizon_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.import_horizon_btn = QPushButton("Import Horizon...")
+        self.import_horizon_btn.setToolTip(
+            "Import a custom horizon for this location from a NINA horizon file (.hrz)\n"
+            "or a Stellarium landscape (landscape.ini or .zip).\n\n"
+            "Visibility calculations treat objects below this horizon as blocked\n"
+            "(e.g. by trees or buildings) while this is the active location."
+        )
+        self.import_horizon_btn.clicked.connect(self._import_horizon)
+        self.clear_horizon_btn = QPushButton("Clear Horizon")
+        self.clear_horizon_btn.setToolTip("Remove the custom horizon from this location")
+        self.clear_horizon_btn.clicked.connect(self._clear_horizon)
+        # Preview plot, shown only when the location has a horizon
+        self.horizon_preview = HorizonPreview()
+        form_grid.addWidget(QLabel("Horizon:"), 4, 0)
+        form_grid.addWidget(self.horizon_status_label, 4, 1, 1, 2)
+        form_grid.addWidget(self.horizon_preview, 5, 1, 1, 2)
+        form_grid.addWidget(self.import_horizon_btn, 6, 1)
+        form_grid.addWidget(self.clear_horizon_btn, 6, 2)
+        self._show_horizon_status(None)
 
         # Map picker button
-        map_button_layout = QHBoxLayout()
         map_button = QPushButton("Select Location from Map")
         map_button.setToolTip("Open an interactive map to visually select your location")
         map_button.clicked.connect(self._open_map_picker)
-        map_button_layout.addStretch()
-        map_button_layout.addWidget(map_button)
-        map_button_layout.addStretch()
-        right_layout.addLayout(map_button_layout)
+        form_grid.addWidget(map_button, 7, 1, 1, 2)
 
-        # Save / Clear buttons
-        form_btn_layout = QHBoxLayout()
+        # Save / Clear buttons, set apart from the field buttons above
+        form_grid.setRowMinimumHeight(8, 8)
         self.save_location_btn = QPushButton("Save Location")
         self.save_location_btn.clicked.connect(self._save_location)
         self.clear_form_btn = QPushButton("Clear Form")
         self.clear_form_btn.clicked.connect(self._clear_location_form)
-        form_btn_layout.addStretch()
-        form_btn_layout.addWidget(self.save_location_btn)
-        form_btn_layout.addWidget(self.clear_form_btn)
-        right_layout.addLayout(form_btn_layout)
+        form_grid.addWidget(self.save_location_btn, 9, 1)
+        form_grid.addWidget(self.clear_form_btn, 9, 2)
 
         right_layout.addStretch()
         location_layout.addWidget(right_panel)
@@ -1778,17 +1887,29 @@ class SettingsDialog(QDialog):
         except Exception as e:
             logger.error(f"Error loading settings: {str(e)}")
             
-    def _refresh_location_list(self):
-        """Refresh the location list widget from database"""
+    def _refresh_location_list(self, keep_selection_id=None):
+        """Refresh the location list widget from database
+
+        Args:
+            keep_selection_id: Re-select this location without reloading the
+                form (so unsaved edits survive). By default the active
+                location is selected and loaded into the form.
+        """
+        if keep_selection_id is not None:
+            self.location_list.blockSignals(True)
         self.location_list.clear()
-        active_item = None
+        select_item = None
         try:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT id, location_lat, location_lon, location_name, timezone, is_active FROM usersettings ORDER BY id")
+                cursor.execute("""
+                    SELECT id, location_lat, location_lon, location_name, timezone, is_active,
+                           COALESCE(horizon_points, '') != ''
+                    FROM usersettings ORDER BY id
+                """)
                 rows = cursor.fetchall()
                 for row in rows:
-                    loc_id, lat, lon, name, tz, is_active = row
+                    loc_id, lat, lon, name, tz, is_active, has_horizon = row
                     if name:
                         display = name
                     else:
@@ -1797,16 +1918,23 @@ class SettingsDialog(QDialog):
                         display = "(Active) " + display
                     if tz:
                         display += f" [{tz}]"
+                    if has_horizon:
+                        display += " ⛰"
                     item = QListWidgetItem(display)
                     item.setData(Qt.UserRole, loc_id)
+                    if has_horizon:
+                        item.setToolTip("Has a custom horizon")
                     if is_active:
                         item.setBackground(QColor(tint(COLORS['accent'], 0.35)))
-                        active_item = item
+                    if (loc_id == keep_selection_id) if keep_selection_id is not None else is_active:
+                        select_item = item
                     self.location_list.addItem(item)
-            if active_item:
-                self.location_list.setCurrentItem(active_item)
+            if select_item:
+                self.location_list.setCurrentItem(select_item)
         except Exception as e:
             logger.error(f"Error loading location list: {str(e)}")
+        finally:
+            self.location_list.blockSignals(False)
 
     def _on_location_selected(self, current, previous):
         """Handle location list selection - populate form for editing"""
@@ -1816,10 +1944,20 @@ class SettingsDialog(QDialog):
         try:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon, location_name, timezone, is_active FROM usersettings WHERE id = ?", (loc_id,))
+                cursor.execute("""
+                    SELECT location_lat, location_lon, location_name, timezone, is_active, horizon_points, horizon_name
+                    FROM usersettings WHERE id = ?
+                """, (loc_id,))
                 row = cursor.fetchone()
                 if row:
-                    lat, lon, name, tz, is_active = row
+                    lat, lon, name, tz, is_active, horizon_points, horizon_name = row
+                    self.pending_horizon = None
+                    try:
+                        from HorizonProfile import HorizonProfile
+                        self._show_horizon_status(HorizonProfile.from_json(horizon_points, name=horizon_name))
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Ignoring unreadable custom horizon for location {loc_id}: {e}")
+                        self._show_horizon_status(None)
                     self.set_active_btn.setEnabled(not is_active)
                     self.latitude_input.setText(str(lat) if lat is not None else "")
                     self.longitude_input.setText(str(lon) if lon is not None else "")
@@ -1844,8 +1982,94 @@ class SettingsDialog(QDialog):
         self.location_name_input.clear()
         self.timezone_combo.setCurrentIndex(0)
         self.editing_location_id = None
+        self.pending_horizon = None
+        self._show_horizon_status(None)
         self.save_location_btn.setText("Save Location")
+        # Reset the current item too, not just the selection, so clicking the
+        # same location again fires currentItemChanged and reloads the form
+        self.location_list.setCurrentRow(-1)
         self.location_list.clearSelection()
+
+    def _show_horizon_status(self, profile, pending=False):
+        """Show a location's custom horizon (or None) in the Location Details form"""
+        if profile is None:
+            self.horizon_status_label.setText("None")
+            self.horizon_status_label.setToolTip("")
+        else:
+            text = profile.summary()
+            if pending:
+                text += " (saved with the location)"
+            self.horizon_status_label.setText(text)
+            self.horizon_status_label.setToolTip(text)
+        self.clear_horizon_btn.setEnabled(profile is not None)
+        self.horizon_preview.set_profile(profile)
+        self.horizon_preview.setVisible(profile is not None)
+
+    def _import_horizon(self):
+        """Import a NINA/Stellarium horizon file for the location in the form.
+
+        An existing location is updated immediately; a new location keeps the
+        horizon until Save Location."""
+        from HorizonProfile import HorizonParseError, parse_horizon_file
+
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        start_dir = settings.value("last_horizon_dir", "", type=str)
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Custom Horizon",
+            start_dir,
+            "Horizon Files (*.hrz *.ini *.zip *.txt *.csv);;"
+            "NINA Horizon (*.hrz);;"
+            "Stellarium Landscape (*.ini *.zip);;"
+            "All Files (*.*)"
+        )
+        if not file_path:
+            return
+        settings.setValue("last_horizon_dir", os.path.dirname(file_path))
+
+        try:
+            profile = parse_horizon_file(file_path)
+        except HorizonParseError as e:
+            QMessageBox.warning(self, "Invalid Horizon File", str(e))
+            return
+
+        if self.editing_location_id:
+            self._store_horizon(self.editing_location_id, profile)
+        else:
+            self.pending_horizon = profile
+            self._show_horizon_status(profile, pending=True)
+
+    def _clear_horizon(self):
+        """Remove the custom horizon from the location in the form"""
+        if not self.editing_location_id:
+            self.pending_horizon = None
+            self._show_horizon_status(None)
+            return
+
+        reply = QMessageBox.question(self, "Remove Custom Horizon",
+            "Remove the custom horizon from this location?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self._store_horizon(self.editing_location_id, None)
+
+    def _store_horizon(self, loc_id, profile):
+        """Save (or with profile=None, remove) a location's custom horizon"""
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE usersettings SET horizon_points = ?, horizon_name = ? WHERE id = ?",
+                    (profile.to_json() if profile else None, profile.name if profile else None, loc_id)
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error saving custom horizon: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to save custom horizon: {str(e)}")
+            return
+
+        self._show_horizon_status(profile)
+        self._refresh_location_list(keep_selection_id=loc_id)
+        logger.debug(f"Custom horizon for location {loc_id}: {profile.summary() if profile else 'removed'}")
 
     def _save_location(self):
         """Save or update a location in the database"""
@@ -1892,11 +2116,14 @@ class SettingsDialog(QDialog):
                         WHERE id = ?
                     """, (lat, lon, location_name, timezone, self.editing_location_id))
                 else:
-                    # Insert new location
+                    # Insert new location, with any horizon imported before saving
+                    horizon = self.pending_horizon
                     cursor.execute("""
-                        INSERT INTO usersettings (location_lat, location_lon, location_name, timezone, is_active)
-                        VALUES (?, ?, ?, ?, 0)
-                    """, (lat, lon, location_name, timezone))
+                        INSERT INTO usersettings (location_lat, location_lon, location_name, timezone, is_active,
+                                                  horizon_points, horizon_name)
+                        VALUES (?, ?, ?, ?, 0, ?, ?)
+                    """, (lat, lon, location_name, timezone,
+                          horizon.to_json() if horizon else None, horizon.name if horizon else None))
 
                     # If it's the only location, auto-set as active
                     cursor.execute("SELECT COUNT(*) FROM usersettings")

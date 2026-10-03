@@ -42,6 +42,7 @@ a = Analysis(
         'BestDSOTonight',
         'DSOVisibilityCalculator',
         'DSOTargetList',
+        'HorizonProfile',
         'concurrent.futures',
     ],
     hookspath=[],

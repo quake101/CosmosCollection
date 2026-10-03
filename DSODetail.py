@@ -256,6 +256,10 @@ class VisibilityCalculationWorker(QObject):
         except ImportError:
             self.calculator = None
 
+        # lat/lon are the active location's, so its custom horizon applies
+        from HorizonProfile import load_active_horizon
+        self.horizon = load_active_horizon()
+
     def calculate_visibility(self):
         """Calculate visibility seasons in background thread"""
         try:
@@ -285,7 +289,7 @@ class VisibilityCalculationWorker(QObject):
                         dso_coord, date_str, 12)
 
                     optimal_times = self.calculator.find_optimal_viewing_times(
-                        dso_altaz, sun_altaz, min_altitude)
+                        dso_altaz, sun_altaz, min_altitude, horizon=self.horizon)
 
                     results = {"optimal_times": optimal_times}
 
@@ -317,7 +321,8 @@ class VisibilityCalculationWorker(QObject):
                             season_strs.append(f"{season_start.strftime('%B %d')} - {date.strftime('%B %d')}")
 
                 if season_strs:
-                    visibility_text = f"Best viewing seasons (>30° altitude in dark sky):<br>" + "<br>".join(season_strs)
+                    criteria = ">30° altitude and above your custom horizon" if self.horizon else ">30° altitude"
+                    visibility_text = f"Best viewing seasons ({criteria} in dark sky):<br>" + "<br>".join(season_strs)
                     visibility_text += "<br><br><small>Use Visibility Calculator for detailed nightly times.</small>"
                 else:
                     visibility_text = "Object not optimally visible from your location this year."

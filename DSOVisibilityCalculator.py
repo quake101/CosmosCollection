@@ -72,11 +72,18 @@ class DSOVisibilityCalculator:
         """
         self.location = None
         self.timezone = pytz.UTC  # Default to UTC
+        # Custom horizon of the active location (HorizonProfile or None). Only
+        # loaded when the location comes from the database; callers opt in by
+        # passing it to find_optimal_viewing_times(horizon=...)
+        self.horizon = None
 
         if location_lat is not None and location_lon is not None:
             self.set_location(location_lat, location_lon, height)
         else:
             self._load_location_from_database()
+            if self.location is not None:
+                from HorizonProfile import load_active_horizon
+                self.horizon = load_active_horizon()
 
         if timezone:
             self.set_timezone(timezone)
@@ -315,7 +322,7 @@ class DSOVisibilityCalculator:
 
         return time_range, dso_altaz, sun_altaz
 
-    def find_optimal_viewing_times(self, dso_altaz, sun_altaz, min_altitude=30, max_sun_altitude=-12):
+    def find_optimal_viewing_times(self, dso_altaz, sun_altaz, min_altitude=30, max_sun_altitude=-12, horizon=None):
         """
         Find optimal viewing times based on altitude and darkness criteria.
 
@@ -324,15 +331,20 @@ class DSOVisibilityCalculator:
             sun_altaz: Sun altitude/azimuth data
             min_altitude (float): Minimum DSO altitude in degrees (default: 30)
             max_sun_altitude (float): Maximum sun altitude for dark sky (default: -12)
+            horizon (HorizonProfile): Optional custom horizon. The DSO must be
+                above both min_altitude and the horizon at its azimuth.
 
         Returns:
             numpy array: Boolean array indicating optimal viewing times
         """
-        dso_visible = dso_altaz.alt.deg > min_altitude
+        threshold = min_altitude
+        if horizon is not None:
+            threshold = np.maximum(min_altitude, horizon.altitude_at(dso_altaz.az.deg))
+        dso_visible = dso_altaz.alt.deg > threshold
         dark_sky = sun_altaz.alt.deg < max_sun_altitude
         return dso_visible & dark_sky
 
-    def calculate_visibility_for_date(self, dso_name, date, duration_hours=24, min_altitude=30):
+    def calculate_visibility_for_date(self, dso_name, date, duration_hours=24, min_altitude=30, horizon=None):
         """
         Calculate complete visibility information for a DSO on a specific date.
 
@@ -341,6 +353,7 @@ class DSOVisibilityCalculator:
             date (str): Date in ISO format (YYYY-MM-DD)
             duration_hours (float): Duration to calculate (default: 24 hours)
             min_altitude (float): Minimum altitude threshold (default: 30 degrees)
+            horizon (HorizonProfile): Optional custom horizon (see find_optimal_viewing_times)
 
         Returns:
             dict: Complete visibility results or None if error
@@ -350,9 +363,11 @@ class DSOVisibilityCalculator:
         if dso_coord is None:
             return {"error": f"Could not find coordinates for {dso_name}: {error}"}
 
-        return self.calculate_visibility_for_coordinates(dso_coord, date, duration_hours, min_altitude, dso_name)
+        return self.calculate_visibility_for_coordinates(dso_coord, date, duration_hours, min_altitude, dso_name,
+                                                         horizon=horizon)
 
-    def calculate_visibility_for_coordinates(self, dso_coord, date, duration_hours=24, min_altitude=30, dso_name=None):
+    def calculate_visibility_for_coordinates(self, dso_coord, date, duration_hours=24, min_altitude=30, dso_name=None,
+                                             horizon=None):
         """
         Calculate complete visibility information for DSO coordinates on a specific date.
 
@@ -362,6 +377,7 @@ class DSOVisibilityCalculator:
             duration_hours (float): Duration to calculate (default: 24 hours)
             min_altitude (float): Minimum altitude threshold (default: 30 degrees)
             dso_name (str, optional): Name of the DSO for display purposes
+            horizon (HorizonProfile): Optional custom horizon (see find_optimal_viewing_times)
 
         Returns:
             dict: Complete visibility results or None if error
@@ -372,7 +388,7 @@ class DSOVisibilityCalculator:
                 dso_coord, date, duration_hours)
 
             # Find optimal viewing times
-            optimal_times = self.find_optimal_viewing_times(dso_altaz, sun_altaz, min_altitude)
+            optimal_times = self.find_optimal_viewing_times(dso_altaz, sun_altaz, min_altitude, horizon=horizon)
 
             # Calculate summary statistics
             max_altitude = np.max(dso_altaz.alt.deg)
@@ -400,7 +416,7 @@ class DSOVisibilityCalculator:
         except Exception as e:
             return {"error": f"Calculation error: {str(e)}"}
 
-    def calculate_visibility_hours_for_day(self, dso_coord, date, min_altitude=30):
+    def calculate_visibility_hours_for_day(self, dso_coord, date, min_altitude=30, horizon=None):
         """
         Calculate total visibility hours for a DSO on a specific day.
 
@@ -408,6 +424,7 @@ class DSOVisibilityCalculator:
             dso_coord (SkyCoord): Coordinates of the DSO
             date (str): Date in ISO format (YYYY-MM-DD)
             min_altitude (float): Minimum altitude threshold (default: 30 degrees)
+            horizon (HorizonProfile): Optional custom horizon (see find_optimal_viewing_times)
 
         Returns:
             float: Total hours the DSO is optimally visible on this day
@@ -418,7 +435,7 @@ class DSOVisibilityCalculator:
                 dso_coord, date, 24, time_resolution=4)
 
             # Find optimal viewing times
-            optimal_times = self.find_optimal_viewing_times(dso_altaz, sun_altaz, min_altitude)
+            optimal_times = self.find_optimal_viewing_times(dso_altaz, sun_altaz, min_altitude, horizon=horizon)
 
             # Calculate total hours (each time point represents 15 minutes = 0.25 hours)
             total_hours = np.sum(optimal_times) * 0.25
@@ -683,7 +700,7 @@ class MonthlyVisibilityThread(QThread):
             while current <= self.end_date:
                 date_str = current.strftime("%Y-%m-%d")
                 hours = self.calculator.calculate_visibility_hours_for_day(
-                    self.dso_coord, date_str, self.min_altitude)
+                    self.dso_coord, date_str, self.min_altitude, horizon=self.calculator.horizon)
                 visibility_hours[current] = hours
                 moon_illumination[current] = DSOVisibilityCalculator.get_moon_illumination(
                     Time(f"{date_str}T12:00:00"))
@@ -1205,11 +1222,13 @@ class CalculationThread(QThread):
 
                 dso_coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
                 results = self.calculator.calculate_visibility_for_coordinates(
-                    dso_coord, self.date, self.hours, self.min_altitude, self.dso_name)
+                    dso_coord, self.date, self.hours, self.min_altitude, self.dso_name,
+                    horizon=self.calculator.horizon)
             else:
                 # Use name-based calculation (original behavior)
                 results = self.calculator.calculate_visibility_for_date(
-                    self.dso_name, self.date, self.hours, self.min_altitude)
+                    self.dso_name, self.date, self.hours, self.min_altitude,
+                    horizon=self.calculator.horizon)
 
             if "error" in results:
                 self.error.emit(results["error"])
@@ -1217,6 +1236,8 @@ class CalculationThread(QThread):
 
             # Add local timezone for compatibility with existing UI code
             results['local_tz'] = self.local_tz
+            # Active location's custom horizon (or None), drawn on the altitude chart
+            results['horizon'] = self.calculator.horizon
 
             self.finished.emit(results)
 
@@ -1347,7 +1368,8 @@ class VisibilityPlot(FigureCanvas):
             'sun_altaz': sun_altaz,
             'optimal_times': optimal_times,
             'dso_name': dso_name,
-            'local_tz': local_tz
+            'local_tz': local_tz,
+            'horizon_alt': None,  # filled in below when there's a custom horizon
         }
 
         # Convert times to local timezone for display
@@ -1373,6 +1395,18 @@ class VisibilityPlot(FigureCanvas):
         ax1.plot(hours_from_start, dso_altaz.alt.deg, color=chart_color('#00aaff'), linewidth=2, label=f'{dso_name} Altitude')
         ax1.axhline(y=30, color=chart_color('#00ff88'), linestyle='--', alpha=0.8, label='Min Altitude (30°)')
         ax1.axhline(y=0, color=chart_color('#888888'), linestyle='-', alpha=0.6, label='Horizon')
+
+        # Custom horizon along the object's path: the obstruction height at the
+        # object's azimuth at each moment, so the object is blocked wherever its
+        # altitude line dips into the shaded area
+        horizon = results.get('horizon')
+        horizon_alt = None
+        if horizon is not None:
+            horizon_alt = horizon.altitude_at(dso_altaz.az.deg)
+            horizon_color = chart_color('#8a6a45')
+            ax1.fill_between(hours_from_start, -20, horizon_alt, color=horizon_color, alpha=0.35,
+                             linewidth=0, zorder=1, label=f'Custom Horizon ({horizon.name or "custom"})')
+            ax1.plot(hours_from_start, horizon_alt, color=horizon_color, linewidth=1.5, zorder=1)
 
         # Highlight optimal viewing times
         optimal_alt = np.where(optimal_times, dso_altaz.alt.deg, np.nan)
@@ -1448,6 +1482,7 @@ class VisibilityPlot(FigureCanvas):
         self.figure.tight_layout()
 
         # Store additional data needed for hover and current time updates
+        self.hover_data['horizon_alt'] = horizon_alt
         self.hover_data['local_times'] = local_times
         self.hover_data['hours_from_start'] = hours_from_start
         self.hover_data['axes'] = [ax1, ax2, ax3]
@@ -1615,10 +1650,16 @@ class VisibilityPlot(FigureCanvas):
         tz_name = local_time.strftime('%Z')
 
         # Create hover text
+        horizon_line = ""
+        horizon_alt = self.hover_data.get('horizon_alt')
+        if horizon_alt is not None:
+            blocked = " - blocked" if dso_alt <= horizon_alt[idx] else ""
+            horizon_line = f"Custom Horizon: {horizon_alt[idx]:.1f}°{blocked}\n"
         hover_text = (
             f"Time: {format_time(local_time, seconds=True)} {tz_name}\n"
             f"{dso_name} Alt: {dso_alt:.1f}°\n"
             f"{dso_name} Az: {dso_az:.0f}° ({direction})\n"
+            f"{horizon_line}"
             f"Sun Alt: {sun_alt:.1f}° ({twilight})\n"
             f"Optimal: {'Yes' if optimal else 'No'}"
         )
@@ -1964,6 +2005,11 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
 
         text += f"Maximum altitude: {max_altitude:.1f}° at {format_time(max_alt_time_local)} {tz_name}\n"
         text += f"Direction at max altitude: {max_direction} ({max_azimuth:.0f}°)\n\n"
+
+        horizon = results.get('horizon')
+        if horizon is not None:
+            text += f"Custom horizon: {horizon.name or 'custom'}\n"
+            text += "Times the object is behind it are excluded from viewing windows.\n\n"
 
         # Find viewing windows
         if not np.any(optimal_times):
