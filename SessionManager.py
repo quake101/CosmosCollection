@@ -13,7 +13,7 @@ from datetime import datetime, date as date_cls, timedelta
 
 from PySide6.QtCore import (Qt, QDate, QDateTime, QEvent, QTime, QTimer, QPoint, QSettings, Signal, QThread,
                             QStringListModel, QUrl)
-from PySide6.QtGui import QColor, QDesktopServices, QFont
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
@@ -2392,6 +2392,7 @@ class SessionCalendarWidget(QWidget):
     is selected."""
 
     MONTH_COUNT_SETTING = "session_calendar_month_count"
+    SHOW_ALL_SETTING = "session_calendar_show_all_sessions"
 
     def __init__(self, db_manager, parent=None):
         super().__init__(parent)
@@ -2436,9 +2437,22 @@ class SessionCalendarWidget(QWidget):
         next_btn.clicked.connect(self._go_next)
         row.addWidget(next_btn)
 
+        self.show_all_checkbox = QCheckBox("Show All Sessions")
+        self.show_all_checkbox.setToolTip(
+            "Mark the nights of every session in the months shown,\n"
+            "not just the selected session's.\n\n"
+            "Visibility and weather still follow the selected session."
+        )
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        self.show_all_checkbox.setChecked(settings.value(self.SHOW_ALL_SETTING, False, type=bool))
+        self.show_all_checkbox.toggled.connect(self._on_show_all_toggled)
+        row.addWidget(self.show_all_checkbox)
+
         row.addStretch()
 
-        row.addWidget(QLabel("Background: DSO visibility • Top stripe: weather • Dot: selected session's nights"))
+        self.legend_label = QLabel()
+        self._update_legend()
+        row.addWidget(self.legend_label)
         for label, color_key in (
             ("Excellent", 'success'), ("Good", 'info'),
             ("Moderate", 'warning'), ("Poor", 'error'),
@@ -2458,6 +2472,16 @@ class SessionCalendarWidget(QWidget):
     def _save_month_count(self, count):
         settings = QSettings("CosmosCollection", "CosmosCollection")
         settings.setValue(self.MONTH_COUNT_SETTING, count)
+
+    def _update_legend(self):
+        dots = "all sessions' nights" if self.show_all_checkbox.isChecked() else "selected session's nights"
+        self.legend_label.setText(f"Background: DSO visibility • Top stripe: weather • Dot: {dots}")
+
+    def _on_show_all_toggled(self, checked):
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue(self.SHOW_ALL_SETTING, checked)
+        self._update_legend()
+        self.refresh_session_markers()
 
     def _on_month_count_changed(self, index):
         self.month_count = index + 1
@@ -2531,8 +2555,22 @@ class SessionCalendarWidget(QWidget):
         markers = self.session_markers.get(py_date)
         if not markers or not self.on_date_with_session_clicked:
             return
-        session_id = markers[0][0]
-        self.on_date_with_session_clicked(session_id)
+
+        # One entry per session - a session can have several observations on a date
+        sessions = {}
+        for session_id, dso_name, status, _, _ in markers:
+            sessions.setdefault(session_id, f"{dso_name} - {status}")
+        if len(sessions) == 1:
+            self.on_date_with_session_clicked(next(iter(sessions)))
+            return
+
+        # Several sessions share this date (Show All Sessions) - let the user pick
+        menu = QMenu(self)
+        for session_id, text in sessions.items():
+            action = menu.addAction(text)
+            action.triggered.connect(
+                lambda _checked=False, sid=session_id: self.on_date_with_session_clicked(sid))
+        menu.exec(QCursor.pos())
 
     def set_active_session(self, session):
         self._current_session = session
@@ -2621,42 +2659,51 @@ class SessionCalendarWidget(QWidget):
             cal.set_data(visibility_hours=hours_by_date)
 
     def refresh_session_markers(self):
-        # Dots only for the selected session's nights - none when nothing is selected.
-        session_id = self._current_session.get("id") if self._current_session else None
+        # Dots for every session's nights with Show All Sessions, otherwise only
+        # for the selected session's - none when nothing is selected.
         start_date, end_date = self._display_range()
-        self.session_markers = (self._query_session_markers(start_date, end_date, session_id)
-                                if session_id is not None else {})
+        if self.show_all_checkbox.isChecked():
+            self.session_markers = self._query_session_markers(start_date, end_date)
+        else:
+            session_id = self._current_session.get("id") if self._current_session else None
+            self.session_markers = (self._query_session_markers(start_date, end_date, session_id)
+                                    if session_id is not None else {})
         for cal in self.calendars:
             cal.set_data(session_markers=self.session_markers)
 
-    def _query_session_markers(self, start_date, end_date, session_id):
+    def _query_session_markers(self, start_date, end_date, session_id=None):
         """Returns date -> [(session_id, dso_name, status, night_integration_seconds,
-        night_filters), ...] for one session, one entry per observation (observing
-        night). A night that runs past midnight (e.g. Friday 21:00 to Saturday
-        04:00) is one observation, and its complete counted totals are shown on
-        EVERY calendar date it touches (both Friday and Saturday) rather than
-        split across them. A session with no observations is marked on its
-        session_date."""
+        night_filters), ...] for one session (or every session when session_id is
+        None), one entry per observation (observing night). A night that runs
+        past midnight (e.g. Friday 21:00 to Saturday 04:00) is one observation,
+        and its complete counted totals are shown on EVERY calendar date it
+        touches (both Friday and Saturday) rather than split across them. A
+        session with no observations is marked on its session_date."""
         markers = {}
         try:
             # A night starting the evening before start_date can reach into it.
             padded_start = start_date - timedelta(days=1)
 
+            # Leave the session filter out entirely for all sessions
+            session_filter = "" if session_id is None else "AND s.id = ?"
+            session_params = () if session_id is None else (session_id,)
+
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT o.id, o.session_id, s.status, s.dso_name, o.night_date,
                            o.start_datetime, o.end_datetime
                     FROM usersessionobservations o
                     JOIN usersessions s ON s.id = o.session_id
-                    WHERE o.session_id = ? AND o.night_date BETWEEN ? AND ?
-                """, (session_id, padded_start.isoformat(), end_date.isoformat()))
+                    WHERE o.night_date BETWEEN ? AND ? {session_filter}
+                    ORDER BY o.night_date, s.dso_name
+                """, (padded_start.isoformat(), end_date.isoformat()) + session_params)
                 observations = cursor.fetchall()
                 breakdowns = SessionObservations.load_breakdowns(conn, [row[0] for row in observations])
 
-                for obs_id, session_id, status, dso_name, night_date, start_dt, end_dt in observations:
+                for obs_id, obs_session_id, status, dso_name, night_date, start_dt, end_dt in observations:
                     _subs, seconds, filters = SessionObservations.summarize_breakdown(breakdowns[obs_id])
-                    marker = (session_id, dso_name, status, seconds, ",".join(filters) or None)
+                    marker = (obs_session_id, dso_name, status, seconds, ",".join(filters) or None)
                     try:
                         night = datetime.strptime(night_date, "%Y-%m-%d").date()
                     except (ValueError, TypeError):
@@ -2671,20 +2718,19 @@ class SessionCalendarWidget(QWidget):
                             markers.setdefault(day, []).append(marker)
                         day += timedelta(days=1)
 
-                cursor.execute("SELECT 1 FROM usersessionobservations WHERE session_id = ? LIMIT 1", (session_id,))
-                if cursor.fetchone() is None:
-                    cursor.execute("""
-                        SELECT session_date, status, dso_name FROM usersessions
-                        WHERE id = ? AND session_date BETWEEN ? AND ?
-                    """, (session_id, start_date.isoformat(), end_date.isoformat()))
-                    row = cursor.fetchone()
-                    if row:
-                        session_date, status, dso_name = row
-                        try:
-                            day = datetime.strptime(session_date, "%Y-%m-%d").date()
-                            markers.setdefault(day, []).append((session_id, dso_name, status, 0, None))
-                        except (ValueError, TypeError):
-                            pass
+                cursor.execute(f"""
+                    SELECT s.id, s.session_date, s.status, s.dso_name FROM usersessions s
+                    WHERE s.session_date BETWEEN ? AND ? {session_filter}
+                      AND NOT EXISTS (SELECT 1 FROM usersessionobservations o
+                                      WHERE o.session_id = s.id)
+                    ORDER BY s.dso_name
+                """, (start_date.isoformat(), end_date.isoformat()) + session_params)
+                for row_session_id, session_date, status, dso_name in cursor.fetchall():
+                    try:
+                        day = datetime.strptime(session_date, "%Y-%m-%d").date()
+                    except (ValueError, TypeError):
+                        continue
+                    markers.setdefault(day, []).append((row_session_id, dso_name, status, 0, None))
         except Exception as e:
             logger.error(f"Error querying session markers: {e}")
         return markers
