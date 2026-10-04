@@ -15,11 +15,12 @@ from datetime import datetime
 from PySide6.QtCore import Qt, QThread, Signal, QProcess, QProcessEnvironment, QUrl, QTimer, QSettings
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                               QRadioButton, QButtonGroup, QGroupBox, QCheckBox, QLineEdit,
+                               QRadioButton, QButtonGroup, QGroupBox, QCheckBox, QLineEdit, QComboBox,
                                QFileDialog, QMessageBox, QPlainTextEdit, QProgressBar, QListWidget,
                                QListWidgetItem, QProgressDialog, QGridLayout, QWidget, QAbstractItemView)
 
 import ProcessingHandoff as handoff
+import LightQualityReview
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, font_size, themed_style
@@ -144,10 +145,13 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
     CALIBRATION_KINDS = (("Dark", "Darks"), ("Flat", "Flats"), ("Bias", "Bias"))
     OSC_LABEL = "Color camera (debayer the subs)"
 
-    def __init__(self, session, parent=None, app=None):
+    def __init__(self, session, parent=None, app=None, light_choice=None, light_paths=None):
         """With app (handoff.SIRIL / handoff.PIXINSIGHT) the dialog is the Session
         Manager's 'Processing' action instead: that app preselected, and no
-        completion choices, target option or remembered choice."""
+        completion choices, target option or remembered choice.
+
+        light_choice (a LightQualityReview LIGHTS_* value) preselects which lights
+        to stack - with LIGHTS_PICKED, light_paths are the ones picked."""
         super().__init__(parent)
         self.session = dict(session)
         self._fixed_app = app
@@ -159,6 +163,12 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self._stage_worker = None
         self._frame_check = None
         self._osc_touched = False
+        self._all_lights = {}      # filter key -> every attached light, before any quality choice
+        self._missing = set()      # attached files no longer on disk
+        self._light_grades = {}    # path -> quality grade, from the light quality review's saved measurements
+        self._exposures = {}       # path -> exposure seconds
+        self._picked_lights = set(light_paths or ())
+        self._requested_light_choice = light_choice
 
         self.setWindowTitle(f"Process in {handoff.APP_LABELS[app]}" if app else "Session Completed")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
@@ -168,6 +178,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self._load()
         self._setup_ui()
         self._restore_choices()
+        self._apply_light_choice()
         self._on_choice_changed()
         self.setup_window_position()
         # Checking hundreds of subs on disk can take seconds on a spinning drive -
@@ -181,6 +192,12 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
             with self.db_manager.get_connection() as conn:
                 # The per-file disk check runs in FrameCheckWorker after the dialog shows.
                 self.frames = handoff.collect_session_frames(conn, self.session["id"], check_exists=False)
+                self._all_lights = {key: list(paths) for key, paths in self.frames.lights.items()}
+                try:
+                    lights, self._light_grades = LightQualityReview.grade_session_lights(conn, self.session["id"])
+                    self._exposures = {path: f["exptime_seconds"] or 0 for path, f in lights.items()}
+                except Exception as e:
+                    logger.warning(f"Couldn't grade session {self.session.get('id')}'s lights: {e}")
                 if self.session.get("target_id"):
                     cursor = conn.cursor()
                     cursor.execute("SELECT id, name, status FROM usertargetlist WHERE id = ?",
@@ -276,7 +293,8 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self.continue_btn.setToolTip("This session has no light frames (on disk) to process.")
 
     def _disable_apps_without_lights(self):
-        if self.frames.light_count:
+        # Any light on disk at all - an empty Lights choice is handled by _update_continue
+        if any(p not in self._missing for paths in self._all_lights.values() for p in paths):
             return
         if self._fixed_app:
             self._no_lights_to_process()
@@ -290,7 +308,9 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
                     self.choice_group.button(self.CHOICE_NOTHING).setChecked(True)
 
     def _start_frame_check(self):
-        self._frame_check = FrameCheckWorker(self.frames)
+        # Every attached light, not just the Lights choice's, so switching choice stays accurate
+        self._frame_check = FrameCheckWorker(handoff.FrameSet(
+            lights=self._all_lights, flats=self.frames.flats, darks=self.frames.darks, biases=self.frames.biases))
         self._frame_check.checked.connect(self._on_frame_check)
         self._frame_check.start()
 
@@ -299,11 +319,13 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         if self._stage_worker is not None:
             return  # staging already started - it skips missing files itself
         if missing:
+            self._missing |= set(missing)
             handoff.remove_frames(self.frames, missing)
             self.missing_label.setText(f"{len(missing)} attached file(s) no longer exist on disk and will be "
                                        "left out of any handoff.")
             self.missing_label.show()
-            self.summary_label.setText(self._summary_text())
+            self._fill_lights_combo()  # its counts leave the missing files out
+            self._apply_light_choice()
             self._refresh_calibration_labels()
             self._disable_apps_without_lights()
         self._osc_detected = osc
@@ -321,29 +343,46 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
     def _summary_text(self):
         lights = self.frames.lights
         if not lights:
-            return "No light frames are attached to this session."
+            return ("No light frames match this Lights choice." if self._all_lights
+                    else "No light frames are attached to this session.")
         per_filter = ", ".join(f"{key} {len(paths)}" for key, paths in sorted(lights.items()))
-        text = f"{self.frames.light_count} light frames ({per_filter})"
-        if self.session.get("integration_seconds"):
-            text += f" · {format_duration(self.session['integration_seconds'])} integration"
+        attached = len({p for paths in self._all_lights.values() for p in paths} - self._missing)
+        count = self.frames.light_count
+        text = (f"{count} light frames ({per_filter})" if count == attached
+                else f"{count} of {attached} light frames ({per_filter})")
+        # The lights actually being stacked (the session total also counts missing files)
+        seconds = (sum(self._exposures.get(p, 0) for paths in lights.values() for p in paths)
+                   if self._exposures else self.session.get("integration_seconds"))
+        if seconds:
+            text += f" · {format_duration(seconds)} integration"
         return text
 
     def _build_handoff_options(self):
         self.options_box = QGroupBox("Handoff options")
         grid = QGridLayout(self.options_box)
 
-        grid.addWidget(QLabel("Workspace:"), 0, 0)
+        # Which lights to stack - offered once the light quality review has graded them
+        self.lights_label = QLabel("Lights:")
+        grid.addWidget(self.lights_label, 0, 0)
+        self.lights_combo = QComboBox()
+        self.lights_combo.setToolTip("Graded in the light quality review (Session Details → Files). "
+                                     "Frames it couldn't compare, in groups of fewer than 3, are kept.")
+        grid.addWidget(self.lights_combo, 0, 1, 1, 2)
+        self._fill_lights_combo()
+        self.lights_combo.currentIndexChanged.connect(self._apply_light_choice)
+
+        grid.addWidget(QLabel("Workspace:"), 1, 0)
         self.workspace_edit = QLineEdit()
         self.workspace_edit.setToolTip("Frames are linked (or copied) into this folder and the app works "
                                        "there. Your original subs are never moved or changed.")
         self.workspace_edit.textEdited.connect(lambda _: setattr(self, "_workspace_edited", True))
-        grid.addWidget(self.workspace_edit, 0, 1)
+        grid.addWidget(self.workspace_edit, 1, 1)
         browse_btn = QPushButton("Browse...")
         browse_btn.clicked.connect(self._browse_workspace)
-        grid.addWidget(browse_btn, 0, 2)
+        grid.addWidget(browse_btn, 1, 2)
 
         self.calibration_labels = {}
-        for row, (kind, label) in enumerate(self.CALIBRATION_KINDS, start=1):
+        for row, (kind, label) in enumerate(self.CALIBRATION_KINDS, start=2):
             grid.addWidget(QLabel(f"{label}:"), row, 0)
             count_label = QLabel()
             self.calibration_labels[kind] = count_label
@@ -360,15 +399,15 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self.osc_checkbox.setToolTip("Detected from the subs' BAYERPAT header. Siril needs to know "
                                      "whether to debayer; WBPP detects it itself.")
         self.osc_checkbox.clicked.connect(lambda: setattr(self, "_osc_touched", True))
-        grid.addWidget(self.osc_checkbox, 4, 0, 1, 3)
+        grid.addWidget(self.osc_checkbox, 5, 0, 1, 3)
 
         self.run_now_checkbox = QCheckBox("Start WBPP right away (otherwise it opens for review first)")
-        grid.addWidget(self.run_now_checkbox, 5, 0, 1, 3)
+        grid.addWidget(self.run_now_checkbox, 6, 0, 1, 3)
 
         self.copy_checkbox = QCheckBox("Copy the files instead of hard-linking them")
         self.copy_checkbox.setToolTip("Hard links take no extra disk space and are used whenever possible. "
                                       "Files on another drive are always copied.")
-        grid.addWidget(self.copy_checkbox, 6, 0, 1, 3)
+        grid.addWidget(self.copy_checkbox, 7, 0, 1, 3)
 
         grid.setColumnStretch(1, 1)
         return self.options_box
@@ -383,12 +422,79 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
                 text += " (step skipped)"
             label.setText(text)
 
+    # ---- Which lights (from the light quality review) -------------------------
+
+    LIGHT_CHOICE_SETTING = "session_completion/light_choice"
+
+    def _lights_for(self, choice):
+        """Attached lights a Lights choice keeps, missing files included."""
+        every = [p for paths in self._all_lights.values() for p in paths]
+        if choice == LightQualityReview.LIGHTS_PICKED:
+            return [p for p in every if p in self._picked_lights]
+        keep = LightQualityReview.KEEP_GRADES.get(choice)
+        if keep is None:
+            return every
+        return [p for p in every if self._light_grades.get(p) in keep]
+
+    def _fill_lights_combo(self):
+        """Offered when the lights have been graded (or picked in the review);
+        hidden otherwise, which stacks them all as before."""
+        LQR = LightQualityReview
+        choices = [LQR.LIGHTS_PICKED] if self._requested_light_choice == LQR.LIGHTS_PICKED else []
+        if self._light_grades:
+            choices += [LQR.LIGHTS_ALL, LQR.LIGHTS_GOOD, LQR.LIGHTS_GOOD_MARGINAL]
+        elif choices:
+            choices.append(LQR.LIGHTS_ALL)
+
+        if self.lights_combo.count():
+            wanted = self.lights_combo.currentData()
+        else:
+            saved = QSettings("CosmosCollection", "CosmosCollection").value(
+                self.LIGHT_CHOICE_SETTING, LQR.LIGHTS_ALL, type=str)
+            wanted = self._requested_light_choice or saved
+        every = {p for paths in self._all_lights.values() for p in paths} - self._missing
+        not_graded = sum(1 for p in every if p not in self._light_grades)
+
+        self.lights_combo.blockSignals(True)
+        self.lights_combo.clear()
+        for choice in choices:
+            paths = [p for p in self._lights_for(choice) if p not in self._missing]
+            text = (f"{LQR.LIGHT_CHOICE_LABELS[choice]} - {len(paths)} frames, "
+                    f"{format_duration(sum(self._exposures.get(p, 0) for p in paths))}")
+            if choice in LQR.KEEP_GRADES and not_graded:
+                text += f" ({not_graded} not analyzed left out)"
+            self.lights_combo.addItem(text, choice)
+        index = self.lights_combo.findData(wanted)
+        self.lights_combo.setCurrentIndex(max(index, 0))
+        self.lights_combo.blockSignals(False)
+        self.lights_label.setVisible(bool(choices))
+        self.lights_combo.setVisible(bool(choices))
+
+    def _light_choice(self):
+        return self.lights_combo.currentData() or LightQualityReview.LIGHTS_ALL
+
+    def _apply_light_choice(self, *_):
+        keep = set(self._lights_for(self._light_choice())) - self._missing
+        lights = {key: [p for p in paths if p in keep] for key, paths in self._all_lights.items()}
+        self.frames.lights = {key: paths for key, paths in lights.items() if paths}
+        self.summary_label.setText(self._summary_text())
+        self._update_continue()
+
+    def _update_continue(self):
+        if not hasattr(self, "continue_btn"):
+            return  # still building the dialog
+        stacking = self._selected_app() is not None
+        enabled = not stacking or self.frames.light_count > 0
+        self.continue_btn.setEnabled(enabled)
+        self.continue_btn.setToolTip("" if enabled else "No light frames to process with this Lights choice.")
+
     def _selected_app(self):
         return self._app_for_choice.get(self.choice_group.checkedId())
 
     def _on_choice_changed(self):
         app = self._selected_app()
         self.options_box.setVisible(app is not None)
+        self._update_continue()
         if app is None:
             return
         self.osc_checkbox.setVisible(app == handoff.SIRIL)
@@ -461,6 +567,9 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         settings.setValue(self.COPY_SETTING, self.copy_checkbox.isChecked())
         if not self.target_checkbox.isHidden():
             settings.setValue(self.MARK_TARGET_SETTING, self.target_checkbox.isChecked())
+        # A review's one-off pick isn't a preference
+        if not self.lights_combo.isHidden() and self._light_choice() != LightQualityReview.LIGHTS_PICKED:
+            settings.setValue(self.LIGHT_CHOICE_SETTING, self._light_choice())
 
     # ---- Actions ----------------------------------------------------------
 

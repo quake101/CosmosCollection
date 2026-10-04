@@ -441,6 +441,19 @@ def load_session_files(conn, session_id):
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
+def remove_files(conn, session_id, file_ids):
+    """Detach files from a session - rows only, the files on disk are untouched -
+    and recompute its nights and totals. Does not commit."""
+    cursor = conn.cursor()
+    file_ids = list(file_ids)
+    for i in range(0, len(file_ids), 500):
+        chunk = file_ids[i:i + 500]
+        cursor.execute(f"DELETE FROM usersessionfiles WHERE session_id = ? AND id IN "
+                       f"({','.join('?' * len(chunk))})", [session_id] + chunk)
+    assign_files_to_observations(conn, session_id)
+    recompute_session_aggregates(conn, session_id, promote=False)
+
+
 def recompute_session_aggregates(conn, session_id, promote=True):
     """Recompute the session's sub_count / integration_seconds / filters_used /
     date range from its observations' counted totals (plus any Light files that

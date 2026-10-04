@@ -16,6 +16,9 @@ from collections import Counter
 
 logger = logging.getLogger(__name__)
 
+# Subfolder the light quality review moves rejected subs into (skipped when scanning)
+REJECTED_FOLDER = "Rejected"
+
 FITS_EXTENSIONS = {'.fits', '.fit', '.fts'}
 XISF_EXTENSIONS = {'.xisf'}
 SUPPORTED_EXTENSIONS = FITS_EXTENSIONS | XISF_EXTENSIONS
@@ -28,6 +31,7 @@ FITS_KEYWORDS = [
     'OBJCTDEC', 'AIRMASS', 'GAIN', 'OFFSET', 'TEMP', 'CCD-TEMP', 'SET-TEMP',
     'XBINNING', 'YBINNING', 'IMAGETYP', 'FRAME', 'SWCREATE', 'SWMODIFY',
     'BAYERPAT',  # present on one-shot-colour subs - ProcessingHandoff debayers those
+    'XPIXSZ',    # pixel size (microns) - FrameQuality's arcsec/pixel with FOCALLEN
 ]
 
 XISF_SIGNATURE = b"XISF0100"
@@ -187,9 +191,12 @@ def scan_file(file_path):
 
 
 def scan_folder(folder_path, progress_callback=None):
-    """Recursively scan a folder for FITS/XISF files and extract each one's header metadata."""
+    """Recursively scan a folder for FITS/XISF files and extract each one's header
+    metadata. Folders named REJECTED_FOLDER (where the light quality review
+    moves rejected subs) are skipped, so re-attaching a night doesn't bring them back."""
     matches = []
-    for root, _dirs, files in os.walk(folder_path):
+    for root, dirs, files in os.walk(folder_path):
+        dirs[:] = [d for d in dirs if d.lower() != REJECTED_FOLDER.lower()]
         for name in files:
             if os.path.splitext(name)[1].lower() in SUPPORTED_EXTENSIONS:
                 matches.append(os.path.join(root, name))

@@ -1425,8 +1425,14 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
     def _build_files_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        top = QHBoxLayout()
         self.files_count_label = QLabel()
-        layout.addWidget(self.files_count_label)
+        top.addWidget(self.files_count_label, 1)
+        review_btn = QPushButton("Review Lights Quality...")
+        review_btn.setToolTip("Grade the light frames (stars, focus, trailing, clouds) to stack only the best.")
+        review_btn.clicked.connect(self._review_light_quality)
+        top.addWidget(review_btn)
+        layout.addLayout(top)
         self.files_table = _make_table(["File", "Night", "Frame", "Filter", "Exposure", "Gain", "Temp", "Binning"])
         self.files_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.files_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1929,6 +1935,15 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
+    def _review_light_quality(self):
+        if not self._save_pending_before("Removing, moving or deleting frames in the review"):
+            return
+        from LightQualityReview import LightQualityDialog
+        dialog = LightQualityDialog(self.session_data, parent=self)
+        dialog.exec()
+        if dialog.files_changed:
+            self._after_immediate_write()
+
     def _remove_selected_files(self):
         file_ids = self._selected_file_ids()
         if not file_ids:
@@ -1942,13 +1957,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
             return
         try:
             with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                for i in range(0, len(file_ids), 500):
-                    chunk = file_ids[i:i + 500]
-                    cursor.execute(f"DELETE FROM usersessionfiles WHERE session_id = ? AND id IN "
-                                   f"({','.join('?' * len(chunk))})", [self.session_id] + chunk)
-                SessionObservations.assign_files_to_observations(conn, self.session_id)
-                SessionObservations.recompute_session_aggregates(conn, self.session_id, promote=False)
+                SessionObservations.remove_files(conn, self.session_id, file_ids)
                 conn.commit()
         except Exception as e:
             _rollback(self.db_manager)
@@ -3427,6 +3436,8 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         add_obs_action.triggered.connect(self._add_observation_to_selected)
         duplicate_action = menu.addAction("Duplicate Session")
         duplicate_action.triggered.connect(self._duplicate_selected_session)
+        menu.addAction("Review Light Quality...").triggered.connect(
+            lambda: self._review_light_quality(session_data))
         menu.addSeparator()
         self._add_target_tool_actions(menu, session_data)
         menu.addSeparator()
@@ -3474,6 +3485,14 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                 lambda: self._nina_action(session, NINAIntegration.send_to_framing_assistant))
             nina_menu.addAction("Slew to Target").triggered.connect(
                 lambda: self._nina_action(session, NINAIntegration.slew_to_coordinates))
+
+    def _review_light_quality(self, session):
+        from LightQualityReview import LightQualityDialog
+        dialog = LightQualityDialog(session, parent=self)
+        dialog.exec()
+        if dialog.files_changed:  # sub counts and integration changed
+            self._load_sessions()
+            self._select_session_by_id(session["id"])
 
     def _process_session(self, session, app):
         """Hand the session to Siril/PixInsight from the right-click menu - the

@@ -102,6 +102,19 @@ def _read_fits_array(file_path):
         return np.array(image_data)
 
 
+def read_astro_array(file_path):
+    """Raw pixel data of a FITS or XISF file as a numpy array - (h, w) or
+    (h, w, 3), native dtype and range - or None for other extensions or a
+    file with no image. Raises on unreadable/corrupt files."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in FITS_EXTENSIONS:
+        return _read_fits_array(file_path)
+    if ext in XISF_EXTENSIONS:
+        from XISFReader import read_xisf_pixels
+        return read_xisf_pixels(file_path)
+    return None
+
+
 def load_astro_qimage(file_path):
     """Decode a FITS or XISF file into a displayable QImage. Unlike QPixmap,
     QImage is safe to create in a worker thread.
@@ -112,17 +125,8 @@ def load_astro_qimage(file_path):
     if not file_path or not os.path.exists(file_path):
         return None
 
-    ext = os.path.splitext(file_path)[1].lower()
-
     try:
-        if ext in FITS_EXTENSIONS:
-            image_data = _read_fits_array(file_path)
-        elif ext in XISF_EXTENSIONS:
-            from XISFReader import read_xisf_pixels
-            image_data = read_xisf_pixels(file_path)
-        else:
-            return None
-
+        image_data = read_astro_array(file_path)
         if image_data is None:
             return None
 
