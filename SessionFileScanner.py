@@ -20,9 +20,8 @@ FITS_EXTENSIONS = {'.fits', '.fit', '.fts'}
 XISF_EXTENSIONS = {'.xisf'}
 SUPPORTED_EXTENSIONS = FITS_EXTENSIONS | XISF_EXTENSIONS
 
-# Same keyword set ImageViewer._get_fits_info() displays, minus the ones that
-# don't matter for session aggregation (EQUINOX, SWCREATE, SWMODIFY, etc. are
-# still captured via header_json for reference, just not summarized on).
+# Header keywords captured for session aggregation (EQUINOX, SWCREATE, SWMODIFY,
+# etc. are captured via header_json for reference, just not summarized on).
 FITS_KEYWORDS = [
     'OBJECT', 'TELESCOP', 'INSTRUME', 'OBSERVER', 'DATE-OBS', 'EXPTIME', 'FILTER',
     'FOCALLEN', 'APTDIA', 'APTAREA', 'FWHM', 'EQUINOX', 'RA', 'DEC', 'OBJCTRA',

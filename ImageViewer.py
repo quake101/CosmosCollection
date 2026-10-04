@@ -6,12 +6,16 @@ Provides the ImageViewerWindow class for displaying images with zoom, pan, and a
 
 import json
 import logging
+import math
 import platform
 import ctypes
+import re
 import subprocess
 import os
+from collections import namedtuple
+from html import escape
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QSettings, QThread, QRectF
 from PySide6.QtGui import QPixmap, QPainter, QImage
@@ -20,10 +24,12 @@ from PySide6.QtWidgets import (
     QGroupBox, QScrollArea, QFileDialog, QMessageBox, QCheckBox, QProgressBar
 )
 
-from Theme import COLORS, adapt_color, font_size, themed_style
+from Theme import COLORS, adapt_color, font_size, theme_manager, themed_style
 from WindowPositionManager import WindowPositionManager
 from ResourceManager import ResourceManager
 from TimeFormatHelper import format_datetime
+from SessionFileScanner import (FITS_EXTENSIONS, XISF_EXTENSIONS, read_xisf_xml,
+                                _coerce_fits_value, _file_coordinates, _parse_sexagesimal)
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -103,6 +109,524 @@ class BackgroundSetterWorker(QThread):
         except Exception as e:
             logger.error(f"Failed to set desktop background: {e}", exc_info=True)
             self.background_set.emit("error", f"Failed to set desktop background: {str(e)}")
+
+
+# ------------------------------------------------------------------------------
+# FITS/XISF header info for the File Information panel. Only the header is read,
+# never the pixel data, and each section lists only what the file records.
+# ------------------------------------------------------------------------------
+
+# keywords: upper-case FITS keyword -> value (first occurrence wins)
+# history: HISTORY card texts
+# image: 'width'/'height'/'channels'/'sample_format'/'color_space'/'software' where known
+HeaderData = namedtuple('HeaderData', ['keywords', 'history', 'image'])
+
+# XISF Properties that hold the same data as a FITS keyword. Only used when the
+# file doesn't also carry that FITS keyword.
+XISF_PROPERTY_KEYWORDS = {
+    'Observation:Object:Name': 'OBJECT',
+    'Observation:Center:RA': 'RA',
+    'Observation:Center:Dec': 'DEC',
+    'Observation:Time:Start': 'DATE-OBS',
+    'Observation:Location:Latitude': 'SITELAT',
+    'Observation:Location:Longitude': 'SITELONG',
+    'Observation:Location:Elevation': 'SITEELEV',
+    'Instrument:Camera:Name': 'INSTRUME',
+    'Instrument:Camera:XBinning': 'XBINNING',
+    'Instrument:Camera:YBinning': 'YBINNING',
+    'Instrument:ExposureTime': 'EXPTIME',
+    'Instrument:Filter:Name': 'FILTER',
+    'Instrument:Focuser:Position': 'FOCPOS',
+    'Instrument:Sensor:Temperature': 'CCD-TEMP',
+    'Instrument:Sensor:TargetTemperature': 'SET-TEMP',
+    'Instrument:Sensor:XPixelSize': 'XPIXSZ',
+    'Instrument:Sensor:YPixelSize': 'YPIXSZ',
+    'Instrument:Telescope:Name': 'TELESCOP',
+    'Instrument:Telescope:FocalLength': 'FOCALLEN',
+    'Instrument:Telescope:Aperture': 'APTDIA',
+    'PCL:CFASourcePattern': 'BAYERPAT',
+}
+# XISF stores these in meters, FITS in millimeters
+XISF_METER_PROPERTIES = {'Instrument:Telescope:FocalLength', 'Instrument:Telescope:Aperture'}
+
+BITPIX_FORMATS = {
+    8: '8-bit unsigned integer',
+    16: '16-bit integer',
+    32: '32-bit integer',
+    -32: '32-bit float',
+    -64: '64-bit float',
+}
+XISF_SAMPLE_FORMATS = {
+    'UInt8': '8-bit unsigned integer',
+    'UInt16': '16-bit unsigned integer',
+    'UInt32': '32-bit unsigned integer',
+    'UInt64': '64-bit unsigned integer',
+    'Float32': '32-bit float',
+    'Float64': '64-bit float',
+}
+
+# Keywords that make up a WCS (plate solution), including SIP distortion terms
+WCS_KEYWORD_PATTERN = re.compile(
+    r'^(WCSAXES|CTYPE\d|CUNIT\d|CRVAL\d|CRPIX\d|CDELT\d|CROTA\d|CD\d_\d|PC\d_\d|'
+    r'RADESYS|EQUINOX|LONPOLE|LATPOLE|(A|B|AP|BP)_(ORDER|\d+_\d+))$')
+
+
+def read_image_header(file_path):
+    """Read a FITS/XISF file's header into a HeaderData. Raises on unreadable files."""
+    if Path(file_path).suffix.lower() in XISF_EXTENSIONS:
+        return _read_xisf_header(file_path)
+    return _read_fits_header(file_path)
+
+
+def _read_fits_header(file_path):
+    from astropy.io import fits
+
+    keywords = {}
+    history = []
+    with fits.open(file_path) as hdul:
+        headers = [hdul[0].header]
+        # Compressed (fpack) files and some writers keep the image in an extension
+        if hdul[0].header.get('NAXIS', 0) == 0:
+            for hdu in hdul[1:]:
+                if hdu.is_image and hdu.header.get('NAXIS', 0) >= 2:
+                    headers.append(hdu.header)
+                    break
+
+        for header in headers:
+            for card in header.cards:
+                try:
+                    key, value = card.keyword, card.value
+                except Exception:
+                    continue  # Malformed card
+                if key == 'HISTORY':
+                    history.append(str(value))
+                elif key and key != 'COMMENT' and key not in keywords and _has_value(value):
+                    keywords[key] = value
+
+    image = {}
+    image_header = headers[-1]
+    naxis = image_header.get('NAXIS', 0)
+    if naxis >= 2:
+        image['width'] = image_header.get('NAXIS1')
+        image['height'] = image_header.get('NAXIS2')
+        image['channels'] = image_header.get('NAXIS3', 1) if naxis >= 3 else 1
+    bitpix = image_header.get('BITPIX')
+    if bitpix in BITPIX_FORMATS:
+        sample_format = BITPIX_FORMATS[bitpix]
+        # Unsigned 16/32-bit data is stored signed with a BZERO offset
+        if bitpix in (16, 32) and image_header.get('BZERO') == 2 ** (bitpix - 1):
+            sample_format = sample_format.replace('integer', 'unsigned integer')
+        image['sample_format'] = sample_format
+
+    return HeaderData(keywords, history, image)
+
+
+def _read_xisf_header(file_path):
+    root, image_el, ns = read_xisf_xml(file_path)
+
+    def children(scope, tag):
+        if scope is None:
+            return []
+        return scope.findall(f'xisf:{tag}', ns) or scope.findall(tag)
+
+    keywords = {}
+    history = []
+    for kw_el in children(image_el, 'FITSKeyword'):
+        name = (kw_el.get('name') or '').strip().upper()
+        value = kw_el.get('value')
+        if name == 'HISTORY':
+            # PixInsight puts the history text in the comment attribute
+            history.append(kw_el.get('comment') or _coerce_fits_value(value or ''))
+        elif name and name != 'COMMENT' and name not in keywords and value is not None:
+            value = _coerce_fits_value(value)
+            if _has_value(value):
+                keywords[name] = value
+
+    metadata_el = root.find('xisf:Metadata', ns)
+    if metadata_el is None:
+        metadata_el = root.find('Metadata')
+
+    properties = {}
+    for scope in (image_el, root, metadata_el):
+        for prop_el in children(scope, 'Property'):
+            prop_id = prop_el.get('id')
+            if not prop_id or prop_id in properties:
+                continue
+            value = prop_el.get('value')
+            if value is None:
+                value = (prop_el.text or '').strip()  # String properties can hold the text inline
+            if prop_el.get('type', '').startswith(('Float', 'Int', 'UInt')):
+                try:
+                    value = float(value) if '.' in value or 'e' in value.lower() else int(value)
+                except ValueError:
+                    pass
+            properties[prop_id] = value
+
+    for prop_id, keyword in XISF_PROPERTY_KEYWORDS.items():
+        value = properties.get(prop_id)
+        if keyword in keywords or not _has_value(value):
+            continue
+        if prop_id in XISF_METER_PROPERTIES and isinstance(value, (int, float)):
+            value = value * 1000.0
+        keywords[keyword] = value
+
+    image = {}
+    if image_el is not None:
+        dims = (image_el.get('geometry') or '').split(':')
+        if len(dims) >= 2 and all(d.isdigit() for d in dims):
+            image['width'], image['height'] = int(dims[0]), int(dims[1])
+            image['channels'] = int(dims[2]) if len(dims) >= 3 else 1
+        sample_format = image_el.get('sampleFormat')
+        if sample_format:
+            image['sample_format'] = XISF_SAMPLE_FORMATS.get(sample_format, sample_format)
+        if image_el.get('colorSpace'):
+            image['color_space'] = image_el.get('colorSpace')
+    if _has_value(properties.get('XISF:CreatorApplication')):
+        image['software'] = properties['XISF:CreatorApplication']
+
+    return HeaderData(keywords, history, image)
+
+
+def read_wcs_file(wcs_path):
+    """Read a plate solver's .wcs sidecar file (a bare FITS header, e.g. from
+    ASTAP) into a {keyword: value} dict, or None if it can't be read."""
+    try:
+        from astropy.io import fits
+        text = Path(wcs_path).read_text(errors='replace')
+        header = fits.Header.fromstring(text, sep='\n' if '\n' in text else '')
+        return {key: header[key] for key in header if key and _has_value(header[key])}
+    except Exception as e:
+        logger.debug(f"Could not read WCS file {wcs_path}: {e}")
+        return None
+
+
+def build_header_sections(header, image_size=None, fallback_wcs=None):
+    """Organize a HeaderData into [(section title, [(label, value), ...]), ...].
+
+    image_size: (width, height) of the decoded image, used when the header
+        doesn't record its dimensions
+    fallback_wcs: WCS keyword dict (e.g. a cached plate solve) to use when the
+        file itself isn't plate solved
+    """
+    kw = header.keywords
+    if header.image.get('width') and header.image.get('height'):
+        image_size = (header.image['width'], header.image['height'])
+
+    sections = [
+        ("Target", _target_rows(kw)),
+        ("Capture", _capture_rows(kw, header.history)),
+        ("Equipment", _equipment_rows(kw, image_size)),
+        ("Plate Solution", _plate_solution_rows(kw, image_size, fallback_wcs)),
+        ("Site", _site_rows(kw)),
+        ("Image Data", _image_rows(kw, header.image)),
+    ]
+    return [(title, rows) for title, rows in sections if rows]
+
+
+def _target_rows(kw):
+    rows = []
+    _add_row(rows, "Object", _first_value(kw, 'OBJECT', 'OBJNAME'))
+    coords = _file_coordinates(kw)
+    if coords:
+        rows.append(("RA", format_ra(coords[0])))
+        rows.append(("Dec", format_dec(coords[1])))
+    altitude = _to_float(_first_value(kw, 'OBJCTALT', 'CENTALT', 'ALTITUDE'))
+    if altitude is not None:
+        rows.append(("Altitude", f"{altitude:.1f}°"))
+    azimuth = _to_float(_first_value(kw, 'OBJCTAZ', 'CENTAZ', 'AZIMUTH'))
+    if azimuth is not None:
+        rows.append(("Azimuth", f"{azimuth:.1f}°"))
+    airmass = _to_float(kw.get('AIRMASS'))
+    if airmass is not None:
+        rows.append(("Airmass", f"{airmass:.3f}"))
+    rotation = _to_float(kw.get('OBJCTROT'))
+    if rotation is not None:
+        rows.append(("Rotation", f"{_fmt_num(rotation, 2)}°"))
+    _add_row(rows, "Pier Side", kw.get('PIERSIDE'))
+    return rows
+
+
+def _capture_rows(kw, history):
+    rows = []
+    _add_row(rows, "Frame Type", _first_value(kw, 'IMAGETYP', 'FRAME'))
+
+    date_obs = kw.get('DATE-OBS')
+    utc = _parse_iso_datetime(date_obs)
+    if utc is not None:
+        utc = utc.replace(tzinfo=timezone.utc) if utc.tzinfo is None else utc.astimezone(timezone.utc)
+        rows.append(("Date (UTC)", format_datetime(utc, seconds=True)))
+        # Prefer the capture site's local time when the file records it
+        local = _parse_iso_datetime(kw.get('DATE-LOC'))
+        if local is None:
+            local = utc.astimezone()
+        rows.append(("Date (Local)", format_datetime(local, seconds=True)))
+    else:
+        _add_row(rows, "Date", date_obs)
+
+    exposure = _to_float(_first_value(kw, 'EXPTIME', 'EXPOSURE'))
+    if exposure is not None:
+        rows.append(("Exposure", format_duration(exposure)))
+
+    frames = _to_float(_first_value(kw, 'NCOMBINE', 'STACKCNT'))
+    if frames is None:
+        # PixInsight records the integration count in the HISTORY cards
+        for line in history:
+            match = re.search(r'ImageIntegration\.numberOfImages:\s*(\d+)', str(line))
+            if match:
+                frames = float(match.group(1))
+                break
+    if frames is not None and frames > 1:
+        rows.append(("Frames Stacked", f"{frames:.0f}"))
+        live_time = _to_float(kw.get('LIVETIME'))
+        if live_time is not None:
+            rows.append(("Total Integration", format_duration(live_time)))
+
+    _add_row(rows, "Filter", kw.get('FILTER'))
+    for label, keyword in (("Gain", 'GAIN'), ("Offset", 'OFFSET')):
+        number = _to_float(kw.get(keyword))
+        _add_row(rows, label, _fmt_num(number, 2) if number is not None else kw.get(keyword))
+    egain = _to_float(kw.get('EGAIN'))
+    if egain is not None:
+        rows.append(("e-/ADU", _fmt_num(egain, 3)))
+
+    x_bin, y_bin = _to_float(kw.get('XBINNING')), _to_float(kw.get('YBINNING'))
+    if x_bin is not None:
+        rows.append(("Binning", f"{x_bin:.0f}x{(y_bin if y_bin is not None else x_bin):.0f}"))
+
+    sensor_temp = _to_float(_first_value(kw, 'CCD-TEMP', 'CCD_TEMP', 'TEMPERAT'))
+    set_temp = _to_float(_first_value(kw, 'SET-TEMP', 'SET_TEMP'))
+    if sensor_temp is not None:
+        text = f"{_fmt_num(sensor_temp, 1)} °C"
+        if set_temp is not None:
+            text += f" (set {_fmt_num(set_temp, 1)} °C)"
+        rows.append(("Sensor Temp", text))
+    elif set_temp is not None:
+        rows.append(("Set Temp", f"{_fmt_num(set_temp, 1)} °C"))
+
+    _add_row(rows, "Readout Mode", kw.get('READOUTM'))
+    _add_row(rows, "Bayer Pattern", kw.get('BAYERPAT'))
+    hfr = _to_float(kw.get('HFR'))
+    if hfr is not None:
+        rows.append(("HFR", f"{_fmt_num(hfr, 2)} px"))
+    fwhm = _to_float(kw.get('FWHM'))
+    if fwhm is not None:
+        rows.append(("FWHM", _fmt_num(fwhm, 2)))
+    return rows
+
+
+def _equipment_rows(kw, image_size):
+    rows = []
+    _add_row(rows, "Telescope", kw.get('TELESCOP'))
+    _add_row(rows, "Camera", kw.get('INSTRUME'))
+
+    focal_length = _to_float(kw.get('FOCALLEN'))
+    aperture = _to_float(kw.get('APTDIA'))
+    if focal_length:
+        rows.append(("Focal Length", f"{_fmt_num(focal_length, 1)} mm"))
+    if aperture:
+        rows.append(("Aperture", f"{_fmt_num(aperture, 1)} mm"))
+    focal_ratio = _to_float(kw.get('FOCRATIO'))
+    if not focal_ratio and focal_length and aperture:
+        focal_ratio = focal_length / aperture
+    if focal_ratio:
+        rows.append(("Focal Ratio", f"f/{_fmt_num(focal_ratio, 1)}"))
+
+    x_pixel, y_pixel = _to_float(kw.get('XPIXSZ')), _to_float(kw.get('YPIXSZ'))
+    if x_pixel:
+        text = f"{_fmt_num(x_pixel, 2)} µm"
+        if y_pixel and abs(y_pixel - x_pixel) > 1e-6:
+            text = f"{_fmt_num(x_pixel, 2)} x {_fmt_num(y_pixel, 2)} µm"
+        rows.append(("Pixel Size", text))
+
+    # Image scale as recorded, or from the optics (XPIXSZ already includes binning)
+    scale = _to_float(_first_value(kw, 'PIXSCALE', 'SCALE'))
+    if not scale and x_pixel and focal_length:
+        scale = 206.265 * x_pixel / focal_length
+    if scale:
+        rows.append(("Image Scale", f"{scale:.2f}\"/px"))
+        if image_size:
+            rows.append(("Field of View", format_fov(scale, *image_size)))
+
+    _add_row(rows, "Focuser Position", _first_value(kw, 'FOCPOS', 'FOCUSPOS'))
+    focuser_temp = _to_float(_first_value(kw, 'FOCTEMP', 'FOCUSTEM'))
+    if focuser_temp is not None:
+        rows.append(("Focuser Temp", f"{_fmt_num(focuser_temp, 1)} °C"))
+    rotator = _to_float(_first_value(kw, 'ROTATANG', 'ROTATOR'))
+    if rotator is not None:
+        rows.append(("Rotator Angle", f"{_fmt_num(rotator, 2)}°"))
+    return rows
+
+
+def _plate_solution_rows(kw, image_size, fallback_wcs):
+    source = None
+    wcs_keywords = {key: value for key, value in kw.items() if WCS_KEYWORD_PATTERN.match(key)}
+    if _is_plate_solved(wcs_keywords):
+        source = "File header"
+    elif fallback_wcs:
+        wcs_keywords = {key: value for key, value in fallback_wcs.items()
+                        if WCS_KEYWORD_PATTERN.match(str(key))}
+        if _is_plate_solved(wcs_keywords):
+            source = "Cached plate solve"
+    if source is None or not image_size:
+        return []
+
+    try:
+        import numpy as np
+        from astropy.wcs import WCS
+        from astropy.wcs.utils import proj_plane_pixel_scales
+
+        wcs = WCS(wcs_keywords, naxis=2)
+        width, height = image_size
+        center = wcs.all_pix2world(np.array([[(width - 1) / 2.0, (height - 1) / 2.0]]), 0)[0]
+        scale = float(np.mean(proj_plane_pixel_scales(wcs))) * 3600.0
+        cd = wcs.pixel_scale_matrix
+        rotation = math.degrees(math.atan2(-cd[0][1], cd[1][1]))
+    except Exception as e:
+        logger.debug(f"Could not evaluate plate solution: {e}")
+        return []
+
+    return [
+        ("Center RA", format_ra(center[0])),
+        ("Center Dec", format_dec(center[1])),
+        ("Image Scale", f"{scale:.2f}\"/px"),
+        ("Rotation", f"{rotation:.2f}°"),
+        ("Field of View", format_fov(scale, width, height)),
+        ("Source", source),
+    ]
+
+
+def _site_rows(kw):
+    rows = []
+    latitude = _to_degrees(_first_value(kw, 'SITELAT', 'OBSGEO-B', 'LAT-OBS'))
+    if latitude is not None:
+        rows.append(("Latitude", f"{abs(latitude):.4f}° {'N' if latitude >= 0 else 'S'}"))
+    longitude = _to_degrees(_first_value(kw, 'SITELONG', 'OBSGEO-L', 'LONG-OBS'))
+    if longitude is not None:
+        if longitude > 180:
+            longitude -= 360
+        rows.append(("Longitude", f"{abs(longitude):.4f}° {'E' if longitude >= 0 else 'W'}"))
+    elevation = _to_float(_first_value(kw, 'SITEELEV', 'OBSGEO-H', 'ALT-OBS'))
+    if elevation is not None:
+        rows.append(("Elevation", f"{elevation:.0f} m"))
+    return rows
+
+
+def _image_rows(kw, image):
+    rows = []
+    channels = image.get('channels')
+    if channels:
+        rows.append(("Channels", f"{channels} ({'mono' if channels == 1 else 'color'})"))
+    _add_row(rows, "Sample Format", image.get('sample_format'))
+    _add_row(rows, "Color Space", image.get('color_space'))
+    _add_row(rows, "Created By", _first_value(kw, 'SWCREATE', 'CREATOR', 'PROGRAM') or image.get('software'))
+    _add_row(rows, "Modified By", kw.get('SWMODIFY'))
+    return rows
+
+
+def _has_value(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    # astropy represents a keyword without a value as an Undefined instance
+    return type(value).__name__ != 'Undefined'
+
+
+def _first_value(kw, *names):
+    """Value of the first keyword in names that the header has"""
+    for name in names:
+        if _has_value(kw.get(name)):
+            return kw[name]
+    return None
+
+
+def _add_row(rows, label, value):
+    """Append (label, value) if there's a value"""
+    if _has_value(value) and not isinstance(value, bool):
+        rows.append((label, str(value).strip()))
+
+
+def _to_float(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _to_degrees(value):
+    """Degrees from a number or a sexagesimal string like '+40 30 00'"""
+    result = _to_float(value)
+    if result is None and isinstance(value, str):
+        result = _parse_sexagesimal(value)
+    return result
+
+
+def _fmt_num(value, decimals):
+    """Number with up to `decimals` places, without trailing zeros"""
+    return f"{value:.{decimals}f}".rstrip('0').rstrip('.')
+
+
+def _parse_iso_datetime(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace('Z', '+00:00')
+    # fromisoformat only takes up to 6 fractional digits
+    text = re.sub(r'(\.\d{6})\d+', r'\1', text)
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _is_plate_solved(wcs_keywords):
+    return ('CRVAL1' in wcs_keywords and 'CRVAL2' in wcs_keywords and 'CRPIX1' in wcs_keywords
+            and ('CD1_1' in wcs_keywords or 'CDELT1' in wcs_keywords))
+
+
+def format_duration(seconds):
+    """'300 s (5m)' style exposure/integration time"""
+    text = f"{_fmt_num(seconds, 3)} s"
+    if seconds < 60:
+        return text
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours:.0f}h")
+    if minutes:
+        parts.append(f"{minutes:.0f}m")
+    if secs >= 0.05:
+        parts.append(f"{_fmt_num(secs, 1)}s")
+    return f"{text} ({' '.join(parts)})"
+
+
+def format_ra(ra_deg):
+    """RA in degrees as '05h 35m 17.3s'"""
+    total_seconds = round((ra_deg % 360.0) / 15.0 * 3600.0, 1) % 86400.0
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02.0f}h {minutes:02.0f}m {seconds:04.1f}s"
+
+
+def format_dec(dec_deg):
+    """Dec in degrees as '+22° 00' 52"'"""
+    sign = '-' if dec_deg < 0 else '+'
+    total_arcsec = round(abs(dec_deg) * 3600.0)
+    degrees, remainder = divmod(total_arcsec, 3600)
+    arcmin, arcsec = divmod(remainder, 60)
+    return f"{sign}{degrees:02d}° {arcmin:02d}' {arcsec:02d}\""
+
+
+def format_fov(scale_arcsec, width, height):
+    """Field of view for an image scale in arcsec/px, in arcmin or degrees"""
+    width_arcmin = scale_arcsec * width / 60.0
+    height_arcmin = scale_arcsec * height / 60.0
+    if max(width_arcmin, height_arcmin) >= 120:
+        return f"{width_arcmin / 60.0:.2f}° x {height_arcmin / 60.0:.2f}°"
+    return f"{width_arcmin:.1f}' x {height_arcmin:.1f}'"
 
 
 class ImageViewerWindow(QDialog):
@@ -270,7 +794,8 @@ class ImageViewerWindow(QDialog):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # Values wrap to the panel width instead
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         # Dark mode styling for scroll area
         themed_style(scroll_area, lambda: f"""
@@ -308,6 +833,9 @@ class ImageViewerWindow(QDialog):
         """)
         self.file_info_content.setWordWrap(True)
         self.file_info_content.setAlignment(Qt.AlignTop)
+        self.file_info_content.setTextFormat(Qt.RichText)
+        # The section colors are baked into the rich text, so re-render on theme changes
+        theme_manager().theme_changed.connect(self._refresh_file_info)
 
         scroll_area.setWidget(self.file_info_content)
         file_info_layout.addWidget(scroll_area)
@@ -932,57 +1460,87 @@ class ImageViewerWindow(QDialog):
             created_time = format_datetime(datetime.fromtimestamp(file_stats.st_ctime), seconds=True)
             modified_time = format_datetime(datetime.fromtimestamp(file_stats.st_mtime), seconds=True)
 
+            # FITS/XISF header - read before the dimensions so they're known
+            # even while the image itself is still loading
+            header = None
+            if file_path_obj.suffix.lower() in FITS_EXTENSIONS | XISF_EXTENSIONS:
+                try:
+                    header = read_image_header(self.file_path)
+                except Exception as e:
+                    logger.warning(f"Failed to read header from {self.file_path}: {e}")
+
             # Image dimensions
             if self.original_pixmap:
-                width = self.original_pixmap.width()
-                height = self.original_pixmap.height()
-                dimensions = f"{width} x {height} pixels"
+                image_size = (self.original_pixmap.width(), self.original_pixmap.height())
+            elif header and header.image.get('width') and header.image.get('height'):
+                image_size = (header.image['width'], header.image['height'])
+            else:
+                image_size = None
 
-                # Calculate megapixels
+            if image_size:
+                width, height = image_size
                 megapixels = (width * height) / 1000000
                 if megapixels >= 1:
-                    megapixels_str = f"({megapixels:.1f} MP)"
+                    dimensions = f"{width} x {height} pixels ({megapixels:.1f} MP)"
                 else:
-                    megapixels_str = f"({megapixels * 1000:.0f}K pixels)"
+                    dimensions = f"{width} x {height} pixels ({megapixels * 1000:.0f}K pixels)"
             else:
                 dimensions = "Unknown"
-                megapixels_str = ""
 
-            # Try to get EXIF data if available
-            exif_info = self._get_exif_info()
+            sections = [("File", [
+                ("Filename", file_name),
+                ("Location", file_dir),
+                ("File Size", file_size),
+                ("Dimensions", dimensions),
+                ("Created", created_time),
+                ("Modified", modified_time),
+            ])]
 
-            # Try to get FITS header information if available
-            fits_info = self._get_fits_info()
+            if header is not None:
+                sections.extend(build_header_sections(header, image_size, self._cached_wcs_header()))
+            else:
+                # Try to get EXIF data if available
+                exif_info = self._get_exif_info()
+                if exif_info:
+                    sections.append(("EXIF", list(exif_info.items())))
 
-            # Build information string
-            info_lines = [
-                f"Filename: {file_name}",
-                f"Location: {file_dir}",
-                f"File Size: {file_size}",
-                f"Dimensions: {dimensions} {megapixels_str}",
-                f"Created: {created_time}",
-                f"Modified: {modified_time}",
-            ]
-
-            # Add FITS information if available
-            if fits_info:
-                info_lines.append("")
-                info_lines.append("FITS Header Information:")
-                for key, value in fits_info.items():
-                    info_lines.append(f"  {key}: {value}")
-
-            # Add EXIF information if available
-            if exif_info:
-                info_lines.append("")
-                info_lines.append("EXIF Data:")
-                for key, value in exif_info.items():
-                    info_lines.append(f"  {key}: {value}")
-
-            # Display the information
-            self.file_info_content.setText("\n".join(info_lines))
+            self.file_info_content.setText(self._file_info_html(sections))
 
         except Exception as e:
-            self.file_info_content.setText(f"Error loading file information:\n{str(e)}")
+            self.file_info_content.setText(f"Error loading file information:<br>{escape(str(e))}")
+
+    @staticmethod
+    def _file_info_html(sections):
+        """Render [(title, [(label, value), ...]), ...] as rich text for the
+        File Information panel - one label/value table with a heading row per
+        section, so the value column lines up across sections"""
+        parts = ["<table width='100%' cellspacing='0' cellpadding='1'>"]
+        for index, (title, rows) in enumerate(sections):
+            padding = 0 if index == 0 else 10
+            parts.append(f"<tr><td colspan='2' style='font-weight: bold; color: {COLORS['info']}; "
+                         f"padding-top: {padding}px;'>{escape(title)}</td></tr>")
+            for label, value in rows:
+                # Zero-width spaces let long paths wrap at their separators
+                value_html = escape(str(value)).replace('\\', '\\​').replace('/', '/​')
+                parts.append(
+                    f"<tr><td style='color: {COLORS['text_disabled']}; padding-right: 8px; "
+                    f"white-space: nowrap;' valign='top'>{escape(label)}</td>"
+                    f"<td style='color: {COLORS['text']};'>{value_html}</td></tr>")
+        parts.append("</table>")
+        return "".join(parts)
+
+    def _cached_wcs_header(self):
+        """WCS keywords from this image's plate solve - the loaded result, or
+        the cached .wcs file next to the image - or None"""
+        if self.plate_solve_result and self.plate_solve_result.success and self.plate_solve_result.wcs_header:
+            return self.plate_solve_result.wcs_header
+        wcs_file = Path(self.file_path).with_suffix('.wcs')
+        return read_wcs_file(wcs_file) if wcs_file.exists() else None
+
+    def _refresh_file_info(self):
+        """Re-render the File Information panel (e.g. with the new theme's colors)"""
+        if self.file_info_panel.isVisible():
+            self._load_file_information()
 
     def _get_exif_info(self):
         """Extract basic EXIF information from the image file"""
@@ -1035,162 +1593,6 @@ class ImageViewerWindow(QDialog):
             return None
         except Exception as e:
             # Any other error reading EXIF
-            return None
-
-    @staticmethod
-    def _format_header_keywords(header):
-        """Build the {description: formatted value} info dict from a FITS-style
-        header - works with either an astropy Header (FITS) or a plain dict
-        (XISF, via SessionFileScanner.extract_xisf_header), since both support
-        'in'/'[]' the same way. Shared by both formats' branches in
-        _get_fits_info() below so the keyword list/formatting rules stay in
-        exactly one place."""
-        fits_info = {}
-
-        # Common FITS keywords we want to show
-        useful_keywords = {
-            'OBJECT': 'Object Name',
-            'TELESCOP': 'Telescope',
-            'INSTRUME': 'Instrument',
-            'OBSERVER': 'Observer',
-            'DATE-OBS': 'Observation Date',
-            'EXPTIME': 'Exposure Time (s)',
-            'FILTER': 'Filter',
-            'FOCALLEN': 'Focal Length (mm)',
-            'APTDIA': 'Aperture Diameter (mm)',
-            'APTAREA': 'Aperture Area (mm^2)',
-            'FWHM': 'FWHM (arcsec)',
-            'EQUINOX': 'Equinox',
-            'RA': 'Right Ascension',
-            'DEC': 'Declination',
-            'OBJCTRA': 'Object RA',
-            'OBJCTDEC': 'Object Dec',
-            'AIRMASS': 'Airmass',
-            'GAIN': 'Gain',
-            'OFFSET': 'Offset',
-            'TEMP': 'Temperature (C)',
-            'CCD-TEMP': 'CCD Temperature (C)',
-            'SET-TEMP': 'Set Temperature (C)',
-            'XBINNING': 'X Binning',
-            'YBINNING': 'Y Binning',
-            'IMAGETYP': 'Image Type',
-            'FRAME': 'Frame Type',
-            'SWCREATE': 'Software Created',
-            'SWMODIFY': 'Software Modified'
-        }
-
-        for keyword, description in useful_keywords.items():
-            if keyword in header:
-                value = header[keyword]
-
-                # Format specific values
-                if keyword in ['DATE-OBS'] and isinstance(value, str):
-                    # Try to format the date nicely
-                    try:
-                        if 'T' in value:
-                            dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                            value = dt.strftime('%Y-%m-%d %H:%M:%S UTC')
-                    except:
-                        pass
-                elif keyword in ['EXPTIME'] and isinstance(value, (int, float)):
-                    if value >= 60:
-                        minutes = int(value // 60)
-                        seconds = value % 60
-                        if seconds == 0:
-                            value = f"{value} s ({minutes}m)"
-                        else:
-                            value = f"{value} s ({minutes}m {seconds:.1f}s)"
-                    else:
-                        value = f"{value} s"
-                elif keyword in ['RA', 'OBJCTRA'] and isinstance(value, (int, float)):
-                    # Convert RA from degrees to hours:minutes:seconds
-                    ra_hours = value / 15.0
-                    hours = int(ra_hours)
-                    minutes = int((ra_hours - hours) * 60)
-                    seconds = ((ra_hours - hours) * 60 - minutes) * 60
-                    value = f"{value} deg ({hours:02d}h {minutes:02d}m {seconds:05.2f}s)"
-                elif keyword in ['DEC', 'OBJCTDEC'] and isinstance(value, (int, float)):
-                    # Format declination as degrees:arcminutes:arcseconds
-                    dec_deg = abs(value)
-                    sign = '+' if value >= 0 else '-'
-                    degrees = int(dec_deg)
-                    arcmin = int((dec_deg - degrees) * 60)
-                    arcsec = ((dec_deg - degrees) * 60 - arcmin) * 60
-                    value = f"{value} deg ({sign}{degrees:02d} deg {arcmin:02d}' {arcsec:05.2f}\")"
-                elif keyword in ['TEMP', 'CCD-TEMP', 'SET-TEMP'] and isinstance(value, (int, float)):
-                    value = f"{value} C"
-
-                fits_info[description] = str(value)
-
-        return fits_info
-
-    def _get_fits_info(self):
-        """Extract FITS/XISF header information from the image file"""
-        file_ext = Path(self.file_path).suffix.lower()
-        if file_ext not in ['.fits', '.fit', '.fts', '.xisf']:
-            return None
-
-        try:
-            if file_ext == '.xisf':
-                from SessionFileScanner import extract_xisf_header, read_xisf_xml
-
-                header = extract_xisf_header(self.file_path)
-                if not header:
-                    return None
-
-                fits_info = self._format_header_keywords(header)
-
-                # XISF doesn't carry NAXIS-style keywords in the curated header
-                # dict above - read image dimensions straight from the <Image>
-                # element's geometry attribute instead.
-                try:
-                    _, image_el, _ = read_xisf_xml(self.file_path)
-                    geometry = image_el.get('geometry') if image_el is not None else None
-                    if geometry:
-                        dims = geometry.split(':')
-                        if len(dims) == 2:
-                            fits_info['Image Dimensions'] = f"{dims[0]} x {dims[1]} pixels"
-                        elif len(dims) == 3:
-                            fits_info['Image Dimensions'] = f"{dims[0]} x {dims[1]} x {dims[2]} pixels"
-                except Exception:
-                    pass
-
-                return fits_info if fits_info else None
-
-            from astropy.io import fits
-
-            # Open FITS file and read header
-            with fits.open(self.file_path) as hdul:
-                header = hdul[0].header
-
-                if not header:
-                    return None
-
-                fits_info = self._format_header_keywords(header)
-
-                # Add image dimensions from FITS if available
-                if 'NAXIS1' in header and 'NAXIS2' in header:
-                    width = header['NAXIS1']
-                    height = header['NAXIS2']
-                    if 'NAXIS3' in header:
-                        depth = header['NAXIS3']
-                        fits_info['Image Dimensions'] = f"{width} x {height} x {depth} pixels"
-                    else:
-                        fits_info['Image Dimensions'] = f"{width} x {height} pixels"
-
-                # Add pixel scale if available
-                if 'PIXSCALE' in header:
-                    fits_info['Pixel Scale'] = f"{header['PIXSCALE']} arcsec/pixel"
-                elif 'CDELT1' in header:
-                    fits_info['Pixel Scale'] = f"{abs(header['CDELT1']) * 3600:.2f} arcsec/pixel"
-
-                return fits_info if fits_info else None
-
-        except ImportError:
-            # Astropy not available
-            return None
-        except Exception as e:
-            # Any other error reading FITS/XISF
             return None
 
     def _show_annotations_dialog(self):
