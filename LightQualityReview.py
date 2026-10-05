@@ -36,8 +36,12 @@ from SessionManager import format_duration, format_exposure, _retire_thread, _ro
 
 logger = logging.getLogger(__name__)
 
-# Parallel file reads + analyses.
-ANALYSIS_WORKERS = 4
+def analysis_workers():
+    """Parallel file reads + analyses: Settings → Maximum Threads, the same
+    setting used for parallel work elsewhere in the app."""
+    settings = QSettings("CosmosCollection", "CosmosCollection")
+    default_threads = max(1, (os.cpu_count() or 4) - 2)
+    return max(1, min(settings.value("max_threads", default_threads, type=int), 128))
 
 SETTINGS_PREFIX = "light_quality/"
 
@@ -173,11 +177,12 @@ class AnalysisWorker(QThread):
     checked = Signal(int)                 # how many frames need analyzing
     frame_ready = Signal(object, object)  # FrameMetrics, (size, mtime_ns) to cache it under - or None
 
-    def __init__(self, paths, cached, force=False):
+    def __init__(self, paths, cached, force=False, workers=1):
         super().__init__()
         self.paths = paths
         self.cached = cached
         self.force = force
+        self.workers = workers
         self._cancelled = False
 
     def cancel(self):
@@ -206,7 +211,7 @@ class AnalysisWorker(QThread):
         self.checked.emit(len(todo))
         if not todo or self._cancelled:
             return
-        pool = ThreadPoolExecutor(max_workers=ANALYSIS_WORKERS)
+        pool = ThreadPoolExecutor(max_workers=self.workers)
         futures, emitted = {}, set()
         try:
             futures = {pool.submit(FrameQuality.analyze_file, path): (size, mtime_ns)
@@ -802,7 +807,8 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             return
         if force:
             self._cached = {}
-        self._worker = AnalysisWorker(list(self._lights), self._cached, force=force)
+        # Read per run, so a change in Settings applies to the next analysis
+        self._worker = AnalysisWorker(list(self._lights), self._cached, force=force, workers=analysis_workers())
         self._worker.checked.connect(self._on_checked)
         self._worker.frame_ready.connect(self._on_frame_ready)
         self._worker.finished.connect(self._on_analysis_finished)
