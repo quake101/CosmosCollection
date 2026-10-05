@@ -70,7 +70,7 @@ os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
 
 # Core PySide6 imports (always needed)
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings, Slot, QCoreApplication, QPointF, QRectF, QSize
-from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush, QAction
+from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush, QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
     QVBoxLayout, QWidget, QLabel, QDialog,
@@ -5684,6 +5684,15 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         about_action.triggered.connect(self._show_about)
         toolbar.addAction(about_action)
 
+        toolbar.addSeparator()
+
+        # Quit action - closing the window only minimizes to the tray when that's enabled
+        quit_action = QAction("Quit", self)
+        quit_action.setToolTip("Quit Cosmos Collection (Ctrl+Q)")
+        quit_action.setShortcut(QKeySequence("Ctrl+Q"))  # QKeySequence.Quit has no binding on Windows
+        quit_action.triggered.connect(self._quit_application)
+        toolbar.addAction(quit_action)
+
     def _show_settings(self):
         """Show the settings dialog"""
         settings_dialog = SettingsDialog(self)
@@ -7031,7 +7040,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self._show_nina_dashboard()
 
     def _quit_application(self):
-        """Quit the application from tray menu"""
+        """Quit the application (tray menu or toolbar Quit)"""
         # Stop background timers
         self._stop_tray_weather_refresh()
         self._stop_tray_update_check()
