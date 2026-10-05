@@ -3436,7 +3436,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         add_obs_action.triggered.connect(self._add_observation_to_selected)
         duplicate_action = menu.addAction("Duplicate Session")
         duplicate_action.triggered.connect(self._duplicate_selected_session)
-        menu.addAction("Review Light Quality...").triggered.connect(
+        menu.addAction("Review Lights Quality...").triggered.connect(
             lambda: self._review_light_quality(session_data))
         menu.addSeparator()
         self._add_target_tool_actions(menu, session_data)

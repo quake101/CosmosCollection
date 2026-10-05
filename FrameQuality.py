@@ -25,7 +25,8 @@ import SessionFileScanner
 logger = logging.getLogger(__name__)
 
 # Bump whenever measurements change so cached results get re-analyzed.
-ANALYSIS_VERSION = 1
+# 2: added outside_light (guiding jumps, tails and halos)
+ANALYSIS_VERSION = 2
 
 TILE = 64                 # background mesh tile size (analysis pixels)
 DETECT_SIGMA = 5.0        # detection threshold on the smoothed image
@@ -43,6 +44,14 @@ MAX_MEASURED = 1500       # brightest unsaturated stars measured for shape
 TRANSPARENCY_BANDS = ((100, 300), (300, 1000), (1000, 3000))
 SATURATION_FRACTION = 0.9
 MAX_ANALYSIS_PIXELS = 12_000_000  # bigger mono frames are binned 2x2 for speed
+# Light outside the star cores: of each bright star's light within OUTSIDE_RADIUS
+# sensor pixels, the share beyond OUTSIDE_CORE_FWHM x the frame's FWHM (which
+# holds essentially all of a clean star). A guiding jump leaves a round core
+# plus a faint tail that the shape measurements - which only see the brighter
+# pixels - miss; tails, double images and dew/cloud halos all raise this.
+OUTSIDE_RADIUS = 40
+OUTSIDE_CORE_FWHM = 3.0
+OUTSIDE_STARS = 200
 
 # Moments are taken over pixels above this fraction of each star's peak, so a
 # faint star and a bright one are truncated alike (a noise-level cut would make
@@ -75,6 +84,7 @@ class FrameMetrics:
     star_snr: float = None            # median peak / noise of the measured stars
     star_flux: list = None            # median flux per TRANSPARENCY_BANDS band (None past the last star) - drops under cloud
     saturated: int = 0                # saturated stars
+    outside_light: float = None       # share of star light outside the cores (0-1) - rises with tails and halos
     width: int = 0
     height: int = 0
     seconds: float = 0.0              # time taken to analyze
@@ -334,6 +344,22 @@ def _measure(boxes):
     return fwhm, hfr, eccentricity, angle, aperture
 
 
+def _outside_light(boxes, wide, core):
+    """Median share of each star's light within `wide` pixels that lies beyond
+    `core` pixels. The box's corners outside `wide` are the local background."""
+    half = boxes.shape[1] // 2
+    offsets = np.arange(-half, half + 1)
+    yy, xx = np.meshgrid(offsets, offsets, indexing="ij")
+    distance = np.hypot(yy, xx)
+    light = boxes - np.median(boxes[:, distance > wide], axis=1)[:, None, None]
+    total = np.where(distance <= wide, light, 0).sum(axis=(1, 2))
+    inner = np.where(distance <= core, light, 0).sum(axis=(1, 2))
+    good = total > 0
+    if not good.any():
+        return None
+    return float(np.median(1 - inner[good] / total[good]))
+
+
 def _shape_stats(boxes):
     """Frame medians of the per-star shape measurements, dropping blends."""
     fwhm, hfr, ecc, angle, _flux = _measure(boxes)
@@ -403,9 +429,9 @@ def analyze_file(path):
         radius = 6 * scale // pixel
         max_radius = 20 * scale // pixel
 
-        def boxable(selection):
+        def boxable(selection, box_radius=None):
             """The stars in selection far enough from the edges for a full box."""
-            edge = radius + pad
+            edge = (box_radius or radius) + pad
             return selection[(src_y[selection] >= edge) & (src_y[selection] < source.shape[0] - edge)
                              & (src_x[selection] >= edge) & (src_x[selection] < source.shape[1] - edge)]
 
@@ -444,6 +470,15 @@ def analyze_file(path):
                 flux = (_measure(_sensor_boxes(source, src_y[band], src_x[band], radius, green_odd))[4]
                         if band.size else np.empty(0))
                 result.star_flux.append(float(np.median(flux)) if flux.size else None)
+
+            # Wide enough for the tail, and well past the core of bloated stars
+            core = OUTSIDE_CORE_FWHM * stats["fwhm"]
+            wide = int(math.ceil(max(OUTSIDE_RADIUS / pixel, core * 1.5)))
+            # Boxes run a little past the circle - that ring is each star's local background
+            bright = boxable(candidates, wide + 4)[:OUTSIDE_STARS]
+            if bright.size:
+                result.outside_light = _outside_light(
+                    _sensor_boxes(source, src_y[bright], src_x[bright], wide + 4, green_odd), wide, core)
         result.ok = True
     except Exception as e:
         logger.debug(f"Frame quality analysis failed for {path}: {e}")
@@ -523,6 +558,7 @@ class GradeSettings:
     star_drop_pct: float = 60.0        # fewer stars (obstruction, heavy cloud) - loose, as moonlight hides faint stars too
     fwhm_rise_pct: float = 25.0        # bigger stars (seeing, focus)
     eccentricity_rise: float = 0.12    # more elongated stars (trailing, wind, guiding) - absolute
+    outside_rise_pct: float = 35.0     # more light outside the star cores (guiding jumps, tails, halos)
     background_rise_pct: float = 60.0  # brighter sky (moon, dawn, clouds lit from below) - Marginal at most on its own
 
 
@@ -565,9 +601,25 @@ def grade_frames(frames, settings=None):
                 grades[m.path] = FrameGrade(GRADE_UNGRADED, 0.0, ["Too few frames in this group to compare"])
             continue
         band = transparency_band(usable)
-        medians = _group_medians(usable, band)
-        for m in usable:
-            grades[m.path] = _grade_one(m, medians, settings, band)
+        grades.update(_grade_group(usable, settings, band))
+    return grades
+
+
+def _grade_group(frames, settings, band):
+    """Grade against the median of the frames that aren't rejected. With bad
+    frames in the median it sits lower, so removing them would make it rise and
+    reject frames that passed before - each removal peeling off another layer.
+    Re-grading against the survivors until nothing changes gives that end
+    result at once, so removing the rejects leaves the rest graded the same."""
+    reference = frames
+    for _ in range(10):
+        medians = _group_medians(reference, band)
+        grades = {m.path: _grade_one(m, medians, settings, band) for m in frames}
+        survivors = [m for m in frames if grades[m.path].grade != GRADE_REJECT]
+        # A better reference mostly just adds rejects, so this settles in a few rounds
+        if len(survivors) == len(reference) or len(survivors) < MIN_GROUP_SIZE:
+            break
+        reference = survivors
     return grades
 
 
@@ -597,7 +649,7 @@ def _median_of(values):
 
 def _group_medians(frames, band):
     medians = {attr: _median_of(getattr(f, attr) for f in frames)
-               for attr in ("stars", "fwhm_px", "eccentricity", "background")}
+               for attr in ("stars", "fwhm_px", "eccentricity", "background", "outside_light")}
     medians["star_flux"] = _median_of(band_flux(f, band) for f in frames)
     return medians
 
@@ -634,6 +686,14 @@ def _grade_one(m, med, s, band):
             flags.append(f"Elongated stars (eccentricity {m.eccentricity:.2f} vs "
                          f"{med['eccentricity']:.2f}) - {cause}?")
 
+    if m.outside_light is not None and med["outside_light"]:
+        rise = (m.outside_light - med["outside_light"]) / med["outside_light"] * 100
+        # Never credit: bloated stars have less light outside their (bigger) cores,
+        # which would offset the FWHM penalty they deserve
+        badness["outside"] = max(rise / s.outside_rise_pct, 0.0)
+        if badness["outside"] >= 0.5:
+            flags.append(f"Light spread outside the star cores (+{rise:.0f}%) - guiding jump, trailing or halos?")
+
     if med["background"]:
         rise = (m.background - med["background"]) / med["background"] * 100
         if rise / s.background_rise_pct >= 0.5:
@@ -655,12 +715,15 @@ def _grade_one(m, med, s, band):
         grade = GRADE_MARGINAL
     else:
         grade = GRADE_GOOD
-    if grade != GRADE_GOOD and worst < 0.5:
+    # Graded down by the total rather than any one problem - say so, since the
+    # flags alone (a bright sky, say) wouldn't explain it
+    if (grade == GRADE_REJECT and reject_worst < 1.0) or (grade == GRADE_MARGINAL and worst < 0.5):
         flags.append("Several metrics slightly worse than the rest")
 
     relative = {}
     for name, value, median in (("flux", flux, med["star_flux"]), ("stars", m.stars, med["stars"]),
-                                ("fwhm", m.fwhm_px, med["fwhm_px"]), ("background", m.background, med["background"])):
+                                ("fwhm", m.fwhm_px, med["fwhm_px"]), ("background", m.background, med["background"]),
+                                ("outside", m.outside_light, med["outside_light"])):
         if value is not None and median:
             relative[name] = value / median * 100
     return FrameGrade(grade, _score(total), flags, badness, relative)
@@ -742,10 +805,11 @@ def main(argv):
             band_text = f"ranks {TRANSPARENCY_BANDS[band][0]}-{TRANSPARENCY_BANDS[band][1]}" if band is not None else "none"
             print(f"== {key[0]}  {key[1]}s  bin {key[2]}  (flux from star {band_text}) ==")
             print(f"{'Grade':<10} {'Score':>5} {'Stars':>6} {'FWHM':>5} {'arcs':>5} {'HFR':>5} "
-                  f"{'Ecc':>5} {'Align':>5} {'Bkgnd':>7} {'Grad%':>6} {'SNR':>6} {'Flux':>8}  File / flags")
+                  f"{'Ecc':>5} {'Align':>5} {'Out%':>5} {'Bkgnd':>7} {'Grad%':>6} {'SNR':>6} {'Flux':>8}  File / flags")
         g = grades[m.path]
         print(f"{g.grade:<10} {g.score:>5.0f} {m.stars:>6} {_fmt(m.fwhm_px, '5.2f')} {_fmt(m.fwhm_arcsec, '5.2f')} "
               f"{_fmt(m.hfr_px, '5.2f')} {_fmt(m.eccentricity, '5.2f')} {_fmt(m.alignment, '5.2f')} "
+              f"{_fmt(m.outside_light * 100 if m.outside_light is not None else None, '5.1f')} "
               f"{_fmt(m.background, '7.0f')} {_fmt(m.gradient_pct, '6.1f')} {_fmt(m.star_snr, '6.0f')} "
               f"{_fmt(band_flux(m, band), '8.0f')}  "
               f"{os.path.basename(m.path)}" + (f"  [{'; '.join(g.flags)}]" if g.flags else ""))

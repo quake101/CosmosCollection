@@ -36,7 +36,7 @@ from SessionManager import format_duration, format_exposure, _retire_thread, _ro
 
 logger = logging.getLogger(__name__)
 
-# Parallel file reads + analyses. From a NAS, more than this doesn't read any faster.
+# Parallel file reads + analyses.
 ANALYSIS_WORKERS = 4
 
 SETTINGS_PREFIX = "light_quality/"
@@ -58,6 +58,7 @@ THRESHOLDS = [
     ("star_drop_pct", "Fewer stars (obstruction)", "-", "%", 10, 95, 1, 0),
     ("fwhm_rise_pct", "Bigger stars (seeing, focus)", "+", "%", 5, 300, 1, 0),
     ("eccentricity_rise", "More elongated (trailing, guiding)", "+", "", 0.02, 0.5, 0.01, 2),
+    ("outside_rise_pct", "Light outside star cores (guiding jumps, halos)", "+", "%", 10, 300, 5, 0),
     ("background_rise_pct", "Brighter sky (moon, dawn)", "+", "%", 10, 500, 5, 0),
 ]
 
@@ -485,9 +486,9 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
 
     WINDOW_POSITION_KEY = "LightQualityDialog"
     COLUMNS = ["", "Grade", "Score", "File", "Night", "Filter", "Stars", "FWHM", "Eccentricity",
-               "Star Brightness", "Sky", "Issues"]
+               "Tails/Halos", "Star Brightness", "Sky", "Issues"]
     (COL_CHECK, COL_GRADE, COL_SCORE, COL_FILE, COL_NIGHT, COL_FILTER, COL_STARS, COL_FWHM, COL_ECC,
-     COL_FLUX, COL_SKY, COL_ISSUES) = range(12)
+     COL_OUTSIDE, COL_FLUX, COL_SKY, COL_ISSUES) = range(13)
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
@@ -667,6 +668,9 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         for col, tip in ((self.COL_STARS, "Stars detected"),
                          (self.COL_FWHM, "Star size (full width at half maximum), in sensor pixels and arcseconds"),
                          (self.COL_ECC, "0 = round, 1 = a line. Elongation that all points one way is trailing."),
+                         (self.COL_OUTSIDE, "Star light outside the round star cores vs the group's median frame.\n"
+                                            "A guiding jump leaves round cores with faint tails, which only this shows;\n"
+                                            "double images and dew or cloud halos raise it too."),
                          (self.COL_FLUX, "Brightness of the same stars, as % of the group's median frame.\n"
                                          "Clouds and haze dim it; moonlight and seeing don't."),
                          (self.COL_SKY, "Sky background vs the group's median frame")):
@@ -760,7 +764,8 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         box = QGroupBox("Reject when worse than the group's median by")
         grid = QGridLayout(box)
         note = QLabel("Half of each is Marginal. A brighter sky alone is Marginal at most, and fewer stars "
-                      "only count on their own - moonlight hides faint stars too.")
+                      "only count on their own - moonlight hides faint stars too. The median leaves out "
+                      "rejected frames, so removing them doesn't turn up new rejects.")
         note.setWordWrap(True)
         themed_style(note, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_size(8)};")
         grid.addWidget(note, 0, 0, 1, 2)
@@ -919,7 +924,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self.table.resizeColumnsToContents()
         # Room for values still to come (rows may all be waiting on analysis)
         for col, sample in ((self.COL_SCORE, "100"), (self.COL_STARS, "88,888"), (self.COL_FWHM, '8.88 px (88.8")'),
-                            (self.COL_FLUX, "100%"), (self.COL_SKY, "+888%")):
+                            (self.COL_OUTSIDE, "+888%"), (self.COL_FLUX, "100%"), (self.COL_SKY, "+888%")):
             width = self.table.fontMetrics().horizontalAdvance(sample) + 24
             self.table.setColumnWidth(col, max(self.table.columnWidth(col), width))
         # NINA-style names are long - a fixed (draggable) width keeps the metrics in view
@@ -970,6 +975,13 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         if ecc is not None and m.alignment is not None:
             ecc_item.setToolTip(f"Alignment {m.alignment:.2f} (0 = random directions, 1 = all one way)")
         self.table.setItem(row, self.COL_ECC, ecc_item)
+
+        outside = relative.get("outside")
+        outside_item = SortItem(f"{outside - 100:+.0f}%" if outside is not None else "",
+                                outside if outside is not None else -1)
+        if ok and m.outside_light is not None:
+            outside_item.setToolTip(f"{m.outside_light * 100:.1f}% of the star light is outside the cores")
+        self.table.setItem(row, self.COL_OUTSIDE, outside_item)
 
         flux = relative.get("flux")
         self.table.setItem(row, self.COL_FLUX, SortItem(f"{flux:.0f}%" if flux is not None else "",
@@ -1400,6 +1412,8 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
                 f"Stars: {m.stars:,}{pct('stars')} · {m.measured:,} measured · {m.saturated} saturated",
                 f"FWHM: {fwhm}{pct('fwhm')} · HFR: {m.hfr_px:.2f} px" if m.hfr_px is not None else f"FWHM: {fwhm}",
                 f"Eccentricity: {m.eccentricity:.2f} · alignment {m.alignment:.2f}" if m.eccentricity is not None else "",
+                f"Light outside the star cores: {m.outside_light * 100:.1f}%{pct('outside')}"
+                if m.outside_light is not None else "",
                 f"Star brightness: {rel['flux']:.0f}% of median" if "flux" in rel else "",
                 f"Sky: {m.background:.0f} ADU{pct('background')} · noise {m.noise:.1f} ADU · gradient {m.gradient_pct:.1f}%"
                 if m.background is not None else "",
