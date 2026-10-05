@@ -182,14 +182,24 @@ def launch_detached(args, cwd=None):
         return False
 
 
-def pixinsight_wbpp_args(pixinsight_path, frames_dir, output_dir, run_immediately=False):
+# WBPP switches a post-calibration light group to FastIntegration once it holds
+# this many frames, while its automatic integration mode is on (BPP-global.js).
+WBPP_FAST_INTEGRATION_FRAMES = 150
+
+
+def pixinsight_wbpp_args(pixinsight_path, frames_dir, output_dir, run_immediately=False, fast_integration=True):
     """PixInsight command line that opens WBPP with every sub under frames_dir
     loaded (WBPP groups them by IMAGETYP/FILTER itself). -n starts a new
     instance so this works even while PixInsight is already open; loadOnly
     opens the WBPP dialog for review instead of running straight away.
+    fast_integration sets WBPP's automatic integration mode (FastIntegration
+    for groups of WBPP_FAST_INTEGRATION_FRAMES+ lights). It's always passed:
+    WBPP saves its settings when its dialog closes, so leaving it out would
+    inherit whatever an earlier handoff left behind.
     See BPP-automation.js in the PixInsight install for the parameters."""
     wbpp = find_wbpp_script(pixinsight_path)
-    params = [wbpp, "automationMode=true", f"dir={frames_dir}", f"outputDirectory={output_dir}"]
+    params = [wbpp, "automationMode=true", f"dir={frames_dir}", f"outputDirectory={output_dir}",
+              f"autoIntegrationMode={'true' if fast_integration else 'false'}"]
     if not run_immediately:
         params.append("loadOnly")
     return [pixinsight_path, "-n", "--automation-mode", "-r=" + ",".join(params)]

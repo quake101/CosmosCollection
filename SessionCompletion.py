@@ -404,10 +404,19 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self.run_now_checkbox = QCheckBox("Start WBPP right away (otherwise it opens for review first)")
         grid.addWidget(self.run_now_checkbox, 6, 0, 1, 3)
 
+        self.fast_integration_checkbox = QCheckBox()
+        self.fast_integration_checkbox.setToolTip(
+            f"WBPP's automatic integration mode: a filter group with {handoff.WBPP_FAST_INTEGRATION_FRAMES} or more "
+            "lights is integrated with FastIntegration - much quicker and lighter on memory, while "
+            "ImageIntegration's full pixel rejection is a little more thorough.\n\n"
+            "Smaller groups always use ImageIntegration (you can still switch a group to Fast Integration "
+            "in WBPP when it opens for review). WBPP remembers this setting for its next use too.")
+        grid.addWidget(self.fast_integration_checkbox, 7, 0, 1, 3)
+
         self.copy_checkbox = QCheckBox("Copy the files instead of hard-linking them")
         self.copy_checkbox.setToolTip("Hard links take no extra disk space and are used whenever possible. "
                                       "Files on another drive are always copied.")
-        grid.addWidget(self.copy_checkbox, 7, 0, 1, 3)
+        grid.addWidget(self.copy_checkbox, 8, 0, 1, 3)
 
         grid.setColumnStretch(1, 1)
         return self.options_box
@@ -478,7 +487,16 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         lights = {key: [p for p in paths if p in keep] for key, paths in self._all_lights.items()}
         self.frames.lights = {key: paths for key, paths in lights.items() if paths}
         self.summary_label.setText(self._summary_text())
+        self._update_fast_integration_text()
         self._update_continue()
+
+    def _update_fast_integration_text(self):
+        """Say which filter groups are big enough for WBPP to use it - per filter
+        is close to WBPP's own grouping (it also splits by exposure and binning)."""
+        threshold = handoff.WBPP_FAST_INTEGRATION_FRAMES
+        large = [f"{key} {len(paths)}" for key, paths in sorted(self.frames.lights.items()) if len(paths) >= threshold]
+        note = f"used for: {', '.join(large)}" if large else "no filter here has that many"
+        self.fast_integration_checkbox.setText(f"Fast Integration for filters with {threshold}+ lights  ({note})")
 
     def _update_continue(self):
         if not hasattr(self, "continue_btn"):
@@ -499,6 +517,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
             return
         self.osc_checkbox.setVisible(app == handoff.SIRIL)
         self.run_now_checkbox.setVisible(app == handoff.PIXINSIGHT)
+        self.fast_integration_checkbox.setVisible(app == handoff.PIXINSIGHT)
         if not self._workspace_edited:
             self.workspace_edit.setText(handoff.default_workspace(
                 app, self.session.get("dso_name"), self.session.get("session_date"), self.frames))
@@ -535,6 +554,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
     # QSettings keys for what the user picked last time (saved on Continue only).
     CHOICE_SETTING = "session_completion/choice"
     RUN_NOW_SETTING = "session_completion/wbpp_run_now"
+    FAST_INTEGRATION_SETTING = "session_completion/wbpp_fast_integration"
     COPY_SETTING = "session_completion/copy_files"
     MARK_TARGET_SETTING = "session_completion/mark_target_completed"
     CHOICE_NAMES = {CHOICE_SIRIL: "siril", CHOICE_PIXINSIGHT: "pixinsight",
@@ -555,6 +575,8 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
             # falls back to the default.
             (button if button.isEnabled() else self.choice_group.button(self.CHOICE_NOTHING)).setChecked(True)
         self.run_now_checkbox.setChecked(settings.value(self.RUN_NOW_SETTING, False, type=bool))
+        # On by default, as in WBPP itself
+        self.fast_integration_checkbox.setChecked(settings.value(self.FAST_INTEGRATION_SETTING, True, type=bool))
         self.copy_checkbox.setChecked(settings.value(self.COPY_SETTING, False, type=bool))
         if not self.target_checkbox.isHidden():
             self.target_checkbox.setChecked(settings.value(self.MARK_TARGET_SETTING, True, type=bool))
@@ -564,6 +586,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         if not self._fixed_app:  # a menu's Processing action isn't a completion choice
             settings.setValue(self.CHOICE_SETTING, self.CHOICE_NAMES[self.choice_group.checkedId()])
         settings.setValue(self.RUN_NOW_SETTING, self.run_now_checkbox.isChecked())
+        settings.setValue(self.FAST_INTEGRATION_SETTING, self.fast_integration_checkbox.isChecked())
         settings.setValue(self.COPY_SETTING, self.copy_checkbox.isChecked())
         if not self.target_checkbox.isHidden():
             settings.setValue(self.MARK_TARGET_SETTING, self.target_checkbox.isChecked())
@@ -713,7 +736,8 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         exe = handoff.resolve_executable(handoff.PIXINSIGHT)
         output_dir = os.path.join(workdir, handoff.WBPP_OUTPUT_DIR)
         os.makedirs(output_dir, exist_ok=True)
-        args = handoff.pixinsight_wbpp_args(exe, frames_dir, output_dir, self.run_now_checkbox.isChecked())
+        args = handoff.pixinsight_wbpp_args(exe, frames_dir, output_dir, self.run_now_checkbox.isChecked(),
+                                            fast_integration=self.fast_integration_checkbox.isChecked())
         if handoff.launch_detached(args, cwd=workdir):
             fixed = len(self.frames.retype) - len(self._unfixed_frames)
             notes = ""
