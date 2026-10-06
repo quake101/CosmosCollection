@@ -793,6 +793,25 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
             coord_match = separation <= DROP_MATCH_MAX_SEPARATION_DEG
         return int(name_match) + int(coord_match)
 
+    # Sessions the dropped subs can be suggested for - a Planned one is promoted
+    # to In Progress when files are attached
+    OPEN_STATUSES = ("Planned", "In Progress")
+
+    def _taken_on(self, session_date):
+        """True when the subs could be from the night a session is dated. A
+        session's date is the local evening, while DATE-OBS is UTC - after
+        midnight UTC (evening in the Americas) the subs carry the next day."""
+        earliest = self.summary.get("earliest_sub_date")
+        latest = self.summary.get("latest_sub_date") or earliest
+        if not earliest or not session_date:
+            return False
+        try:
+            first = date_cls.fromisoformat(earliest[:10]) - timedelta(days=1)
+            last = date_cls.fromisoformat(latest[:10])
+            return first <= date_cls.fromisoformat(str(session_date)[:10]) <= last
+        except ValueError:
+            return False
+
     def _load_existing_sessions(self):
         rows = []
         try:
@@ -806,28 +825,36 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
         except Exception as e:
             logger.error(f"Error loading sessions for drop match: {e}")
 
-        # Matching sessions float to the top (ongoing first, then strongest match),
-        # everything else keeps its newest-first order below them. sorted() is
-        # stable, so date order holds within each group.
-        scored = [(row, self._match_score(row[1], row[4], row[5])) for row in rows]
-        scored.sort(key=lambda entry: (entry[1] == 0, entry[0][2] != "In Progress", -entry[1]))
+        # Matching sessions float to the top - open ones (Planned / In Progress)
+        # first, then one dated the night these subs were taken, then ongoing over
+        # planned, then strongest match. Everything else keeps its newest-first
+        # order below them (sorted() is stable).
+        def rank(entry):
+            (_id, _name, status, session_date, _ra, _dec), score = entry
+            return (score == 0, status not in self.OPEN_STATUSES, not self._taken_on(session_date),
+                    status != "In Progress", -score)
+        scored = sorted(((row, self._match_score(row[1], row[4], row[5])) for row in rows), key=rank)
 
         suggested_item = None
         for (session_id, dso_name, status, session_date, _ra, _dec), score in scored:
             label = f"{dso_name} — {status} — {session_date}"
-            is_ongoing_match = score > 0 and status == "In Progress"
-            if is_ongoing_match:
-                label += "  (ongoing — suggested match)"
+            # The first open match is the suggestion: the session planned for this
+            # night, or the one already in progress for this target
+            suggest = score > 0 and status in self.OPEN_STATUSES and suggested_item is None
+            if suggest:
+                reason = ("planned for this night" if status == "Planned" and self._taken_on(session_date)
+                          else "ongoing" if status == "In Progress" else "planned")
+                label += f"  ({reason} — suggested match)"
             elif score > 0:
                 label += "  (same target)"
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, session_id)
             self.sessions_list.addItem(item)
-            if is_ongoing_match and suggested_item is None:
+            if suggest:
                 suggested_item = item
 
         # Still always requires the user to click OK - this only changes the
-        # dialog's *default* selection so continuing an already-ongoing session
+        # dialog's *default* selection so continuing a planned or ongoing session
         # for the same DSO is the path of least resistance, per the "always
         # confirm, never silently auto-attach" rule.
         if suggested_item is not None:
