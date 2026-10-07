@@ -160,6 +160,27 @@ def load_image_qimage(file_path):
     return qimage, None
 
 
+def load_screen_stretched_qimage(file_path):
+    """A FITS/XISF sub at full resolution with an auto screen stretch (debayered
+    on a color camera) - for reviewing raw light frames, which a plain linear
+    stretch leaves nearly black. Safe to call from a worker thread.
+    Returns (qimage, None) on success or (None, error message) on failure."""
+    if not file_path or not os.path.exists(file_path):
+        return None, "File not found"
+    try:
+        from FrameQuality import screen_stretched
+        pixels = np.ascontiguousarray(screen_stretched(file_path))
+    except Exception as e:
+        logger.debug(f"Could not screen-stretch {file_path}: {e}")
+        return None, f"Failed to load FITS/XISF file: {e}"
+    height, width = pixels.shape[:2]
+    if pixels.ndim == 3:
+        qimage = QImage(pixels.data, width, height, width * 3, QImage.Format_RGB888)
+    else:
+        qimage = QImage(pixels.data, width, height, width, QImage.Format_Grayscale8)
+    return qimage.copy(), None
+
+
 def load_astro_pixmap(file_path, max_dim=None):
     """Decode a FITS or XISF file into a displayable QPixmap.
 

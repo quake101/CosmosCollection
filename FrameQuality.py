@@ -498,6 +498,69 @@ def _auto_stretch(values, background, noise, white, target=0.2):
     return ((m - 1) * x / ((2 * m - 1) * x - m)).astype(np.float32)
 
 
+_RB_KERNEL = np.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], np.float32) / 4
+_G_KERNEL = np.array([[0, 1, 0], [1, 4, 1], [0, 1, 0]], np.float32) / 4
+
+
+def _convolve3(image, kernel):
+    padded = np.pad(image, 1, mode="reflect")
+    height, width = image.shape
+    out = np.zeros_like(image)
+    for dy in range(3):
+        for dx in range(3):
+            if kernel[dy, dx]:
+                out += kernel[dy, dx] * padded[dy:dy + height, dx:dx + width]
+    return out
+
+
+def _debayer(raw, header):
+    """Bilinear demosaic of a Bayer frame into (h, w, 3) float32 RGB."""
+    pattern = str(header.get("BAYERPAT") or "RGGB").strip().upper()
+    if len(pattern) != 4 or set(pattern) - set("RGB"):
+        pattern = "RGGB"
+    try:
+        x_shift = int(float(header.get("XBAYROFF") or 0)) % 2
+        y_shift = int(float(header.get("YBAYROFF") or 0)) % 2
+    except (TypeError, ValueError):
+        x_shift = y_shift = 0
+    # cell[(row, col)] is the color at row % 2, col % 2, after any pattern offset
+    cell = {(r, c): pattern[2 * ((r + y_shift) % 2) + (c + x_shift) % 2] for r in range(2) for c in range(2)}
+    image = raw.astype(np.float32)
+    rgb = np.empty(raw.shape + (3,), np.float32)
+    for channel, color in enumerate("RGB"):
+        sparse = np.zeros_like(image)
+        for (r, c), cell_color in cell.items():
+            if cell_color == color:
+                sparse[r::2, c::2] = image[r::2, c::2]
+        rgb[..., channel] = _convolve3(sparse, _G_KERNEL if color == "G" else _RB_KERNEL)
+    return rgb
+
+
+def screen_stretched(path, target=0.25):
+    """A frame at full resolution for close viewing, as uint8 (h, w) or (h, w, 3):
+    debayered to color on a color camera, then auto-stretched like PixInsight's
+    STF - each channel on its own, which also neutralizes a color cast."""
+    data, header = _read_frame(path)
+    white = _full_scale(data)
+    if data.ndim == 2 and header.get("BAYERPAT"):
+        image = _debayer(data, header)
+    else:
+        image = data.astype(np.float32)
+    del data
+    out = np.empty(image.shape, np.uint8)
+    for channel in range(1 if image.ndim == 2 else image.shape[2]):
+        values = image if image.ndim == 2 else image[..., channel]
+        background, noise = _clipped_stats(values[::4, ::4].ravel())
+        stretched = _auto_stretch(values, background, noise, white, target)
+        stretched *= 255
+        stretched += 0.5
+        if image.ndim == 2:
+            out[...] = stretched
+        else:
+            out[..., channel] = stretched
+    return out
+
+
 def inspection_images(path, crop_radius=32):
     """Display images for reviewing a frame: (overview, overview_scale, crops).
     overview is the whole frame, auto-stretched to 0-1, at 1/overview_scale of

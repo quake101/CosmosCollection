@@ -682,6 +682,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             self.table.horizontalHeaderItem(col).setToolTip(tip)
         self.table.itemChanged.connect(self._on_item_changed)
         self.table.itemSelectionChanged.connect(lambda: self._preview_timer.start(150))
+        self.table.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_menu)
         return self.table
@@ -1442,8 +1443,32 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         menu.addAction(f"Check {len(paths)} Selected").triggered.connect(lambda: self._set_checked(paths, True))
         menu.addAction(f"Uncheck {len(paths)} Selected").triggered.connect(lambda: self._set_checked(paths, False))
         menu.addSeparator()
+        menu.addAction("Open in Image Viewer").triggered.connect(lambda: self._open_viewer(paths[0]))
         menu.addAction("Open Containing Folder").triggered.connect(lambda: self._open_folder(paths[0]))
         menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def _on_item_double_clicked(self, item):
+        # A double-click on the checkbox just toggles it twice - not an "open"
+        if item.column() != self.COL_CHECK:
+            self._open_viewer(self._row_path(item.row()))
+
+    def _open_viewer(self, path):
+        """The frame at full resolution, screen-stretched, in the image viewer."""
+        if not path:
+            return
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "File Not Found", f"The file no longer exists:\n{path}")
+            return
+        from ImageViewer import ImageViewerWindow
+        # Opens straight away and loads in the background; a child of this dialog,
+        # so it stays usable while the (modal) review is open
+        viewer = ImageViewerWindow(None, os.path.basename(path), path, self,
+                                   dso_ra=self.session.get("ra_deg"), dso_dec=self.session.get("dec_deg"),
+                                   screen_stretch=True)
+        self._viewers = [v for v in getattr(self, "_viewers", []) if v.isVisible()] + [viewer]
+        viewer.show()
+        viewer.raise_()
+        viewer.activateWindow()
 
     def _open_folder(self, path):
         folder = os.path.dirname(path)

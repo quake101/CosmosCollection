@@ -46,14 +46,19 @@ class ImageLoadWorker(QThread):
     image_loaded = Signal(object)  # QImage
     load_failed = Signal(str)  # error message
 
-    def __init__(self, file_path):
+    def __init__(self, file_path, screen_stretch=False):
         super().__init__()
         self.file_path = file_path
+        self.screen_stretch = screen_stretch
 
     def run(self):
         try:
-            from ImageLoader import load_image_qimage
-            qimage, error = load_image_qimage(self.file_path)
+            from ImageLoader import load_image_qimage, load_screen_stretched_qimage
+            is_astro = os.path.splitext(self.file_path)[1].lower() in ('.fits', '.fit', '.fts', '.xisf')
+            if self.screen_stretch and is_astro:
+                qimage, error = load_screen_stretched_qimage(self.file_path)
+            else:
+                qimage, error = load_image_qimage(self.file_path)
             if qimage is not None:
                 self.image_loaded.emit(qimage)
             else:
@@ -634,10 +639,13 @@ class ImageViewerWindow(QDialog):
     zoom_changed = Signal(float)  # Signal for zoom level changes
 
     def __init__(self, pixmap: QPixmap, title: str, file_path: str = None, parent=None,
-                 dso_ra: float = None, dso_dec: float = None):
+                 dso_ra: float = None, dso_dec: float = None, screen_stretch: bool = False):
         """pixmap may be None when file_path is given - the window then opens
-        straight away and loads the image in a background thread."""
+        straight away and loads the image in a background thread. screen_stretch
+        loads a FITS/XISF raw sub with an auto screen stretch (debayered on a color
+        camera) instead of the plain linear one - for reviewing light frames."""
         super().__init__(parent)
+        self.screen_stretch = screen_stretch
         self.setWindowTitle(f"{title} - Image Viewer - Cosmos Collection")
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
@@ -868,6 +876,11 @@ class ImageViewerWindow(QDialog):
         if self.original_pixmap is None and self.file_path:
             self._start_image_load()
 
+        # Reopen the file info panel if it was open last time
+        if self.file_path and QSettings("CosmosCollection", "CosmosCollection").value(
+                self.INFO_PANEL_SETTING, False, type=bool):
+            self._set_file_info_visible(True)
+
         # Update status
         self._update_status()
 
@@ -882,7 +895,7 @@ class ImageViewerWindow(QDialog):
         for button in self._image_buttons():
             button.setEnabled(False)
 
-        self.image_load_worker = ImageLoadWorker(self.file_path)
+        self.image_load_worker = ImageLoadWorker(self.file_path, screen_stretch=self.screen_stretch)
         self.image_load_worker.image_loaded.connect(self._on_image_loaded)
         self.image_load_worker.load_failed.connect(self._on_image_load_failed)
         self.image_load_worker.start()
@@ -901,6 +914,9 @@ class ImageViewerWindow(QDialog):
         self.image_label.setText("")
         for button in self._image_buttons():
             button.setEnabled(True)
+        # A panel opened before the image arrived is missing the image's size
+        if self.file_info_panel.isVisible():
+            self._load_file_information()
 
         if self.isVisible():
             self._do_initial_fit()
@@ -1416,20 +1432,23 @@ class ImageViewerWindow(QDialog):
         else:
             QMessageBox.critical(self, "Error", f"Failed to save annotated image:\n{save_path}")
 
-    def _toggle_file_info(self):
-        """Toggle the visibility of the file information panel"""
-        if hasattr(self, 'file_info_panel'):
-            is_visible = self.file_info_panel.isVisible()
-            self.file_info_panel.setVisible(not is_visible)
+    INFO_PANEL_SETTING = "image_viewer/file_info_visible"
 
-            # Update button text
-            if hasattr(self, 'info_toggle_button'):
-                if not is_visible:
-                    self.info_toggle_button.setText("Hide File Info")
-                    # Load and display file information when showing
-                    self._load_file_information()
-                else:
-                    self.info_toggle_button.setText("Show File Info")
+    def _toggle_file_info(self):
+        """Toggle the file information panel, remembering the choice for next time"""
+        if hasattr(self, 'file_info_panel'):
+            visible = not self.file_info_panel.isVisible()
+            self._set_file_info_visible(visible)
+            QSettings("CosmosCollection", "CosmosCollection").setValue(self.INFO_PANEL_SETTING, visible)
+
+    def _set_file_info_visible(self, visible):
+        self.file_info_panel.setVisible(visible)
+        if hasattr(self, 'info_toggle_button'):
+            self.info_toggle_button.setChecked(visible)
+            self.info_toggle_button.setText("Hide File Info" if visible else "Show File Info")
+        if visible:
+            # Load and display file information when showing
+            self._load_file_information()
 
     def _load_file_information(self):
         """Load and display file information"""

@@ -7457,12 +7457,14 @@ if __name__ == "__main__":
         # faulthandler.enable() only registers SIGSEGV/SIGFPE/SIGABRT/SIGBUS/SIGILL by default --
         # it misses SIGTRAP, which is how e.g. a hardened-glibc/OpenBLAS/Chromium-GPU-process
         # trap can take the whole process down. Register it too so that shows up here instead
-        # of vanishing with nothing but a "session started" line.
-        try:
-            import signal
-            faulthandler.register(signal.SIGTRAP, file=_crash_log_file, all_threads=True)
-        except Exception as e:
-            logger.debug(f"Could not register SIGTRAP handler: {e}")
+        # of vanishing with nothing but a "session started" line. Unix only: Windows has
+        # neither SIGTRAP nor faulthandler.register() (enable() above covers its crashes).
+        import signal
+        if hasattr(faulthandler, "register") and hasattr(signal, "SIGTRAP"):
+            try:
+                faulthandler.register(signal.SIGTRAP, file=_crash_log_file, all_threads=True)
+            except Exception as e:
+                logger.debug(f"Could not register SIGTRAP handler: {e}")
         logger.debug(f"Crash log: {_crash_log_path}")
     except Exception as e:
         logger.warning(f"Could not enable crash log: {e}")
