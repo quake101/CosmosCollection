@@ -26,7 +26,10 @@ logger = logging.getLogger(__name__)
 
 # Bump whenever measurements change so cached results get re-analyzed.
 # 2: added outside_light (guiding jumps, tails and halos)
-ANALYSIS_VERSION = 2
+# 3: eccentricity from adaptive moments; FWHM corrected to the true FWHM
+# 4: outside light stored at fixed radii (outside_profile), read at the group's core radius
+# 5: satellite/plane trails
+ANALYSIS_VERSION = 5
 
 TILE = 64                 # background mesh tile size (analysis pixels)
 DETECT_SIGMA = 5.0        # detection threshold on the smoothed image
@@ -45,13 +48,37 @@ TRANSPARENCY_BANDS = ((100, 300), (300, 1000), (1000, 3000))
 SATURATION_FRACTION = 0.9
 MAX_ANALYSIS_PIXELS = 12_000_000  # bigger mono frames are binned 2x2 for speed
 # Light outside the star cores: of each bright star's light within OUTSIDE_RADIUS
-# sensor pixels, the share beyond OUTSIDE_CORE_FWHM x the frame's FWHM (which
-# holds essentially all of a clean star). A guiding jump leaves a round core
-# plus a faint tail that the shape measurements - which only see the brighter
-# pixels - miss; tails, double images and dew/cloud halos all raise this.
+# sensor pixels, the share beyond a core radius that holds essentially all of a
+# clean star. A guiding jump leaves a round core plus a faint tail that the
+# shape measurements - which only see the brighter pixels - miss; tails, double
+# images and dew/cloud halos all raise this. Each frame stores the share at the
+# OUTSIDE_PROFILE_RADII, and grading reads it at OUTSIDE_CORE_FWHM x the larger
+# of the frame's own FWHM and its group's median. A core sized only by the
+# frame's own FWHM shrinks in good seeing while the faint halo every star has
+# stays put, so the sharpest frames read as the worst; one fixed core for the
+# whole group lets a soft frame's own wider wings spill past it, counting its
+# FWHM twice.
 OUTSIDE_RADIUS = 40
-OUTSIDE_CORE_FWHM = 3.0
+OUTSIDE_CORE_FWHM = 3.5   # x the true FWHM
+OUTSIDE_PROFILE_RADII = (2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 17, 20, 24, 28, 33, 40, 48, 57, 68, 80)  # sensor pixels
 OUTSIDE_STARS = 200
+
+# Satellite / plane trails, in analysis pixels. A line filter (along a short
+# segment vs across it, at TRAIL_ORIENTATIONS angles) on a 2x pooled image picks
+# out thin lines but not round stars; a Hough transform finds straight runs of
+# them; each candidate is then checked by the median brightness along the line
+# against the sky beside it - the median ignores the stars a line crosses, and
+# a broad nebula filament is as bright beside the line as on it.
+TRAIL_ORIENTATIONS = 12
+TRAIL_LINE_SIGMA = 4.0      # line-filter threshold for the Hough points
+TRAIL_ANGLE_STEP = 0.25     # degrees
+TRAIL_SEGMENT = 40          # pixels per continuity segment along a candidate
+TRAIL_LIT_SIGMA = 3.0       # a segment's median excess (noise units) to count as lit
+TRAIL_MIN_LENGTH = 300      # lit length of a trail...
+TRAIL_SHORT_LENGTH = 120    # ...or this much if it's bright (meteors, flares, corners)
+TRAIL_SHORT_EXCESS = 10.0
+TRAIL_CANDIDATES = 15       # Hough peaks checked per frame
+TRAIL_SKIP_ECCENTRICITY = 0.85  # stars this elongated are trailed themselves - every star is a "trail"
 
 # Moments are taken over pixels above this fraction of each star's peak, so a
 # faint star and a bright one are truncated alike (a noise-level cut would make
@@ -62,6 +89,30 @@ _TRUNCATED_VARIANCE = ((1 - (1 + math.log(1 / _MOMENT_FRACTION)) * _MOMENT_FRACT
                        / (1 - _MOMENT_FRACTION))
 _PIXEL_VARIANCE = 1 / 12  # a uniform pixel's own contribution to a second moment
 _SIGMA_TO_FWHM = 2 * math.sqrt(2 * math.log(2))
+_ADAPTIVE_ITERATIONS = 8
+_ADAPTIVE_CHUNK = 256     # stars per pass, to bound memory with big boxes
+
+# The moment FWHM reads high: real stars have wider wings than the Gaussian the
+# truncation correction assumes, and on a color camera filling in the red and
+# blue sites from their green neighbors blurs small stars further. Measured
+# FWHM of simulated Moffat (beta 4) stars of known FWHM, measured exactly as
+# here, maps a measurement back to the true FWHM. Checked against PixInsight on
+# broadband color subs (2.21 vs its 2.27 px); on dual-band subs PixInsight reads
+# higher, since its debayered stars include the softer-focused Ha (red) image.
+_FWHM_TRUE = (1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.7, 3.0, 3.5, 4.0, 5.0, 6.0)
+_FWHM_MEASURED_COLOR = (1.989, 2.099, 2.237, 2.392, 2.542, 2.740, 2.973, 3.275, 3.558, 4.064, 4.623, 5.653, 6.720)
+_FWHM_MEASURED_MONO = (1.373, 1.593, 1.779, 2.033, 2.228, 2.459, 2.680, 3.007, 3.331, 3.888, 4.433, 5.527, 6.606)
+
+
+def _true_fwhm(measured, color):
+    """The true FWHM (box pixels) for a moment FWHM measured on a color
+    (green-filled) or mono box - past either end of the table, the end's ratio."""
+    table = _FWHM_MEASURED_COLOR if color else _FWHM_MEASURED_MONO
+    if measured <= table[0]:
+        return measured * _FWHM_TRUE[0] / table[0]
+    if measured >= table[-1]:
+        return measured * _FWHM_TRUE[-1] / table[-1]
+    return float(np.interp(measured, table, _FWHM_TRUE))
 
 
 @dataclass
@@ -84,7 +135,8 @@ class FrameMetrics:
     star_snr: float = None            # median peak / noise of the measured stars
     star_flux: list = None            # median flux per TRANSPARENCY_BANDS band (None past the last star) - drops under cloud
     saturated: int = 0                # saturated stars
-    outside_light: float = None       # share of star light outside the cores (0-1) - rises with tails and halos
+    outside_profile: list = None      # share of star light beyond each OUTSIDE_PROFILE_RADII radius (None past the box) - rises with tails and halos
+    trails: list = None               # satellite/plane trails, [x0, y0, x1, y1, excess] in sensor pixels; None if not checked
     width: int = 0
     height: int = 0
     seconds: float = 0.0              # time taken to analyze
@@ -293,7 +345,9 @@ def _sensor_boxes(raw, ys, xs, radius, green_odd=None):
     """Boxes of sensor pixels around each star. On a color (Bayer) sensor the
     red and blue pixels are replaced by the mean of their four green
     neighbors, so the star is measured at full resolution without the color
-    pattern. green_odd is None for a mono sensor."""
+    pattern. green_odd is None for a mono sensor.
+    (Shapes from the green pixels alone were tried and checked against
+    PixInsight: FWHM barely changed and eccentricity got noisier.)"""
     if green_odd is None:
         return _patches(raw, ys, xs, radius).astype(np.float32)
     p = _patches(raw, ys, xs, radius + 1).astype(np.float32)
@@ -303,11 +357,60 @@ def _sensor_boxes(raw, ys, xs, radius, green_odd=None):
     return np.where(parity == int(green_odd), p[:, 1:-1, 1:-1], neighbors)
 
 
-def _measure(boxes):
-    """Per-star FWHM/HFR (box pixels), eccentricity and angle from
-    intensity-weighted second moments, plus each star's total flux inside the
-    box's circle (aperture photometry - no peak-relative cut, which would let
-    bloated stars keep more of their light)."""
+def _adaptive_shape(boxes, inside, yy, xx, fwhm, cy, cx):
+    """Per-star eccentricity and angle from adaptive moments: second moments
+    weighted by an elliptical Gaussian matched to the star itself, iterated.
+    Unlike the peak-fraction cut, the weight falls off smoothly, so the noisy
+    pixels at the edge of a star barely count - eccentricity drifts far less
+    with noise (moonlight, haze) and follows PixInsight's PSF fits more closely.
+    NaN where a star's weighted flux vanished."""
+    ecc = np.full(len(boxes), np.nan, np.float32)
+    angle = np.zeros(len(boxes), np.float32)
+    for start in range(0, len(boxes), _ADAPTIVE_CHUNK):
+        part = slice(start, start + _ADAPTIVE_CHUNK)
+        b = np.where(inside, boxes[part], 0)
+        n = len(b)
+        mxx = ((fwhm[part] / _SIGMA_TO_FWHM) ** 2).astype(np.float32)
+        myy = mxx.copy()
+        mxy = np.zeros(n, np.float32)
+        y0, x0 = cy[part].copy(), cx[part].copy()
+        ok = np.ones(n, bool)
+        for _ in range(_ADAPTIVE_ITERATIONS):
+            limit = 0.95 * np.sqrt(mxx * myy)  # keep the weight's ellipse a real ellipse
+            mxy = np.clip(mxy, -limit, limit)
+            det = mxx * myy - mxy ** 2
+            dy = yy - y0[:, None, None]
+            dx = xx - x0[:, None, None]
+            q = (myy[:, None, None] * dx * dx - 2 * mxy[:, None, None] * dx * dy
+                 + mxx[:, None, None] * dy * dy) / det[:, None, None]
+            w = np.exp(-0.5 * np.minimum(q, 60)) * b
+            flux = w.sum(axis=(1, 2))
+            ok &= flux > 0
+            flux = np.where(flux > 0, flux, 1.0)
+            y0 = np.clip(y0 + (w * dy).sum(axis=(1, 2)) / flux, -2, 2)
+            x0 = np.clip(x0 + (w * dx).sum(axis=(1, 2)) / flux, -2, 2)
+            dy = yy - y0[:, None, None]
+            dx = xx - x0[:, None, None]
+            # A matched Gaussian weight halves a Gaussian star's moments - doubled back
+            mxx = np.clip(2 * (w * dx * dx).sum(axis=(1, 2)) / flux, 0.3, 400)
+            myy = np.clip(2 * (w * dy * dy).sum(axis=(1, 2)) / flux, 0.3, 400)
+            mxy = 2 * (w * dx * dy).sum(axis=(1, 2)) / flux
+        limit = 0.99 * np.sqrt(mxx * myy)
+        mxy = np.clip(mxy, -limit, limit)
+        half_sum = (mxx + myy) / 2
+        half_diff = np.sqrt(((mxx - myy) / 2) ** 2 + mxy ** 2)
+        major = np.maximum(half_sum + half_diff - _PIXEL_VARIANCE, 1e-6)
+        minor = np.minimum(np.maximum(half_sum - half_diff - _PIXEL_VARIANCE, 1e-6), major)
+        ecc[part] = np.where(ok, np.sqrt(1 - minor / major), np.nan)
+        angle[part] = 0.5 * np.arctan2(2 * mxy, mxx - myy)
+    return ecc, angle
+
+
+def _measure(boxes, shape=True):
+    """Per-star FWHM/HFR (box pixels) from intensity-weighted second moments,
+    eccentricity and angle from adaptive moments (None unless shape), plus each
+    star's total flux inside the box's circle (aperture photometry - no
+    peak-relative cut, which would let bloated stars keep more of their light)."""
     radius = boxes.shape[1] // 2
     offsets = np.arange(-radius, radius + 1, dtype=np.float32)
     yy, xx = np.meshgrid(offsets, offsets, indexing="ij")
@@ -339,25 +442,43 @@ def _measure(boxes):
     minor = np.minimum(minor, major)
 
     fwhm = _SIGMA_TO_FWHM * np.sqrt((major + minor) / 2)
-    eccentricity = np.sqrt(1 - minor / major)
-    angle = 0.5 * np.arctan2(2 * ixy, ixx - iyy)
+    eccentricity = angle = None
+    if shape:
+        eccentricity, angle = _adaptive_shape(boxes[good], inside, yy, xx, fwhm, cy, cx)
     return fwhm, hfr, eccentricity, angle, aperture
 
 
-def _outside_light(boxes, wide, core):
+def _outside_profile(boxes, wide, radii):
     """Median share of each star's light within `wide` pixels that lies beyond
-    `core` pixels. The box's corners outside `wide` are the local background."""
+    each of `radii` pixels (None from `wide` on). The box's corners outside
+    `wide` are the local background."""
     half = boxes.shape[1] // 2
     offsets = np.arange(-half, half + 1)
     yy, xx = np.meshgrid(offsets, offsets, indexing="ij")
     distance = np.hypot(yy, xx)
     light = boxes - np.median(boxes[:, distance > wide], axis=1)[:, None, None]
-    total = np.where(distance <= wide, light, 0).sum(axis=(1, 2))
-    inner = np.where(distance <= core, light, 0).sum(axis=(1, 2))
+    total = light[:, distance <= wide].sum(axis=1)
     good = total > 0
     if not good.any():
         return None
-    return float(np.median(1 - inner[good] / total[good]))
+    light, total = light[good], total[good]
+    return [float(np.median(1 - light[:, distance <= r].sum(axis=1) / total)) if r < wide else None
+            for r in radii]
+
+
+def outside_at(metrics, group_fwhm):
+    """A frame's share of star light beyond its core radius (OUTSIDE_CORE_FWHM x
+    the larger of its own FWHM and its group's median), from its
+    outside_profile - None when it wasn't measured that far out."""
+    profile = metrics.outside_profile
+    if not profile or metrics.fwhm_px is None or not group_fwhm:
+        return None
+    radius = OUTSIDE_CORE_FWHM * max(metrics.fwhm_px, group_fwhm)
+    points = [(r, v) for r, v in zip(OUTSIDE_PROFILE_RADII, profile) if v is not None]
+    if not points or not points[0][0] <= radius <= points[-1][0]:
+        return None
+    radii, values = zip(*points)
+    return float(np.interp(radius, radii, values))
 
 
 def _shape_stats(boxes):
@@ -367,15 +488,153 @@ def _shape_stats(boxes):
         return None
     median_fwhm = np.median(fwhm)
     single = fwhm < 2.5 * median_fwhm   # two touching stars measure as one fat one
-    fwhm, hfr, ecc, angle = fwhm[single], hfr[single], ecc[single], angle[single]
+    fwhm, hfr = fwhm[single], hfr[single]
+    shaped = single.copy()
+    shaped[single] = np.isfinite(ecc[single])  # the adaptive fit can fail on a star
+    ecc, angle = ecc[shaped], angle[shaped]
 
     # Mean direction of the elongation (angles double, since 0 and 180 degrees are the same axis)
     weights = ecc.sum()
     alignment = float(abs((ecc * np.exp(2j * angle)).sum()) / weights) if weights > 0 else 0.0
     return {
         "count": int(fwhm.size), "fwhm": float(np.median(fwhm)), "hfr": float(np.median(hfr)),
-        "eccentricity": float(np.median(ecc)), "alignment": alignment,
+        "eccentricity": float(np.median(ecc)) if ecc.size else None, "alignment": alignment,
     }
+
+
+# ---- Trails -----------------------------------------------------------------
+
+def _pool2(img):
+    h, w = img.shape[0] // 2 * 2, img.shape[1] // 2 * 2
+    return img[:h, :w].reshape(h // 2, 2, w // 2, 2).mean(axis=(1, 3))
+
+
+def _segment_mean(padded, pad, shape, angle):
+    """Per pixel, the dimmest of three 4-pixel sub-segment means along a
+    12-pixel segment at angle (noise units): a trail lights all three, a star -
+    a few pixels across - only the middle one, so stars don't read as lines."""
+    h, w = shape
+    dy, dx = math.sin(angle), math.cos(angle)
+    dimmest = None
+    for group in ((-6, -5, -4, -3), (-2, -1, 0, 1), (2, 3, 4, 5)):
+        part = np.zeros(shape, np.float32)
+        for k in group:
+            oy, ox = int(round(k * dy)), int(round(k * dx))
+            part += padded[pad + oy:pad + oy + h, pad + ox:pad + ox + w]
+        dimmest = part if dimmest is None else np.minimum(dimmest, part)
+    # Each direction against its own noise, so none (the diagonals' pixel steps) is favored
+    center, spread = _clipped_stats(dimmest[::3, ::3].ravel())
+    return (dimmest - center) / max(spread, 1e-9)
+
+
+def _line_filter(img):
+    """How much brighter each pixel's surroundings are along some direction
+    than across it, in noise units - high on thin lines, low on round stars."""
+    pad = 7
+    padded = np.pad(img, pad, mode="edge")
+    half = TRAIL_ORIENTATIONS // 2
+    best = None
+    for o in range(half):
+        along = _segment_mean(padded, pad, img.shape, math.pi * o / TRAIL_ORIENTATIONS)
+        across = _segment_mean(padded, pad, img.shape, math.pi * (o + half) / TRAIL_ORIENTATIONS)
+        contrast = np.abs(along - across)
+        best = contrast if best is None else np.maximum(best, contrast)
+    return best
+
+
+def _hough_votes(ys, xs, thetas, diag):
+    """Hough accumulator (angle x 2-pixel distance bins over -diag..diag)."""
+    bins = diag + 1
+    cos, sin = np.cos(thetas).astype(np.float32), np.sin(thetas).astype(np.float32)
+    votes = np.empty((len(thetas), bins), np.int32)
+    for i in range(len(thetas)):
+        votes[i] = np.bincount(((xs * cos[i] + ys * sin[i] + diag) / 2).astype(np.int32), minlength=bins)[:bins]
+    return votes
+
+
+def _line_profile(sub, noise, theta, rho):
+    """Points along a line (x, y) and their excess in noise units: the brightest
+    pixel within one of the line minus the median 5-9 pixels to either side."""
+    h, w = sub.shape
+    c, s = math.cos(theta), math.sin(theta)
+    reach = math.hypot(h, w)
+    t = np.arange(-reach, reach, 1.0)
+    x, y = rho * c - t * s, rho * s + t * c
+    inside = (x >= 10) & (x < w - 10) & (y >= 10) & (y < h - 10)
+    x, y = x[inside], y[inside]
+    if x.size == 0:
+        return x, y, x
+
+    def sample(d):
+        return sub[np.round(y + d * s).astype(int), np.round(x + d * c).astype(int)]
+    on = np.max([sample(d) for d in (-1, 0, 1)], axis=0)
+    off = np.median([sample(d) for d in (-9, -7, -5, 5, 7, 9)], axis=0)
+    return x, y, (on - off) / noise
+
+
+def _lit_span(excess):
+    """(first, end) samples of the longest run of lit segments along a line -
+    one unlit segment at a time is allowed, since plane lights blink - or None."""
+    n = len(excess) // TRAIL_SEGMENT
+    if n == 0:
+        return None
+    lit = np.median(excess[:n * TRAIL_SEGMENT].reshape(n, TRAIL_SEGMENT), axis=1) >= TRAIL_LIT_SIGMA
+    best = start = last = None
+    for i in np.nonzero(lit)[0]:
+        if start is None or i - last > 2:
+            start = i
+        last = i
+        if best is None or last - start > best[1] - best[0]:
+            best = (start, last)
+    return (best[0] * TRAIL_SEGMENT, (best[1] + 1) * TRAIL_SEGMENT) if best else None
+
+
+def _find_trails(sub, noise):
+    """Satellite and plane trails in a background-subtracted analysis image, as
+    [(x0, y0, x1, y1, excess)] in its pixels, excess the trail's median
+    brightness above the sky in noise units."""
+    contrast = _line_filter(_pool2(sub))
+    center, spread = _clipped_stats(contrast[::3, ::3].ravel())
+    ys, xs = np.nonzero(contrast > center + TRAIL_LINE_SIGMA * spread)
+    del contrast
+    ys = ys.astype(np.float32) * 2 + 0.5  # pooled pixel centers, in analysis pixels
+    xs = xs.astype(np.float32) * 2 + 0.5
+    thetas = np.deg2rad(np.arange(0, 180, TRAIL_ANGLE_STEP))
+    diag = int(math.ceil(math.hypot(*sub.shape)))
+    votes = _hough_votes(ys, xs, thetas, diag)
+
+    trails = []
+    for _ in range(TRAIL_CANDIDATES):
+        i, j = np.unravel_index(np.argmax(votes), votes.shape)
+        if votes[i, j] < TRAIL_SHORT_LENGTH / 4:  # pooled pixels are 2 apart, and allow gaps
+            break
+        votes[max(0, i - 8):i + 9, max(0, j - 10):j + 11] = 0
+        # The Hough cell is coarse - fit the line to the image itself
+        best = None
+        for dth in np.deg2rad(np.arange(-0.3, 0.31, 0.1)):
+            for drho in (-2.0, -1.0, 0.0, 1.0, 2.0):
+                theta, rho = thetas[i] + dth, j * 2 - diag + 1.0 + drho
+                x, y, excess = _line_profile(sub, noise, theta, rho)
+                span = _lit_span(excess)
+                if span:
+                    key = (span[1] - span[0], float(np.median(excess[span[0]:span[1]])))
+                    if best is None or key > best[0]:
+                        best = (key, theta, rho, x, y, span)
+        if best is None:
+            continue
+        (length, brightness), theta, rho, x, y, span = best
+        if length < TRAIL_MIN_LENGTH and (length < TRAIL_SHORT_LENGTH or brightness < TRAIL_SHORT_EXCESS):
+            continue
+        degrees = math.degrees(theta) % 90
+        if min(degrees, 90 - degrees) < 0.2:
+            continue  # along a sensor row or column - a defect, not a trail
+        end = min(span[1], len(x)) - 1
+        trails.append((float(x[span[0]]), float(y[span[0]]), float(x[end]), float(y[end]), brightness))
+        # Take back the votes of the points along it, so it isn't found again
+        near = np.abs(xs * math.cos(theta) + ys * math.sin(theta) - rho) <= 8
+        if near.any():
+            votes -= _hough_votes(ys[near], xs[near], thetas, diag)
+    return trails
 
 
 # ---- Analysis ---------------------------------------------------------------
@@ -452,7 +711,8 @@ def analyze_file(path):
 
         if stats:
             result.measured = stats["count"]
-            result.fwhm_px = stats["fwhm"] * pixel
+            # Box sizes stay on the measured FWHM they were tuned on
+            result.fwhm_px = _true_fwhm(stats["fwhm"], green_odd is not None) * pixel
             result.hfr_px = stats["hfr"] * pixel
             result.eccentricity = stats["eccentricity"]
             result.alignment = stats["alignment"]
@@ -467,18 +727,28 @@ def analyze_file(path):
             for start, stop in TRANSPARENCY_BANDS:
                 band = by_brightness[start:stop]
                 band = boxable(band[unsaturated[band]])
-                flux = (_measure(_sensor_boxes(source, src_y[band], src_x[band], radius, green_odd))[4]
+                flux = (_measure(_sensor_boxes(source, src_y[band], src_x[band], radius, green_odd), shape=False)[4]
                         if band.size else np.empty(0))
                 result.star_flux.append(float(np.median(flux)) if flux.size else None)
 
             # Wide enough for the tail, and well past the core of bloated stars
-            core = OUTSIDE_CORE_FWHM * stats["fwhm"]
-            wide = int(math.ceil(max(OUTSIDE_RADIUS / pixel, core * 1.5)))
+            wide = int(math.ceil(max(OUTSIDE_RADIUS / pixel, 4.5 * stats["fwhm"])))
             # Boxes run a little past the circle - that ring is each star's local background
             bright = boxable(candidates, wide + 4)[:OUTSIDE_STARS]
             if bright.size:
-                result.outside_light = _outside_light(
-                    _sensor_boxes(source, src_y[bright], src_x[bright], wide + 4, green_odd), wide, core)
+                result.outside_profile = _outside_profile(
+                    _sensor_boxes(source, src_y[bright], src_x[bright], wide + 4, green_odd), wide,
+                    [r / pixel for r in OUTSIDE_PROFILE_RADII])
+
+        # Trails - not when the stars are trailed themselves, as every star would be one
+        if result.eccentricity is None or result.eccentricity < TRAIL_SKIP_ECCENTRICITY:
+            try:
+                offset = (scale - 1) / 2
+                result.trails = [[round(x0 * scale + offset, 1), round(y0 * scale + offset, 1),
+                                  round(x1 * scale + offset, 1), round(y1 * scale + offset, 1), round(excess, 1)]
+                                 for x0, y0, x1, y1, excess in _find_trails(sub, noise)]
+            except Exception as e:
+                logger.debug(f"Trail detection failed for {path}: {e}")
         result.ok = True
     except Exception as e:
         logger.debug(f"Frame quality analysis failed for {path}: {e}")
@@ -623,6 +893,8 @@ class GradeSettings:
     eccentricity_rise: float = 0.12    # more elongated stars (trailing, wind, guiding) - absolute
     outside_rise_pct: float = 35.0     # more light outside the star cores (guiding jumps, tails, halos)
     background_rise_pct: float = 60.0  # brighter sky (moon, dawn, clouds lit from below) - Marginal at most on its own
+    signal_drop_pct: float = 50.0      # less signal (frame_signal) - what a bright sky or haze costs the stack (0 = never)
+    trail_count: float = 3.0           # satellite/plane trails in one frame that make it Marginal (0 = never) - a count, not vs the median
 
 
 @dataclass
@@ -632,6 +904,8 @@ class FrameGrade:
     flags: list = field(default_factory=list)
     badness: dict = field(default_factory=dict)  # per metric, 1.0 = at its Reject line
     relative: dict = field(default_factory=dict)  # per metric, % of the group median
+    medians: dict = field(default_factory=dict)   # the group medians graded against (shared by the group)
+    outside: float = None              # share of star light beyond the core radius outside_at uses (0-1)
 
 
 # Total badness at which several smaller problems add up to a Marginal/Reject.
@@ -640,9 +914,46 @@ _REJECT_TOTAL = 1.25
 _BEST_CREDIT = -0.5  # how much one better-than-median metric can offset others
 _BACKGROUND_CAP = 0.6  # most a bright sky adds toward Marginal - it never counts toward Reject
 
+# The score ranks frames by what they'd add to a stack (grades don't use it):
+# each measurement's badness (1.0 = at its Reject line) times its weight.
+# Sharpness and signal lead, and only they earn credit for beating the median -
+# otherwise a soft frame could top the ranking on side measurements. Signal
+# (frame_signal) is the same stars' flux against the noise, which ranks frames
+# almost exactly like PixInsight's PSF Signal Weight; it also carries the sky
+# (moonlight lowers it), so the background isn't counted again here.
+SCORE_WEIGHTS = {"fwhm": 1.5, "signal": 1.5, "flux": 0.5, "eccentricity": 0.75, "outside": 0.75, "stars": 0.25}
+# Most credit each one can earn. Signal's is the largest: a dark-sky frame with
+# 160% of the median SNR adds far more to a stack than one at 125%, and with
+# the same small cap as sharpness both scored alike and moonlit frames with
+# slightly sharper stars caught up with them.
+SCORE_CREDIT = {"fwhm": _BEST_CREDIT, "signal": -1.5}
+SIGNAL_DROP_PCT = 40.0  # signal this far below the group median counts as badness 1.0
+
+
+def frame_signal(metrics, band):
+    """A frame's signal: the flux of the stars in the group's transparency band
+    over the background noise. The same stars in every frame - star_snr (the
+    measured stars' peaks) is only the fallback when the group has no band:
+    in a bright sky fewer stars clear its brightness cut, and the brighter ones
+    left made moonlit and dawn frames read about 80% of the median where
+    PixInsight's weights put them nearer 45%."""
+    if band is None:
+        return metrics.star_snr
+    flux = band_flux(metrics, band)
+    return flux / metrics.noise if flux is not None and metrics.noise else None
+
 
 def _score(total):
     return float(100 / (1 + math.exp(2.2 * (total - 0.75))))
+
+
+def _score_total(badness):
+    """Weighted badness for the score - credit only where SCORE_CREDIT allows."""
+    total = 0.0
+    for metric, weight in SCORE_WEIGHTS.items():
+        if metric in badness:
+            total += weight * min(max(badness[metric], SCORE_CREDIT.get(metric, 0.0)), 2.0)
+    return total
 
 
 def grade_frames(frames, settings=None):
@@ -712,8 +1023,10 @@ def _median_of(values):
 
 def _group_medians(frames, band):
     medians = {attr: _median_of(getattr(f, attr) for f in frames)
-               for attr in ("stars", "fwhm_px", "eccentricity", "background", "outside_light")}
+               for attr in ("stars", "fwhm_px", "eccentricity", "background")}
     medians["star_flux"] = _median_of(band_flux(f, band) for f in frames)
+    medians["signal"] = _median_of(frame_signal(f, band) for f in frames)
+    medians["outside_light"] = _median_of(outside_at(f, medians["fwhm_px"]) for f in frames)
     return medians
 
 
@@ -749,10 +1062,11 @@ def _grade_one(m, med, s, band):
             flags.append(f"Elongated stars (eccentricity {m.eccentricity:.2f} vs "
                          f"{med['eccentricity']:.2f}) - {cause}?")
 
-    if m.outside_light is not None and med["outside_light"]:
-        rise = (m.outside_light - med["outside_light"]) / med["outside_light"] * 100
-        # Never credit: bloated stars have less light outside their (bigger) cores,
-        # which would offset the FWHM penalty they deserve
+    outside = outside_at(m, med["fwhm_px"])
+    if outside is not None and med["outside_light"]:
+        rise = (outside - med["outside_light"]) / med["outside_light"] * 100
+        # Never credit: a fainter halo than the median isn't worth offsetting
+        # other problems, and the score's credit is for sharpness and signal
         badness["outside"] = max(rise / s.outside_rise_pct, 0.0)
         if badness["outside"] >= 0.5:
             flags.append(f"Light spread outside the star cores (+{rise:.0f}%) - guiding jump, trailing or halos?")
@@ -765,13 +1079,34 @@ def _grade_one(m, med, s, band):
         # weights them down), so a bright sky alone tops out at Marginal
         badness["background"] = min(rise / s.background_rise_pct, _BACKGROUND_CAP)
 
-    # The background never counts toward a Reject, and star count only on its
-    # own - a brighter sky hides faint stars too, so it isn't a separate problem
+    # A bright sky alone stops at Marginal, but the signal it costs can still sink
+    # a frame - PixInsight's WBPP drops frames this weak by its own weights.
+    # Never credit: a dark-sky frame's extra signal shouldn't excuse soft stars.
+    signal = frame_signal(m, band)
+    if s.signal_drop_pct and signal is not None and med["signal"]:
+        drop = (med["signal"] - signal) / med["signal"] * 100
+        badness["signal"] = max(drop / s.signal_drop_pct, 0.0)
+        if badness["signal"] >= 0.5:
+            flags.append(f"Low signal ({100 - drop:.0f}% of the median) - moonlight, dawn, haze or clouds?")
+
+    # Stacking's pixel rejection removes a trail or two, so they only say so -
+    # unless there are enough to risk some surviving where they cross
+    if m.trails:
+        count = len(m.trails)
+        many = bool(s.trail_count) and count >= s.trail_count
+        flags.append(f"{count} satellite or plane trail{'s' if count > 1 else ''} - "
+                     + ("enough that some may survive stacking" if many else "pixel rejection in stacking removes these"))
+        if many:
+            badness["trails"] = 0.5
+
+    # The background and trails never count toward a Reject, and star count and
+    # signal only on their own - a brighter sky hides faint stars and lowers the
+    # signal too, so they aren't separate problems
     worst = max(badness.values(), default=0.0)
     total = sum(min(max(b, _BEST_CREDIT), 2.0) for b in badness.values())
-    reject_worst = max((b for metric, b in badness.items() if metric != "background"), default=0.0)
+    reject_worst = max((b for metric, b in badness.items() if metric not in ("background", "trails")), default=0.0)
     reject_total = sum(min(max(b, _BEST_CREDIT), 2.0) for metric, b in badness.items()
-                       if metric not in ("background", "stars"))
+                       if metric not in ("background", "stars", "signal", "trails"))
     if reject_worst >= 1.0 or reject_total >= _REJECT_TOTAL:
         grade = GRADE_REJECT
     elif worst >= 0.5 or total >= _MARGINAL_TOTAL:
@@ -786,10 +1121,19 @@ def _grade_one(m, med, s, band):
     relative = {}
     for name, value, median in (("flux", flux, med["star_flux"]), ("stars", m.stars, med["stars"]),
                                 ("fwhm", m.fwhm_px, med["fwhm_px"]), ("background", m.background, med["background"]),
-                                ("outside", m.outside_light, med["outside_light"])):
+                                ("outside", outside, med["outside_light"]),
+                                ("signal", signal, med["signal"])):
         if value is not None and median:
             relative[name] = value / median * 100
-    return FrameGrade(grade, _score(total), flags, badness, relative)
+
+    # The score's own measurement - signal doesn't grade (a moonlit frame with
+    # good stars stays Good), it only ranks
+    score_badness = dict(badness)
+    if "signal" in relative:
+        score_badness["signal"] = (100 - relative["signal"]) / SIGNAL_DROP_PCT
+    elif med["signal"]:
+        score_badness["signal"] = 1.0  # too few stars to measure where the others could
+    return FrameGrade(grade, _score(_score_total(score_badness)), flags, badness, relative, med, outside)
 
 
 # ---- Command line -----------------------------------------------------------
@@ -872,7 +1216,7 @@ def main(argv):
         g = grades[m.path]
         print(f"{g.grade:<10} {g.score:>5.0f} {m.stars:>6} {_fmt(m.fwhm_px, '5.2f')} {_fmt(m.fwhm_arcsec, '5.2f')} "
               f"{_fmt(m.hfr_px, '5.2f')} {_fmt(m.eccentricity, '5.2f')} {_fmt(m.alignment, '5.2f')} "
-              f"{_fmt(m.outside_light * 100 if m.outside_light is not None else None, '5.1f')} "
+              f"{_fmt(g.outside * 100 if g.outside is not None else None, '5.1f')} "
               f"{_fmt(m.background, '7.0f')} {_fmt(m.gradient_pct, '6.1f')} {_fmt(m.star_snr, '6.0f')} "
               f"{_fmt(band_flux(m, band), '8.0f')}  "
               f"{os.path.basename(m.path)}" + (f"  [{'; '.join(g.flags)}]" if g.flags else ""))

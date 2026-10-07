@@ -16,23 +16,32 @@ import shutil
 import logging
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import numpy as np
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
+from matplotlib.transforms import blended_transform_factory
+from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import (Qt, QItemSelection, QItemSelectionModel, QPointF, QSettings, QThread, QTimer, QUrl,
                             Signal)
-from PySide6.QtGui import QColor, QDesktopServices, QImage, QPainter, QPixmap, QTransform
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QGuiApplication, QImage, QPainter, QPixmap, QTransform
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QWidget, QLabel,
                                QPushButton, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QSplitter, QGroupBox, QDoubleSpinBox, QProgressBar,
                                QMenu, QMessageBox, QSizePolicy, QGraphicsView, QGraphicsScene, QToolButton,
-                               QWidgetAction, QScrollArea, QCheckBox, QFileDialog, QProgressDialog, QSpinBox)
+                               QWidgetAction, QScrollArea, QCheckBox, QFileDialog, QProgressDialog, QSpinBox,
+                               QToolTip)
 
 import FrameQuality
 import SessionFileScanner
 import SessionObservations
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS, font_size, themed_style
+from Theme import (COLORS, chart_background, chart_color, chart_font_size, font_size, themed_style,
+                   theme_manager)
 from SessionManager import format_duration, format_exposure, _retire_thread, _rollback
 
 logger = logging.getLogger(__name__)
@@ -65,6 +74,8 @@ THRESHOLDS = [
     ("eccentricity_rise", "More elongated (trailing, guiding)", "+", "", 0.02, 0.5, 0.01, 2),
     ("outside_rise_pct", "Light outside star cores (guiding jumps, halos)", "+", "%", 10, 300, 5, 0),
     ("background_rise_pct", "Brighter sky (moon, dawn)", "+", "%", 10, 500, 5, 0),
+    ("signal_drop_pct", "Less signal (moon, dawn, haze; 0 = off)", "-", "%", 0, 95, 1, 0),
+    ("trail_count", "Satellite trails in one frame (Marginal at, 0 = off)", "", "", 0, 50, 1, 0),
 ]
 
 
@@ -523,6 +534,282 @@ class ZoomableImageView(QGraphicsView):
             self._zoom_applied()
 
 
+# ---- Quality chart --------------------------------------------------------------
+# The frames as points in capture order, each night a shaded band - so trends
+# through a night (seeing, a passing cloud, dawn) and from night to night stand
+# out at a glance. Each point is colored and shaped by its grade.
+
+@dataclass
+class ChartPoint:
+    """One frame on the chart, in capture order."""
+    path: str
+    night: str            # its night's label - consecutive equal labels form a band
+    value: float = None   # None when not measured (not drawn)
+    grade: str = ""
+    tooltip: str = ""
+    checked: bool = False
+
+
+# Grade -> (COLORS key, marker, legend label). Shape as well as color, so the
+# grade never rests on color alone (red/green is the classic color-blind pair).
+CHART_GRADE_STYLES = [
+    (FrameQuality.GRADE_GOOD, 'success', 'o', "Good"),
+    (FrameQuality.GRADE_MARGINAL, 'warning', '^', "Marginal"),
+    (FrameQuality.GRADE_REJECT, 'error', 'X', "Reject"),
+    (FrameQuality.GRADE_UNGRADED, 'text_secondary', 'o', "Not graded"),
+]
+CHART_RANKED = (FrameQuality.GRADE_GOOD, FrameQuality.GRADE_MARGINAL, FrameQuality.GRADE_REJECT)
+CHART_MARKER_SIZE = 38     # points^2 - an 8 px marker at typical screen dpi
+CHART_HIGHLIGHT_SIZE = 150
+CHART_CHECKED_SIZE = 95
+CHART_HIT_RADIUS_PX = 9    # how close the cursor must be to a point to hover/click it
+
+# What the graph can plot: (key, picker label, axis label). Stars, star
+# brightness and sky differ between filters, so they're plotted as % of each
+# filter's median - comparable when filters share the graph.
+CHART_METRICS = [
+    ("score", "Score", "Score"),
+    ("signal", "Signal", "Signal - star brightness vs noise (% of median)"),
+    ("fwhm", "FWHM", "FWHM (px)"),
+    ("eccentricity", "Eccentricity", "Eccentricity"),
+    ("stars", "Stars", "Stars (% of median)"),
+    ("flux", "Star Brightness", "Star brightness (% of median)"),
+    ("sky", "Sky", "Sky (% of median)"),
+    ("outside", "Tails/Halos", "Light outside cores (%)"),
+]
+GRAPH_VISIBLE_SETTING = SETTINGS_PREFIX + "graph_visible"
+GRAPH_SPLITTER_SETTING = SETTINGS_PREFIX + "graph_splitter"
+GRAPH_METRIC_SETTING = SETTINGS_PREFIX + "graph_metric"
+HIDDEN_COLUMNS_SETTING = SETTINGS_PREFIX + "hidden_columns"  # column names, "|"-separated
+
+
+class QualityChart(FigureCanvas):
+    """frame_clicked(path) when a point is clicked, range_selected(paths) when
+    dragged across; set_selected() and set_checked() ring points."""
+    frame_clicked = Signal(str)
+    range_selected = Signal(list)
+
+    def __init__(self, parent=None):
+        self.figure = Figure(figsize=(8, 2.2), layout="constrained")
+        super().__init__(self.figure)
+        self.setParent(parent)
+        self.setMinimumHeight(110)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+
+        self._points = []
+        self._value_label = ""
+        self._lines = []         # (y, label, kind) reference lines, or None for "pick a filter"
+        self._selected = set()
+        self._xy = np.empty((0, 2))
+        self._screen_xy = None   # _xy in display pixels, recomputed after each draw
+        self._hover_index = None
+        self._highlight = None
+        self._press_xy = None    # where the left button went down - a click is a press without a drag
+        self._span = None
+        self.ax = None
+
+        self.mpl_connect("button_press_event", self._on_press)
+        self.mpl_connect("button_release_event", self._on_release)
+        self.mpl_connect("motion_notify_event", self._on_motion)
+        self.mpl_connect("figure_leave_event", lambda _event: self._clear_hover())
+        self.mpl_connect("draw_event", lambda _event: setattr(self, "_screen_xy", None))
+        theme_manager().theme_changed.connect(self._redraw)
+        self._redraw()
+
+    # ---- Data
+
+    def set_points(self, points, value_label, lines=()):
+        """points: ChartPoints in capture order. value_label names the y axis.
+        lines: (y, label, kind) reference lines - kind 'median', 'marginal' or
+        'reject' - or None when they depend on a filter not picked."""
+        self._points = list(points)
+        self._value_label = value_label
+        self._lines = lines if lines is None else list(lines)
+        self._redraw()
+
+    def set_selected(self, paths):
+        """Ring these frames' points (the frames selected in the table)."""
+        self._selected = set(paths)
+        self._update_highlight()
+        self.draw_idle()
+
+    def set_checked(self, paths):
+        """Square-ring the checked frames' points (and show them in the legend)."""
+        paths = set(paths)
+        if {p.path for p in self._points if p.checked} != (paths & {p.path for p in self._points}):
+            for point in self._points:
+                point.checked = point.path in paths
+            self._redraw()
+
+    # ---- Drawing
+
+    def _redraw(self):
+        self.figure.clear()
+        self.figure.set_facecolor(chart_background())
+        ax = self.ax = self.figure.add_subplot(111)
+        surface = COLORS['background_light']
+        ax.set_facecolor(surface)
+        for spine in ax.spines.values():
+            spine.set_color(COLORS['border'])
+            spine.set_linewidth(0.8)
+        ax.tick_params(colors=COLORS['text_secondary'], labelsize=chart_font_size(8), length=0)
+        ax.set_ylabel(self._value_label, color=COLORS['text_secondary'], fontsize=chart_font_size(8))
+        self._hover_index = None
+
+        values = np.array([p.value if p.value is not None else np.nan for p in self._points], float)
+        if not self._points or np.isnan(values).all():
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.text(0.5, 0.5, "No measurements yet", transform=ax.transAxes, ha="center", va="center",
+                    color=COLORS['text_secondary'], fontsize=chart_font_size(9))
+            self._xy = np.empty((0, 2))
+            self._highlight = None
+            self.draw_idle()
+            return
+
+        x = np.arange(len(self._points), dtype=float)
+        self._draw_nights(ax)
+        ax.yaxis.grid(True, color=COLORS['border'], linewidth=0.6, alpha=0.6)
+        ax.set_axisbelow(True)
+
+        handles = []
+        for grade, color_key, marker, label in CHART_GRADE_STYLES:
+            mask = np.array([p.grade == grade for p in self._points]) & ~np.isnan(values)
+            if not mask.any():
+                continue
+            color = chart_color(COLORS[color_key])
+            # A ring in the plot's own color keeps overlapping points apart
+            ax.scatter(x[mask], values[mask], s=CHART_MARKER_SIZE, marker=marker, color=color,
+                       edgecolors=surface, linewidths=1.2, zorder=3)
+            handles.append(Line2D([], [], linestyle="", marker=marker, markersize=7, color=color,
+                                  markeredgecolor=surface, label=f"{label} ({int(mask.sum())})"))
+
+        checked = np.array([p.checked for p in self._points]) & ~np.isnan(values)
+        if checked.any():
+            ax.scatter(x[checked], values[checked], s=CHART_CHECKED_SIZE, marker="s", facecolors="none",
+                       edgecolors=COLORS['text_secondary'], linewidths=1.1, zorder=4)
+            handles.append(Line2D([], [], linestyle="", marker="s", markersize=8, markerfacecolor="none",
+                                  markeredgecolor=COLORS['text_secondary'], label=f"Checked ({int(checked.sum())})"))
+        self._draw_lines(ax, values)
+
+        if handles:
+            # Above the plot, so it never covers points (the low ones matter most)
+            legend = ax.legend(handles=handles, loc="lower right", bbox_to_anchor=(1.0, 1.0), ncol=len(handles),
+                               fontsize=chart_font_size(8), frameon=False, handletextpad=0.3,
+                               columnspacing=1.2, borderaxespad=0.2)
+            for text in legend.get_texts():
+                text.set_color(COLORS['text_secondary'])
+
+        ax.set_xlim(-0.5, len(self._points) - 0.5)
+        # Room for the points and any reference line, with a little air
+        ys = list(values[~np.isnan(values)]) + [y for y, _label, _kind in (self._lines or [])]
+        low, high = min(ys), max(ys)
+        pad = (high - low) * 0.08 or abs(high) * 0.05 or 1
+        ax.set_ylim(low - pad, high + pad)
+        self._xy = np.column_stack([x, values])
+        self._highlight = ax.scatter([], [], s=CHART_HIGHLIGHT_SIZE, facecolors="none", edgecolors=COLORS['text'],
+                                     linewidths=1.6, zorder=5)
+        self._update_highlight()
+        # Drag across to select a range of frames; a press without a drag is a click
+        self._span = SpanSelector(ax, self._on_span, "horizontal", useblit=True, minspan=0.6, button=1,
+                                  props=dict(facecolor=COLORS['text_secondary'], alpha=0.18))
+        self.draw_idle()
+
+    def _draw_lines(self, ax, values):
+        """The median and the Marginal / Reject limits, labelled at the right end."""
+        if self._lines is None:
+            ax.text(0.005, 0.97, "Choose one filter in Show: to see its median and limits", transform=ax.transAxes,
+                    ha="left", va="top", color=COLORS['text_secondary'], fontsize=chart_font_size(7.5), zorder=6)
+            return
+        to_right_edge = blended_transform_factory(ax.transAxes, ax.transData)
+        for y, label, kind in self._lines:
+            if kind == "median":
+                ax.axhline(y, color=COLORS['text_secondary'], linewidth=1, alpha=0.8, zorder=2)
+            else:
+                color = chart_color(COLORS['warning' if kind == "marginal" else 'error'])
+                ax.axhline(y, color=color, linewidth=1, linestyle=(0, (4, 3)), alpha=0.9, zorder=2)
+            # Text in a text color - the line beside it carries the meaning
+            ax.text(0.998, y, label, transform=to_right_edge, ha="right", va="bottom",
+                    color=COLORS['text_secondary'], fontsize=chart_font_size(7), zorder=6)
+
+    def _draw_nights(self, ax):
+        """Alternate nights shaded, each labelled under its band."""
+        runs = []  # (first index, last index, label)
+        for i, point in enumerate(self._points):
+            if runs and runs[-1][2] == point.night:
+                runs[-1][1] = i
+            else:
+                runs.append([i, i, point.night])
+        for n, (first, last, _label) in enumerate(runs):
+            if n % 2:
+                ax.axvspan(first - 0.5, last + 0.5, color=COLORS['background_lighter'], alpha=0.55,
+                           linewidth=0, zorder=0)
+            if n:
+                ax.axvline(first - 0.5, color=COLORS['border'], linewidth=0.8, zorder=1)
+        ax.set_xticks([(first + last) / 2 for first, last, _label in runs])
+        ax.set_xticklabels([label for _first, _last, label in runs])
+
+    def _update_highlight(self):
+        if self._highlight is None:
+            return
+        rows = [i for i, p in enumerate(self._points)
+                if p.path in self._selected and not np.isnan(self._xy[i, 1])] if len(self._xy) else []
+        self._highlight.set_offsets(self._xy[rows] if rows else np.empty((0, 2)))
+
+    # ---- Mouse
+
+    def _point_at(self, event):
+        """Index of the point under the mouse, or None."""
+        if self.ax is None or event.inaxes is not self.ax or not len(self._xy):
+            return None
+        if self._screen_xy is None:
+            self._screen_xy = self.ax.transData.transform(np.nan_to_num(self._xy, nan=-1e9))
+        distance = np.hypot(self._screen_xy[:, 0] - event.x, self._screen_xy[:, 1] - event.y)
+        distance[np.isnan(self._xy[:, 1])] = np.inf
+        index = int(np.argmin(distance))
+        # Event and transform pixels are both device pixels on a high-DPI screen
+        return index if distance[index] <= CHART_HIT_RADIUS_PX * getattr(self, "device_pixel_ratio", 1) else None
+
+    def _on_motion(self, event):
+        index = self._point_at(event)
+        if index == self._hover_index:
+            return
+        self._hover_index = index
+        if index is None:
+            self._clear_hover()
+        else:
+            self.setCursor(Qt.PointingHandCursor)
+            QToolTip.showText(QCursor.pos(), self._points[index].tooltip, self)
+
+    def _clear_hover(self):
+        self._hover_index = None
+        self.unsetCursor()
+        QToolTip.hideText()
+
+    def _on_press(self, event):
+        self._press_xy = (event.x, event.y) if event.button == 1 else None
+
+    def _on_release(self, event):
+        """A click - the button released where it went down (else it was a drag)."""
+        if event.button != 1 or self._press_xy is None:
+            return
+        moved = np.hypot(event.x - self._press_xy[0], event.y - self._press_xy[1])
+        self._press_xy = None
+        if moved <= 4 * getattr(self, "device_pixel_ratio", 1):
+            index = self._point_at(event)
+            if index is not None:
+                self.frame_clicked.emit(self._points[index].path)
+
+    def _on_span(self, x_min, x_max):
+        # A little slack at the ends: a drag that starts or stops on a point includes it
+        first, last = math.ceil(x_min - 0.3), math.floor(x_max + 0.3)
+        paths = [p.path for i, p in enumerate(self._points)
+                 if first <= i <= last and p.value is not None]
+        if paths:
+            self.range_selected.emit(paths)
+
+
 # ---- Dialog ---------------------------------------------------------------------
 
 class LightQualityDialog(WindowPositionMixin, QDialog):
@@ -530,9 +817,12 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
 
     WINDOW_POSITION_KEY = "LightQualityDialog"
     COLUMNS = ["", "Grade", "Score", "File", "Night", "Filter", "Stars", "FWHM", "Eccentricity",
-               "Tails/Halos", "Star Brightness", "Sky", "Issues"]
+               "Tails/Halos", "Star Brightness", "Sky", "Trails", "Issues"]
     (COL_CHECK, COL_GRADE, COL_SCORE, COL_FILE, COL_NIGHT, COL_FILTER, COL_STARS, COL_FWHM, COL_ECC,
-     COL_OUTSIDE, COL_FLUX, COL_SKY, COL_ISSUES) = range(13)
+     COL_OUTSIDE, COL_FLUX, COL_SKY, COL_TRAILS, COL_ISSUES) = range(14)
+    FIXED_COLUMNS = (COL_CHECK, COL_GRADE, COL_FILE)  # can't be hidden
+    # Hidden until chosen from the header menu - the details panel always shows them
+    DEFAULT_HIDDEN_COLUMNS = (COL_STARS, COL_ECC, COL_OUTSIDE, COL_FLUX, COL_SKY, COL_TRAILS)
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
@@ -599,6 +889,32 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         exposure_text = format_exposure(exposure) if exposure is not None else "?s"
         return f"{filter_name} · {exposure_text} · {binning}x{binning}"
 
+    def _fill_group_combo(self):
+        """'All filters' plus one entry per filter group that still has frames.
+        Keeps the selection while its group exists; when its last frames were
+        removed, moves to the next remaining group (the previous one if it was
+        last), so the review carries on. Returns the group left behind, or None."""
+        keys = sorted(set(self._groups.values()), key=lambda k: (str(k[0]), k[1] or 0, k[2]))
+        old_keys = [self.group_combo.itemData(i) for i in range(1, self.group_combo.count())]
+        current = self.group_combo.currentData() if self.group_combo.count() else None
+        target, emptied = current, None
+        if current is not None and current not in keys:
+            emptied = current
+            # The groups after the emptied one in the old order, then the ones before it
+            position = old_keys.index(current)
+            following = [k for k in old_keys[position + 1:] + old_keys[:position][::-1] if k in keys]
+            target = following[0] if following else None
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.addItem("All filters", None)
+        for key in keys:
+            self.group_combo.addItem(self._group_label(key), key)
+        # Matched in Python - tuples don't round-trip reliably through findData
+        index = next((i for i in range(1, self.group_combo.count()) if self.group_combo.itemData(i) == target), 0)
+        self.group_combo.setCurrentIndex(index)
+        self.group_combo.blockSignals(False)
+        return emptied
+
     def _grade_settings(self):
         # Same values saved_grade_settings() reads - each change is saved as it's made
         return FrameQuality.GradeSettings(**{name: spin.value() for name, spin in self.threshold_spins.items()})
@@ -608,21 +924,29 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
-        intro = QLabel("Each frame is compared with the others of the same filter, exposure and binning. "
-                       "Grades update instantly when you change the thresholds - no re-analysis needed.")
-        intro.setWordWrap(True)
-        themed_style(intro, lambda: f"color: {COLORS['text_secondary']};")
-        layout.addWidget(intro)
+        # What to do next, in plain words - the how-it-works note is its tooltip
+        self.guide_label = QLabel()
+        self.guide_label.setWordWrap(True)
+        self.guide_label.setTextFormat(Qt.RichText)
+        self.guide_label.setToolTip("Each frame is compared with the others of the same filter, exposure and "
+                                    "binning.\nGrades update instantly when you change the thresholds - "
+                                    "no re-analysis needed.")
+        self.guide_label.linkActivated.connect(lambda _link: self.stack_btn.showMenu())
+        themed_style(self.guide_label, lambda: f"color: {COLORS['text_secondary']};")
+        layout.addWidget(self.guide_label)
 
         top = QHBoxLayout()
         top.addWidget(QLabel("Show:"))
         self.group_combo = QComboBox()
-        self.group_combo.addItem("All filters", None)
-        for key in sorted(set(self._groups.values()), key=lambda k: (str(k[0]), k[1] or 0, k[2])):
-            self.group_combo.addItem(self._group_label(key), key)
+        self._fill_group_combo()
         self.group_combo.currentIndexChanged.connect(self._apply_group_filter)
         top.addWidget(self.group_combo)
         top.addWidget(self._build_thresholds_button())
+        self.graph_btn = QToolButton()
+        self.graph_btn.setText("Graph")
+        self.graph_btn.setCheckable(True)
+        self.graph_btn.setToolTip("Show the quality graph above the frame list")
+        top.addWidget(self.graph_btn)
         top.addSpacing(16)
         self.summary_label = QLabel()
         self.summary_label.setTextFormat(Qt.RichText)
@@ -663,8 +987,23 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             checks.addWidget(button)
         layout.addLayout(checks)
 
+        # The graph above the frame list - a time series wants the full width
+        self.list_splitter = QSplitter(Qt.Vertical)
+        self.list_splitter.addWidget(self._build_chart_strip())
+        self.list_splitter.addWidget(self._build_table())
+        self.list_splitter.setCollapsible(0, False)  # hidden with the Graph button instead
+        self.list_splitter.setStretchFactor(1, 1)
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        if not self.list_splitter.restoreState(settings.value(GRAPH_SPLITTER_SETTING, b"")):
+            self.list_splitter.setSizes([220, 600])
+        self.list_splitter.splitterMoved.connect(self._save_graph_layout)
+        graph_visible = settings.value(GRAPH_VISIBLE_SETTING, True, type=bool)
+        self.chart_strip.setVisible(graph_visible)
+        self.graph_btn.setChecked(graph_visible)
+        self.graph_btn.toggled.connect(self._on_graph_toggled)
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_table())
+        splitter.addWidget(self.list_splitter)
         splitter.addWidget(self._build_side_panel())
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
@@ -707,22 +1046,102 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         header.setStretchLastSection(True)
         header.setSortIndicator(self.COL_SCORE, Qt.DescendingOrder)  # best first
         self.table.setSortingEnabled(True)
-        for col, tip in ((self.COL_STARS, "Stars detected"),
-                         (self.COL_FWHM, "Star size (full width at half maximum), in sensor pixels and arcseconds"),
-                         (self.COL_ECC, "0 = round, 1 = a line. Elongation that all points one way is trailing."),
-                         (self.COL_OUTSIDE, "Star light outside the round star cores vs the group's median frame.\n"
-                                            "A guiding jump leaves round cores with faint tails, which only this shows;\n"
-                                            "double images and dew or cloud halos raise it too."),
-                         (self.COL_FLUX, "Brightness of the same stars, as % of the group's median frame.\n"
-                                         "Clouds and haze dim it; moonlight and seeing don't."),
-                         (self.COL_SKY, "Sky background vs the group's median frame")):
-            self.table.horizontalHeaderItem(col).setToolTip(tip)
+        tips = {
+            self.COL_CHECK: "Checked frames are the ones Remove, Move and Delete act on",
+            self.COL_GRADE: "Good, Marginal or Reject against the frame's group - see Issues for why",
+            self.COL_SCORE: "Ranks frames by what they'd add to a stack (Top % uses it).\n"
+                            "Sharpness (FWHM) and signal (star brightness vs noise) count most; the grade is decided separately.",
+            self.COL_STARS: "Stars detected",
+            self.COL_FWHM: "Star size (full width at half maximum), in sensor pixels and arcseconds",
+            self.COL_ECC: "0 = round, 1 = a line. Elongation that all points one way is trailing.",
+            self.COL_OUTSIDE: "Star light outside the round star cores vs the group's median frame.\n"
+                              "A guiding jump leaves round cores with faint tails, which only this shows;\n"
+                              "double images and dew or cloud halos raise it too.",
+            self.COL_FLUX: "Brightness of the same stars, as % of the group's median frame.\n"
+                           "Clouds and haze dim it; moonlight and seeing don't.",
+            self.COL_SKY: "Sky background vs the group's median frame",
+            self.COL_TRAILS: "Satellite, plane and meteor trails found in the frame.\n"
+                             "Stacking's pixel rejection removes a few; many can leave traces.",
+        }
+        for col in range(len(self.COLUMNS)):
+            tip = tips.get(col, "")
+            self.table.horizontalHeaderItem(col).setToolTip(
+                (tip + "\n\n" if tip else "") + "Right-click the column headers to choose which columns show.")
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._show_header_menu)
+        self._apply_hidden_columns(self._saved_hidden_columns())
         self.table.itemChanged.connect(self._on_item_changed)
         self.table.itemSelectionChanged.connect(lambda: self._preview_timer.start(150))
+        self.table.itemSelectionChanged.connect(self._sync_chart_selection)
         self.table.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_menu)
         return self.table
+
+    # ---- Column choice --------------------------------------------------
+
+    def _saved_hidden_columns(self):
+        """Hidden columns, saved by name so new columns don't shift anyone's choice."""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        if not settings.contains(HIDDEN_COLUMNS_SETTING):
+            return set(self.DEFAULT_HIDDEN_COLUMNS)
+        names = [n for n in str(settings.value(HIDDEN_COLUMNS_SETTING, "") or "").split("|") if n]
+        return {self.COLUMNS.index(n) for n in names if n in self.COLUMNS} - set(self.FIXED_COLUMNS)
+
+    def _apply_hidden_columns(self, hidden, save=False):
+        for col in range(len(self.COLUMNS)):
+            was_hidden = self.table.isColumnHidden(col)
+            self.table.setColumnHidden(col, col in hidden)
+            if was_hidden and col not in hidden and self.table.columnWidth(col) < 20:
+                self.table.resizeColumnToContents(col)  # hidden since opening, so never sized
+        if save:
+            QSettings("CosmosCollection", "CosmosCollection").setValue(
+                HIDDEN_COLUMNS_SETTING, "|".join(self.COLUMNS[col] for col in sorted(hidden)))
+
+    def _show_header_menu(self, position):
+        menu = QMenu(self)
+        hidden = {col for col in range(len(self.COLUMNS)) if self.table.isColumnHidden(col)}
+        for col, name in enumerate(self.COLUMNS):
+            if col in self.FIXED_COLUMNS:
+                continue
+            action = menu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(col not in hidden)
+            action.toggled.connect(lambda shown, c=col: self._apply_hidden_columns(
+                {x for x in range(len(self.COLUMNS)) if self.table.isColumnHidden(x) and x != c} | ({c} if not shown else set()),
+                save=True))
+        menu.addSeparator()
+        menu.addAction("Show All Columns").triggered.connect(lambda: self._apply_hidden_columns(set(), save=True))
+        menu.addAction("Reset to Default Columns").triggered.connect(
+            lambda: self._apply_hidden_columns(set(self.DEFAULT_HIDDEN_COLUMNS), save=True))
+        menu.exec(self.table.horizontalHeader().viewport().mapToGlobal(position))
+
+    def _build_chart_strip(self):
+        self.chart_strip = QWidget()
+        layout = QVBoxLayout(self.chart_strip)
+        layout.setContentsMargins(0, 0, 0, 0)
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("Graph:"))
+        self.chart_metric_combo = QComboBox()
+        for key, label, _axis in CHART_METRICS:
+            self.chart_metric_combo.addItem(label, key)
+        saved = QSettings("CosmosCollection", "CosmosCollection").value(GRAPH_METRIC_SETTING, "score", type=str)
+        self.chart_metric_combo.setCurrentIndex(max(self.chart_metric_combo.findData(saved), 0))
+        self.chart_metric_combo.setToolTip("Stars, Star Brightness and Sky are shown as % of their filter's median, "
+                                           "so filters can share the graph")
+        self.chart_metric_combo.currentIndexChanged.connect(self._on_chart_metric_changed)
+        bar.addWidget(self.chart_metric_combo)
+        hint = QLabel("Frames in the order taken, a band per night · click a point, or drag across several, "
+                      "to select them")
+        themed_style(hint, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_size(8)};")
+        bar.addWidget(hint)
+        bar.addStretch()
+        layout.addLayout(bar)
+        self.chart = QualityChart()
+        self.chart.frame_clicked.connect(self._on_chart_frame_clicked)
+        self.chart.range_selected.connect(self._on_chart_range_selected)
+        layout.addWidget(self.chart, 1)
+        return self.chart_strip
 
     def _build_side_panel(self):
         splitter = QSplitter(Qt.Vertical)
@@ -806,9 +1225,11 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
     def _build_thresholds_box(self):
         box = QGroupBox("Reject when worse than the group's median by")
         grid = QGridLayout(box)
-        note = QLabel("Half of each is Marginal. A brighter sky alone is Marginal at most, and fewer stars "
-                      "only count on their own - moonlight hides faint stars too. The median leaves out "
-                      "rejected frames, so removing them doesn't turn up new rejects.")
+        note = QLabel("Half of each is Marginal. A brighter sky alone is Marginal at most, though the signal "
+                      "it costs can reject a frame. Fewer stars and less signal only count on their own - "
+                      "moonlight causes both. The median leaves out "
+                      "rejected frames, so removing them doesn't turn up new rejects. Satellite trails are "
+                      "a count per frame instead, and make it Marginal at most.")
         note.setWordWrap(True)
         themed_style(note, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_size(8)};")
         grid.addWidget(note, 0, 0, 1, 2)
@@ -860,6 +1281,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self._analyzing = True
         self._worker.start()
         self._update_action_buttons()
+        self._refresh_guide()
 
     def _on_checked(self, count):
         self._to_analyze = count
@@ -968,7 +1390,8 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self.table.resizeColumnsToContents()
         # Room for values still to come (rows may all be waiting on analysis)
         for col, sample in ((self.COL_SCORE, "100"), (self.COL_STARS, "88,888"), (self.COL_FWHM, '8.88 px (88.8")'),
-                            (self.COL_OUTSIDE, "+888%"), (self.COL_FLUX, "100%"), (self.COL_SKY, "+888%")):
+                            (self.COL_OUTSIDE, "+888%"), (self.COL_FLUX, "100%"), (self.COL_SKY, "+888%"),
+                            (self.COL_TRAILS, "88")):
             width = self.table.fontMetrics().horizontalAdvance(sample) + 24
             self.table.setColumnWidth(col, max(self.table.columnWidth(col), width))
         # NINA-style names are long - a fixed (draggable) width keeps the metrics in view
@@ -1023,8 +1446,8 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         outside = relative.get("outside")
         outside_item = SortItem(f"{outside - 100:+.0f}%" if outside is not None else "",
                                 outside if outside is not None else -1)
-        if ok and m.outside_light is not None:
-            outside_item.setToolTip(f"{m.outside_light * 100:.1f}% of the star light is outside the cores")
+        if ok and g is not None and g.outside is not None:
+            outside_item.setToolTip(f"{g.outside * 100:.1f}% of the star light is outside the cores")
         self.table.setItem(row, self.COL_OUTSIDE, outside_item)
 
         flux = relative.get("flux")
@@ -1036,7 +1459,14 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             sky_item.setToolTip(f"{m.background:.0f} ADU")
         self.table.setItem(row, self.COL_SKY, sky_item)
 
-        issues = "; ".join(g.flags) if g else ("Analyzing..." if not m else "")
+        trails = m.trails if ok else None
+        trails_item = SortItem(str(len(trails)) if trails else "", len(trails) if trails is not None else -1)
+        if trails:
+            trails_item.setToolTip("\n".join(f"{math.hypot(x1 - x0, y1 - y0):.0f} px long, {excess:.0f}x the noise"
+                                             for x0, y0, x1, y1, excess in trails))
+        self.table.setItem(row, self.COL_TRAILS, trails_item)
+
+        issues ="; ".join(g.flags) if g else ("Analyzing..." if not m else "")
         issues_item = SortItem(issues, issues, Qt.AlignLeft | Qt.AlignVCenter)
         issues_item.setToolTip(issues.replace("; ", "\n"))
         self.table.setItem(row, self.COL_ISSUES, issues_item)
@@ -1051,6 +1481,142 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             path = self._row_path(row)
             self.table.setRowHidden(row, key is not None and self._groups.get(path) != key)
         self._refresh_summary()
+        self._refresh_chart()
+
+    # ---- Quality graph --------------------------------------------------
+
+    def _refresh_chart(self):
+        """Redraw the graph from the frames shown (it follows the filter selector)."""
+        if not hasattr(self, "chart") or not self.graph_btn.isChecked():
+            return  # hidden - redrawn when shown
+        key = self.chart_metric_combo.currentData()
+        axis = next(axis for k, _label, axis in CHART_METRICS if k == key)
+        paths = sorted(self._visible_paths(), key=lambda p: self._lights[p]["date_obs"] or "~")
+        points = []
+        for path in paths:
+            f, m, g = self._lights[path], self._metrics.get(path), self._grades.get(path)
+            value = self._chart_value(key, m, g)
+            tooltip = [self._local_time(f["date_obs"]), os.path.basename(path)]
+            if g:
+                tooltip.insert(1, f"{g.grade}" + (f" · score {g.score:.0f}" if g.grade in CHART_RANKED else ""))
+            if value is not None and key != "score":
+                tooltip.insert(2, f"{axis}: {value:.2f}" if abs(value) < 10 else f"{axis}: {value:,.0f}")
+            points.append(ChartPoint(path=path, night=self._night_label(f["night_date"]), value=value,
+                                     grade=g.grade if g else "", tooltip="\n".join(t for t in tooltip if t),
+                                     checked=path in self._checked))
+        self.chart.set_points(points, axis, self._chart_lines(key, paths))
+
+    def _chart_lines(self, key, paths):
+        """Reference lines for the plotted measurement: the median and the
+        Marginal / Reject limits from the thresholds. None when the measurement's
+        median differs by filter and more than one is shown."""
+        s = self._grade_settings()
+        if key == "score":
+            return []  # the grade colors already say it
+        if key == "signal":
+            if not s.signal_drop_pct:
+                return [(100, "Median", "median")]  # grading by signal is off - it only ranks
+            return [(100, "Median", "median"), (100 - s.signal_drop_pct / 2, "Marginal", "marginal"),
+                    (100 - s.signal_drop_pct, "Reject", "reject")]
+        if key in ("stars", "flux", "sky"):  # plotted as % of each filter's median
+            if key == "sky":  # a bright sky alone is Marginal at most
+                return [(100, "Median", "median"), (100 + s.background_rise_pct / 2, "Marginal", "marginal")]
+            drop = s.star_drop_pct if key == "stars" else s.flux_drop_pct
+            return [(100, "Median", "median"), (100 - drop / 2, "Marginal", "marginal"),
+                    (100 - drop, "Reject", "reject")]
+        medians = [self._grades[p].medians for p in paths if p in self._grades and self._grades[p].medians]
+        if len({self._groups[p] for p in paths if p in self._grades and self._grades[p].medians}) != 1:
+            return None if medians else []
+        med = medians[0]
+        if key == "fwhm" and med.get("fwhm_px"):
+            m, rise = med["fwhm_px"], s.fwhm_rise_pct / 100
+            return [(m, "Median", "median"), (m * (1 + rise / 2), "Marginal", "marginal"),
+                    (m * (1 + rise), "Reject", "reject")]
+        if key == "eccentricity" and med.get("eccentricity") is not None:
+            m, rise = med["eccentricity"], s.eccentricity_rise
+            return [(m, "Median", "median"), (m + rise / 2, "Marginal", "marginal"), (m + rise, "Reject", "reject")]
+        if key == "outside" and med.get("outside_light"):
+            m, rise = med["outside_light"] * 100, s.outside_rise_pct / 100
+            return [(m, "Median", "median"), (m * (1 + rise / 2), "Marginal", "marginal"),
+                    (m * (1 + rise), "Reject", "reject")]
+        return []
+
+    def _on_chart_range_selected(self, paths):
+        """Frames dragged across in the graph - select them in the list."""
+        self._select_paths(paths)
+        for row in range(self.table.rowCount()):
+            if self._row_path(row) == paths[0]:
+                self.table.scrollToItem(self.table.item(row, self.COL_FILE), QAbstractItemView.PositionAtCenter)
+                break
+        self.status_label.setText(f"Selected {len(paths)} frame(s) from the graph - right-click the list to check them.")
+
+    @staticmethod
+    def _chart_value(key, metrics, grade):
+        if metrics is None or not metrics.ok:
+            return None
+        relative = grade.relative if grade else {}
+        if key == "score":
+            return grade.score if grade and grade.grade in CHART_RANKED else None
+        if key == "fwhm":
+            return metrics.fwhm_px
+        if key == "eccentricity":
+            return metrics.eccentricity
+        if key == "outside":
+            return grade.outside * 100 if grade and grade.outside is not None else None
+        return relative.get({"stars": "stars", "flux": "flux", "sky": "background", "signal": "signal"}[key])
+
+    @staticmethod
+    def _night_label(night_date):
+        try:
+            return datetime.strptime(night_date, "%Y-%m-%d").strftime("%b %d")
+        except (TypeError, ValueError):
+            return "No date"
+
+    def _local_time(self, date_obs):
+        """DATE-OBS (UTC) as the session's local time, for the graph's tooltips."""
+        if not date_obs:
+            return ""
+        try:
+            moment = datetime.fromisoformat(str(date_obs)[:19]).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return str(date_obs)
+        zone = self.session.get("location_timezone")
+        if zone:
+            try:
+                import pytz
+                return moment.astimezone(pytz.timezone(zone)).strftime("%b %d %H:%M")
+            except Exception:
+                pass
+        return moment.strftime("%b %d %H:%M UTC")
+
+    def _on_chart_metric_changed(self):
+        QSettings("CosmosCollection", "CosmosCollection").setValue(GRAPH_METRIC_SETTING,
+                                                                   self.chart_metric_combo.currentData())
+        self._refresh_chart()
+
+    def _on_graph_toggled(self, visible):
+        self.chart_strip.setVisible(visible)
+        self._save_graph_layout()
+        if visible:
+            self._refresh_chart()
+            self._sync_chart_selection()
+
+    def _save_graph_layout(self, *_):
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue(GRAPH_VISIBLE_SETTING, self.graph_btn.isChecked())
+        if self.chart_strip.isVisible():
+            settings.setValue(GRAPH_SPLITTER_SETTING, self.list_splitter.saveState())
+
+    def _sync_chart_selection(self):
+        self.chart.set_selected(self._selected_paths())
+
+    def _on_chart_frame_clicked(self, path):
+        """A point was clicked - select its frame in the list (and so the preview)."""
+        for row in range(self.table.rowCount()):
+            if self._row_path(row) == path:
+                self._select_paths([path])
+                self.table.scrollToItem(self.table.item(row, self.COL_FILE), QAbstractItemView.PositionAtCenter)
+                break
 
     def _visible_paths(self):
         key = self.group_combo.currentData()
@@ -1078,6 +1644,61 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self.checked_label.setText(f"{len(checked)} checked ({format_duration(self._integration(checked))})"
                                    if checked else "None checked")
         self._update_action_buttons()
+        self._refresh_guide()
+        if hasattr(self, "chart") and self.graph_btn.isChecked():
+            self.chart.set_checked(self._checked)  # redraws only if the checks changed
+
+    def _refresh_guide(self):
+        """The next-step line: what the results mean and what to do, for the
+        whole session - the same frames Stack Lights hands off."""
+        if not self._lights:
+            self.guide_label.setText("This session has no light frames attached.")
+            return
+        if self._analyzing:
+            self.guide_label.setText(f"Analyzing {len(self._lights)} frames - grades appear as each one finishes.")
+            return
+        grades = {p: self._grades[p] for p in self._lights if p in self._grades}
+        of = lambda grade: [p for p, g in grades.items() if g.grade == grade]
+        plural = lambda n, word: f"{n} {word}{'' if n == 1 else 's'}"
+        rejects = of(FrameQuality.GRADE_REJECT)
+        errors = of(FrameQuality.GRADE_ERROR)
+        missing = [p for p in errors if self._metrics.get(p) and self._metrics[p].error == "File not found"]
+        unreadable = len(errors) - len(missing)
+        ungraded = of(FrameQuality.GRADE_UNGRADED)
+        trails = sum(1 for p in grades if self._metrics.get(p) and self._metrics[p].trails)
+
+        parts = []
+        waiting = len(self._lights) - len(grades)  # analysis was stopped part way
+        if waiting:
+            parts.append(f"<b>{plural(waiting, 'frame')} {'isn' if waiting == 1 else 'aren'}'t analyzed yet</b> "
+                         "- reopen the review to finish them.")
+        if rejects:
+            lead = f"<b>{plural(len(rejects), 'frame')} {'has' if len(rejects) == 1 else 'have'} problems</b>"
+            if all(p in self._checked for p in rejects):
+                parts.append(f"{lead} and {'is' if len(rejects) == 1 else 'are'} checked - "
+                             "Remove from Session or Move them, then stack.")
+            else:
+                parts.append(f"{lead} - check them (Check: Rejects), then Remove from Session or Move them.")
+        elif grades:
+            parts.append("<b>No problem frames</b> - ready to stack.")
+        if missing:
+            parts.append(f"{plural(len(missing), 'file')} {'is' if len(missing) == 1 else 'are'} missing "
+                         "on disk - remove them from the session.")
+        if unreadable:
+            parts.append(f"{plural(unreadable, 'frame')} couldn't be analyzed - see Issues.")
+        if ungraded:
+            parts.append(f"{plural(len(ungraded), 'frame')} couldn't be graded - too few in their filter "
+                         "group to compare.")
+        if trails:
+            parts.append(f"Satellite trails in {plural(trails, 'frame')} - stacking removes these.")
+
+        # Good + Marginal: Marginal frames are only slightly worse and still add signal
+        suggested = self._stack_paths(LIGHTS_GOOD_MARGINAL)
+        if suggested:
+            parts.append(f"<b>Suggested:</b> <a href='stack' style='color:{COLORS['link']};'>stack "
+                         f"{LIGHT_CHOICE_LABELS[LIGHTS_GOOD_MARGINAL]} ({plural(len(suggested), 'frame')}, "
+                         f"{format_duration(self._integration(suggested))})</a>")
+        self.guide_label.setText("  ".join(parts))
 
     def _update_action_buttons(self):
         # Not mid-analysis: the worker could be reading the very file being moved or deleted
@@ -1314,7 +1935,13 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             for tile in self.crop_tiles:
                 tile.set_image(None)
             self.details_label.setText("")
+        emptied = self._fill_group_combo()  # drops filters with no frames left
         self._regrade()
+        if emptied is not None:
+            # After the caller's own status message, which would otherwise replace this
+            QTimer.singleShot(0, lambda: self.status_label.setText(
+                f"{self.status_label.text()}  No {emptied[0]} frames left - showing "
+                f"{self.group_combo.currentText()}."))
         return True
 
     # ---- Stacking -------------------------------------------------------
@@ -1493,11 +2120,13 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
                 f"Stars: {m.stars:,}{pct('stars')} · {m.measured:,} measured · {m.saturated} saturated",
                 f"FWHM: {fwhm}{pct('fwhm')} · HFR: {m.hfr_px:.2f} px" if m.hfr_px is not None else f"FWHM: {fwhm}",
                 f"Eccentricity: {m.eccentricity:.2f} · alignment {m.alignment:.2f}" if m.eccentricity is not None else "",
-                f"Light outside the star cores: {m.outside_light * 100:.1f}%{pct('outside')}"
-                if m.outside_light is not None else "",
+                f"Light outside the star cores: {g.outside * 100:.1f}%{pct('outside')}"
+                if g and g.outside is not None else "",
                 f"Star brightness: {rel['flux']:.0f}% of median" if "flux" in rel else "",
+                f"Signal (star brightness vs noise): {rel['signal']:.0f}% of median" if "signal" in rel else "",
                 f"Sky: {m.background:.0f} ADU{pct('background')} · noise {m.noise:.1f} ADU · gradient {m.gradient_pct:.1f}%"
                 if m.background is not None else "",
+                f"Satellite/plane trails: {len(m.trails)}" if m.trails else "",
             ]
             if g:
                 color = COLORS[GRADE_COLOR_KEYS.get(g.grade, 'text_secondary')]
@@ -1519,7 +2148,14 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         menu.addSeparator()
         menu.addAction("Open in Image Viewer").triggered.connect(lambda: self._open_viewer(paths[0]))
         menu.addAction("Open Containing Folder").triggered.connect(lambda: self._open_folder(paths[0]))
+        menu.addAction("Copy File Path" if len(paths) == 1 else f"Copy {len(paths)} File Paths").triggered.connect(
+            lambda: self._copy_paths(paths))
         menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def _copy_paths(self, paths):
+        """The paths on the clipboard, one per line, with the platform's separators."""
+        QGuiApplication.clipboard().setText("\n".join(os.path.normpath(p) for p in paths))
+        self.status_label.setText(f"Copied {len(paths)} file path(s) to the clipboard.")
 
     def _on_item_double_clicked(self, item):
         # A double-click on the checkbox just toggles it twice - not an "open"
@@ -1554,6 +2190,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
     # ---- Closing --------------------------------------------------------
 
     def done(self, result):
+        self._save_graph_layout()
         # Keep the measurements made so far; let running threads finish unseen
         if self._worker is not None:
             self._worker.cancel()
