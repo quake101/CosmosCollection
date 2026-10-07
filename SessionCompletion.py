@@ -15,7 +15,7 @@ from datetime import datetime
 from PySide6.QtCore import Qt, QThread, Signal, QProcess, QProcessEnvironment, QUrl, QTimer, QSettings
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                               QRadioButton, QButtonGroup, QGroupBox, QCheckBox, QLineEdit, QComboBox,
+                               QRadioButton, QButtonGroup, QGroupBox, QCheckBox, QLineEdit, QComboBox, QSpinBox,
                                QFileDialog, QMessageBox, QPlainTextEdit, QProgressBar, QListWidget,
                                QListWidgetItem, QProgressDialog, QGridLayout, QWidget, QAbstractItemView)
 
@@ -165,7 +165,8 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self._osc_touched = False
         self._all_lights = {}      # filter key -> every attached light, before any quality choice
         self._missing = set()      # attached files no longer on disk
-        self._light_grades = {}    # path -> quality grade, from the light quality review's saved measurements
+        self._light_grades = {}    # path -> FrameGrade, from the light quality review's saved measurements
+        self._quality_lights = {}  # path -> file dict, for grouping the Top % choice by filter
         self._exposures = {}       # path -> exposure seconds
         self._picked_lights = set(light_paths or ())
         self._requested_light_choice = light_choice
@@ -195,6 +196,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
                 self._all_lights = {key: list(paths) for key, paths in self.frames.lights.items()}
                 try:
                     lights, self._light_grades = LightQualityReview.grade_session_lights(conn, self.session["id"])
+                    self._quality_lights = lights
                     self._exposures = {path: f["exptime_seconds"] or 0 for path, f in lights.items()}
                 except Exception as e:
                     logger.warning(f"Couldn't grade session {self.session.get('id')}'s lights: {e}")
@@ -367,7 +369,15 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self.lights_combo = QComboBox()
         self.lights_combo.setToolTip("Graded in the light quality review (Session Details → Files). "
                                      "Frames it couldn't compare, in groups of fewer than 3, are kept.")
-        grid.addWidget(self.lights_combo, 0, 1, 1, 2)
+        grid.addWidget(self.lights_combo, 0, 1)
+        # The Top % choice's percent - shown only with that choice
+        self.top_spin = QSpinBox()
+        self.top_spin.setRange(1, 100)
+        self.top_spin.setSuffix("%")
+        self.top_spin.setValue(LightQualityReview.saved_top_percent())
+        self.top_spin.setToolTip("Keep this share of each filter's lights, best quality score first")
+        self.top_spin.valueChanged.connect(self._on_top_percent_changed)
+        grid.addWidget(self.top_spin, 0, 2)
         self._fill_lights_combo()
         self.lights_combo.currentIndexChanged.connect(self._apply_light_choice)
 
@@ -440,10 +450,19 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         every = [p for paths in self._all_lights.values() for p in paths]
         if choice == LightQualityReview.LIGHTS_PICKED:
             return [p for p in every if p in self._picked_lights]
+        if choice == LightQualityReview.LIGHTS_TOP:
+            top = LightQualityReview.top_percent_lights(self._quality_lights, self._light_grades,
+                                                        self.top_spin.value())
+            return [p for p in every if p in top]
         keep = LightQualityReview.KEEP_GRADES.get(choice)
         if keep is None:
             return every
-        return [p for p in every if self._light_grades.get(p) in keep]
+        return [p for p in every if p in self._light_grades and self._light_grades[p].grade in keep]
+
+    def _on_top_percent_changed(self, value):
+        LightQualityReview.save_top_percent(value)
+        self._fill_lights_combo()  # the Top % entry's label and counts
+        self._apply_light_choice()
 
     def _fill_lights_combo(self):
         """Offered when the lights have been graded (or picked in the review);
@@ -451,7 +470,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         LQR = LightQualityReview
         choices = [LQR.LIGHTS_PICKED] if self._requested_light_choice == LQR.LIGHTS_PICKED else []
         if self._light_grades:
-            choices += [LQR.LIGHTS_ALL, LQR.LIGHTS_GOOD, LQR.LIGHTS_GOOD_MARGINAL]
+            choices += [LQR.LIGHTS_ALL, LQR.LIGHTS_GOOD, LQR.LIGHTS_GOOD_MARGINAL, LQR.LIGHTS_TOP]
         elif choices:
             choices.append(LQR.LIGHTS_ALL)
 
@@ -468,9 +487,9 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self.lights_combo.clear()
         for choice in choices:
             paths = [p for p in self._lights_for(choice) if p not in self._missing]
-            text = (f"{LQR.LIGHT_CHOICE_LABELS[choice]} - {len(paths)} frames, "
+            text = (f"{LQR.light_choice_label(choice, self.top_spin.value())} - {len(paths)} frames, "
                     f"{format_duration(sum(self._exposures.get(p, 0) for p in paths))}")
-            if choice in LQR.KEEP_GRADES and not_graded:
+            if (choice in LQR.KEEP_GRADES or choice == LQR.LIGHTS_TOP) and not_graded:
                 text += f" ({not_graded} not analyzed left out)"
             self.lights_combo.addItem(text, choice)
         index = self.lights_combo.findData(wanted)
@@ -483,6 +502,8 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         return self.lights_combo.currentData() or LightQualityReview.LIGHTS_ALL
 
     def _apply_light_choice(self, *_):
+        self.top_spin.setVisible(not self.lights_combo.isHidden()
+                                 and self._light_choice() == LightQualityReview.LIGHTS_TOP)
         keep = set(self._lights_for(self._light_choice())) - self._missing
         lights = {key: [p for p in paths if p in keep] for key, paths in self._all_lights.items()}
         self.frames.lights = {key: paths for key, paths in lights.items() if paths}

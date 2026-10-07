@@ -10,6 +10,7 @@ modification time), so reopening the review only analyzes new or changed subs.
 
 import os
 import json
+import math
 import time
 import shutil
 import logging
@@ -24,7 +25,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, Q
                                QPushButton, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QSplitter, QGroupBox, QDoubleSpinBox, QProgressBar,
                                QMenu, QMessageBox, QSizePolicy, QGraphicsView, QGraphicsScene, QToolButton,
-                               QWidgetAction, QScrollArea, QCheckBox, QFileDialog, QProgressDialog)
+                               QWidgetAction, QScrollArea, QCheckBox, QFileDialog, QProgressDialog, QSpinBox)
 
 import FrameQuality
 import SessionFileScanner
@@ -112,11 +113,13 @@ def save_cached(conn, entries):
 # ---- Grading a session from saved measurements -------------------------------------
 
 # Which lights a stacking handoff takes (SessionCompletionDialog's Lights choice)
-LIGHTS_ALL, LIGHTS_GOOD, LIGHTS_GOOD_MARGINAL, LIGHTS_PICKED = "all", "good", "good_marginal", "picked"
+LIGHTS_ALL, LIGHTS_GOOD, LIGHTS_GOOD_MARGINAL, LIGHTS_TOP, LIGHTS_PICKED = (
+    "all", "good", "good_marginal", "top", "picked")
 LIGHT_CHOICE_LABELS = {
     LIGHTS_ALL: "All lights",
     LIGHTS_GOOD: "Good only",
     LIGHTS_GOOD_MARGINAL: "Good + Marginal",
+    LIGHTS_TOP: "Top {percent}% of each filter",
     LIGHTS_PICKED: "Picked in the quality review",
 }
 # Frames in a group too small to compare can't be judged, so they're kept
@@ -124,6 +127,42 @@ KEEP_GRADES = {
     LIGHTS_GOOD: {FrameQuality.GRADE_GOOD, FrameQuality.GRADE_UNGRADED},
     LIGHTS_GOOD_MARGINAL: {FrameQuality.GRADE_GOOD, FrameQuality.GRADE_MARGINAL, FrameQuality.GRADE_UNGRADED},
 }
+TOP_PERCENT_SETTING = SETTINGS_PREFIX + "top_percent"
+DEFAULT_TOP_PERCENT = 75
+_RANKED_GRADES = (FrameQuality.GRADE_GOOD, FrameQuality.GRADE_MARGINAL, FrameQuality.GRADE_REJECT)
+
+
+def light_choice_label(choice, percent):
+    return LIGHT_CHOICE_LABELS[choice].format(percent=percent)
+
+
+def saved_top_percent():
+    value = QSettings("CosmosCollection", "CosmosCollection").value(TOP_PERCENT_SETTING, DEFAULT_TOP_PERCENT, type=int)
+    return min(max(value, 1), 100)
+
+
+def save_top_percent(percent):
+    QSettings("CosmosCollection", "CosmosCollection").setValue(TOP_PERCENT_SETTING, int(percent))
+
+
+def top_percent_lights(lights, grades, percent):
+    """The best `percent` of each group's graded lights by score - always at
+    least one. Per group, as scores only compare frames of the same filter,
+    exposure and binning (which also keeps the stack's filter balance). Frames
+    in groups too small to grade are kept; missing or unanalyzed ones aren't.
+    lights: {path: file dict}, grades: {path: FrameGrade}."""
+    keep, ranked = set(), {}
+    for path, g in grades.items():
+        if path not in lights:
+            continue
+        if g.grade == FrameQuality.GRADE_UNGRADED:
+            keep.add(path)
+        elif g.grade in _RANKED_GRADES:
+            ranked.setdefault(group_key(lights[path]), []).append((g.score, path))
+    for members in ranked.values():
+        members.sort(reverse=True)
+        keep.update(path for _score, path in members[:max(1, math.ceil(len(members) * percent / 100))])
+    return keep
 
 
 def session_light_files(conn, session_id):
@@ -155,9 +194,9 @@ def saved_grade_settings():
 
 
 def grade_session_lights(conn, session_id):
-    """(lights, {path: grade}) for a session from its saved measurements and the
-    saved thresholds. Lights never analyzed have no grade; the grades are empty
-    when none has been analyzed."""
+    """(lights, {path: FrameGrade}) for a session from its saved measurements and
+    the saved thresholds. Lights never analyzed have no grade; the grades are
+    empty when none has been analyzed."""
     lights = session_light_files(conn, session_id)
     ensure_cache_table(conn)
     metrics = {path: m for path, (_size, _mtime, version, m) in load_cached(conn, lights).items()
@@ -166,7 +205,7 @@ def grade_session_lights(conn, session_id):
         return lights, {}
     grades = FrameQuality.grade_frames(((group_key(lights[p]), m) for p, m in metrics.items()),
                                        saved_grade_settings())
-    return lights, {path: g.grade for path, g in grades.items()}
+    return lights, grades
 
 
 # ---- Workers --------------------------------------------------------------------
@@ -588,6 +627,13 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self.summary_label = QLabel()
         self.summary_label.setTextFormat(Qt.RichText)
         top.addWidget(self.summary_label, 1)
+        # Beside the grade counts it picks from
+        self.stack_btn = QPushButton("Stack Lights")
+        self.stack_btn.setToolTip("Hand the chosen lights to Siril or PixInsight (closes this review)")
+        stack_menu = QMenu(self.stack_btn)
+        stack_menu.aboutToShow.connect(self._fill_stack_menu)
+        self.stack_btn.setMenu(stack_menu)
+        top.addWidget(self.stack_btn)
         layout.addLayout(top)
 
         checks = QHBoxLayout()
@@ -641,15 +687,6 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self.reanalyze_btn.setToolTip("Measure every frame again, ignoring the saved measurements.")
         self.reanalyze_btn.clicked.connect(lambda: self._start_analysis(force=True))
         bottom.addWidget(self.reanalyze_btn)
-        self.stack_btn = QToolButton()
-        self.stack_btn.setText("Stack")
-        self.stack_btn.setToolTip("Hand the chosen lights to Siril or PixInsight (closes this review)")
-        self.stack_btn.setPopupMode(QToolButton.InstantPopup)
-        self.stack_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        stack_menu = QMenu(self.stack_btn)
-        stack_menu.aboutToShow.connect(self._fill_stack_menu)
-        self.stack_btn.setMenu(stack_menu)
-        bottom.addWidget(self.stack_btn)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.reject)
         bottom.addWidget(close_btn)
@@ -1282,17 +1319,24 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
 
     # ---- Stacking -------------------------------------------------------
 
-    def _stack_choices(self):
-        """[(choice, label, paths)] - the grade-based picks span every filter, not just the one shown."""
-        graded = {p: g.grade for p, g in self._grades.items()}
-        usable = [p for p in self._lights if graded.get(p) != FrameQuality.GRADE_ERROR]
-        return [
-            (LIGHTS_GOOD, LIGHT_CHOICE_LABELS[LIGHTS_GOOD],
-             [p for p in usable if graded.get(p) in KEEP_GRADES[LIGHTS_GOOD]]),
-            (LIGHTS_GOOD_MARGINAL, LIGHT_CHOICE_LABELS[LIGHTS_GOOD_MARGINAL],
-             [p for p in usable if graded.get(p) in KEEP_GRADES[LIGHTS_GOOD_MARGINAL]]),
-            (LIGHTS_PICKED, "All except checked", [p for p in usable if p not in self._checked]),
-        ]
+    STACK_CHOICES = (LIGHTS_GOOD, LIGHTS_GOOD_MARGINAL, LIGHTS_TOP, LIGHTS_PICKED)
+
+    def _stack_paths(self, choice):
+        """The lights a Stack choice takes - the grade-based picks span every
+        filter, not just the one shown."""
+        usable = [p for p in self._lights
+                  if not (p in self._grades and self._grades[p].grade == FrameQuality.GRADE_ERROR)]
+        if choice == LIGHTS_TOP:
+            keep = top_percent_lights(self._lights, self._grades, saved_top_percent())
+            return [p for p in usable if p in keep]
+        if choice == LIGHTS_PICKED:
+            return [p for p in usable if p not in self._checked]
+        return [p for p in usable if p in self._grades and self._grades[p].grade in KEEP_GRADES[choice]]
+
+    def _stack_text(self, choice):
+        label = "All except checked" if choice == LIGHTS_PICKED else light_choice_label(choice, saved_top_percent())
+        paths = self._stack_paths(choice)
+        return f"{label} - {len(paths)} frames, {format_duration(self._integration(paths))}", bool(paths)
 
     def _fill_stack_menu(self):
         import ProcessingHandoff as handoff
@@ -1304,20 +1348,49 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         if not apps:
             menu.addAction("Set up Siril or PixInsight under Settings → Integrations first").setEnabled(False)
             return
-        for choice, label, paths in self._stack_choices():
-            text = f"{label} - {len(paths)} frames, {format_duration(self._integration(paths))}"
+
+        # The Top % choice's percent, set right in the menu
+        percent_row = QWidget()
+        row = QHBoxLayout(percent_row)
+        row.setContentsMargins(8, 4, 8, 4)
+        row.addWidget(QLabel("Top"))
+        percent_spin = QSpinBox()
+        percent_spin.setRange(1, 100)
+        percent_spin.setSuffix("%")
+        percent_spin.setValue(saved_top_percent())
+        percent_spin.setToolTip("The best frames of each filter by quality score")
+        row.addWidget(percent_spin)
+        row.addWidget(QLabel("of each filter, by quality score"))
+        row.addStretch()
+        percent_action = QWidgetAction(menu)
+        percent_action.setDefaultWidget(percent_row)
+        menu.addAction(percent_action)
+        menu.addSeparator()
+
+        entries = {}  # choice -> the action whose text shows its frame count
+        for choice in self.STACK_CHOICES:
+            text, enabled = self._stack_text(choice)
             if len(apps) == 1:
                 action = menu.addAction(f"{text}  →  {handoff.APP_LABELS[apps[0]]}...")
-                action.triggered.connect(lambda _=False, a=apps[0], c=choice, p=paths: self._stack(a, c, p))
-                action.setEnabled(bool(paths))
+                action.triggered.connect(lambda _=False, a=apps[0], c=choice: self._stack(a, c))
+                entries[choice] = action
             else:
                 submenu = menu.addMenu(text)
-                submenu.setEnabled(bool(paths))
                 for app in apps:
                     submenu.addAction(f"{handoff.APP_LABELS[app]}...").triggered.connect(
-                        lambda _=False, a=app, c=choice, p=paths: self._stack(a, c, p))
+                        lambda _=False, a=app, c=choice: self._stack(a, c))
+                entries[choice] = submenu.menuAction()
+            entries[choice].setEnabled(enabled)
 
-    def _stack(self, app, choice, paths):
+        def on_percent_changed(value):
+            save_top_percent(value)
+            text, enabled = self._stack_text(LIGHTS_TOP)
+            action = entries[LIGHTS_TOP]
+            action.setText(f"{text}  →  {handoff.APP_LABELS[apps[0]]}..." if len(apps) == 1 else text)
+            action.setEnabled(enabled)
+        percent_spin.valueChanged.connect(on_percent_changed)
+
+    def _stack(self, app, choice):
         """Close the review and open the processing handoff with these lights. It
         opens over the main window: a Siril run outlives dialogs it was started from."""
         from SessionCompletion import SessionCompletionDialog
@@ -1332,9 +1405,10 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         parent = self.parentWidget()
         while isinstance(parent, QDialog) and parent.parentWidget() is not None:
             parent = parent.parentWidget()
+        # Worked out now, so it matches the current percent and checks
+        paths = self._stack_paths(choice) if choice == LIGHTS_PICKED else None
         self.accept()
-        SessionCompletionDialog(session, parent=parent, app=app, light_choice=choice,
-                                light_paths=paths if choice == LIGHTS_PICKED else None).exec()
+        SessionCompletionDialog(session, parent=parent, app=app, light_choice=choice, light_paths=paths).exec()
 
     # ---- Selection, preview and menu ------------------------------------
 
