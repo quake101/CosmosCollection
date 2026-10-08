@@ -17,7 +17,9 @@ Cosmos Collection is designed to help astrophotographers manage their image coll
 - **Telescope FOV Simulator**: Visualize future astrophotography sessions and what equipment to use.
 - **Collage Builder**: Create collages of your DSO images.
 - **Image Gallery**: View all your images in a gallery view. (With filters)
-- **Weather Forecast**: 7 day weather forecast with astro related scoring. The weather detail window shows hourly forecast per day. 
+- **Weather Forecast**: 7 day weather forecast with astro related scoring. The weather detail window shows hourly forecast per day.
+- **Session Manager**: Manage sessions/observations, drag and drop a observation night's data to create/update sessions. Hand a session's data (lights, darks, flats) to Siril or PixInsight for stacking/processing.
+- **Light Quality Review**: Grades a session's light frames and displays graph, grouped by obervations.
 
 ## Screenshots
   ### DSO Detail
@@ -49,6 +51,12 @@ Cosmos Collection is designed to help astrophotographers manage their image coll
 
   ### NINA Dashboard
   ![Nina Dashboard](screenshots/NINA-Dashboard.jpg)
+
+  ### Session Manager
+  ![Session Manager](screenshots/Session-Manager.jpg)
+  
+  ### Light Quaility Review
+  ![Light Quaility Review](screenshots/Light-Frame-Quality-Review.jpg)
 
 ## Getting Started
 
