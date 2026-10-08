@@ -1437,6 +1437,144 @@ class NINAIntegration:
             return []
 
     @staticmethod
+    def get_sequence(host, port):
+        """
+        Get the loaded advanced sequence from NINA.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            tuple: (items, error). items is the list of top-level sequence entries
+                   (a {'GlobalTriggers': [...]} dict, then the Start/Targets/End
+                   containers). When NINA reports no sequence, items is [] and
+                   error is NINA's message; when the request fails, items is None.
+        """
+        url = f"http://{host}:{port}/v2/api/sequence/json"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('Success') and isinstance(result.get('Response'), list):
+                    return result['Response'], ""
+                return [], result.get('Error') or "No sequence loaded"
+        except urllib.error.HTTPError as e:
+            # NINA answers with an error status and a JSON body when no sequence is loaded
+            try:
+                body = json.loads(e.read().decode('utf-8'))
+            except Exception:
+                body = None
+            if isinstance(body, dict) and body.get('Error'):
+                logger.debug(f"No sequence from NINA: {body['Error']}")
+                return [], body['Error']
+            logger.debug(f"Error getting sequence: {e}")
+            return None, str(e)
+        except Exception as e:
+            logger.debug(f"Error getting sequence: {e}")
+            return None, str(e)
+
+    @staticmethod
+    def get_sequence_issues(host, port):
+        """
+        Get the validation issues NINA reports for the loaded sequence.
+
+        Uses /sequence/state, which (unlike /sequence/json) includes each entry's
+        'Issues' list - the same problems NINA's own start validation reports.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            list: (entry name, issue text) tuples, empty if none; None on failure
+        """
+        url = f"http://{host}:{port}/v2/api/sequence/state"
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                result = json.loads(response.read().decode('utf-8'))
+        except Exception as e:
+            logger.debug(f"Error getting sequence state: {e}")
+            return None
+        if not result.get('Success') or not isinstance(result.get('Response'), list):
+            return None
+
+        issues = []
+
+        def collect(entry):
+            if not isinstance(entry, dict):
+                return
+            for issue in entry.get('Issues') or []:
+                issues.append((entry.get('Name') or "", str(issue)))
+            for key in ('GlobalTriggers', 'Conditions', 'Triggers', 'Items'):
+                for child in entry.get(key) or []:
+                    collect(child)
+
+        for entry in result['Response']:
+            collect(entry)
+        return issues
+
+    @staticmethod
+    def _sequence_command(host, port, command, params=None):
+        """Send /sequence/<command>; returns (success, message) with NINA's error on failure."""
+        url = f"http://{host}:{port}/v2/api/sequence/{command}"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                logger.debug(f"API Response: {result}")
+                if result.get('Success'):
+                    return True, str(result.get('Response') or "")
+                return False, result.get('Error') or "Unknown error"
+        except urllib.error.HTTPError as e:
+            # e.g. 409 "Sequence is not initialized" / "Sequence is already running"
+            try:
+                message = json.loads(e.read().decode('utf-8')).get('Error') or str(e)
+            except Exception:
+                message = str(e)
+            logger.warning(f"Sequence {command} failed: {message}")
+            return False, message
+        except Exception as e:
+            logger.error(f"Error sending sequence {command}: {e}")
+            return False, str(e)
+
+    @staticmethod
+    def start_sequence(host, port, skip_validation=False):
+        """
+        Start the loaded advanced sequence.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            skip_validation: Start without NINA's validation. Without this, a sequence
+                             with issues makes NINA ask for confirmation in a dialog
+                             on the NINA computer.
+
+        Returns:
+            tuple: (success, message)
+        """
+        params = {'skipValidation': 'true'} if skip_validation else None
+        return NINAIntegration._sequence_command(host, port, 'start', params)
+
+    @staticmethod
+    def stop_sequence(host, port):
+        """
+        Stop the running advanced sequence.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+
+        Returns:
+            tuple: (success, message)
+        """
+        return NINAIntegration._sequence_command(host, port, 'stop')
+
+    @staticmethod
     def get_last_autofocus(host, port):
         """
         Get the report of the last completed autofocus run from NINA.

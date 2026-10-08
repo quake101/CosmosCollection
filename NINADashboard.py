@@ -9,6 +9,7 @@ import logging
 import math
 import re
 import sys
+import time
 import warnings
 from collections import deque
 from datetime import datetime
@@ -33,7 +34,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QSizePolicy, QDockWidget, QCheckBox, QSpinBox,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLineEdit,
     QTabWidget, QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView
+    QHeaderView, QAbstractItemView, QTreeWidget, QTreeWidgetItem, QSplitter, QMessageBox
 )
 from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QIcon, QColor
 
@@ -57,6 +58,185 @@ def format_image_stat(value, decimals=None, allow_negative=True):
     if not isinstance(value, (int, float)) or math.isnan(value) or (not allow_negative and value < 0):
         return "--"
     return f"{value:.{decimals}f}" if decimals is not None else str(int(value))
+
+
+# Sequence entry statuses (NINA SequenceEntityStatus) and the COLORS key each is drawn in.
+# CREATED (not run yet) uses the normal text color and shows no status text.
+SEQUENCE_STATUS_COLORS = {
+    'RUNNING': 'info',
+    'FINISHED': 'success',
+    'FAILED': 'error',
+    'SKIPPED': 'text_disabled',
+    'DISABLED': 'text_disabled',
+}
+
+
+def sequence_display_name(entry, kind):
+    """Readable name for a sequence entry; kind is 'item', 'condition' or 'trigger'.
+
+    NINA suffixes containers, triggers and conditions ('Bubble Nebula_Container'),
+    and some instructions (e.g. inside the flat wizard) serialize with no name at all.
+    """
+    name = entry.get('Name') or ""
+    for suffix in ('_Container', '_Trigger', '_Condition'):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    if name:
+        return name
+    # Infer unnamed entries from their fields
+    if kind == 'condition':
+        return "Loop For Iterations" if 'Iterations' in entry else "Condition"
+    if kind == 'trigger':
+        return "Trigger"
+    if 'Items' in entry:
+        return "Container"
+    if 'ExposureTime' in entry:
+        return "Take Exposure"
+    if 'Filter' in entry:
+        return "Switch Filter"
+    return "Instruction"
+
+
+def sequence_children(entry):
+    """(kind, child) pairs under a sequence container: conditions, triggers, then items."""
+    children = [('condition', c) for c in entry.get('Conditions') or [] if isinstance(c, dict)]
+    children += [('trigger', t) for t in entry.get('Triggers') or [] if isinstance(t, dict)]
+    children += [('item', i) for i in entry.get('Items') or [] if isinstance(i, dict)]
+    return children
+
+
+def _format_timespan(text):
+    """Turn a .NET TimeSpan string ('1.02:03:04.567') into 'h:mm:ss'."""
+    match = re.match(r'^(-)?(?:(\d+)\.)?(\d+):(\d\d):(\d\d)', str(text))
+    if not match:
+        return str(text)
+    sign, days, hours, minutes, seconds = match.groups()
+    hours = int(hours) + int(days or 0) * 24
+    return f"{sign or ''}{hours}:{minutes}:{seconds}"
+
+
+def _format_hours(hours):
+    """Turn fractional hours into '2h 35m'."""
+    total_minutes = max(0, round(hours * 60))
+    h, m = divmod(total_minutes, 60)
+    return f"{h}h {m}m" if h else f"{m}m"
+
+
+def _format_number(value):
+    """Drop a trailing .0 so 300.0 reads as 300."""
+    return f"{value:g}" if isinstance(value, float) else str(value)
+
+
+def sequence_entry_details(entry, kind):
+    """One-line summary of a sequence entry's settings and progress."""
+    parts = []
+    if kind == 'condition':
+        target_time = entry.get('TargetTime')
+        if target_time:
+            try:
+                parts.append(f"Until {format_time(datetime.fromisoformat(target_time).astimezone())}")
+            except (ValueError, TypeError):
+                parts.append(f"Until {target_time}")
+        if entry.get('RemainingTime'):
+            parts.append(f"{_format_timespan(entry['RemainingTime'])} left")
+        if 'Iterations' in entry:
+            parts.append(f"{entry.get('CompletedIterations', 0)}/{entry['Iterations']} done")
+    elif kind == 'trigger':
+        time_to_flip = entry.get('TimeToFlip')
+        if isinstance(time_to_flip, (int, float)):
+            parts.append(f"Flip in {_format_hours(time_to_flip)}" if time_to_flip > 0 else "Flip due")
+        if isinstance(entry.get('TargetDrift'), (int, float)):
+            drift = entry.get('Drift')
+            drift_text = f"{drift:.2f}" if isinstance(drift, (int, float)) else "--"
+            parts.append(f"Drift {drift_text}′ of {_format_number(entry['TargetDrift'])}′")
+        if isinstance(entry.get('HFRTrendPercentage'), (int, float)):
+            parts.append(f"HFR trend {entry['HFRTrendPercentage']:+.1f}% "
+                         f"of {_format_number(entry.get('DeltaHFR', '?'))}%")
+    else:
+        if isinstance(entry.get('Filter'), str):
+            parts.append(entry['Filter'])
+        if isinstance(entry.get('ExposureTime'), (int, float)):
+            exposure = f"{_format_number(entry['ExposureTime'])}s"
+            if entry.get('Type'):
+                exposure += f" {entry['Type']}"
+            parts.append(exposure)
+        binning = entry.get('Binning')
+        if isinstance(binning, dict) and binning.get('Name') and binning.get('Name') != '1x1':
+            parts.append(f"Bin {binning['Name']}")
+        # -1 means the camera default
+        for key in ('Gain', 'Offset'):
+            if isinstance(entry.get(key), (int, float)) and entry[key] >= 0:
+                parts.append(f"{key} {_format_number(entry[key])}")
+        if 'Iterations' in entry and 'CompletedIterations' in entry:
+            parts.append(f"{entry['CompletedIterations']}/{entry['Iterations']} done")
+        if entry.get('ExposureCount'):
+            parts.append(f"{entry['ExposureCount']} taken")
+        coords = entry.get('Coordinates')
+        if isinstance(coords, dict):
+            coords = coords.get('Coordinates', coords)  # Center After Drift nests them
+            if coords.get('RAString') and coords.get('DecString'):
+                parts.append(f"RA {coords['RAString']}  Dec {coords['DecString']}")
+    if not parts:
+        # Unknown (e.g. plugin) entries: show their simple settings
+        parts = [f"{key}: {_format_number(value)}" for key, value in entry.items()
+                 if key not in ('Name', 'Status') and isinstance(value, (str, int, float))
+                 and not isinstance(value, bool)][:4]
+    return " · ".join(parts)
+
+
+def sequence_activity(entries):
+    """Summarize what the sequence is doing from the /sequence/json entries.
+
+    Returns a dict with 'state' ('running', 'finished' or 'idle'), 'path' (the
+    chain of RUNNING entries from a top-level container down to the deepest one),
+    'trigger' (a RUNNING trigger, which runs between instructions, or None),
+    'loop' (the condition of the nearest running container that has one, or None)
+    and 'next' (the next not-yet-run entry after the current one, or None).
+    """
+    containers = [e for e in entries if isinstance(e, dict) and 'Items' in e]
+    path = []
+    level = containers
+    while True:
+        running = next((e for e in level if isinstance(e, dict) and e.get('Status') == 'RUNNING'), None)
+        if running is None:
+            break
+        path.append(running)
+        level = running.get('Items') or []
+
+    trigger = None
+    global_triggers = next((e.get('GlobalTriggers') for e in entries
+                            if isinstance(e, dict) and 'GlobalTriggers' in e), None) or []
+    for owner_triggers in [global_triggers] + [e.get('Triggers') or [] for e in path]:
+        for t in owner_triggers:
+            if isinstance(t, dict) and t.get('Status') == 'RUNNING':
+                trigger = t
+
+    loop = None
+    for container in reversed(path):
+        conditions = [c for c in container.get('Conditions') or [] if isinstance(c, dict)]
+        if conditions:
+            loop = conditions[0]
+            break
+
+    # Next entry: the first not-yet-run sibling after the current entry, walking up the path
+    next_entry = None
+    for depth in range(len(path) - 1, -1, -1):
+        siblings = containers if depth == 0 else path[depth - 1].get('Items') or []
+        index = next((i for i, s in enumerate(siblings) if s is path[depth]), None)
+        if index is None:
+            continue
+        next_entry = next((s for s in siblings[index + 1:]
+                           if isinstance(s, dict) and s.get('Status') == 'CREATED'), None)
+        if next_entry is not None:
+            break
+
+    if path:
+        state = 'running'
+    elif containers and all(c.get('Status') == 'FINISHED' for c in containers):
+        state = 'finished'
+    else:
+        state = 'idle'
+    return {'state': state, 'path': path, 'trigger': trigger, 'loop': loop, 'next': next_entry}
 
 
 # A failed/cancelled autofocus never emits AUTOFOCUS-FINISHED; treat a run with no
@@ -203,6 +383,65 @@ class ZoomableImageWidget(QWidget):
         self.update()
 
 
+class SequencePanel(QWidget):
+    """Sequence dock contents: the activity summary and the sequence tree in a
+    splitter, side by side when the dock is wide (e.g. in the bottom area) and
+    stacked when it's tall. The activity's width (side by side) and height
+    (stacked) are each remembered, so dragging one doesn't change the other."""
+
+    DEFAULT_ACTIVITY_WIDTH = 340
+    DEFAULT_ACTIVITY_HEIGHT = 190
+
+    def __init__(self, activity, tree, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        self._splitter = QSplitter(Qt.Vertical)
+        self._splitter.setChildrenCollapsible(False)
+        self._splitter.addWidget(activity)
+        self._splitter.addWidget(tree)
+        # The activity keeps its size as the dock resizes; the tree takes the rest
+        self._splitter.setStretchFactor(0, 0)
+        self._splitter.setStretchFactor(1, 1)
+        self._splitter.splitterMoved.connect(self._on_splitter_moved)
+        layout.addWidget(self._splitter)
+        self._activity_size = {Qt.Horizontal: self.DEFAULT_ACTIVITY_WIDTH,
+                               Qt.Vertical: self.DEFAULT_ACTIVITY_HEIGHT}
+        self._sized = False
+
+    def activity_sizes(self):
+        """(width when side by side, height when stacked)."""
+        return self._activity_size[Qt.Horizontal], self._activity_size[Qt.Vertical]
+
+    def set_activity_sizes(self, width, height):
+        self._activity_size[Qt.Horizontal] = width
+        self._activity_size[Qt.Vertical] = height
+        self._apply_activity_size()
+
+    def _apply_activity_size(self):
+        orientation = self._splitter.orientation()
+        length = self._splitter.width() if orientation == Qt.Horizontal else self._splitter.height()
+        length -= self._splitter.handleWidth()
+        if length <= 0:
+            return
+        # Leave the tree some room if the dock is now smaller than the saved size
+        activity = max(0, min(self._activity_size[orientation], length - 100))
+        self._splitter.setSizes([activity, length - activity])
+        self._sized = True
+
+    def _on_splitter_moved(self, pos, index):
+        self._activity_size[self._splitter.orientation()] = self._splitter.sizes()[0]
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        orientation = Qt.Horizontal if self.width() > 1.6 * self.height() else Qt.Vertical
+        if self._splitter.orientation() != orientation:
+            self._splitter.setOrientation(orientation)
+            self._apply_activity_size()
+        elif not self._sized:
+            self._apply_activity_size()
+
+
 class NINAStatusWorker(QThread):
     """Background thread for polling NINA API endpoints."""
 
@@ -219,12 +458,17 @@ class NINAStatusWorker(QThread):
     error_occurred = Signal(str)  # Emits error message
     connection_changed = Signal(bool, str, str, int)  # Emits connected state, version, host, port
     history_thumbnail = Signal(int, bytes, dict)  # Emits (index, small_thumbnail_data, image_stats)
+    history_reset = Signal()  # NINA's image history started over (e.g. NINA restarted)
+    sequence_updated = Signal(object, str)  # Emits (sequence entries, [] if none loaded, None on failure; error)
 
     # Adaptive polling rates
     POLL_RATE_ACTIVE = 0.5  # when exposing/guiding
     POLL_RATE_IDLE = 2    # when idle
 
     INITIAL_EVENT_BACKLOG = 200  # Past events shown in the event log on connect
+    HISTORY_THUMBNAILS = 20  # Most thumbnails sent at once (on connect, or after catching up)
+    HISTORY_CHECK_SECONDS = 30  # How often to confirm NINA still has our latest image
+    SEQUENCE_POLL_SECONDS = 2  # The sequence tree is large; refresh it less often than equipment
 
     def __init__(self, host, port):
         super().__init__()
@@ -233,11 +477,10 @@ class NINAStatusWorker(QThread):
         self._running = False
         self._poll_interval = self.POLL_RATE_IDLE  # Start with idle rate
         self._fetch_images = True
-        self._was_exposing = False  # Track exposure state to detect when exposure completes
-        self._exposure_end_time = None  # Expected end time of current exposure
-        self._waiting_for_new_image = False  # Keep checking until new image is saved
-        self._initial_image_check_done = False  # Have we done the initial image check?
+        self._initial_image_check_done = False  # Have we found NINA's latest image yet?
         self._last_image_index = -1  # Track the last known image index (-1 = no images yet)
+        self._last_history_check = 0.0  # time.monotonic() of the last "latest image still there" check
+        self._history_check_failures = 0  # Consecutive checks that didn't find our latest image
         self._last_livestack_hash = None  # Track livestack image hash
         self._last_livestack_count = None  # Track livestack stack count
         self._last_livestack_running = False  # Track if livestack was running
@@ -259,6 +502,9 @@ class NINAStatusWorker(QThread):
         # Active image tab (0=Live View, 1=Latest Image, 2=Live Stack)
         self._active_image_tab = 1
         self._pending_image_fetch = False  # New image detected while not on Latest Image tab
+        # Sequence dock polling (only while the dock is visible)
+        self._sequence_active = False
+        self._last_sequence_poll = 0.0  # time.monotonic() of the last sequence fetch
 
     def set_image_quality_settings(self, image_quality, image_size, livestack_quality, livestack_size):
         """Update image quality/size settings (thread-safe for primitive types)."""
@@ -342,132 +588,9 @@ class NINAStatusWorker(QThread):
                         self.connection_changed.emit(False, "", self.host, self.port)
                         # Keep counting but don't reset - we want to stay disconnected
 
-                # --- Exposure state tracking (always runs, no API calls) ---
-                if self._fetch_images:
-                    camera = status_data.get('camera', {})
-                    is_exposing = camera.get('IsExposing', False) if isinstance(camera, dict) else False
-
-                    # Track exposure end time while exposing
-                    if is_exposing and isinstance(camera, dict):
-                        exposure_end_str = camera.get('ExposureEndTime')
-                        if exposure_end_str:
-                            try:
-                                from datetime import timezone
-                                self._exposure_end_time = datetime.fromisoformat(
-                                    exposure_end_str.replace('Z', '+00:00')
-                                )
-                            except (ValueError, TypeError):
-                                pass
-
-                    # Detect when exposure ends
-                    if self._was_exposing and not is_exposing:
-                        # Check if exposure was cancelled (ended before expected time)
-                        was_cancelled = False
-                        if self._exposure_end_time:
-                            try:
-                                from datetime import timezone
-                                now = datetime.now(timezone.utc) if self._exposure_end_time.tzinfo else datetime.now()
-                                # If we're more than 2 seconds before expected end, it was cancelled
-                                time_remaining = (self._exposure_end_time - now).total_seconds()
-                                if time_remaining > 2:
-                                    was_cancelled = True
-                                    logger.debug(f"Exposure cancelled ({time_remaining:.1f}s remaining)")
-                            except Exception:
-                                pass
-
-                        if was_cancelled:
-                            logger.debug("Exposure was cancelled, not waiting for new image")
-                        else:
-                            logger.debug("Exposure completed, waiting for new image to be saved...")
-                            self._waiting_for_new_image = True
-
-                        self._exposure_end_time = None  # Reset for next exposure
-
-                    self._was_exposing = is_exposing
-
-                    # --- Latest Image fetching (only when tab 1 is active) ---
-                    if self._active_image_tab == 1:
-                        # Initial fetch on startup - find and display the latest image (only once)
-                        if not self._initial_image_check_done:
-                            self._initial_image_check_done = True
-                            image_count = NINAIntegration.get_image_count(self.host, self.port)
-                            if image_count > 0:
-                                self._last_image_index = image_count - 1
-                                logger.debug(f"Initial image fetch (index {self._last_image_index})")
-                                self.image_fetching.emit(0, -1)
-                                image_data, _ = NINAIntegration.get_image(
-                                    self.host, self.port, self._last_image_index,
-                                    quality=self._image_quality, size_wh=self._image_size,
-                                    progress_callback=lambda recv, total: self.image_fetching.emit(recv, total)
-                                )
-                                self.image_fetching.emit(-1, -1)
-                                if image_data:
-                                    self.image_updated.emit(image_data, status_data)
-                                # Load history thumbnails for last 20 images
-                                for idx in range(self._last_image_index, max(self._last_image_index - 20, -1), -1):
-                                    thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, idx, 200)
-                                    if thumb_data:
-                                        stats = NINAIntegration.get_image_statistics(self.host, self.port, idx) or {}
-                                        self.history_thumbnail.emit(idx, thumb_data, stats)
-                            else:
-                                logger.debug("No images available yet, waiting for first exposure")
-
-                        # Check for pending image that was detected while on another tab
-                        elif self._pending_image_fetch:
-                            self._pending_image_fetch = False
-                            if self._last_image_index >= 0:
-                                logger.debug(f"Fetching pending image at index {self._last_image_index}")
-                                self.image_fetching.emit(0, -1)
-                                image_data, _ = NINAIntegration.get_image(
-                                    self.host, self.port, self._last_image_index,
-                                    quality=self._image_quality, size_wh=self._image_size,
-                                    progress_callback=lambda recv, total: self.image_fetching.emit(recv, total)
-                                )
-                                self.image_fetching.emit(-1, -1)
-                                if image_data:
-                                    self.image_updated.emit(image_data, status_data)
-                                thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, self._last_image_index, 200)
-                                if thumb_data:
-                                    stats = NINAIntegration.get_image_statistics(self.host, self.port, self._last_image_index) or {}
-                                    self.history_thumbnail.emit(self._last_image_index, thumb_data, stats)
-
-                        # Keep checking for new image after exposure completes
-                        elif self._waiting_for_new_image:
-                            # If no images exist yet, check for index 0, otherwise check next index
-                            next_index = 0 if self._last_image_index == -1 else self._last_image_index + 1
-                            if NINAIntegration._image_exists(self.host, self.port, next_index):
-                                logger.debug(f"New image available at index {next_index}")
-                                self._last_image_index = next_index
-                                self._waiting_for_new_image = False
-                                self.image_fetching.emit(0, -1)
-                                image_data, _ = NINAIntegration.get_image(
-                                    self.host, self.port, next_index,
-                                    quality=self._image_quality, size_wh=self._image_size,
-                                    progress_callback=lambda recv, total: self.image_fetching.emit(recv, total)
-                                )
-                                self.image_fetching.emit(-1, -1)
-                                if image_data:
-                                    self.image_updated.emit(image_data, status_data)
-                                # Emit history thumbnail for the new image
-                                thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, next_index, 200)
-                                if thumb_data:
-                                    stats = NINAIntegration.get_image_statistics(self.host, self.port, next_index) or {}
-                                    self.history_thumbnail.emit(next_index, thumb_data, stats)
-
-                    else:
-                        # Not on Latest Image tab — still detect new images, just defer the full fetch
-                        if self._waiting_for_new_image:
-                            next_index = 0 if self._last_image_index == -1 else self._last_image_index + 1
-                            if NINAIntegration._image_exists(self.host, self.port, next_index):
-                                logger.debug(f"New image at index {next_index} (deferred, tab not active)")
-                                self._last_image_index = next_index
-                                self._waiting_for_new_image = False
-                                self._pending_image_fetch = True
-                                # Always emit history thumbnail — the dock is visible on all tabs
-                                thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, next_index, 200)
-                                if thumb_data:
-                                    stats = NINAIntegration.get_image_statistics(self.host, self.port, next_index) or {}
-                                    self.history_thumbnail.emit(next_index, thumb_data, stats)
+                # --- New images (on every tab: the history dock is always visible) ---
+                if self._fetch_images and status_data:
+                    self._check_for_new_images(status_data)
 
                 # --- Live Stack fetching (only when tab 2 is active) ---
                 if self._active_image_tab == 2:
@@ -557,6 +680,14 @@ class NINAStatusWorker(QThread):
                         if report:
                             self.autofocus_report.emit(report)
 
+                # Fetch the sequence — only while the Sequence dock is visible, or the
+                # Live Stack tab is open (it follows the sequence's current target)
+                if ((self._sequence_active or self._active_image_tab == 2) and
+                        time.monotonic() - self._last_sequence_poll >= self.SEQUENCE_POLL_SECONDS):
+                    self._last_sequence_poll = time.monotonic()
+                    sequence, sequence_error = NINAIntegration.get_sequence(self.host, self.port)
+                    self.sequence_updated.emit(sequence, sequence_error)
+
                 # Fetch live view (prepared image) — only when tab 0 is active
                 if self._active_image_tab == 0 and self._liveview_active and not is_exposing:
                     image_data = NINAIntegration.get_prepared_image(
@@ -580,6 +711,93 @@ class NINAStatusWorker(QThread):
                     if not self._running:
                         break
                     self.msleep(50)
+
+    def _check_for_new_images(self, status_data):
+        """Send images NINA saved since the last poll to the UI.
+
+        Looks for the next image history index on every poll rather than waiting
+        to see the camera stop exposing: in a sequence NINA starts the next
+        exposure as soon as the last one downloads, so that gap is usually too
+        short for a poll to catch, and the history fell behind.
+        """
+        if not self._initial_image_check_done:
+            self._initial_image_check_done = True
+            self._last_history_check = time.monotonic()
+            image_count = NINAIntegration.get_image_count(self.host, self.port)
+            self._last_image_index = image_count - 1
+            if image_count == 0:
+                logger.debug("No images available yet, waiting for first exposure")
+                return
+            logger.debug(f"Latest image on connect: index {self._last_image_index}")
+            self._pending_image_fetch = True
+            # Newest first; the list adds each older thumbnail below
+            for index in range(self._last_image_index,
+                               max(self._last_image_index - self.HISTORY_THUMBNAILS, -1), -1):
+                self._emit_history_thumbnail(index)
+        else:
+            # Catch up on every image saved since the last poll
+            new_indexes = []
+            next_index = self._last_image_index + 1
+            while self._running and NINAIntegration._image_exists(self.host, self.port, next_index):
+                new_indexes.append(next_index)
+                next_index += 1
+            if new_indexes:
+                logger.debug(f"New image(s) at index {new_indexes[0]}-{new_indexes[-1]}")
+                self._last_image_index = new_indexes[-1]
+                self._pending_image_fetch = True
+                self._history_check_failures = 0
+                # Oldest first, so each lands on top of the list
+                for index in new_indexes[-self.HISTORY_THUMBNAILS:]:
+                    self._emit_history_thumbnail(index)
+            elif self._history_was_reset():
+                logger.debug("NINA's image history was reset; reloading it")
+                self._initial_image_check_done = False
+                self._last_image_index = -1
+                self._pending_image_fetch = False
+                self.history_reset.emit()
+                return
+
+        # The full-size image is only needed on the Latest Image tab; on other
+        # tabs it's fetched when that tab is next shown
+        if self._pending_image_fetch and self._active_image_tab == 1 and self._last_image_index >= 0:
+            self._pending_image_fetch = False
+            self.image_fetching.emit(0, -1)
+            image_data, _ = NINAIntegration.get_image(
+                self.host, self.port, self._last_image_index,
+                quality=self._image_quality, size_wh=self._image_size,
+                progress_callback=lambda recv, total: self.image_fetching.emit(recv, total)
+            )
+            self.image_fetching.emit(-1, -1)
+            if image_data:
+                self.image_updated.emit(image_data, status_data)
+
+    def _history_was_reset(self):
+        """Whether NINA no longer has our latest image (its history started over).
+
+        Checked every HISTORY_CHECK_SECONDS; takes two misses in a row so one
+        failed request doesn't reload the history.
+        """
+        if self._last_image_index < 0:
+            return False
+        interval = self.HISTORY_CHECK_SECONDS if not self._history_check_failures else 5
+        if time.monotonic() - self._last_history_check < interval:
+            return False
+        self._last_history_check = time.monotonic()
+        if NINAIntegration._image_exists(self.host, self.port, self._last_image_index):
+            self._history_check_failures = 0
+            return False
+        self._history_check_failures += 1
+        if self._history_check_failures < 2:
+            return False
+        self._history_check_failures = 0
+        return True
+
+    def _emit_history_thumbnail(self, index):
+        """Fetch a history thumbnail and its statistics and send them to the UI."""
+        thumb_data, _ = NINAIntegration.get_image_thumbnail(self.host, self.port, index, 200)
+        if thumb_data:
+            stats = NINAIntegration.get_image_statistics(self.host, self.port, index) or {}
+            self.history_thumbnail.emit(index, thumb_data, stats)
 
     @staticmethod
     def _parse_event_time(time_str):
@@ -656,6 +874,16 @@ class NINAStatusWorker(QThread):
     def set_active_image_tab(self, index):
         """Set which image tab is active (0=Live View, 1=Latest Image, 2=Live Stack)."""
         self._active_image_tab = index
+
+    def refresh_sequence(self):
+        """Fetch the sequence on the next poll (e.g. right after starting or stopping it)."""
+        self._last_sequence_poll = 0.0
+
+    def set_sequence_active(self, active):
+        """Start or stop sequence polling; becoming active fetches on the next poll."""
+        if active and not self._sequence_active:
+            self._last_sequence_poll = 0.0
+        self._sequence_active = active
 
 
 class GuidingGraph(FigureCanvas):
@@ -1267,7 +1495,7 @@ class SlewDialog(QDialog):
 class NINADashboardWindow(WindowPositionMixin, QMainWindow):
     """Main NINA Dashboard window."""
     WINDOW_POSITION_KEY = "NINADashboard"
-    DOCK_LAYOUT_VERSION = 2  # Bump when adding docks so older saved layouts get default placement
+    DOCK_LAYOUT_VERSION = 4  # Bump when adding docks so older saved layouts get default placement
     _image_fetch_done = Signal(object)
 
     def __init__(self):
@@ -1347,6 +1575,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._create_image_history_dock()
         self._create_autofocus_dock()
         self._create_event_log_dock()
+        self._create_sequence_dock()
 
         # Set up View menu
         self._setup_view_menu()
@@ -1757,7 +1986,6 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.liveview_quality_spin.setRange(1, 100)
         self.liveview_quality_spin.setValue(80)
         self.liveview_quality_spin.setToolTip("JPEG quality 1-100 (lower = faster transfer)")
-        self.liveview_quality_spin.setFixedWidth(60)
         self.liveview_quality_spin.valueChanged.connect(self._on_liveview_quality_changed)
         liveview_settings_layout.addWidget(self.liveview_quality_spin)
 
@@ -1806,7 +2034,6 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.image_quality_spin.setRange(-1, 100)
         self.image_quality_spin.setValue(-1)
         self.image_quality_spin.setToolTip("-1 = PNG (lossless), 1-100 = JPEG quality")
-        self.image_quality_spin.setFixedWidth(60)
         self.image_quality_spin.valueChanged.connect(self._on_image_quality_changed)
         image_settings_layout.addWidget(self.image_quality_spin)
 
@@ -1848,6 +2075,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.livestack_target_combo = QComboBox()
         self.livestack_target_combo.setToolTip("Select livestack target")
         self.livestack_target_combo.setMinimumWidth(120)
+        # Grow with the names (the list is filled after the tab is first shown)
+        self.livestack_target_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.livestack_target_combo.currentIndexChanged.connect(self._on_livestack_selection_changed)
         selection_layout.addWidget(self.livestack_target_combo)
 
@@ -1855,6 +2084,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.livestack_filter_combo = QComboBox()
         self.livestack_filter_combo.setToolTip("Select livestack filter")
         self.livestack_filter_combo.setMinimumWidth(80)
+        self.livestack_filter_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.livestack_filter_combo.currentIndexChanged.connect(self._on_livestack_selection_changed)
         selection_layout.addWidget(self.livestack_filter_combo)
 
@@ -1870,7 +2100,6 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.livestack_quality_spin.setRange(-1, 100)
         self.livestack_quality_spin.setValue(100)
         self.livestack_quality_spin.setToolTip("-1 = PNG (lossless), 1-100 = JPEG quality")
-        self.livestack_quality_spin.setFixedWidth(60)
         self.livestack_quality_spin.valueChanged.connect(self._on_livestack_quality_changed)
         livestack_settings_layout.addWidget(self.livestack_quality_spin)
 
@@ -1890,6 +2119,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         # Track available stacks to avoid unnecessary updates
         self._livestack_available_stacks = []
         self._updating_livestack_combos = False
+        # Following the sequence's target: names of the containers the sequence is
+        # running in, names still waiting for their first stack, and the last target selected
+        self._sequence_container_names = None
+        self._livestack_follow_pending = None
+        self._livestack_followed_target = None
 
         self.livestack_label = ZoomableImageWidget(placeholder_text="Live stack not active")
         livestack_layout.addWidget(self.livestack_label, 1)
@@ -2024,6 +2258,73 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         self.event_log_dock.setWidget(log_widget)
 
+    def _create_sequence_dock(self):
+        """Create the Sequence dock: current activity summary above the sequence tree."""
+        self.sequence_dock = QDockWidget("Sequence", self)
+        self.sequence_dock.setObjectName("SequenceDock")
+        self.sequence_dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea |
+            Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea
+        )
+        self.sequence_dock.setFeatures(
+            QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable
+        )
+
+        # Current activity
+        activity_group = QGroupBox("Current Activity")
+        activity_layout = QGridLayout(activity_group)
+        activity_layout.setColumnStretch(1, 1)
+
+        buttons_layout = QHBoxLayout()
+        self.sequence_start_btn = QPushButton("Start")
+        self.sequence_start_btn.setToolTip("Start the sequence loaded in NINA")
+        self.sequence_start_btn.setEnabled(False)
+        self.sequence_start_btn.clicked.connect(self._on_sequence_start)
+        buttons_layout.addWidget(self.sequence_start_btn)
+        self.sequence_stop_btn = QPushButton("Stop")
+        self.sequence_stop_btn.setToolTip("Stop the running sequence")
+        self.sequence_stop_btn.setEnabled(False)
+        self.sequence_stop_btn.clicked.connect(self._on_sequence_stop)
+        buttons_layout.addWidget(self.sequence_stop_btn)
+        buttons_layout.addStretch()
+        activity_layout.addLayout(buttons_layout, 0, 0, 1, 2)
+
+        self._sequence_activity_rows = {}
+        for row, (key, title) in enumerate((
+                ('status', "Status:"), ('container', "Container:"), ('now', "Now:"),
+                ('loop', "Loop:"), ('next', "Next:"))):
+            title_label = QLabel(title)
+            title_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+            value_label = QLabel("--")
+            value_label.setWordWrap(True)
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            activity_layout.addWidget(title_label, row + 1, 0)
+            activity_layout.addWidget(value_label, row + 1, 1)
+            self._sequence_activity_rows[key] = (title_label, value_label)
+        activity_layout.setRowStretch(len(self._sequence_activity_rows) + 1, 1)
+
+        # Sequence tree
+        self.sequence_tree = QTreeWidget()
+        self.sequence_tree.setColumnCount(3)
+        self.sequence_tree.setHeaderLabels(["Item", "Status", "Details"])
+        self.sequence_tree.setUniformRowHeights(True)
+        self.sequence_tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        header = self.sequence_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setStretchLastSection(True)
+        self.sequence_tree.setColumnWidth(0, 220)
+
+        self.sequence_panel = SequencePanel(activity_group, self.sequence_tree)
+        self.sequence_dock.setWidget(self.sequence_panel)
+
+        self._sequence_running_key = None  # Path of the deepest running tree item, to follow it
+        self._sequence_state = None  # sequence_activity() state; 'none' when no sequence is loaded
+        self._sequence_command_busy = False  # A start/stop request is in progress
+        # Only poll the sequence while the dock can be seen
+        self.sequence_dock.visibilityChanged.connect(self._on_sequence_dock_visibility)
+        theme_manager().theme_changed.connect(self._recolor_sequence_tree)
+
     def _setup_view_menu(self):
         """Set up the View menu for panel visibility and layout reset."""
         view_menu = self.menuBar().addMenu("View")
@@ -2047,17 +2348,14 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         view_menu.addAction(self.autofocus_dock.toggleViewAction())
         view_menu.addAction(self.event_log_dock.toggleViewAction())
         view_menu.addAction(self.image_history_dock.toggleViewAction())
+        view_menu.addAction(self.sequence_dock.toggleViewAction())
         view_menu.addSeparator()
         reset_action = view_menu.addAction("Reset Layout")
         reset_action.triggered.connect(self._reset_layout)
 
     def _set_default_layout(self):
-        """Set default dock positions (matches original layout)."""
-        # Configure corners so top dock spans full width and bottom dock spans full width
-        self.setCorner(Qt.TopLeftCorner, Qt.TopDockWidgetArea)
-        self.setCorner(Qt.TopRightCorner, Qt.TopDockWidgetArea)
-        self.setCorner(Qt.BottomLeftCorner, Qt.BottomDockWidgetArea)
-        self.setCorner(Qt.BottomRightCorner, Qt.BottomDockWidgetArea)
+        """Set default dock positions."""
+        self._apply_dock_corners()
 
         # Action docks at top, side by side with spacer absorbing extra space
         self.addDockWidget(Qt.TopDockWidgetArea, self.imaging_dock)
@@ -2082,11 +2380,13 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.splitDockWidget(self.mount_dock, self.guider_dock, Qt.Vertical)
         self.splitDockWidget(self.guider_dock, self.filterwheel_dock, Qt.Vertical)
         self.splitDockWidget(self.filterwheel_dock, self.focuser_dock, Qt.Vertical)
-        self.splitDockWidget(self.focuser_dock, self.statistics_dock, Qt.Vertical)
+        self._tabify_statistics_dock()
 
         # Add guiding graph at bottom, with autofocus graph and event log as tabs
         self.addDockWidget(Qt.BottomDockWidgetArea, self.guiding_dock)
         self._tabify_bottom_docks()
+        # Sequence beside them
+        self._place_sequence_dock()
 
         # Add image history on right
         self.addDockWidget(Qt.RightDockWidgetArea, self.image_history_dock)
@@ -2107,6 +2407,37 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.tabifyDockWidget(self.guiding_dock, dock)
         self.guiding_dock.raise_()
 
+    def _apply_dock_corners(self):
+        """Top action docks span the full width; the left equipment column runs down
+        to the window's bottom edge, with the bottom docks beside it.
+
+        With the bottom docks below the column instead, the two stack and the
+        window is too tall for a 1080p screen. saveState() includes the corners,
+        so this is reapplied after restoring older saved layouts.
+        """
+        self.setCorner(Qt.TopLeftCorner, Qt.TopDockWidgetArea)
+        self.setCorner(Qt.TopRightCorner, Qt.TopDockWidgetArea)
+        self.setCorner(Qt.BottomLeftCorner, Qt.LeftDockWidgetArea)
+        self.setCorner(Qt.BottomRightCorner, Qt.BottomDockWidgetArea)
+
+    def _tabify_statistics_dock(self):
+        """Make Statistics a tab beside Focuser (in front, as it changes with every frame).
+
+        Six stacked equipment docks are too tall for a 1080p screen.
+        """
+        self.tabifyDockWidget(self.focuser_dock, self.statistics_dock)
+        self.statistics_dock.raise_()
+
+    def _place_sequence_dock(self):
+        """Put the sequence dock at the right end of the bottom area, beside the graphs."""
+        # (splitDockWidget would add it as another tab of the tabbed guiding graph)
+        self.removeDockWidget(self.sequence_dock)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.sequence_dock, Qt.Horizontal)
+        self.sequence_dock.show()
+        width = self.width()
+        self.resizeDocks([self.guiding_dock, self.sequence_dock],
+                         [int(width * 0.55), int(width * 0.45)], Qt.Horizontal)
+
     def _reset_layout(self):
         """Reset dock layout to defaults."""
         # Remove all docks first
@@ -2124,6 +2455,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.removeDockWidget(self.autofocus_dock)
         self.removeDockWidget(self.event_log_dock)
         self.removeDockWidget(self.image_history_dock)
+        self.removeDockWidget(self.sequence_dock)
 
         # Re-add in default positions
         self._set_default_layout()
@@ -2143,7 +2475,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.autofocus_dock.show()
         self.event_log_dock.show()
         self.image_history_dock.show()
+        self.sequence_dock.show()
         self.guiding_dock.raise_()
+        self.statistics_dock.raise_()
 
     def _restore_settings(self):
         """Restore saved dock layout, refresh rate, and image quality settings."""
@@ -2165,6 +2499,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.liveview_quality_spin.setValue(liveview_quality)
         self.liveview_size_combo.setCurrentText(liveview_size)
         self._restoring_settings = False
+
+        self.sequence_panel.set_activity_sizes(
+            settings.value("nina_sequence_activity_width", SequencePanel.DEFAULT_ACTIVITY_WIDTH, type=int),
+            settings.value("nina_sequence_activity_height", SequencePanel.DEFAULT_ACTIVITY_HEIGHT, type=int),
+        )
 
         # Apply to worker if already running
         self._apply_image_settings_to_worker()
@@ -2199,11 +2538,22 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.addDockWidget(Qt.BottomDockWidgetArea, self.autofocus_dock)
                 self.addDockWidget(Qt.BottomDockWidgetArea, self.event_log_dock)
                 self.addDockWidget(Qt.RightDockWidgetArea, self.image_history_dock)
+                self.addDockWidget(Qt.RightDockWidgetArea, self.sequence_dock)
                 self.restoreState(state_bytes)
-                # Layouts saved before the autofocus/event log docks existed don't place them
+                self._apply_dock_corners()
+                # Layouts saved before a dock existed don't place it
                 layout_version = settings.value("nina_dashboard_dock_layout_version", 1, type=int)
-                if layout_version < self.DOCK_LAYOUT_VERSION:
+                if layout_version < 2:  # Autofocus graph and event log
                     self._tabify_bottom_docks()
+                if layout_version < 3:  # Sequence
+                    self._place_sequence_dock()
+                if layout_version < 4:  # Fit 1080p: Statistics no longer stacked under Focuser
+                    stacked_in_left_column = all(
+                        self.dockWidgetArea(dock) == Qt.LeftDockWidgetArea and not dock.isFloating()
+                        for dock in (self.focuser_dock, self.statistics_dock))
+                    # Leave it alone if the user moved it or already tabbed it
+                    if stacked_in_left_column and not self.tabifiedDockWidgets(self.statistics_dock):
+                        self._tabify_statistics_dock()
                 logger.debug(f"Restored dock state, size={state_bytes.size()}")
             else:
                 self._set_default_layout()
@@ -2235,6 +2585,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         settings.setValue("nina_livestack_size", self.livestack_size_combo.currentText())
         settings.setValue("nina_liveview_quality", self.liveview_quality_spin.value())
         settings.setValue("nina_liveview_size", self.liveview_size_combo.currentText())
+        activity_width, activity_height = self.sequence_panel.activity_sizes()
+        settings.setValue("nina_sequence_activity_width", activity_width)
+        settings.setValue("nina_sequence_activity_height", activity_height)
 
         settings.sync()
 
@@ -2254,6 +2607,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         # AF state is rebuilt from the event backlog on connect
         self._autofocus_running = False
         self._autofocus_stale_timer.stop()
+        # Select the sequence's current target again once connected
+        self._sequence_container_names = None
+        self._livestack_followed_target = None
+        # The new worker reloads the recent thumbnails
+        self.image_history_list.clear()
 
         self.connection_label.setText("Connection: Connecting...")
         themed_style(self.connection_label, lambda: f"color: {COLORS['info']};")
@@ -2276,6 +2634,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.worker.autofocus_report.connect(self._on_autofocus_report)
         self.worker.error_occurred.connect(self._on_error)
         self.worker.history_thumbnail.connect(self._on_history_thumbnail)
+        self.worker.history_reset.connect(self.image_history_list.clear)
+        self.worker.sequence_updated.connect(self._on_sequence_updated)
+        self.worker.set_sequence_active(self.sequence_dock.isVisible())
         self._apply_image_settings_to_worker()
         self.worker.start()
 
@@ -2323,6 +2684,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.mount_park_btn.setEnabled(False)
             self.mount_unpark_btn.setEnabled(False)
             self.mount_slew_btn.setEnabled(False)
+        self._update_sequence_buttons()
 
     def _on_status_updated(self, status_data):
         """Handle status update from worker."""
@@ -2954,6 +3316,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         if is_running:
             # Update comboboxes if available stacks changed
             self._update_livestack_combos(available_stacks, status)
+            self._follow_sequence_target()
 
             # Update livestack tab with indicator
             self.image_tabs.setTabText(2, "Live Stack *")
@@ -3020,6 +3383,46 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.livestack_filter_combo.clear()
             self._livestack_available_stacks = []
             self._updating_livestack_combos = False
+            # Select the sequence's target again when stacking restarts
+            self._livestack_followed_target = None
+            if self._sequence_container_names:
+                self._livestack_follow_pending = self._sequence_container_names[::-1]
+
+    def _follow_sequence_target(self):
+        """Select the sequence's current target in the Live Stack target list.
+
+        Runs after the sequence moves to another container; waits until that
+        target has a stack. A target picked by hand stays selected until the
+        sequence moves to a different target.
+        """
+        stacks = self._livestack_available_stacks
+        if not self._livestack_follow_pending or not stacks:
+            return
+        targets = {s.get('Target') for s in stacks}
+        # Match the deepest running container that has a stack (a target sits
+        # inside 'Targets', and may hold loop containers of its own)
+        target = next((n for n in self._livestack_follow_pending if n in targets), None)
+        if target is None:
+            return  # No stack for it yet; try again when the stacks update
+        self._livestack_follow_pending = None
+        if target == self._livestack_followed_target:
+            return  # Same target (e.g. only an inner loop changed); keep the user's choice
+        self._livestack_followed_target = target
+        if self.livestack_target_combo.currentText() == target:
+            return
+
+        # Keep the selected filter if the new target has it, else prefer RGB
+        filters = [s.get('Filter') for s in stacks if s.get('Target') == target and s.get('Filter')]
+        filter_name = self.livestack_filter_combo.currentText()
+        if filter_name not in filters:
+            filter_name = 'RGB' if 'RGB' in filters else (filters[0] if filters else filter_name)
+
+        self._updating_livestack_combos = True
+        self.livestack_target_combo.setCurrentText(target)
+        self.livestack_filter_combo.setCurrentText(filter_name)
+        self._updating_livestack_combos = False
+        logger.debug(f"Live stack following sequence target: {target} ({filter_name})")
+        self._on_livestack_selection_changed()
 
     def _update_livestack_combos(self, available_stacks, status):
         """Update the livestack target and filter comboboxes."""
@@ -3373,6 +3776,264 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 color_key = item.data(self.EVENT_COLOR_ROLE) if item else None
                 if color_key:
                     item.setForeground(QColor(COLORS[color_key]))
+
+    SEQUENCE_ITEM_ROLE = Qt.UserRole + 1  # {'key', 'kind', 'status'} of a sequence tree item
+
+    def _on_sequence_dock_visibility(self, visible):
+        """Poll the sequence only while its dock is shown (not closed or behind another tab)."""
+        if self.worker:
+            self.worker.set_sequence_active(visible)
+
+    def _on_sequence_updated(self, entries, error):
+        """Refresh the sequence tree and current activity from /sequence/json."""
+        if entries is None:
+            # Request failed; keep showing the last sequence
+            self._set_sequence_activity_row('status', f"Not updating: {error}", 'warning')
+            return
+        if not entries:
+            self._sequence_state = 'none'
+            self._update_sequence_buttons()
+            self.sequence_tree.clear()
+            self._sequence_running_key = None
+            self._set_sequence_activity_row('status', error or "No sequence loaded", 'warning')
+            for key in ('container', 'now', 'loop', 'next'):
+                self._set_sequence_activity_row(key, None)
+            return
+
+        # Global triggers get their own branch, like NINA's sequencer
+        roots = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if 'GlobalTriggers' in entry:
+                if entry['GlobalTriggers']:
+                    roots.append(('item', {'Name': "Global Triggers", 'Status': '',
+                                           'Triggers': entry['GlobalTriggers']}))
+            else:
+                roots.append(('item', entry))
+
+        self.sequence_tree.setUpdatesEnabled(False)
+        running = []  # (path key, item) of each RUNNING tree item, outermost first
+        self._sync_sequence_children(self.sequence_tree.invisibleRootItem(), roots, "", running)
+        self.sequence_tree.setUpdatesEnabled(True)
+
+        # Follow the current instruction as the sequence advances
+        running_key, running_item = running[-1] if running else (None, None)
+        if running_key != self._sequence_running_key:
+            self._sequence_running_key = running_key
+            if running_item is not None:
+                # Scroll vertically only; scrollToItem would also pan to the item's indent
+                h_bar = self.sequence_tree.horizontalScrollBar()
+                h_value = h_bar.value()
+                self.sequence_tree.scrollToItem(running_item, QAbstractItemView.EnsureVisible)
+                h_bar.setValue(h_value)
+
+        activity = sequence_activity(entries)
+        self._update_sequence_activity(activity)
+        self._sequence_state = activity['state']
+        self._update_sequence_buttons()
+
+        # When the sequence moves to another container (e.g. the next target),
+        # have the Live Stack tab follow it
+        names = tuple(sequence_display_name(e, 'item') for e in activity['path'] if 'Items' in e)
+        if names and names != self._sequence_container_names:
+            self._livestack_follow_pending = names[::-1]  # Deepest container first
+        self._sequence_container_names = names
+        self._follow_sequence_target()
+
+    def _sync_sequence_children(self, parent, children, parent_key, running):
+        """Update parent's child items to match children in place, keeping expansion and scroll."""
+        for index, (kind, entry) in enumerate(children):
+            name = sequence_display_name(entry, kind)
+            # A string, since item data turns tuples into lists
+            key = f"{parent_key}{kind}:{name}"
+            status = entry.get('Status') or ''
+
+            item = parent.child(index)
+            info = item.data(0, self.SEQUENCE_ITEM_ROLE) if item is not None else None
+            if not info or info['key'] != key:
+                # New entry, or the sequence changed shape here: replace it
+                if item is not None:
+                    parent.takeChild(index)
+                item = QTreeWidgetItem()
+                parent.insertChild(index, item)
+                info = None
+            previous_status = info['status'] if info else None
+
+            details = sequence_entry_details(entry, kind)
+            item.setText(0, name)
+            item.setText(1, status.capitalize() if status != 'CREATED' else "")
+            item.setText(2, details)
+            item.setToolTip(0, name)
+            item.setToolTip(2, details)
+            item.setData(0, self.SEQUENCE_ITEM_ROLE, {'key': key, 'kind': kind, 'status': status})
+            self._style_sequence_item(item, kind, status)
+            if status == 'RUNNING':
+                running.append((key, item))
+
+            grandchildren = sequence_children(entry) if kind == 'item' else []
+            self._sync_sequence_children(item, grandchildren, key, running)
+            if grandchildren:
+                # Open containers as they start and close them as they finish;
+                # otherwise leave the user's expand/collapse choices alone
+                if status == 'RUNNING' and previous_status != 'RUNNING':
+                    item.setExpanded(True)
+                elif previous_status == 'RUNNING' and status != 'RUNNING':
+                    item.setExpanded(False)
+                elif previous_status is None and not parent_key and status != 'FINISHED':
+                    item.setExpanded(True)  # Top-level containers start open
+
+        while parent.childCount() > len(children):
+            parent.takeChild(parent.childCount() - 1)
+
+    def _update_sequence_buttons(self):
+        """Enable Start when a loaded sequence isn't running, Stop while it runs."""
+        ready = self._connected and not self._sequence_command_busy
+        self.sequence_start_btn.setEnabled(ready and self._sequence_state in ('idle', 'finished'))
+        self.sequence_stop_btn.setEnabled(ready and self._sequence_state == 'running')
+
+    def _on_sequence_start(self):
+        """Check the sequence for issues, then start it."""
+        self._sequence_command_busy = True
+        self._update_sequence_buttons()
+        self.status_label.setText("Checking sequence...")
+        themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
+        host, port = NINAIntegration.get_settings()
+        self._run_in_background(lambda: NINAIntegration.get_sequence_issues(host, port),
+                                self._on_sequence_issues_checked)
+
+    def _on_sequence_issues_checked(self, issues):
+        """Confirm with the user if the sequence has issues, then send the start."""
+        if issues:
+            # The same issue repeats across many items (e.g. "Camera not connected"),
+            # so list each issue once with the items it affects
+            items_by_issue = {}
+            for name, issue in issues:
+                items = items_by_issue.setdefault(issue, [])
+                display_name = sequence_display_name({'Name': name}, 'item')
+                if display_name not in items:
+                    items.append(display_name)
+            shown = []
+            for issue, items in list(items_by_issue.items())[:10]:
+                more = f", +{len(items) - 4} more" if len(items) > 4 else ""
+                shown.append(f"• {issue} ({', '.join(items[:4])}{more})")
+            if len(items_by_issue) > len(shown):
+                shown.append(f"...and {len(items_by_issue) - len(shown)} more issues")
+            answer = QMessageBox.warning(
+                self, "Sequence Issues",
+                "NINA reports issues with this sequence:\n\n" + "\n".join(shown) +
+                "\n\nStart the sequence anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                self._sequence_command_busy = False
+                self._update_sequence_buttons()
+                self.status_label.setText("Sequence not started")
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+                return
+        # Validated here, so skip NINA's check: it would ask about issues in a dialog
+        # on the NINA computer. If the issues couldn't be read, let NINA validate.
+        skip_validation = issues is not None
+        host, port = NINAIntegration.get_settings()
+        self._run_in_background(
+            lambda: ("start", *NINAIntegration.start_sequence(host, port, skip_validation)),
+            self._on_sequence_command_done)
+
+    def _on_sequence_stop(self):
+        """Stop the running sequence after confirming."""
+        answer = QMessageBox.question(
+            self, "Stop Sequence",
+            "Stop the running sequence?\n\nAn exposure in progress will be aborted.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        self._sequence_command_busy = True
+        self._update_sequence_buttons()
+        host, port = NINAIntegration.get_settings()
+        self._run_in_background(lambda: ("stop", *NINAIntegration.stop_sequence(host, port)),
+                                self._on_sequence_command_done)
+
+    def _on_sequence_command_done(self, result):
+        """Report the result of a start/stop request and refresh the sequence."""
+        command, success, message = result
+        self._sequence_command_busy = False
+        if success:
+            self.status_label.setText(message or f"Sequence {command} sent")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+        else:
+            self.status_label.setText(f"Couldn't {command} the sequence: {message}")
+            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+        if self.worker:
+            self.worker.refresh_sequence()
+        self._update_sequence_buttons()
+
+    def _style_sequence_item(self, item, kind, status):
+        """Color a sequence row by status; conditions and triggers are muted and italic."""
+        status_key = SEQUENCE_STATUS_COLORS.get(status)
+        name_key = 'info' if status == 'RUNNING' else ('text_secondary' if kind != 'item' else status_key)
+        for col, color_key in ((0, name_key), (1, status_key), (2, 'text_secondary')):
+            item.setForeground(col, QColor(COLORS[color_key or 'text']))
+            font = item.font(col)
+            font.setBold(status == 'RUNNING')
+            font.setItalic(kind != 'item')
+            item.setFont(col, font)
+
+    def _recolor_sequence_tree(self):
+        """Apply the current theme's colors to the sequence tree."""
+        def recolor(parent):
+            for index in range(parent.childCount()):
+                item = parent.child(index)
+                info = item.data(0, self.SEQUENCE_ITEM_ROLE)
+                if info:
+                    self._style_sequence_item(item, info['kind'], info['status'])
+                recolor(item)
+        recolor(self.sequence_tree.invisibleRootItem())
+
+    def _set_sequence_activity_row(self, key, text, color_key=None):
+        """Show a Current Activity row with text (hidden when text is None)."""
+        title_label, value_label = self._sequence_activity_rows[key]
+        title_label.setVisible(text is not None)
+        value_label.setVisible(text is not None)
+        if text is not None:
+            value_label.setText(text)
+            # Restyle only on change; this runs on every sequence poll
+            if value_label.property("sequence_color") != (color_key or ""):
+                value_label.setProperty("sequence_color", color_key or "")
+                themed_style(value_label, lambda: f"color: {COLORS[color_key]};" if color_key else "")
+
+    def _update_sequence_activity(self, activity):
+        """Fill the Current Activity rows from sequence_activity()."""
+        def describe(entry, kind):
+            details = sequence_entry_details(entry, kind)
+            name = sequence_display_name(entry, kind)
+            return f"{name} — {details}" if details else name
+
+        state = activity['state']
+        path = activity['path']
+        if state == 'running':
+            self._set_sequence_activity_row('status', "Running", 'info')
+        elif state == 'finished':
+            self._set_sequence_activity_row('status', "Finished", 'success')
+        else:
+            self._set_sequence_activity_row('status', "Not running")
+
+        # Containers the current instruction sits in, e.g. "Targets › Bubble Nebula"
+        containers = [sequence_display_name(e, 'item') for e in path if 'Items' in e]
+        self._set_sequence_activity_row('container', " › ".join(containers) if containers else None)
+
+        if activity['trigger'] is not None:
+            now = f"{describe(activity['trigger'], 'trigger')} (trigger)"
+        elif path and 'Items' not in path[-1]:
+            now = describe(path[-1], 'item')
+        else:
+            now = None
+        self._set_sequence_activity_row('now', now)
+
+        loop = activity['loop']
+        self._set_sequence_activity_row('loop', describe(loop, 'condition') if loop else None)
+
+        next_entry = activity['next']
+        self._set_sequence_activity_row(
+            'next', describe(next_entry, 'item') if next_entry is not None and state == 'running' else None)
 
     def _on_cooling_changed(self, state):
         """Handle cooling checkbox change."""
