@@ -920,6 +920,48 @@ class NINAIntegration:
         return []
 
     @staticmethod
+    def solve_image(host, port, index, image_type='LIGHT'):
+        """
+        Plate-solve an image from NINA's history with NINA's own plate solver.
+
+        Args:
+            host: The hostname or IP address of the NINA instance
+            port: The API port number
+            index: Index into the image history filtered by image_type
+            image_type: History filter the index refers to (e.g. 'LIGHT')
+
+        Returns:
+            tuple: (solution, error). solution is NINA's result dict with
+                   'Coordinates' (RADegrees/DECDegrees), 'PositionAngle',
+                   'PixelScale', 'Radius' and 'Flipped', relative to the image
+                   as NINA displays it; None with error set on failure.
+        """
+        url = f"http://{host}:{port}/v2/api/image/{index}/solve?imageType={image_type}"
+        logger.debug(f"API Request: {url}")
+        try:
+            request = urllib.request.Request(url)
+            # Blocks while NINA solves
+            with urllib.request.urlopen(request, timeout=180) as response:
+                result = json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            try:
+                message = json.loads(e.read().decode('utf-8')).get('Error') or str(e)
+            except Exception:
+                message = str(e)
+            logger.debug(f"Plate solve of image {index} failed: {message}")
+            return None, message
+        except Exception as e:
+            logger.debug(f"Plate solve of image {index} failed: {e}")
+            return None, str(e)
+        solution = result.get('Response')
+        if not result.get('Success') or not isinstance(solution, dict):
+            return None, result.get('Error') or "Plate solve failed"
+        if not solution.get('Success', True):
+            return None, "NINA couldn't plate-solve the image"
+        logger.debug(f"Plate solve of image {index}: {solution}")
+        return solution, ""
+
+    @staticmethod
     def calculate_integration_from_history(history, target, stack_count):
         """
         Sum ExposureTime for the most recent stack_count LIGHT frames matching target.

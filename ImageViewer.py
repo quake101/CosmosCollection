@@ -1047,6 +1047,8 @@ class ImageViewerWindow(QDialog):
         # Draw annotations if enabled
         if self.annotations_enabled and self.annotation_renderer:
             logger.debug(f"Drawing annotations: zoom={self.zoom_factor}, pos=({x}, {y})")
+            # No labels for objects just outside the frame
+            painter.setClipRect(QRectF(x, y, img_w * self.zoom_factor, img_h * self.zoom_factor))
             self.annotation_renderer.render(painter, self.zoom_factor, x, y)
 
         painter.end()
@@ -1516,7 +1518,10 @@ class ImageViewerWindow(QDialog):
             ])]
 
             if header is not None:
-                sections.extend(build_header_sections(header, image_size, self._cached_wcs_header()))
+                cached_wcs = self._cached_wcs_header()
+                if cached_wcs and image_size:
+                    cached_wcs = self._wcs_for_display(cached_wcs, image_size[1])
+                sections.extend(build_header_sections(header, image_size, cached_wcs))
             else:
                 # Try to get EXIF data if available
                 exif_info = self._get_exif_info()
@@ -1547,6 +1552,37 @@ class ImageViewerWindow(QDialog):
                     f"<td style='color: {COLORS['text']};'>{value_html}</td></tr>")
         parts.append("</table>")
         return "".join(parts)
+
+    def _wcs_for_display(self, wcs_header, image_height):
+        """A plate solve's WCS with y running up the image as displayed.
+
+        ASTAP solves a FITS file with its rows in stored order (first row =
+        y 1, ignoring ROWORDER), and this viewer shows the first stored row at
+        the top, so FITS solutions are flipped. Solves of PNG/JPG (and XISF,
+        converted bottom-up before solving) already match the display.
+        """
+        if self.file_path and Path(self.file_path).suffix.lower() in FITS_EXTENSIONS:
+            from AnnotationOverlay import flip_wcs_rows
+            return flip_wcs_rows(wcs_header, image_height)
+        return wcs_header
+
+    def _release_catalog_worker(self):
+        """Let go of a running catalog lookup without destroying it.
+
+        Dropping the last reference to a running QThread destroys it mid-run,
+        which aborts the app - e.g. re-solving, or closing the viewer, while
+        the star/DSO lookup is still running.
+        """
+        worker = getattr(self, 'catalog_worker', None)
+        self.catalog_worker = None
+        if worker is None or not worker.isRunning():
+            return
+        worker.progress.disconnect()
+        worker.finished.disconnect()
+        _orphaned_workers.add(worker)
+        # CatalogQueryWorker.finished(stars, dsos) replaces QThread.finished and
+        # is emitted as run() ends, so wait for the thread to exit before dropping it
+        worker.finished.connect(lambda *_: (worker.wait(), _orphaned_workers.discard(worker)))
 
     def _cached_wcs_header(self):
         """WCS keywords from this image's plate solve - the loaded result, or
@@ -1858,9 +1894,12 @@ class ImageViewerWindow(QDialog):
         try:
             from AnnotationOverlay import AnnotationRenderer, CatalogQueryWorker
 
+            wcs_header = self._wcs_for_display(self.plate_solve_result.wcs_header,
+                                               self.original_pixmap.height())
+
             self.annotation_renderer = AnnotationRenderer()
             self.annotation_renderer.set_wcs(
-                self.plate_solve_result.wcs_header,
+                wcs_header,
                 self.original_pixmap.width(),
                 self.original_pixmap.height()
             )
@@ -1879,6 +1918,7 @@ class ImageViewerWindow(QDialog):
             self._update_status()
 
             # Query catalogs for objects
+            self._release_catalog_worker()
             self.catalog_worker = CatalogQueryWorker(
                 self.annotation_renderer.wcs,
                 magnitude_limit=8.0
@@ -1982,6 +2022,8 @@ class ImageViewerWindow(QDialog):
             worker.image_saved.disconnect()
             _orphaned_workers.add(worker)
             worker.finished.connect(lambda: _orphaned_workers.discard(worker))
+
+        self._release_catalog_worker()
 
         # Let a background change finish - destroying a running QThread crashes
         if self.background_worker and self.background_worker.isRunning():

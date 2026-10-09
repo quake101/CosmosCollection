@@ -239,6 +239,53 @@ def sequence_activity(entries):
     return {'state': state, 'path': path, 'trigger': trigger, 'loop': loop, 'next': next_entry}
 
 
+def nina_solution_to_wcs_header(solution, width, height):
+    """Build a TAN WCS header for an image of width x height display pixels from
+    a NINA plate-solve result, for AnnotationOverlay.
+
+    NINA reports the solve relative to the image as it displays it: the field
+    center, PositionAngle, Flipped and the field Radius (half the diagonal, in
+    degrees). The live stack is shown the same way up, just resized, so the
+    display pixel scale follows from the radius and this image's diagonal.
+
+    This inverts NINA's ASTAPSolver/WorldCoordinateSystem conversion. NINA
+    solves a FITS copy whose first row is the top of the displayed image, so
+    its CD matrix has y increasing downward; from it NINA derives
+        PositionAngle = 360 - (Rotation - 180), Flipped = not wcs_flipped
+    (PositionAngle 0, not flipped = North up, East left). AnnotationOverlay
+    uses standard FITS y (increasing upward from the bottom row), so the y
+    column of the CD matrix is negated at the end.
+
+    Returns the header dict, or None if the solution lacks what's needed.
+    """
+    coords = solution.get('Coordinates') or {}
+    ra, dec = coords.get('RADegrees'), coords.get('DECDegrees')
+    position_angle = solution.get('PositionAngle')
+    if not all(isinstance(v, (int, float)) for v in (ra, dec, position_angle)) or width <= 0 or height <= 0:
+        return None
+
+    radius = solution.get('Radius')
+    if isinstance(radius, (int, float)) and radius > 0:
+        scale = 2 * radius / math.hypot(width, height)  # degrees per display pixel
+    else:
+        return None
+
+    rotation = math.radians((540 - position_angle) % 360)  # NINA's wcs.Rotation
+    cos_r, sin_r = math.cos(rotation), math.sin(rotation)
+    if not solution.get('Flipped'):
+        # NINA's wcs was flipped (positive determinant)
+        cd1_1, cd1_2, cd2_1, cd2_2 = scale * cos_r, -scale * sin_r, scale * sin_r, scale * cos_r
+    else:
+        cd1_1, cd1_2, cd2_1, cd2_2 = -scale * cos_r, -scale * sin_r, -scale * sin_r, scale * cos_r
+
+    return {
+        'CRVAL1': ra, 'CRVAL2': dec,
+        'CRPIX1': (width + 1) / 2, 'CRPIX2': (height + 1) / 2,
+        # y flipped from NINA's downward rows to FITS' upward rows
+        'CD1_1': cd1_1, 'CD1_2': -cd1_2, 'CD2_1': cd2_1, 'CD2_2': -cd2_2,
+    }
+
+
 # A failed/cancelled autofocus never emits AUTOFOCUS-FINISHED; treat a run with no
 # AF events for this long as ended. Points normally arrive every ~15-30 seconds.
 AUTOFOCUS_STALE_SECONDS = 180
@@ -256,6 +303,7 @@ class ZoomableImageWidget(QWidget):
         self._pan_offset = QPointF(0, 0)
         self._last_mouse_pos = None
         self._placeholder_text = placeholder_text
+        self._overlay = None  # AnnotationRenderer drawn over the image, in image pixels
 
         self.setMinimumSize(200, 150)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -273,6 +321,15 @@ class ZoomableImageWidget(QWidget):
     def setPlaceholderText(self, text):
         """Set the placeholder text shown when no image is loaded."""
         self._placeholder_text = text
+        self.update()
+
+    def pixmapSize(self):
+        """Size of the displayed image (QSize; empty when there's none)."""
+        return self._pixmap.size() if self._pixmap and not self._pixmap.isNull() else QSize()
+
+    def setOverlay(self, renderer):
+        """Draw an AnnotationRenderer over the image (None to remove it)."""
+        self._overlay = renderer
         self.update()
 
     def _reset_view(self):
@@ -320,6 +377,13 @@ class ZoomableImageWidget(QWidget):
         target_rect = QRectF(x, y, scaled_width, scaled_height)
         source_rect = QRectF(0, 0, self._pixmap.width(), self._pixmap.height())
         painter.drawPixmap(target_rect, self._pixmap, source_rect)
+
+        # Annotations follow the image's zoom and pan
+        if self._overlay is not None and self._overlay.wcs is not None:
+            painter.save()
+            painter.setClipRect(target_rect)  # No labels for objects just outside the frame
+            self._overlay.render(painter, effective_zoom, x, y)
+            painter.restore()
 
         # Draw zoom indicator if zoomed
         if self._zoom != 1.0:
@@ -2088,6 +2152,17 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.livestack_filter_combo.currentIndexChanged.connect(self._on_livestack_selection_changed)
         selection_layout.addWidget(self.livestack_filter_combo)
 
+        self.livestack_annotations_check = QCheckBox("Annotations")
+        self.livestack_annotations_check.setToolTip(
+            "Label stars, deep-sky objects and the coordinate grid on the live stack.\n"
+            "NINA plate-solves the stack's first frame once per stack.\n"
+            "Which layers show is set in the image viewer's Annotations dialog.")
+        self.livestack_annotations_check.toggled.connect(self._on_livestack_annotations_toggled)
+        selection_layout.addWidget(self.livestack_annotations_check)
+        self.livestack_annotations_status = QLabel("")
+        themed_style(self.livestack_annotations_status, lambda: f"color: {COLORS['text_secondary']};")
+        selection_layout.addWidget(self.livestack_annotations_status)
+
         selection_layout.addStretch()
         livestack_layout.addLayout(selection_layout, 0)
 
@@ -2124,6 +2199,14 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._sequence_container_names = None
         self._livestack_follow_pending = None
         self._livestack_followed_target = None
+        # Live stack annotations: the (target, filter) stack they're for, its frame
+        # count (a drop means the stack restarted), and NINA's plate solve of it
+        self._ls_annot_key = None
+        self._ls_annot_count = None
+        self._ls_annot_solution = None
+        self._ls_annot_solving = False
+        self._ls_annot_renderer = None
+        self._ls_annot_catalog_workers = []  # Kept referenced until their threads exit
 
         self.livestack_label = ZoomableImageWidget(placeholder_text="Live stack not active")
         livestack_layout.addWidget(self.livestack_label, 1)
@@ -2500,6 +2583,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.liveview_size_combo.setCurrentText(liveview_size)
         self._restoring_settings = False
 
+        self.livestack_annotations_check.setChecked(
+            settings.value("nina_livestack_annotations", False, type=bool))
+
         self.sequence_panel.set_activity_sizes(
             settings.value("nina_sequence_activity_width", SequencePanel.DEFAULT_ACTIVITY_WIDTH, type=int),
             settings.value("nina_sequence_activity_height", SequencePanel.DEFAULT_ACTIVITY_HEIGHT, type=int),
@@ -2585,6 +2671,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         settings.setValue("nina_livestack_size", self.livestack_size_combo.currentText())
         settings.setValue("nina_liveview_quality", self.liveview_quality_spin.value())
         settings.setValue("nina_liveview_size", self.liveview_size_combo.currentText())
+        settings.setValue("nina_livestack_annotations", self.livestack_annotations_check.isChecked())
         activity_width, activity_height = self.sequence_panel.activity_sizes()
         settings.setValue("nina_sequence_activity_width", activity_width)
         settings.setValue("nina_sequence_activity_height", activity_height)
@@ -3343,6 +3430,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                            or status.get('RedStackCount')
                            or status.get('GreenStackCount')
                            or status.get('BlueStackCount'))
+            self._update_livestack_annotations(target, filter_name, stack_count)
             if target and filter_name:
                 info_text = f"{target} - {filter_name}"
                 if stack_count is not None:
@@ -3377,6 +3465,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.livestack_info_label.setText("")
             # Reset integration cache so the next session recalculates from scratch
             self._total_integration_by_target.clear()
+            self._reset_livestack_annotations()
             # Clear comboboxes when not running
             self._updating_livestack_combos = True
             self.livestack_target_combo.clear()
@@ -3423,6 +3512,159 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._updating_livestack_combos = False
         logger.debug(f"Live stack following sequence target: {target} ({filter_name})")
         self._on_livestack_selection_changed()
+
+    def _on_livestack_annotations_toggled(self, enabled):
+        """Show or hide the live stack annotations, solving the stack if needed."""
+        if not enabled:
+            self.livestack_label.setOverlay(None)
+            self.livestack_annotations_status.setText("")
+            return
+        if self._ls_annot_renderer is not None:
+            self._apply_livestack_annotation_layers()
+            self._sync_livestack_annotation_wcs()
+            self.livestack_label.setOverlay(self._ls_annot_renderer)
+            self._show_livestack_annotation_count()
+        elif self._ls_annot_key is not None:
+            self._start_livestack_solve()
+        else:
+            self.livestack_annotations_status.setText("Waiting for the live stack")
+
+    def _reset_livestack_annotations(self):
+        """Forget the current stack's plate solve (live stacking stopped or restarted)."""
+        self._ls_annot_key = None
+        self._ls_annot_count = None
+        self._ls_annot_solution = None
+        self._ls_annot_renderer = None
+        self.livestack_label.setOverlay(None)
+        if self.livestack_annotations_check.isChecked():
+            self.livestack_annotations_status.setText("Waiting for the live stack")
+
+    def _update_livestack_annotations(self, target, filter_name, stack_count):
+        """Keep the annotations matched to the live stack being shown.
+
+        Solves once per stack: again only when another target/filter is shown
+        or the stack restarts (its frame count drops).
+        """
+        if not target or not filter_name:
+            return
+        key = (target, filter_name)
+        restarted = (isinstance(stack_count, (int, float)) and isinstance(self._ls_annot_count, (int, float))
+                     and stack_count < self._ls_annot_count)
+        if key != self._ls_annot_key or restarted:
+            self._reset_livestack_annotations()
+            self._ls_annot_key = key
+        if stack_count:
+            self._ls_annot_count = stack_count
+
+        if not self.livestack_annotations_check.isChecked():
+            return
+        if self._ls_annot_renderer is not None:
+            self._sync_livestack_annotation_wcs()  # The stack image may have changed size
+        elif not self._ls_annot_solving and self._ls_annot_count:
+            self._start_livestack_solve()
+
+    def _start_livestack_solve(self):
+        """Have NINA plate-solve the first frame of the shown stack."""
+        if self._ls_annot_solving or self._ls_annot_key is None:
+            return
+        key, stack_count = self._ls_annot_key, self._ls_annot_count or 1
+        self._ls_annot_solving = True
+        self.livestack_annotations_status.setText("Plate solving...")
+        host, port = NINAIntegration.get_settings()
+
+        def solve():
+            # LIGHT history is oldest first; the stack's frames are the target's
+            # most recent stack_count frames, aligned to the first of them
+            history = NINAIntegration.get_all_image_history(host, port)
+            target, filter_name = key
+            frames = [i for i, image in enumerate(history)
+                      if str(image.get('TargetName', '')).casefold() == target.casefold()]
+            # Mono stacks are per filter; one-shot color stacks (RGB, R_OSC, ...) aren't
+            same_filter = [i for i in frames if history[i].get('Filter') == filter_name]
+            frames = same_filter or frames
+            if not frames:
+                return key, None, f"No {target} frames in NINA's image history"
+            index = frames[-int(stack_count)] if len(frames) >= stack_count else frames[0]
+            solution, error = NINAIntegration.solve_image(host, port, index, 'LIGHT')
+            return key, solution, error
+
+        self._run_in_background(solve, self._on_livestack_solved)
+
+    def _on_livestack_solved(self, result):
+        """Set up the annotations from NINA's plate solve and look up the objects in view."""
+        key, solution, error = result
+        self._ls_annot_solving = False
+        if key != self._ls_annot_key:
+            # The live stack moved on to another target/filter while solving
+            if self.livestack_annotations_check.isChecked() and self._ls_annot_key is not None:
+                self._start_livestack_solve()
+            return
+        if solution is None:
+            self.livestack_annotations_status.setText(f"Plate solve failed: {error}")
+            return
+
+        from AnnotationOverlay import AnnotationRenderer, CatalogQueryWorker
+        self._ls_annot_solution = solution
+        renderer = AnnotationRenderer()
+        self._ls_annot_renderer = renderer
+        self._apply_livestack_annotation_layers()
+        if not self._sync_livestack_annotation_wcs():
+            self.livestack_annotations_status.setText("Plate solve result incomplete")
+            self._ls_annot_renderer = None
+            return
+
+        self.livestack_annotations_status.setText("Looking up objects...")
+        worker = CatalogQueryWorker(renderer.wcs, magnitude_limit=8.0)
+        # (CatalogQueryWorker's finished(stars, dsos) replaces QThread.finished)
+        worker.finished.connect(
+            lambda stars, dsos: self._on_livestack_catalog_done(worker, renderer, stars, dsos))
+        self._ls_annot_catalog_workers.append(worker)
+        worker.start()
+
+    def _on_livestack_catalog_done(self, worker, renderer, stars, dsos):
+        """Show the annotations once the catalog lookup finishes."""
+        # finished is emitted as run() ends; let the thread exit before dropping it
+        worker.wait(2000)
+        if worker in self._ls_annot_catalog_workers:
+            self._ls_annot_catalog_workers.remove(worker)
+        if renderer is not self._ls_annot_renderer:
+            return  # A newer solve replaced it
+        renderer.set_objects(stars, dsos)
+        if self.livestack_annotations_check.isChecked():
+            self.livestack_label.setOverlay(renderer)
+            self._show_livestack_annotation_count()
+
+    def _show_livestack_annotation_count(self):
+        renderer = self._ls_annot_renderer
+        if renderer is not None:
+            self.livestack_annotations_status.setText(
+                f"{len(renderer.dsos)} objects, {len(renderer.stars)} stars")
+
+    def _sync_livestack_annotation_wcs(self):
+        """Fit the plate solution to the displayed stack image's size."""
+        renderer, solution = self._ls_annot_renderer, self._ls_annot_solution
+        size = self.livestack_label.pixmapSize()
+        if renderer is None or solution is None or size.isEmpty():
+            return False
+        if renderer.wcs is not None and (renderer.wcs.width, renderer.wcs.height) == (size.width(), size.height()):
+            return True
+        header = nina_solution_to_wcs_header(solution, size.width(), size.height())
+        if header is None:
+            return False
+        renderer.set_wcs(header, size.width(), size.height())
+        self.livestack_label.update()
+        return True
+
+    def _apply_livestack_annotation_layers(self):
+        """Use the layers chosen in the image viewer's Annotations dialog."""
+        renderer = self._ls_annot_renderer
+        if renderer is None:
+            return
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        renderer.show_dsos = settings.value("annotation_show_dsos", True, type=bool)
+        renderer.show_stars = settings.value("annotation_show_stars", True, type=bool)
+        renderer.show_constellation_lines = settings.value("annotation_show_constellations", True, type=bool)
+        renderer.show_grid = settings.value("annotation_show_grid", True, type=bool)
 
     def _update_livestack_combos(self, available_stacks, status):
         """Update the livestack target and filter comboboxes."""

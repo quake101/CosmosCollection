@@ -173,6 +173,35 @@ class WCSTransform:
         return min(ras), max(ras), min(decs), max(decs)
 
 
+def flip_wcs_rows(wcs_header: Dict[str, Any], image_height: int) -> Dict[str, Any]:
+    """Return a copy of a WCS header with its y axis reversed.
+
+    ASTAP numbers a FITS file's rows in stored order (first row = y 1) and
+    ignores ROWORDER, and FITS images are displayed with the first stored row
+    at the top. WCSTransform expects y to count up from the bottom displayed
+    row, as in ASTAP's solutions of PNG/JPG images, so FITS solutions need
+    their y axis reversed before use.
+    """
+    flipped = dict(wcs_header)
+    if 'CRPIX2' in wcs_header:
+        flipped['CRPIX2'] = image_height + 1 - wcs_header['CRPIX2']
+    # Reversing y negates the matrix's y column. With a PC matrix CDELTn scales
+    # rows, so the PC column is negated rather than CDELT2.
+    if 'CD1_1' in wcs_header or 'CD2_2' in wcs_header:
+        column = {'CD1_2': 0.0, 'CD2_2': 0.0}
+    elif any(key.startswith('PC') for key in wcs_header):
+        column = {'PC1_2': 0.0, 'PC2_2': 1.0}  # Missing PC terms default to the identity
+    else:
+        column = {'CDELT2': 1.0}  # CDELT/CROTA2 form: CDELT2 only appears in the y column
+    for key, default in column.items():
+        flipped[key] = -float(wcs_header.get(key, default))
+    return flipped
+
+
+# SIMBAD object types containing '*' that are groups of stars, not stars
+NON_STAR_OTYPES = {'Cl*', 'As*', 'St*', 'MGr', '**?'}
+
+
 class CatalogQueryWorker(QThread):
     """Background worker for querying star/DSO catalogs"""
 
@@ -218,36 +247,47 @@ class CatalogQueryWorker(QThread):
             # Query bright stars
             coord = SkyCoord(ra=ra, dec=dec, unit='deg')
             simbad = Simbad()
-            simbad.add_votable_fields('flux(V)', 'ids')
+            simbad.add_votable_fields('flux(V)', 'ids', 'otype')
 
             logger.info(f"Querying SIMBAD for stars at RA={ra:.2f}, Dec={dec:.2f}, radius={radius:.2f}")
             result = simbad.query_region(coord, radius=radius * u.deg)
 
             if result is not None:
                 logger.info(f"SIMBAD returned {len(result)} objects, columns: {result.colnames}")
+                # astroquery 0.4.8+ returns lowercase columns (main_id, ra, dec in degrees);
+                # older versions MAIN_ID, RA/DEC as sexagesimal strings
+                columns = {name.lower(): name for name in result.colnames}
+                mag_column = columns.get('flux_v') or columns.get('v')
                 processed = 0
                 skipped_mag = 0
                 for row in result:
                     try:
-                        # Check for magnitude in different column names (SIMBAD varies)
-                        mag = None
-                        if 'FLUX_V' in result.colnames:
-                            mag = row['FLUX_V']
-                        elif 'V' in result.colnames:
-                            mag = row['V']
+                        mag = row[mag_column] if mag_column else None
 
                         # Skip if no magnitude or too faint
                         if mag is None or (hasattr(mag, 'mask') and mag.mask) or mag > self.magnitude_limit:
                             skipped_mag += 1
                             continue
 
-                        ra_obj = row['RA']
-                        dec_obj = row['DEC']
+                        # Galaxies and nebulae have V magnitudes too; they're labeled
+                        # from the DSO catalog. SIMBAD star types all contain '*'
+                        # (except groupings of stars).
+                        otype = row[columns['otype']] if 'otype' in columns else '*'
+                        if isinstance(otype, bytes):
+                            otype = otype.decode('utf-8')
+                        if '*' not in str(otype) or str(otype) in NON_STAR_OTYPES:
+                            continue
+
+                        ra_obj = row[columns['ra']]
+                        dec_obj = row[columns['dec']]
 
                         # Parse coordinates
-                        coord_obj = SkyCoord(ra_obj, dec_obj, unit=(u.hourangle, u.deg))
+                        if isinstance(ra_obj, (str, bytes)):
+                            coord_obj = SkyCoord(ra_obj, dec_obj, unit=(u.hourangle, u.deg))
+                        else:
+                            coord_obj = SkyCoord(float(ra_obj), float(dec_obj), unit='deg')
 
-                        name = row['MAIN_ID']
+                        name = row[columns['main_id']]
                         if isinstance(name, bytes):
                             name = name.decode('utf-8')
 
