@@ -932,7 +932,7 @@ class NINAIntegration:
 
         Returns:
             tuple: (solution, error). solution is NINA's result dict with
-                   'Coordinates' (RADegrees/DECDegrees), 'PositionAngle',
+                   'Coordinates' (RADegrees, and Dec in degrees), 'PositionAngle',
                    'PixelScale', 'Radius' and 'Flipped', relative to the image
                    as NINA displays it; None with error set on failure.
         """

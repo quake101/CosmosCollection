@@ -258,7 +258,9 @@ def nina_solution_to_wcs_header(solution, width, height):
     Returns the header dict, or None if the solution lacks what's needed.
     """
     coords = solution.get('Coordinates') or {}
-    ra, dec = coords.get('RADegrees'), coords.get('DECDegrees')
+    # The API docs say DECDegrees, but NINA sends Dec (already in degrees)
+    ra = coords.get('RADegrees')
+    dec = coords.get('DECDegrees', coords.get('Dec'))
     position_angle = solution.get('PositionAngle')
     if not all(isinstance(v, (int, float)) for v in (ra, dec, position_angle)) or width <= 0 or height <= 0:
         return None
