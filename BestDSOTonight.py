@@ -10,10 +10,12 @@ import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMutex, QSettings
+from PySide6.QtCore import QTime
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
-                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QMenu, QCheckBox, QApplication)
+                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QMenu, QCheckBox, QApplication,
+                               QTimeEdit)
 
 from astropy import units as u
 from astropy.time import Time
@@ -31,6 +33,42 @@ from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, adapt_color, font_px, theme_manager, themed_style, tint
 from TimeFormatHelper import format_time, format_datetime
 from NINAIntegration import NINAIntegration
+
+
+# The "Time:" choice - same options as the Target List's "Direction at:"
+TIME_SETTING = "BestDSOTonight/time"  # "mode|at|from|to", times as HH:MM
+TIME_DEFAULT = ("night", "22:00", "01:00", "02:00")
+
+
+def load_time_choice():
+    """(mode, at, from, to) saved for the Time dropdown."""
+    from DSOTargetList import DIRECTION_MODES
+    settings = QSettings("CosmosCollection", "CosmosCollection")
+    parts = (settings.value(TIME_SETTING, "", type=str) or "").split("|")
+    if len(parts) != 4 or parts[0] not in dict(DIRECTION_MODES):
+        return TIME_DEFAULT
+    return tuple(parts)
+
+
+def resolve_time_window(time_choice, location, timezone_name):
+    """(start, end, note, times) of the chosen time: local datetimes - start ==
+    end for a single moment - and the labeled times the Direction column is for
+    ([("Dusk", ...), ("Dawn", ...)] etc.). Always the coming night (or the
+    current one before dawn)."""
+    from DSOTargetList import resolve_direction_times, local_zone
+    mode, at, start, end = time_choice
+    times, note = resolve_direction_times(mode, at, start, end, location, local_zone(timezone_name))
+    return times[0][1], times[-1][1], note, times
+
+
+def describe_time_window(mode, start, end):
+    """'tonight (20:40 \u2192 06:10)', '01:00 \u2192 02:00', 'at midnight'... for status text."""
+    if start == end:
+        names = {"now": f"right now ({start:%H:%M})", "dusk": f"at dusk ({start:%H:%M})",
+                 "midnight": "at midnight", "dawn": f"at dawn ({start:%H:%M})"}
+        return names.get(mode, f"at {start:%H:%M}")
+    span = f"{start:%H:%M} \u2192 {end:%H:%M}"
+    return f"tonight ({span})" if mode == "night" else span
 
 
 def _get_available_catalogs():
@@ -92,7 +130,7 @@ class DSOCalculationThread(QThread):
     # Altitude during dark sky but never rises above the custom horizon
     BLOCKED_BY_HORIZON = object()
 
-    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None, use_target_list=False, start_hour=18, duration_hours=12, use_horizon=False, hide_completed=False):
+    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None, use_target_list=False, time_choice=TIME_DEFAULT, use_horizon=False, hide_completed=False):
         super().__init__()
         self.min_altitude = min_altitude
         self.max_magnitude = max_magnitude
@@ -102,8 +140,15 @@ class DSOCalculationThread(QThread):
         self.use_target_list = use_target_list
         # Skip target list entries whose status is "Completed"
         self.hide_completed = hide_completed
-        self.start_hour = start_hour
-        self.duration_hours = duration_hours
+        # (mode, at, from, to) - resolved to window_start/window_end in run()
+        self.time_choice = time_choice
+        self.time_mode = time_choice[0]
+        # A custom time frame lists only objects up for the whole frame ("best
+        # viewed from 1am-2am"); Tonight lists anything up at some point
+        self.whole_window = self.time_mode == "frame"
+        self.window_start = self.window_end = None
+        self.window_note = ""
+        self.window_times = []  # [(label, local datetime)] for the Direction column
         # Number of DSOs that would be visible but are entirely below the
         # custom horizon - set by run() before result_ready is emitted
         self.blocked_by_horizon = 0
@@ -163,154 +208,101 @@ class DSOCalculationThread(QThread):
             pass
         return pytz.UTC
 
+    def _window_sampling(self):
+        """(start Time, duration hours, samples per hour) covering the chosen time.
+
+        A single moment is one sample; frames up to 3 hours are sampled every
+        5 minutes (so "up for the whole of 1am-2am" is checked closely), longer
+        ones every 15 minutes as before.
+        """
+        hours = (self.window_end - self.window_start).total_seconds() / 3600
+        start = Time(self.window_start.astimezone(pytz.UTC).replace(tzinfo=None))
+        if hours <= 0:
+            return start, 0.25, 4  # linspace(0, 0.25, 1) -> just the start
+        return start, hours, 12 if hours <= 3 else 4
+
+    def _qualifies(self, visible):
+        """Whether a per-sample visibility mask passes the time rule."""
+        if not np.any(visible):
+            return False
+        return bool(np.all(visible)) if self.whole_window else True
+
+    def _visibility_result(self, dso_info, dso_coord, time_range, dso_altaz, visible, samples_per_hour):
+        """Result dict for a qualifying DSO: its altitude, time visible, and best time."""
+        altitudes = dso_altaz.alt.deg
+        indices = np.where(visible)[0]
+        if self.time_mode == "night":
+            best_idx = indices[len(indices) // 2]  # Middle of its time up tonight
+        else:
+            best_idx = indices[int(np.argmax(altitudes[indices]))]  # Highest within the chosen time
+        single_moment = len(altitudes) == 1
+        best_time_utc = time_range[best_idx].datetime.replace(tzinfo=pytz.UTC)
+        return {
+            "dso_info": dso_info,
+            "max_altitude": np.max(altitudes[visible]),
+            "visible_hours": None if single_moment else float(np.sum(visible)) / samples_per_hour,
+            "optimal_time": best_time_utc.astimezone(self.local_tz),
+            "optimal_altitude": altitudes[best_idx],
+            "optimal_azimuth": dso_altaz.az.deg[best_idx],
+            "coordinates": dso_coord
+        }
+
     def calculate_tonight_visibility(self, dso_info):
-        """Calculate visibility for a DSO tonight using centralized calculator with coordinates"""
+        """Calculate visibility for a DSO in the chosen time using the centralized calculator"""
         try:
             if self.calculator is None:
                 # Fallback to original method if centralized calculator not available
                 return self._calculate_tonight_visibility_fallback(dso_info)
-            
-            # Build start datetime from user-specified start hour
-            now = datetime.now(self.local_tz)
-            start_datetime = now.replace(hour=self.start_hour, minute=0, second=0, microsecond=0)
 
-            # Convert to astropy Time object (in UTC)
-            start_datetime_utc = start_datetime.astimezone(pytz.UTC).replace(tzinfo=None)
-            start_time = Time(start_datetime_utc)
-
-            # Use coordinate-based calculation for reliability (avoids name resolution issues)
-            from astropy.coordinates import SkyCoord
-            import astropy.units as u
-
-            # Create coordinate object from DSO data
+            # Coordinate-based calculation for reliability (avoids name resolution issues)
             dso_coord = SkyCoord(ra=dso_info["ra_deg"] * u.deg, dec=dso_info["dec_deg"] * u.deg)
-
-            # Use coordinate-based calculation with user-specified duration
+            start_time, duration, samples_per_hour = self._window_sampling()
             time_range, dso_altaz, sun_altaz = self.calculator.calculate_altaz_over_time(
-                dso_coord, start_time, self.duration_hours)
-            
-            # Find optimal viewing times using same criteria
-            optimal_times = self.calculator.find_optimal_viewing_times(
+                dso_coord, start_time, duration, samples_per_hour)
+
+            visible = self.calculator.find_optimal_viewing_times(
                 dso_altaz, sun_altaz, self.min_altitude, horizon=self.horizon)
-
-            # Note DSOs hidden only by the custom horizon, for the status line
-            if self.horizon is not None and not np.any(optimal_times):
-                if np.any(self.calculator.find_optimal_viewing_times(dso_altaz, sun_altaz, self.min_altitude)):
+            if not self._qualifies(visible):
+                # Note DSOs hidden only by the custom horizon, for the status line
+                if self.horizon is not None and self._qualifies(
+                        self.calculator.find_optimal_viewing_times(dso_altaz, sun_altaz, self.min_altitude)):
                     return self.BLOCKED_BY_HORIZON
+                return None
+            return self._visibility_result(dso_info, dso_coord, time_range, dso_altaz, visible, samples_per_hour)
 
-            # Create results structure compatible with existing code
-            results = {
-                "optimal_times": optimal_times,
-                "dso_altaz": dso_altaz,
-                "time_range": time_range,
-                "sun_altaz": sun_altaz,
-                "timezone": self.local_tz
-            }
-            
-            if "error" in results or not np.any(results.get("optimal_times", [])):
-                return None
-            
-            # Extract relevant information
-            optimal_times = results["optimal_times"]
-            dso_altaz = results["dso_altaz"]
-            time_range = results["time_range"]
-            
-            # Calculate metrics
-            max_altitude = np.max(dso_altaz.alt.deg[optimal_times])
-            visible_hours = np.sum(optimal_times) * 0.25  # 15-minute intervals
-            
-            # Find optimal viewing time (mid-point of viewing window)
-            optimal_indices = np.where(optimal_times)[0]
-            if len(optimal_indices) > 0:
-                mid_idx = optimal_indices[len(optimal_indices)//2]
-                optimal_time_utc = time_range[mid_idx].datetime.replace(tzinfo=pytz.UTC)
-                optimal_time_local = optimal_time_utc.astimezone(self.local_tz)
-                optimal_altitude = dso_altaz.alt.deg[mid_idx]
-                optimal_azimuth = dso_altaz.az.deg[mid_idx]
-            else:
-                return None
-            
-            return {
-                "dso_info": dso_info,
-                "max_altitude": max_altitude,
-                "visible_hours": visible_hours,
-                "optimal_time": optimal_time_local,
-                "optimal_altitude": optimal_altitude,
-                "optimal_azimuth": optimal_azimuth,
-                "coordinates": dso_coord
-            }
-            
         except Exception:
             return None
-    
+
     def _calculate_tonight_visibility_fallback(self, dso_info):
         """Fallback method using original calculations if centralized calculator unavailable"""
         try:
-            # Get tonight's date range with user-specified start and duration
-            now = datetime.now(self.local_tz)
-            tonight_start = now.replace(hour=self.start_hour, minute=0, second=0, microsecond=0)
+            start_time, duration, samples_per_hour = self._window_sampling()
+            time_range = start_time + np.linspace(0, duration, int(duration * samples_per_hour)) * u.hour
 
-            # Convert to astropy Time objects
-            start_time = Time(tonight_start.astimezone(pytz.UTC).replace(tzinfo=None))
-            # Calculate intervals: 4 per hour (every 15 minutes)
-            num_intervals = int(self.duration_hours * 4)
-            time_range = start_time + np.linspace(0, self.duration_hours, num_intervals) * u.hour
-            
-            # Get DSO coordinates from database data (coordinate-based for reliability).
-            # SkyCoord/u come from the module imports - importing them here would make
-            # u a local for the whole function and break the time_range line above
+            # Get DSO coordinates from database data (coordinate-based for reliability)
             try:
                 dso_coord = SkyCoord(ra=dso_info["ra_deg"] * u.deg, dec=dso_info["dec_deg"] * u.deg)
             except Exception:
                 return None
-            
+
             # Calculate altitude/azimuth
             altaz_frame = AltAz(obstime=time_range, location=self.location)
             dso_altaz = dso_coord.transform_to(altaz_frame)
-            
-            # Calculate sun position
-            sun = get_sun(time_range)
-            sun_altaz = sun.transform_to(altaz_frame)
-            
-            # Find when object is visible (above minimum altitude and custom
-            # horizon, and sun is down)
+            sun_altaz = get_sun(time_range).transform_to(altaz_frame)
+
+            # Visible when above minimum altitude and custom horizon, and the sun is down
             threshold = self.min_altitude
             if self.horizon is not None:
                 threshold = np.maximum(self.min_altitude, self.horizon.altitude_at(dso_altaz.az.deg))
-            dso_visible = dso_altaz.alt.deg > threshold
-            dark_sky = sun_altaz.alt.deg < -12  # Astronomical twilight
-            optimal_times = dso_visible & dark_sky
+            dark_sky = sun_altaz.alt.deg < -12
+            visible = (dso_altaz.alt.deg > threshold) & dark_sky
 
-            if not np.any(optimal_times):
-                if self.horizon is not None and np.any((dso_altaz.alt.deg > self.min_altitude) & dark_sky):
+            if not self._qualifies(visible):
+                if self.horizon is not None and self._qualifies((dso_altaz.alt.deg > self.min_altitude) & dark_sky):
                     return self.BLOCKED_BY_HORIZON
                 return None
-                
-            # Calculate visibility metrics
-            max_altitude = np.max(dso_altaz.alt.deg[optimal_times])
-            visible_hours = np.sum(optimal_times) * 0.25  # 15-minute intervals
-            
-            # Find optimal viewing time
-            optimal_indices = np.where(optimal_times)[0]
-            if len(optimal_indices) > 0:
-                mid_idx = optimal_indices[len(optimal_indices)//2]
-                optimal_time_utc = time_range[mid_idx].datetime.replace(tzinfo=pytz.UTC)
-                optimal_time_local = optimal_time_utc.astimezone(self.local_tz)
-                optimal_altitude = dso_altaz.alt.deg[mid_idx]
-                optimal_azimuth = dso_altaz.az.deg[mid_idx]
-            else:
-                return None
-            
-            return {
-                "dso_info": dso_info,
-                "max_altitude": max_altitude,
-                "visible_hours": visible_hours,
-                "optimal_time": optimal_time_local,
-                "optimal_altitude": optimal_altitude,
-                "optimal_azimuth": optimal_azimuth,
-                "coordinates": dso_coord
-            }
-            
+            return self._visibility_result(dso_info, dso_coord, time_range, dso_altaz, visible, samples_per_hour)
+
         except Exception:
             return None
 
@@ -533,9 +525,34 @@ class DSOCalculationThread(QThread):
             if result is self.BLOCKED_BY_HORIZON:
                 blocked += 1
             elif result:
+                # Replaced by _add_direction_cells() once every batch is done
                 result["direction"] = self.azimuth_to_direction(result["optimal_azimuth"])
                 batch_results.append(result)
         return batch_results, blocked
+
+    def _add_direction_cells(self, visible_dsos):
+        """The Direction column as the Target List shows it: the direction at
+        the chosen time, or at its start and end ("E → SE", dusk and dawn for
+        Tonight), marked "(below)" where under the horizon. The tooltip gives
+        each time's azimuth and altitude, plus the direction at the Best Time."""
+        if not visible_dsos:
+            return
+        try:
+            from DSOTargetList import direction_cells
+            from astropy.coordinates import concatenate
+            coords = concatenate([dso["coordinates"] for dso in visible_dsos])
+            cells = direction_cells(coords, self.window_times, self.location, self.horizon)
+        except Exception as e:
+            logger.error(f"Direction column failed, showing the Best Time direction: {e}")
+            return
+        for dso, (text, tooltip, _below) in zip(visible_dsos, cells):
+            best = (f"Best Time ({dso['optimal_time']:%H:%M}): {dso['direction']}, "
+                    f"azimuth {dso['optimal_azimuth']:.0f}°, altitude {dso['optimal_altitude']:.0f}°")
+            if len(self.window_times) > 1:
+                tooltip += "\n" + best  # A single time is already the Best Time
+            # Not grayed out like the Target List's "below throughout": anything
+            # listed here is up at some point in between
+            dso.update(direction=text, direction_tooltip=tooltip)
 
     def run(self):
         """Main calculation thread with parallel processing"""
@@ -543,6 +560,10 @@ class DSOCalculationThread(QThread):
             if self.location is None:
                 self.error_occurred.emit("Observer location not configured")
                 return
+
+            # The chosen time, on the coming night (or the current one before dawn)
+            self.window_start, self.window_end, self.window_note, self.window_times = resolve_time_window(
+                self.time_choice, self.location, getattr(self.local_tz, "zone", None))
 
             # Load DSOs from database or target list
             if self.use_target_list:
@@ -597,14 +618,17 @@ class DSOCalculationThread(QThread):
             # Sort by combination of altitude and magnitude (lower magnitude is better)
             visible_dsos.sort(key=lambda x: (-x["max_altitude"] + x["dso_info"]["magnitude"]), reverse=False)
 
+            self._add_direction_cells(visible_dsos)
+
             # Moon proximity annotation — runs once after parallel phase completes
             try:
                 from DSOVisibilityCalculator import DSOVisibilityCalculator as _Calc
                 import pytz as _pytz
 
-                _now = datetime.now(self.local_tz)
-                _midnight_utc = _now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(_pytz.UTC).replace(tzinfo=None)
-                moon_illumination = _Calc.get_moon_illumination(Time(_midnight_utc))
+                # Moon phase in the middle of the chosen time (it changes ~12% a day)
+                _middle = self.window_start + (self.window_end - self.window_start) / 2
+                moon_illumination = _Calc.get_moon_illumination(
+                    Time(_middle.astimezone(_pytz.UTC).replace(tzinfo=None)))
 
                 for dso_data in visible_dsos:
                     dso_data["moon_illumination"] = moon_illumination
@@ -630,106 +654,38 @@ class DSOCalculationThread(QThread):
             self.error_occurred.emit(f"Calculation error: {str(e)}")
 
 
-def _compute_twilight_times():
-    """
-    Calculate astronomical twilight start and end times for tonight.
-    Returns (start_hour, duration_hours) based on when sun altitude < -12 degrees.
-    Falls back to (18, 12) if calculation fails.
-    """
-    try:
-        # Get observer location from database. This runs inside a QThread, so
-        # (like the other thread bodies in this file) it opens its own fresh
-        # sqlite3 connection here rather than going through the DatabaseManager
-        # singleton, whose cached connection is bound to whichever thread
-        # first created it and can't be reused from a different thread.
-        import sqlite3
-        from ResourceManager import ResourceManager
+class TimeWindowThread(QThread):
+    """Resolves the chosen time (e.g. tonight's dusk and dawn) off the GUI
+    thread, for the note beside the Time dropdown - this astropy calculation can
+    also trigger an IERS data fetch."""
+    result_ready = Signal(str)  # note text, '' if it couldn't be resolved
 
-        db_path = ResourceManager.get_database_path()
-        conn = sqlite3.connect(str(db_path))
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
-            location_row = cursor.fetchone()
-            if not location_row:
-                cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-                location_row = cursor.fetchone()
-        finally:
-            conn.close()
-
-        if not location_row or None in location_row:
-            # No location configured, use default
-            return (18, 12)
-
-        lat, lon, tz_str = location_row
-
-        # Set up observer location
-        observer_location = EarthLocation(lat=lat*u.deg, lon=lon*u.deg)
-        local_tz = pytz.timezone(tz_str)
-
-        # Create 24-hour time range starting at noon today (to capture both twilights)
-        now = datetime.now(local_tz)
-        noon_today = now.replace(hour=12, minute=0, second=0, microsecond=0)
-        noon_utc = Time(noon_today.astimezone(pytz.UTC).replace(tzinfo=None))
-
-        # Calculate sun position every 15 minutes for 24 hours
-        time_range = noon_utc + np.linspace(0, 24, 96) * u.hour
-        altaz_frame = AltAz(obstime=time_range, location=observer_location)
-        sun = get_sun(time_range)
-        sun_altaz = sun.transform_to(altaz_frame)
-
-        # Find when sun is below -12 degrees (astronomical twilight)
-        dark_periods = sun_altaz.alt.deg < -12
-
-        if not np.any(dark_periods):
-            # No dark period (e.g., polar day) - use default
-            return (18, 12)
-
-        # Find first dark period start (evening twilight)
-        dark_indices = np.where(dark_periods)[0]
-        first_dark_idx = dark_indices[0]
-        last_dark_idx = dark_indices[-1]
-
-        # Convert indices to times
-        evening_twilight = time_range[first_dark_idx]
-        morning_twilight = time_range[last_dark_idx]
-
-        # Convert to local time
-        evening_local = evening_twilight.to_datetime(timezone=pytz.UTC).astimezone(local_tz)
-        morning_local = morning_twilight.to_datetime(timezone=pytz.UTC).astimezone(local_tz)
-
-        # Extract start hour (round to nearest hour)
-        start_hour = evening_local.hour
-
-        # Calculate duration (handle day crossing)
-        duration_td = morning_local - evening_local
-        duration_hours = int(duration_td.total_seconds() / 3600)
-
-        # Ensure reasonable values
-        if duration_hours < 1:
-            duration_hours = 12
-        elif duration_hours > 24:
-            duration_hours = 12
-
-        return (start_hour, duration_hours)
-
-    except Exception as e:
-        # If anything fails, use default values
-        print(f"Error calculating twilight times: {e}")
-        return (18, 12)
-
-
-class TwilightCalculationThread(QThread):
-    """
-    Background thread that computes tonight's astronomical twilight window
-    (start hour + duration) so the main window never blocks the GUI thread
-    on this astropy calculation (which can also trigger an IERS data fetch).
-    """
-    result_ready = Signal(int, int)  # start_hour, duration_hours
+    def __init__(self, time_choice):
+        super().__init__()
+        self.time_choice = time_choice
 
     def run(self):
-        start_hour, duration_hours = _compute_twilight_times()
-        self.result_ready.emit(start_hour, duration_hours)
+        try:
+            import sqlite3
+            from ResourceManager import ResourceManager
+            # Own connection: the DatabaseManager singleton's is bound to the GUI thread
+            conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+            try:
+                from DSOTargetList import load_observer
+                observer = load_observer(conn)
+            finally:
+                conn.close()
+            if not observer:
+                self.result_ready.emit("")
+                return
+            lat, lon, tz_name = observer
+            location = EarthLocation(lat=lat * u.deg, lon=lon * u.deg)
+            start, end, note, _times = resolve_time_window(self.time_choice, location, tz_name)
+            text = describe_time_window(self.time_choice[0], start, end)
+            self.result_ready.emit(f"({text}{' - ' + note if note else ''})")
+        except Exception as e:
+            logger.error(f"Error resolving the time window: {e}")
+            self.result_ready.emit("")
 
 
 class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
@@ -766,15 +722,28 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.status_label.setText("Loading astronomical ephemeris data...")
         themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
 
-        self.twilight_thread = TwilightCalculationThread()
+        self._resolve_time_note()
+        self._initialized = False
+
+    def _resolve_time_note(self):
+        """Show the chosen time's actual window (e.g. tonight's dusk -> dawn) beside the dropdown."""
+        if self.twilight_thread and self.twilight_thread.isRunning():
+            self._time_note_stale = True  # Resolve again when this one finishes
+            return
+        self._time_note_stale = False
+        self.twilight_thread = TimeWindowThread(self._time_choice())
         self.twilight_thread.result_ready.connect(self._on_twilight_calculated)
         self.twilight_thread.start()
 
-    def _on_twilight_calculated(self, start_hour, duration_hours):
-        """Apply the computed twilight window and finish initialization."""
-        self.start_hour_spin.setValue(start_hour)
-        self.duration_hours_spin.setValue(duration_hours)
+    def _on_twilight_calculated(self, note):
+        """Show the resolved time window and, the first time, finish initialization."""
+        self.time_note_label.setText(note)
         self._twilight_calc_date = datetime.now().strftime("%Y-%m-%d")
+        if getattr(self, "_time_note_stale", False):
+            QTimer.singleShot(0, self._resolve_time_note)
+        if getattr(self, "_initialized", True):
+            return
+        self._initialized = True
 
         # Update status to ready
         self.status_label.setText("Ready to calculate best DSOs for tonight")
@@ -801,12 +770,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         today_str = datetime.now().strftime("%Y-%m-%d")
         if self._twilight_calc_date == today_str:
             return
-        if self.twilight_thread and self.twilight_thread.isRunning():
-            return
-
-        self.twilight_thread = TwilightCalculationThread()
-        self.twilight_thread.result_ready.connect(self._on_twilight_calculated)
-        self.twilight_thread.start()
+        self._resolve_time_note()
 
     def _needs_auto_calculate(self):
         """Return True if Auto Calculate should run because the last calculation
@@ -833,22 +797,11 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         
         main_layout = QVBoxLayout(central_widget)
         
-        # Header
-        header_label = QLabel("Best Deep Sky Objects for Tonight")
-        header_label.setAlignment(Qt.AlignCenter)
-        themed_style(header_label, lambda: f"font-size: {font_px(18)}; font-weight: bold; margin: 10px;")
-        main_layout.addWidget(header_label)
-        
-        # Location info
-        self.location_group = QGroupBox("Observer Location")
-        location_layout = QVBoxLayout(self.location_group)
-        self.location_label = QLabel("Loading location...")
-        location_layout.addWidget(self.location_label)
-        main_layout.addWidget(self.location_group)
-
         # Calculation Settings Group
-        settings_group = QGroupBox("Calculation Settings")
+        settings_group = QGroupBox(self.SETTINGS_TITLE)
+        self.settings_group = settings_group  # Its title also shows the observer location
         settings_layout = QVBoxLayout(settings_group)
+        settings_layout.setSpacing(4)
 
         # First row - Basic settings
         settings_row1 = QHBoxLayout()
@@ -905,35 +858,55 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.dso_limit_spin.setToolTip("Maximum number of DSOs to process (ignored when using target list)")
         settings_row2.addWidget(self.dso_limit_spin)
 
-        # Time Frame: Start Hour
-        settings_row2.addWidget(QLabel("Start Hour:"))
-        self.start_hour_spin = QSpinBox()
-        self.start_hour_spin.setRange(0, 23)
-        self.start_hour_spin.setValue(18)  # Default, will be updated
-        self.start_hour_spin.setSuffix(":00")
-        self.start_hour_spin.setToolTip("Observation start time in 24-hour format (used with all calculation modes)")
-        settings_row2.addWidget(self.start_hour_spin)
+        # Time: when the objects should be up (the night, a moment, or a time frame)
+        from DSOTargetList import DIRECTION_MODES
+        mode, at, start, end = load_time_choice()
+        settings_row2.addWidget(QLabel("Time:"))
+        self.time_mode_combo = QComboBox()
+        for key, label in DIRECTION_MODES:
+            self.time_mode_combo.addItem(label, key)
+        self.time_mode_combo.setToolTip(
+            "When the objects should be up:\n"
+            "\u2022 Tonight: up (above Min Altitude, in dark sky) at some point between dusk and dawn\n"
+            "\u2022 Now / Dusk / Midnight / Dawn / Custom time: up at that moment\n"
+            "\u2022 Custom time frame: up for the whole frame, e.g. 01:00 to 02:00\n"
+            "Dusk and dawn are astronomical twilight. Times are for the coming night\n"
+            "(or, before dawn, the night you're in). Highest in the sky during the time ranks first.")
+        settings_row2.addWidget(self.time_mode_combo)
 
-        # Time Frame: Duration
-        settings_row2.addWidget(QLabel("Duration:"))
-        self.duration_hours_spin = QSpinBox()
-        self.duration_hours_spin.setRange(1, 24)
-        self.duration_hours_spin.setValue(12)  # Default, will be updated
-        self.duration_hours_spin.setSuffix(" hrs")
-        self.duration_hours_spin.setToolTip("Observation window duration (used with all calculation modes)")
-        settings_row2.addWidget(self.duration_hours_spin)
+        def time_edit(hhmm, tooltip):
+            edit = QTimeEdit(QTime.fromString(hhmm, "HH:mm"))
+            edit.setDisplayFormat("HH:mm")
+            edit.setToolTip(tooltip)
+            edit.timeChanged.connect(lambda _t: self._on_time_choice_changed())
+            return edit
+
+        self.time_at_edit = time_edit(at, "Time tonight")
+        settings_row2.addWidget(self.time_at_edit)
+        self.time_from_edit = time_edit(start, "Start of the time frame")
+        settings_row2.addWidget(self.time_from_edit)
+        self.time_to_label = QLabel("to")
+        settings_row2.addWidget(self.time_to_label)
+        self.time_to_edit = time_edit(end, "End of the time frame (after midnight is fine)")
+        settings_row2.addWidget(self.time_to_edit)
+        self.time_note_label = QLabel("")
+        themed_style(self.time_note_label, lambda: f"color: {COLORS['text_secondary']};")
+        settings_row2.addWidget(self.time_note_label)
+
+        index = self.time_mode_combo.findData(mode)
+        self.time_mode_combo.setCurrentIndex(max(index, 0))
+        self.time_mode_combo.currentIndexChanged.connect(lambda _i: self._on_time_choice_changed())
+        self._show_time_edits()
 
         settings_row2.addStretch()
         settings_layout.addLayout(settings_row2)
 
-        # Action Group - Button and Checkbox
-        action_group = QGroupBox("Actions")
-        action_layout = QVBoxLayout(action_group)
+        # Third row - options, then the Calculate button at the right
+        action_layout = QHBoxLayout()
 
         # Calculate button
         self.calculate_btn = QPushButton("Calculate Best DSOs Tonight")
         self.calculate_btn.clicked.connect(self.calculate_best_dsos)
-        action_layout.addWidget(self.calculate_btn)
 
         # Use Target List checkbox
         self.use_target_list_checkbox = QCheckBox("Use My Target List")
@@ -990,13 +963,11 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self.auto_calculate_checkbox.setChecked(True)
         action_layout.addWidget(self.auto_calculate_checkbox)
 
-        # Horizontal layout to hold both groups side by side
-        groups_layout = QHBoxLayout()
-        groups_layout.addWidget(settings_group, stretch=3)  # Settings takes more space
-        groups_layout.addWidget(action_group, stretch=1)    # Actions takes less space
-        groups_layout.setAlignment(action_group, Qt.AlignTop)  # Align Actions to top
+        action_layout.addStretch()
+        action_layout.addWidget(self.calculate_btn)
+        settings_layout.addLayout(action_layout)
 
-        main_layout.addLayout(groups_layout)
+        main_layout.addWidget(settings_group)
         
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -1005,6 +976,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         
         # Results table
         results_group = QGroupBox("Tonight's Best DSOs")
+        self.results_group = results_group
         results_layout = QVBoxLayout(results_group)
         
         self.results_table = QTableWidget()
@@ -1031,7 +1003,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.results_table.setColumnWidth(3, 80)
         self.results_table.setColumnWidth(4, 70)
         self.results_table.setColumnWidth(5, 80)
-        self.results_table.setColumnWidth(6, 70)
+        self.results_table.setColumnWidth(6, 150)  # "NE (below) → W"
         self.results_table.setColumnWidth(7, 110)
         
         self.results_table.setAlternatingRowColors(True)
@@ -1051,6 +1023,25 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.status_label = QLabel("Initializing astronomical calculations...")
         themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
         main_layout.addWidget(self.status_label)
+
+    def _time_choice(self):
+        """(mode, at, from, to) currently chosen."""
+        return (self.time_mode_combo.currentData(),
+                self.time_at_edit.time().toString("HH:mm"),
+                self.time_from_edit.time().toString("HH:mm"),
+                self.time_to_edit.time().toString("HH:mm"))
+
+    def _show_time_edits(self):
+        mode = self.time_mode_combo.currentData()
+        self.time_at_edit.setVisible(mode == "time")
+        for widget in (self.time_from_edit, self.time_to_label, self.time_to_edit):
+            widget.setVisible(mode == "frame")
+
+    def _on_time_choice_changed(self):
+        self._show_time_edits()
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue(TIME_SETTING, "|".join(self._time_choice()))
+        self._resolve_time_note()
 
     def _refresh_horizon_state(self):
         """Load the active location's custom horizon and enable the Use Custom
@@ -1072,6 +1063,12 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                 "Settings > Location Manager."
             )
 
+    SETTINGS_TITLE = "Calculation Settings"
+
+    def _show_location(self, text):
+        """Observer location (or a location problem) in the settings box title."""
+        self.settings_group.setTitle(f"{self.SETTINGS_TITLE}  —  {text}" if text else self.SETTINGS_TITLE)
+
     def load_location_info(self):
         """Load and display location information"""
         self._refresh_horizon_state()
@@ -1081,13 +1078,10 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         settings = QSettings("CosmosCollection", "CosmosCollection")
         show_location = settings.value("show_observer_location", True, type=bool)
 
-        # Hide the location group if setting is disabled
+        # The location is only shown (in the settings title) when the setting is on
+        self._show_location(None)
         if not show_location:
-            self.location_group.setVisible(False)
             return
-
-        # Make sure it's visible if setting is enabled
-        self.location_group.setVisible(True)
 
         try:
             db_manager = DatabaseManager()
@@ -1118,16 +1112,16 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                         if self.active_horizon is not None:
                             location_text += f" · Horizon: {self.active_horizon.name or 'custom'}"
 
-                        self.location_label.setText(location_text)
+                        self._show_location(location_text)
                         self.calculate_btn.setEnabled(True)
                         return
                 
                 # No location configured
-                self.location_label.setText("Location not configured - Please set location in main application")
+                self._show_location("Location not configured - please set it in the main application")
                 self.calculate_btn.setEnabled(False)
                 
         except Exception:
-            self.location_label.setText("Error loading location")
+            self._show_location("Error loading location")
             self.calculate_btn.setEnabled(False)
 
     def load_catalog_options(self):
@@ -1258,9 +1252,8 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
 
-        # Get time frame settings from UI
-        start_hour = self.start_hour_spin.value()
-        duration_hours = self.duration_hours_spin.value()
+        # When the objects should be up
+        time_choice = self._time_choice()
 
         # Re-check the active location's horizon - it may have been imported
         # or cleared in Settings while this window was open
@@ -1268,7 +1261,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         use_horizon = self.use_horizon_checkbox.isEnabled() and self.use_horizon_checkbox.isChecked()
 
         # Start calculation thread
-        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit, selected_dso_types, use_target_list, start_hour, duration_hours, use_horizon, hide_completed)
+        self.calc_thread = DSOCalculationThread(min_altitude, max_magnitude, selected_catalogs, dso_limit, selected_dso_types, use_target_list, time_choice, use_horizon, hide_completed)
         self.calc_thread.progress.connect(self.progress_bar.setValue)
         self.calc_thread.result_ready.connect(self.display_results)
         self.calc_thread.error_occurred.connect(self.handle_error)
@@ -1322,14 +1315,21 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         blocked = self.calc_thread.blocked_by_horizon if self.calc_thread else 0
         blocked_text = f" ({blocked} blocked by custom horizon)" if blocked else ""
+        thread = self.calc_thread
+        when = "tonight"
+        if thread is not None and thread.window_start is not None:
+            when = describe_time_window(thread.time_mode, thread.window_start, thread.window_end)
+            if thread.whole_window:
+                when = f"for all of {when}"
+        self.results_group.setTitle(f"Best DSOs {when}")
 
         if not visible_dsos:
-            self.status_label.setText(f"No DSOs meet the visibility criteria for tonight{blocked_text}. Last calculated: {last_calculated}")
+            self.status_label.setText(f"No DSOs meet the visibility criteria {when}{blocked_text}. Last calculated: {last_calculated}")
             self.status_label.setStyleSheet("")  # Reset to default color
             self.results_table.setRowCount(0)
             return
 
-        self.status_label.setText(f"Found {len(visible_dsos)} visible DSOs for tonight{blocked_text}. Last calculated: {last_calculated}")
+        self.status_label.setText(f"Found {len(visible_dsos)} visible DSOs {when}{blocked_text}. Last calculated: {last_calculated}")
         self.status_label.setStyleSheet("")  # Reset to default color
         
         # Disable sorting temporarily while populating
@@ -1408,19 +1408,21 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             time_str = format_time(dso_data["optimal_time"])
             time_item = NumericTableWidgetItem()
             time_item.setData(Qt.DisplayRole, time_str)
-            time_item.setData(Qt.UserRole, dso_data["optimal_time"].hour * 60 + dso_data["optimal_time"].minute)
+            time_item.setData(Qt.UserRole, dso_data["optimal_time"].timestamp())  # 01:00 sorts after 23:00
             time_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 5, time_item)
 
             # Direction
             dir_item = QTableWidgetItem(dso_data["direction"])
             dir_item.setTextAlignment(Qt.AlignCenter)
+            dir_item.setToolTip(dso_data.get("direction_tooltip", ""))
             self.results_table.setItem(row, 6, dir_item)
 
             # Visible hours - use numeric sorting
             hours_item = NumericTableWidgetItem()
-            hours_item.setData(Qt.DisplayRole, f"{dso_data['visible_hours']:.1f}h")
-            hours_item.setData(Qt.UserRole, dso_data['visible_hours'])  # Store numeric value for sorting
+            visible_hours = dso_data['visible_hours']
+            hours_item.setData(Qt.DisplayRole, f"{visible_hours:.1f}h" if visible_hours is not None else "\u2014")
+            hours_item.setData(Qt.UserRole, visible_hours or 0)  # Store numeric value for sorting
             hours_item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, 7, hours_item)
 

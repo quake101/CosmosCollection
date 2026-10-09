@@ -1461,7 +1461,7 @@ def load_observer(conn):
     return row[0], row[1], row[2]
 
 
-def _local_zone(tz_name):
+def local_zone(tz_name):
     """tzinfo for the location (zoneinfo, which unlike pytz doesn't scan every
     zone file on first use); this computer's zone if unknown."""
     from datetime import timezone as dt_timezone
@@ -1541,35 +1541,22 @@ def resolve_direction_times(mode, at, start, end, location, tz, now=None):
     return [("From", first), ("To", last)], ""
 
 
-def compute_directions(targets, lat, lon, tz_name, horizon, mode, at, start, end):
-    """Direction column contents for every target.
-
-    targets: [(id, ra_deg, dec_deg)] with real coordinates.
-    Returns {'times': [(label, local datetime)], 'note': str,
-             'cells': {id: (text, tooltip, below_throughout)}}.
+def direction_cells(coords, times, location, horizon):
+    """Direction column (text, tooltip, below_throughout) for each of coords
+    (a SkyCoord array) at times [(label, local datetime)] - one time, or a
+    frame's start and end ("E → SE"). Shared with Best DSO Tonight.
     """
-    import numpy as np
-    import astropy.units as u
-    from astropy.coordinates import AltAz, EarthLocation, SkyCoord
+    from astropy.coordinates import AltAz
     from astropy.time import Time
 
-    tz = _local_zone(tz_name)
-    location = EarthLocation(lat=lat * u.deg, lon=lon * u.deg)
-    times, note = resolve_direction_times(mode, at, start, end, location, tz)
-    cells = {}
-    if not targets:
-        return {"times": times, "note": note, "cells": cells}
-
-    ids = [t[0] for t in targets]
-    coords = SkyCoord(ra=np.array([t[1] for t in targets]) * u.deg,
-                      dec=np.array([t[2] for t in targets]) * u.deg)
     positions = []  # per time: (az array, alt array)
     for _label, when in times:
         altaz = coords.transform_to(AltAz(obstime=Time(when), location=location))
         positions.append((altaz.az.deg, altaz.alt.deg))
 
     horizon_word = "your horizon" if horizon is not None else "the horizon"
-    for i, target_id in enumerate(ids):
+    cells = []
+    for i in range(len(coords)):
         parts, tips, below_flags = [], [], []
         for (label, when), (az, alt) in zip(times, positions):
             limit = float(horizon.altitude_at(az[i])) if horizon is not None else 0.0
@@ -1583,8 +1570,31 @@ def compute_directions(targets, lat, lon, tz_name, horizon, mode, at, start, end
             # Below throughout: say so once ("E → ESE (below)")
             parts = [compass_direction(az[i]) for az, _alt in positions]
             parts[-1] += " (below)"
-        cells[target_id] = (" → ".join(parts), "\n".join(tips), all(below_flags))
-    return {"times": times, "note": note, "cells": cells}
+        cells.append((" → ".join(parts), "\n".join(tips), all(below_flags)))
+    return cells
+
+
+def compute_directions(targets, lat, lon, tz_name, horizon, mode, at, start, end):
+    """Direction column contents for every target.
+
+    targets: [(id, ra_deg, dec_deg)] with real coordinates.
+    Returns {'times': [(label, local datetime)], 'note': str,
+             'cells': {id: (text, tooltip, below_throughout)}}.
+    """
+    import numpy as np
+    import astropy.units as u
+    from astropy.coordinates import EarthLocation, SkyCoord
+
+    tz = local_zone(tz_name)
+    location = EarthLocation(lat=lat * u.deg, lon=lon * u.deg)
+    times, note = resolve_direction_times(mode, at, start, end, location, tz)
+    if not targets:
+        return {"times": times, "note": note, "cells": {}}
+
+    coords = SkyCoord(ra=np.array([t[1] for t in targets]) * u.deg,
+                      dec=np.array([t[2] for t in targets]) * u.deg)
+    cells = direction_cells(coords, times, location, horizon)
+    return {"times": times, "note": note, "cells": {t[0]: cell for t, cell in zip(targets, cells)}}
 
 
 class DirectionWorker(QThread):
