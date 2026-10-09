@@ -8,21 +8,23 @@ import sys
 import os
 import re
 import calendar
+from dataclasses import dataclass, field
 from datetime import datetime
-from PySide6.QtCore import Qt, QTimer, Signal, QStringListModel
+from PySide6.QtCore import Qt, QTimer, Signal, QStringListModel, QSettings, QThread, QTime
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
                                QHeaderView, QTextEdit, QDialog, QComboBox,
                                QLineEdit, QCheckBox, QDateEdit, QSpinBox, QMenu,
-                               QCompleter)
-from PySide6.QtGui import QFont
+                               QCompleter, QListWidget, QListWidgetItem, QSplitter,
+                               QPlainTextEdit, QTimeEdit)
+from PySide6.QtGui import QFont, QColor
 
 from DatabaseManager import DatabaseManager
-from BestDSOTonight import BestDSOTonightWindow
 from WindowPositionManager import WindowPositionMixin
-from Theme import COLORS, font_px, themed_style
+from Theme import COLORS, font_px, theme_manager, themed_style, themed_text
 from NINAIntegration import NINAIntegration
+import SessionFileScanner
 import logging
 
 # Set up logging
@@ -437,6 +439,20 @@ class AddTargetDialog(QDialog):
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
 
+                if not (self.is_edit_mode and self.target_id):
+                    # Same name/object/position already on the list? (how duplicates
+                    # like "M17" and "M 17" got in)
+                    existing = find_existing_target(
+                        conn, target_data["name"], target_data["ra_deg"], target_data["dec_deg"])
+                    if existing:
+                        reply = QMessageBox.question(
+                            self, "Already on Your Target List",
+                            f"\u201c{target_data['name']}\u201d is already on your target list as "
+                            f"\u201c{existing['name']}\u201d.\n\nAdd it again anyway?",
+                            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                        if reply != QMessageBox.Yes:
+                            return
+
                 if self.is_edit_mode and self.target_id:
                     # Update existing record
                     cursor.execute("""
@@ -628,6 +644,973 @@ def _format_dec_for_display(dec_deg):
     return f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
 
 
+# ---- Duplicate entries --------------------------------------------------------
+# Finds Target List entries that are probably the same object, suggests how to
+# merge them, and performs merges/deletes (moving linked sessions along). Also
+# the shared "is this already on the list?" check used wherever a target can be
+# added (DSODetail, FOVSimulator, BestDSOTonight, main.py), so new duplicates
+# aren't created.
+#
+# - Duplicate: names match once spacing, punctuation and parenthetical common
+#   names are ignored (M17 / "M 17"), or the names are two catalog designations
+#   of one object (IC 4725 / M 25).
+# - Possible: entries within POSSIBLE_MAX_SEPARATION_ARCMIN of each other. Some
+#   are genuinely separate objects (NGC 2244 inside the Rosette), so a possible
+#   group can be dismissed; it's flagged again only if another entry joins it.
+
+# Order from least to most advanced / important (merges keep the highest)
+TARGET_STATUSES = ["Not Observed", "Observed", "Imaged", "Completed"]
+TARGET_PRIORITIES = ["Low", "Medium", "High", "Urgent"]
+
+POSSIBLE_MAX_SEPARATION_ARCMIN = 2.0
+DISMISSED_SETTING = "target_duplicates_dismissed"
+
+TARGET_COLUMNS = ("id", "name", "dso_type", "constellation", "ra_deg", "dec_deg", "magnitude",
+                  "size_info", "priority", "status", "best_months", "notes", "date_added",
+                  "date_observed", "created_date", "telescope_id")
+
+
+@dataclass
+class DuplicateGroup:
+    kind: str  # 'duplicate' (confident) or 'possible' (position only)
+    reason: str  # e.g. "Same name", "Same object (IC 4725 = M 25)", "1′ apart"
+    targets: list = field(default_factory=list)  # target row dicts, oldest first
+
+    @property
+    def ids(self):
+        return frozenset(t["id"] for t in self.targets)
+
+
+# ---------------------------------------------------------------- name rules
+
+def name_key(name):
+    """Comparable key for a target name: spacing, punctuation and parenthetical
+    common names ignored ('M 17', 'M17', 'm-17 (Omega)' all give 'M17')."""
+    return SessionFileScanner.normalize_object_name(name)
+
+
+def _designation_candidates(name):
+    """(catalogue, designation) pairs a target name could be ('Sh2-129' ->
+    ('Sh2', '129'); 'vdB 152 (Wolf's Cave Nebula)' -> ('vdB', '152'))."""
+    base = re.sub(r'\([^)]*\)|\[[^\]]*\]', '', name or '').strip()
+    if not base or '&' in base or ',' in base:
+        return []  # Pairs/groups ('NGC 4038 & NGC 4039') aren't one catalog object
+    candidates = []
+    parts = base.split()
+    if len(parts) >= 2:
+        candidates.append((parts[0], " ".join(parts[1:])))
+    for pattern in (r'([A-Za-z]+)[-_ ]?(\d[\w.+\-]*)', r'([A-Za-z]+\d)[-_ ]+(\d[\w.+\-]*)'):
+        match = re.fullmatch(pattern, base)
+        if match:
+            candidates.append((match.group(1), match.group(2)))
+    return list(dict.fromkeys(candidates))
+
+
+def catalog_object_ids(cursor, name):
+    """The catalog objects (dsodetail ids) a target name designates; empty if
+    the name isn't a known designation."""
+    ids = set()
+    for catalogue, designation in _designation_candidates(name):
+        try:
+            cursor.execute("""
+                SELECT dsodetailid FROM cataloguenr
+                WHERE catalogue = ? COLLATE NOCASE AND designation = ? COLLATE NOCASE
+            """, (catalogue, designation))
+            ids.update(row[0] for row in cursor.fetchall())
+        except Exception as e:
+            logger.debug(f"Catalog lookup failed for {name!r}: {e}")
+    return frozenset(ids)
+
+
+def _standard_name(cursor, name):
+    """The catalog's own spelling of a target's designation ('M17' -> 'M 17'), or None."""
+    for catalogue, designation in _designation_candidates(name):
+        cursor.execute("""
+            SELECT catalogue || ' ' || designation FROM cataloguenr
+            WHERE catalogue = ? COLLATE NOCASE AND designation = ? COLLATE NOCASE LIMIT 1
+        """, (catalogue, designation))
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+    return None
+
+
+# ---------------------------------------------------------------- loading
+
+def load_target_rows(conn):
+    """All Target List rows as dicts (oldest first) and their linked session counts."""
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT {', '.join(TARGET_COLUMNS)} FROM usertargetlist ORDER BY id")
+    targets = [dict(zip(TARGET_COLUMNS, row)) for row in cursor.fetchall()]
+    session_counts = {}
+    try:
+        cursor.execute("SELECT target_id, COUNT(*) FROM usersessions WHERE target_id IS NOT NULL GROUP BY target_id")
+        session_counts = dict(cursor.fetchall())
+    except Exception as e:
+        logger.debug(f"Couldn't count linked sessions: {e}")  # No sessions table yet
+    for target in targets:
+        target["session_count"] = session_counts.get(target["id"], 0)
+    return targets
+
+
+def has_position(target):
+    """Whether a target has real coordinates (the add dialog stores blanks as 0, 0)."""
+    ra, dec = target.get("ra_deg"), target.get("dec_deg")
+    return ra is not None and dec is not None and not (ra == 0 and dec == 0)
+
+
+# ---------------------------------------------------------------- detection
+
+def find_duplicate_groups(conn, targets=None, dismissed=None):
+    """Groups of Target List entries that look like the same object.
+
+    Confident groups (same name / same catalog object) come first, then
+    'possible' ones (close positions) that haven't been dismissed.
+    """
+    if targets is None:
+        targets = load_target_rows(conn)
+    if dismissed is None:
+        dismissed = load_dismissed()
+    cursor = conn.cursor()
+    by_id = {t["id"]: t for t in targets}
+
+    # Union-find over the confident links
+    parent = {t["id"]: t["id"] for t in targets}
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    reasons = {}  # root pair -> reason, filled as links are made
+
+    def link(a, b, reason):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+        reasons.setdefault((min(a, b), max(a, b)), reason)
+
+    keys = {}
+    for t in targets:
+        key = name_key(t["name"])
+        if key:
+            if key in keys:
+                link(keys[key], t["id"], "Same name")
+            else:
+                keys[key] = t["id"]
+
+    objects = {t["id"]: catalog_object_ids(cursor, t["name"]) for t in targets}
+    seen_objects = {}
+    for t in targets:
+        for obj in objects[t["id"]]:
+            other = seen_objects.get(obj)
+            if other is not None and name_key(by_id[other]["name"]) != name_key(t["name"]):
+                link(other, t["id"], f"Same object ({by_id[other]['name']} = {t['name']})")
+            seen_objects.setdefault(obj, t["id"])
+
+    components = {}
+    for t in targets:
+        components.setdefault(find(t["id"]), []).append(t)
+    groups = []
+    for members in components.values():
+        if len(members) < 2:
+            continue
+        member_ids = {m["id"] for m in members}
+        group_reasons = [r for (a, b), r in reasons.items() if a in member_ids and b in member_ids]
+        reason = "Same name" if group_reasons and all(r == "Same name" for r in group_reasons) \
+            else next((r for r in group_reasons if r != "Same name"), "Same name")
+        groups.append(DuplicateGroup("duplicate", reason, sorted(members, key=lambda m: m["id"])))
+
+    # Possible: close pairs that aren't already one confident group
+    positioned = [t for t in targets if has_position(t)]
+    possible_pairs = []
+    for i, a in enumerate(positioned):
+        for b in positioned[i + 1:]:
+            if find(a["id"]) == find(b["id"]):
+                continue
+            separation = SessionFileScanner.angular_separation_deg(
+                a["ra_deg"], a["dec_deg"], b["ra_deg"], b["dec_deg"]) * 60
+            if separation <= POSSIBLE_MAX_SEPARATION_ARCMIN:
+                possible_pairs.append((a, b, separation))
+    for a, b, separation in possible_pairs:
+        ids = frozenset((a["id"], b["id"]))
+        if any(ids <= d for d in dismissed):
+            continue
+        groups.append(DuplicateGroup("possible", f"{separation:.0f}′ apart" if separation >= 0.5
+                                     else "Same position", [a, b]))
+    return groups
+
+
+# ---------------------------------------------------------------- dismissals
+
+def load_dismissed():
+    """Dismissed 'possible' groups, as frozensets of target ids."""
+    settings = QSettings("CosmosCollection", "CosmosCollection")
+    saved = settings.value(DISMISSED_SETTING, "", type=str) or ""
+    dismissed = []
+    for part in saved.split(";"):
+        ids = {int(i) for i in part.split(",") if i.strip().isdigit()}
+        if len(ids) >= 2:
+            dismissed.append(frozenset(ids))
+    return dismissed
+
+
+def dismiss_group(group):
+    """Remember that a group's entries are different objects."""
+    dismissed = load_dismissed()
+    dismissed.append(group.ids)
+    settings = QSettings("CosmosCollection", "CosmosCollection")
+    settings.setValue(DISMISSED_SETTING, ";".join(",".join(str(i) for i in sorted(d)) for d in dismissed))
+
+
+# ---------------------------------------------------------------- merging
+
+# Preferred catalogs for a merged name, as when adding targets (DSOTargetList)
+PREFERRED_CATALOGS = ("M", "NGC", "IC")
+
+
+def preferred_duplicate_name(cursor, names, fallback):
+    """The best name among duplicates: one carrying a common name ("vdB 152
+    (Wolf's Cave Nebula)"), else an M / NGC / IC designation in that order, else
+    fallback - in the catalog's own spelling ('M17' -> 'M 17')."""
+    names = [n for n in names if n]
+    with_common = [n for n in names if "(" in n]
+    if with_common:
+        return with_common[0]
+
+    def catalog_rank(name):
+        candidates = _designation_candidates(name)
+        catalogue = candidates[0][0].upper() if candidates else ""
+        return PREFERRED_CATALOGS.index(catalogue) if catalogue in PREFERRED_CATALOGS else len(PREFERRED_CATALOGS)
+
+    ranked = sorted(names, key=catalog_rank)
+    best = ranked[0] if ranked and catalog_rank(ranked[0]) < len(PREFERRED_CATALOGS) else fallback
+    standard = _standard_name(cursor, best)
+    return standard if standard and name_key(standard) == name_key(best) else best
+
+
+def _rank(value, order):
+    return order.index(value) if value in order else -1
+
+
+def _filled(value):
+    return value not in (None, "", 0, 0.0)
+
+
+def suggest_merge(conn, group):
+    """(keep_id, merged field values) - a best guess the user can change.
+
+    Keeps the entry with the most linked sessions (then the most filled-in,
+    then the oldest); takes the most advanced status, the highest priority,
+    every entry's notes, and the earliest dates.
+    """
+    targets = group.targets
+    keep = max(targets, key=lambda t: (t["session_count"],
+                                       sum(_filled(t.get(c)) for c in TARGET_COLUMNS),
+                                       -t["id"]))
+    merged = {c: keep.get(c) for c in TARGET_COLUMNS if c not in ("id", "created_date")}
+
+    # Blank fields filled from the other entries
+    for column in ("dso_type", "constellation", "magnitude", "size_info", "best_months", "telescope_id"):
+        if not _filled(merged.get(column)):
+            merged[column] = next((t[column] for t in targets if _filled(t.get(column))), merged.get(column))
+    if not has_position(keep):
+        source = next((t for t in targets if has_position(t)), None)
+        if source:
+            merged["ra_deg"], merged["dec_deg"] = source["ra_deg"], source["dec_deg"]
+
+    merged["name"] = preferred_duplicate_name(conn.cursor(), [t["name"] for t in targets], keep["name"])
+
+    merged["status"] = max((t["status"] for t in targets), key=lambda s: _rank(s, TARGET_STATUSES))
+    merged["priority"] = max((t["priority"] for t in targets), key=lambda p: _rank(p, TARGET_PRIORITIES))
+    notes = [t["notes"].strip() for t in targets if (t.get("notes") or "").strip()]
+    merged["notes"] = "\n\n".join(dict.fromkeys(notes))
+    dates_added = [t["date_added"] for t in targets if t.get("date_added")]
+    merged["date_added"] = min(dates_added) if dates_added else keep.get("date_added")
+    observed = [t["date_observed"] for t in targets if t.get("date_observed")]
+    merged["date_observed"] = min(observed) if observed else None
+    return keep["id"], merged
+
+
+def merge_targets(conn, keep_id, other_ids, merged):
+    """Save the merged values on keep_id, move the others' linked sessions to it
+    and delete the others - all or nothing. Returns the number of sessions moved."""
+    cursor = conn.cursor()
+    try:
+        columns = [c for c in TARGET_COLUMNS if c not in ("id", "created_date") and c in merged]
+        cursor.execute(f"UPDATE usertargetlist SET {', '.join(f'{c} = ?' for c in columns)} WHERE id = ?",
+                       [merged[c] for c in columns] + [keep_id])
+        placeholders = ",".join("?" * len(other_ids))
+        moved = 0
+        try:
+            cursor.execute(f"UPDATE usersessions SET target_id = ? WHERE target_id IN ({placeholders})",
+                           [keep_id, *other_ids])
+            moved = cursor.rowcount
+        except Exception as e:
+            if "no such table" not in str(e):
+                raise
+        cursor.execute(f"DELETE FROM usertargetlist WHERE id IN ({placeholders})", list(other_ids))
+        conn.commit()
+        return moved
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def delete_target(conn, target_id, move_sessions_to=None):
+    """Delete one entry; its linked sessions move to move_sessions_to (or are
+    unlinked). Returns the number of sessions moved."""
+    cursor = conn.cursor()
+    try:
+        moved = 0
+        try:
+            # Done here rather than left to ON DELETE SET NULL, which SQLite only
+            # enforces when foreign keys are switched on for the connection
+            cursor.execute("UPDATE usersessions SET target_id = ? WHERE target_id = ?",
+                           (move_sessions_to, target_id))
+            moved = cursor.rowcount if move_sessions_to is not None else 0
+        except Exception as e:
+            if "no such table" not in str(e):
+                raise
+        cursor.execute("DELETE FROM usertargetlist WHERE id = ?", (target_id,))
+        conn.commit()
+        return moved
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# ---------------------------------------------------------------- prevention
+
+# A target within this of a catalog object's position is that object (an entry
+# added from the catalog keeps its coordinates), matching DSODetail's old check
+SAME_POSITION_DEG = 0.001
+
+
+class TargetListIndex:
+    """The Target List indexed for "is this object already on the list?"
+    checks - same name (ignoring case, spacing, punctuation and parenthetical
+    common names), another designation of the same catalog object, or
+    (optionally) the same position. Build once to check many objects."""
+
+    def __init__(self, conn, exclude_id=None):
+        self._cursor = conn.cursor()
+        self._cursor.execute("SELECT id, name, ra_deg, dec_deg FROM usertargetlist ORDER BY id")
+        self.entries = [{"id": row[0], "name": row[1], "ra_deg": row[2], "dec_deg": row[3]}
+                        for row in self._cursor.fetchall() if row[0] != exclude_id and row[1]]
+        self._exact, self._keys = {}, {}
+        objects = {}
+        for entry in self.entries:
+            self._exact.setdefault(entry["name"].strip().upper(), entry)
+            self._keys.setdefault(name_key(entry["name"]), entry)
+            for obj in catalog_object_ids(self._cursor, entry["name"]):
+                objects.setdefault(obj, entry)
+        # Every catalog designation of the listed objects ("NGC 6618" for M 17), so
+        # checking a name is a lookup rather than a catalog query per name
+        self._designations = {}
+        object_ids = list(objects)
+        for start in range(0, len(object_ids), 500):
+            chunk = object_ids[start:start + 500]
+            self._cursor.execute(f"""
+                SELECT dsodetailid, catalogue || ' ' || designation FROM cataloguenr
+                WHERE dsodetailid IN ({",".join("?" * len(chunk))})
+            """, chunk)
+            for obj, designation in self._cursor.fetchall():
+                self._designations.setdefault(name_key(designation), objects[obj])
+
+    def match(self, name, ra_deg=None, dec_deg=None):
+        """The entry that's the same object as name (and, if given, position), or None."""
+        name = (name or "").strip()
+        if name:
+            key = name_key(name)
+            entry = self._exact.get(name.upper()) or self._keys.get(key) or self._designations.get(key)
+            if entry:
+                return entry
+        if ra_deg is not None and dec_deg is not None and not (ra_deg == 0 and dec_deg == 0):
+            for entry in self.entries:
+                if (has_position(entry) and abs(entry["ra_deg"] - ra_deg) < SAME_POSITION_DEG
+                        and abs(entry["dec_deg"] - dec_deg) < SAME_POSITION_DEG):
+                    return entry
+        return None
+
+
+def find_existing_target(conn, name, ra_deg=None, dec_deg=None, exclude_id=None):
+    """The Target List entry that's the same object as name (or at the same
+    position, if given), as {'id', 'name', 'ra_deg', 'dec_deg'}; None if it isn't
+    on the list. exclude_id leaves out the entry being edited."""
+    return TargetListIndex(conn, exclude_id).match(name, ra_deg, dec_deg)
+
+
+# ================================================================ review dialog
+
+class DuplicateReviewDialog(WindowPositionMixin, QDialog):
+    """Review possible duplicate Target List entries: merge them (pre-filled,
+    every field changeable), delete one, edit one, or - for position-only
+    matches - mark them as different objects."""
+
+    WINDOW_POSITION_KEY = "TargetDuplicateReview"
+    targets_changed = Signal()
+
+    # (label, column) rows of the comparison; "position" is RA + Dec together
+    ROWS = (("Name", "name"), ("Linked sessions", "session_count"),
+            ("Type", "dso_type"), ("Constellation", "constellation"),
+            ("Position", "position"), ("Magnitude", "magnitude"), ("Size", "size_info"),
+            ("Priority", "priority"), ("Status", "status"), ("Telescope", "telescope_id"),
+            ("Best months", "best_months"), ("Date added", "date_added"),
+            ("Date observed", "date_observed"), ("Notes", "notes"))
+
+    def __init__(self, db_manager, edit_callback=None, parent=None):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.edit_callback = edit_callback  # callable(target dict) that opens the Edit Target dialog
+        self.groups = []
+        self._group = None
+        self._keep_id = None
+        self._merged_widgets = {}
+        self.setWindowTitle("Possible Duplicate Targets")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.WindowMaximizeButtonHint)
+        self.resize(980, 640)  # default size the first time this dialog is ever opened
+        self._telescopes = self._load_telescopes()
+        self._setup_ui()
+        self.setup_window_position()
+        self._refresh()
+
+    def _load_telescopes(self):
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, name FROM usertelescopes")
+                return {row[0]: row[1] for row in cursor.fetchall()}
+        except Exception as e:
+            logger.debug(f"Couldn't load telescopes: {e}")
+            return {}
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        intro = QLabel("These entries look like the same object. Merge them into one entry (the merged "
+                       "values are pre-filled; change any of them first), delete one, or edit one.")
+        intro.setWordWrap(True)
+        themed_style(intro, lambda: f"color: {COLORS['text_secondary']};")
+        layout.addWidget(intro)
+
+        splitter = QSplitter(Qt.Horizontal)
+        self.groups_list = QListWidget()
+        self.groups_list.currentRowChanged.connect(self._show_group)
+        splitter.addWidget(self.groups_list)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        self.reason_label = QLabel("")
+        self.reason_label.setWordWrap(True)
+        bold = QFont(self.reason_label.font())
+        bold.setBold(True)
+        self.reason_label.setFont(bold)
+        right_layout.addWidget(self.reason_label)
+
+        self.compare_table = QTableWidget()
+        self.compare_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.compare_table.setSelectionMode(QTableWidget.NoSelection)
+        self.compare_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        right_layout.addWidget(self.compare_table, 1)
+
+        actions = QHBoxLayout()
+        self.merge_btn = QPushButton("Merge")
+        self.merge_btn.setDefault(True)
+        self.merge_btn.setToolTip("Combine these entries into one, using the Merged result column")
+        self.merge_btn.clicked.connect(self._merge)
+        actions.addWidget(self.merge_btn)
+        self.delete_btn = QPushButton("Delete...")
+        self.delete_btn.setToolTip("Delete one of these entries")
+        actions.addWidget(self.delete_btn)
+        self.edit_btn = QPushButton("Edit...")
+        self.edit_btn.setToolTip("Edit one of these entries, e.g. if its name or position is wrong")
+        actions.addWidget(self.edit_btn)
+        self.dismiss_btn = QPushButton("Not a Duplicate")
+        self.dismiss_btn.setToolTip("These are different objects that happen to be close together - "
+                                    "don't flag them again")
+        self.dismiss_btn.clicked.connect(self._dismiss)
+        actions.addWidget(self.dismiss_btn)
+        actions.addStretch()
+        right_layout.addLayout(actions)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        layout.addWidget(splitter, 1)
+
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+    # ---------------------------------------------------------------- groups
+
+    def _refresh(self, keep_row=0):
+        """Re-detect duplicates (after a change) and show the group at keep_row."""
+        try:
+            with self.db_manager.get_connection() as conn:
+                self.groups = find_duplicate_groups(conn)
+        except Exception as e:
+            logger.error(f"Error finding duplicate targets: {e}")
+            self.groups = []
+        self.groups_list.blockSignals(True)
+        self.groups_list.clear()
+        for group in self.groups:
+            names = " / ".join(t["name"] for t in group.targets)
+            text = names if group.kind == "duplicate" else f"{names}  (maybe)"
+            item = QListWidgetItem(text)
+            item.setToolTip(group.reason)
+            if group.kind == "possible":
+                font = item.font()
+                font.setItalic(True)
+                item.setFont(font)
+            self.groups_list.addItem(item)
+        self.groups_list.blockSignals(False)
+        if self.groups:
+            self.groups_list.setCurrentRow(min(max(keep_row, 0), len(self.groups) - 1))
+            self._show_group(self.groups_list.currentRow())
+        else:
+            self._group = None
+            self.reason_label.setText("No duplicates left - your target list is clean.")
+            self.compare_table.clear()
+            self.compare_table.setRowCount(0)
+            self.compare_table.setColumnCount(0)
+            for button in (self.merge_btn, self.delete_btn, self.edit_btn, self.dismiss_btn):
+                button.setEnabled(False)
+            self.dismiss_btn.setVisible(False)
+
+    def _show_group(self, row):
+        if row < 0 or row >= len(self.groups):
+            return
+        group = self.groups[row]
+        self._group = group
+        if group.kind == "possible":
+            self.reason_label.setText(f"Maybe the same object: {group.reason}. Close objects can be "
+                                      "genuinely different (e.g. a cluster inside a nebula).")
+        else:
+            self.reason_label.setText(f"Duplicate: {group.reason}")
+        with self.db_manager.get_connection() as conn:
+            self._keep_id, merged = suggest_merge(conn, group)
+        self._fill_table(group, merged)
+        for button in (self.merge_btn, self.delete_btn, self.edit_btn):
+            button.setEnabled(True)
+        self.dismiss_btn.setVisible(group.kind == "possible")
+        self.dismiss_btn.setEnabled(True)
+        self._build_entry_menus(group)
+
+    def _build_entry_menus(self, group):
+        delete_menu = QMenu(self)
+        edit_menu = QMenu(self)
+        for target in group.targets:
+            sessions = target["session_count"]
+            suffix = f"  ({sessions} linked session{'s' if sessions != 1 else ''})" if sessions else ""
+            delete_menu.addAction(f"Delete “{target['name']}”{suffix}",
+                                  lambda t=target: self._delete(t))
+            edit_menu.addAction(f"Edit “{target['name']}”", lambda t=target: self._edit(t))
+        self.delete_btn.setMenu(delete_menu)
+        self.edit_btn.setMenu(edit_menu)
+
+    # ---------------------------------------------------------------- comparison
+
+    def _display(self, target, column):
+        if column == "position":
+            if not has_position(target):
+                return ""
+            return f"RA {target['ra_deg']:.4f}°, Dec {target['dec_deg']:+.4f}°"
+        value = target.get(column)
+        if column == "telescope_id":
+            return self._telescopes.get(value, "Any") if value is not None else "Any"
+        if column == "magnitude":
+            return f"{value:g}" if isinstance(value, (int, float)) and value else ""
+        if column == "session_count":
+            return str(value or 0)
+        return "" if value is None else str(value)
+
+    def _fill_table(self, group, merged):
+        targets = group.targets
+        table = self.compare_table
+        table.clear()
+        table.setRowCount(len(self.ROWS))
+        table.setColumnCount(len(targets) + 1)
+        table.setHorizontalHeaderLabels([t["name"] for t in targets] + ["Merged result"])
+        table.setVerticalHeaderLabels([label for label, _ in self.ROWS])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)  # (reset by setColumnCount)
+        self._merged_widgets = {}
+        merged_col = len(targets)
+
+        for row, (_label, column) in enumerate(self.ROWS):
+            values = [self._display(t, column) for t in targets]
+            differs = len(set(values)) > 1  # Differences in bold
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                if differs:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                table.setItem(row, col, item)
+            widget = self._merged_widget(column, targets, merged)
+            if widget is not None:
+                table.setCellWidget(row, merged_col, widget)
+                self._merged_widgets[column] = widget
+            else:
+                total = sum(t["session_count"] for t in targets)
+                table.setItem(row, merged_col, QTableWidgetItem(f"All {total} move here" if total else "0"))
+        notes_row = [c for _, c in self.ROWS].index("notes")
+        table.setRowHeight(notes_row, 60)
+
+    def _merged_widget(self, column, targets, merged):
+        """Editable control for one merged field, set to the suggestion."""
+        if column == "session_count":
+            return None
+        if column == "notes":
+            return QPlainTextEdit(merged.get("notes") or "")
+        combo = QComboBox()
+        if column == "priority":
+            options = [(p, p) for p in TARGET_PRIORITIES]
+            current = merged.get("priority")
+        elif column == "status":
+            options = [(s, s) for s in TARGET_STATUSES]
+            current = merged.get("status")
+        elif column == "telescope_id":
+            ids = list(dict.fromkeys([t["telescope_id"] for t in targets] + [merged.get("telescope_id")]))
+            options = [(self._telescopes.get(i, "Any") if i is not None else "Any", i) for i in ids]
+            current = merged.get("telescope_id")
+        elif column == "position":
+            options = [(self._display(t, "position"), (t["ra_deg"], t["dec_deg"]))
+                       for t in targets if has_position(t)]
+            current = (merged.get("ra_deg"), merged.get("dec_deg"))
+            if not options:
+                options = [("", current)]
+        else:
+            values = [t.get(column) for t in targets] + [merged.get(column)]
+            if column == "name":
+                with self.db_manager.get_connection() as conn:
+                    standard = _standard_name(conn.cursor(), merged.get("name"))
+                if standard:
+                    values.append(standard)
+                combo.setEditable(True)  # A name of your own is fine too
+            options = [(self._display({column: v}, column), v) for v in dict.fromkeys(values)]
+            current = merged.get(column)
+        seen = set()
+        for text, data in options:
+            if (text, repr(data)) in seen:
+                continue
+            seen.add((text, repr(data)))
+            combo.addItem(text, data)
+        for i in range(combo.count()):
+            if combo.itemData(i) == current:
+                combo.setCurrentIndex(i)
+                break
+        return combo
+
+    def _merged_values(self):
+        """The Merged result column's current values, as usertargetlist columns."""
+        values = {}
+        for column, widget in self._merged_widgets.items():
+            if isinstance(widget, QPlainTextEdit):
+                values[column] = widget.toPlainText().strip()
+            elif column == "position":
+                ra_dec = widget.currentData()
+                values["ra_deg"], values["dec_deg"] = ra_dec if ra_dec else (None, None)
+            elif column == "name":
+                values["name"] = widget.currentText().strip()
+            else:
+                values[column] = widget.currentData()
+        return values
+
+    # ---------------------------------------------------------------- actions
+
+    def _merge(self):
+        group = self._group
+        if not group:
+            return
+        values = self._merged_values()
+        if not values.get("name"):
+            QMessageBox.warning(self, "Name Required", "The merged entry needs a name.")
+            return
+        with self.db_manager.get_connection() as conn:
+            _keep, merged = suggest_merge(conn, group)
+        merged.update(values)
+        others = [t for t in group.targets if t["id"] != self._keep_id]
+        sessions = sum(t["session_count"] for t in others)
+        names = ", ".join(f"“{t['name']}”" for t in group.targets)
+        message = f"Merge {names} into one entry named “{values['name']}”?"
+        if sessions:
+            message += f"\n\n{sessions} linked session{'s' if sessions != 1 else ''} will move to it."
+        message += "\n\nThe other entr" + ("ies" if len(others) > 1 else "y") + " will be deleted."
+        if QMessageBox.question(self, "Merge Targets", message,
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
+            return
+        try:
+            with self.db_manager.get_connection() as conn:
+                merge_targets(conn, self._keep_id, [t["id"] for t in others], merged)
+        except Exception as e:
+            logger.error(f"Error merging targets: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to merge targets: {e}")
+            return
+        self.targets_changed.emit()
+        self._refresh(self.groups_list.currentRow())
+
+    def _delete(self, target):
+        group = self._group
+        others = [t for t in group.targets if t["id"] != target["id"]] if group else []
+        move_to = None
+        count = target["session_count"]
+        if count and others:
+            other = others[0]
+            answer = QMessageBox.question(
+                self, "Linked Sessions",
+                f"“{target['name']}” has {count} linked session{'s' if count != 1 else ''}.\n\n"
+                f"Move {'them' if count != 1 else 'it'} to “{other['name']}”? "
+                "(No leaves them unlinked.)",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes)
+            if answer == QMessageBox.Cancel:
+                return
+            if answer == QMessageBox.Yes:
+                move_to = other["id"]
+        elif QMessageBox.question(self, "Delete Target",
+                                  f"Delete “{target['name']}” from your target list?",
+                                  QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            with self.db_manager.get_connection() as conn:
+                delete_target(conn, target["id"], move_to)
+        except Exception as e:
+            logger.error(f"Error deleting target: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to delete target: {e}")
+            return
+        self.targets_changed.emit()
+        self._refresh(self.groups_list.currentRow())
+
+    def _edit(self, target):
+        if not self.edit_callback:
+            return
+        self.edit_callback(dict(target))
+        self.targets_changed.emit()
+        self._refresh(self.groups_list.currentRow())
+
+    def _dismiss(self):
+        group = self._group
+        if not group or group.kind != "possible":
+            return
+        dismiss_group(group)
+        self.targets_changed.emit()
+        self._refresh(self.groups_list.currentRow())
+
+
+# ---- Direction column --------------------------------------------------------
+# Where each target is in the sky at a chosen time (Now, astronomical dusk,
+# midnight, dawn, or a custom time) or over a time frame (dusk to dawn, or a
+# custom one, shown as start -> end). All targets are computed together in one
+# astropy transform per time, in a worker thread, so the window opens first and
+# the column fills in. Targets below the location's custom horizon (or 0°) are
+# marked.
+
+# (key, label) for the "Direction at:" dropdown
+DIRECTION_MODES = (
+    ("now", "Now"),
+    ("dusk", "Dusk"),
+    ("midnight", "Midnight"),
+    ("dawn", "Dawn"),
+    ("night", "Tonight (dusk → dawn)"),
+    ("time", "Custom time"),
+    ("frame", "Custom time frame"),
+)
+DIRECTION_SETTING = "target_list_direction"  # "mode|at|from|to", times as HH:MM
+DIRECTION_DEFAULT = ("midnight", "22:00", "21:00", "01:00")
+ASTRONOMICAL_TWILIGHT_DEG = -18.0
+NOW_REFRESH_MS = 5 * 60 * 1000  # "Now" mode recalculates every 5 minutes
+
+_COMPASS_POINTS = ('N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+                   'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW')
+
+
+def compass_direction(az):
+    """'NE' etc. for an azimuth in degrees."""
+    return _COMPASS_POINTS[int((az + 11.25) / 22.5) % 16]
+
+
+def load_direction_setting():
+    """(mode, at, start, end) as saved for the Direction column."""
+    settings = QSettings("CosmosCollection", "CosmosCollection")
+    parts = (settings.value(DIRECTION_SETTING, "", type=str) or "").split("|")
+    if len(parts) != 4 or parts[0] not in dict(DIRECTION_MODES):
+        return DIRECTION_DEFAULT
+    return tuple(parts)
+
+
+def save_direction_setting(mode, at, start, end):
+    settings = QSettings("CosmosCollection", "CosmosCollection")
+    settings.setValue(DIRECTION_SETTING, "|".join((mode, at, start, end)))
+
+
+def load_observer(conn):
+    """(lat, lon, timezone name or None) of the active location, or None."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
+    row = cursor.fetchone()
+    if not row:
+        cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+    if not row or row[0] is None or row[1] is None:
+        return None
+    return row[0], row[1], row[2]
+
+
+def _local_zone(tz_name):
+    """tzinfo for the location (zoneinfo, which unlike pytz doesn't scan every
+    zone file on first use); this computer's zone if unknown."""
+    from datetime import timezone as dt_timezone
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(tz_name) if tz_name else datetime.now().astimezone().tzinfo
+    except Exception:
+        return datetime.now().astimezone().tzinfo or dt_timezone.utc
+
+
+def _twilight(location, noon_local, tz):
+    """(dusk, dawn) local datetimes of astronomical twilight in the night
+    following noon_local, and whether it gets that dark at all (if not, both
+    are the darkest moment)."""
+    import numpy as np
+    import astropy.units as u
+    from astropy.coordinates import AltAz, get_sun
+    from astropy.time import Time
+
+    times = Time(noon_local) + np.arange(0, 24 * 12 + 1) * 5 * u.min  # every 5 minutes
+    sun_alt = get_sun(times).transform_to(AltAz(obstime=times, location=location)).alt.deg
+    dark = sun_alt < ASTRONOMICAL_TWILIGHT_DEG
+    if dark.any():
+        first = int(np.argmax(dark))
+        last = len(dark) - 1 - int(np.argmax(dark[::-1]))
+        reaches_dark = True
+    else:
+        first = last = int(np.argmin(sun_alt))
+        reaches_dark = False
+    to_local = lambda t: t.to_datetime(timezone=tz)
+    return to_local(times[first]), to_local(times[last]), reaches_dark
+
+
+def resolve_direction_times(mode, at, start, end, location, tz, now=None):
+    """[(label, local datetime)] the Direction column is for - one time, or a
+    frame's start and end - and a note (e.g. no astronomical darkness).
+
+    "Tonight" is the current night until its dawn, then the coming one, so
+    during the day the presets plan ahead and after midnight they still mean
+    the night you're in.
+    """
+    from datetime import timedelta
+    now = now or datetime.now(tz)
+    if mode == "now":
+        return [("Now", now)], ""
+
+    today_noon = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    noon = today_noon
+    if now < today_noon:
+        previous = today_noon - timedelta(days=1)
+        _dusk, dawn, _dark = _twilight(location, previous, tz)
+        if now < dawn:
+            noon = previous  # Still in last night (before its dawn)
+
+    def on_night(hhmm):
+        hours, minutes = (int(x) for x in hhmm.split(":"))
+        when = noon.replace(hour=hours, minute=minutes)
+        return when if when >= noon else when + timedelta(days=1)
+
+    note = ""
+    if mode in ("dusk", "dawn", "night"):
+        dusk, dawn, dark = _twilight(location, noon, tz)
+        if not dark:
+            note = "the sky doesn't get astronomically dark tonight - using the darkest moment"
+        if mode == "dusk":
+            return [("Dusk", dusk)], note
+        if mode == "dawn":
+            return [("Dawn", dawn)], note
+        return [("Dusk", dusk), ("Dawn", dawn)], note
+    if mode == "midnight":
+        return [("Midnight", noon + timedelta(hours=12))], ""
+    if mode == "time":
+        return [("At", on_night(at))], ""
+    first, last = on_night(start), on_night(end)
+    if last <= first:
+        last += timedelta(days=1)
+    return [("From", first), ("To", last)], ""
+
+
+def compute_directions(targets, lat, lon, tz_name, horizon, mode, at, start, end):
+    """Direction column contents for every target.
+
+    targets: [(id, ra_deg, dec_deg)] with real coordinates.
+    Returns {'times': [(label, local datetime)], 'note': str,
+             'cells': {id: (text, tooltip, below_throughout)}}.
+    """
+    import numpy as np
+    import astropy.units as u
+    from astropy.coordinates import AltAz, EarthLocation, SkyCoord
+    from astropy.time import Time
+
+    tz = _local_zone(tz_name)
+    location = EarthLocation(lat=lat * u.deg, lon=lon * u.deg)
+    times, note = resolve_direction_times(mode, at, start, end, location, tz)
+    cells = {}
+    if not targets:
+        return {"times": times, "note": note, "cells": cells}
+
+    ids = [t[0] for t in targets]
+    coords = SkyCoord(ra=np.array([t[1] for t in targets]) * u.deg,
+                      dec=np.array([t[2] for t in targets]) * u.deg)
+    positions = []  # per time: (az array, alt array)
+    for _label, when in times:
+        altaz = coords.transform_to(AltAz(obstime=Time(when), location=location))
+        positions.append((altaz.az.deg, altaz.alt.deg))
+
+    horizon_word = "your horizon" if horizon is not None else "the horizon"
+    for i, target_id in enumerate(ids):
+        parts, tips, below_flags = [], [], []
+        for (label, when), (az, alt) in zip(times, positions):
+            limit = float(horizon.altitude_at(az[i])) if horizon is not None else 0.0
+            below = alt[i] < limit
+            below_flags.append(below)
+            direction = compass_direction(az[i])
+            parts.append(f"{direction} (below)" if below else direction)
+            tip = f"{label} ({when:%H:%M}): {direction}, azimuth {az[i]:.0f}°, altitude {alt[i]:.0f}°"
+            tips.append(tip + (f" - below {horizon_word}" if below else ""))
+        if len(parts) > 1 and all(below_flags):
+            # Below throughout: say so once ("E → ESE (below)")
+            parts = [compass_direction(az[i]) for az, _alt in positions]
+            parts[-1] += " (below)"
+        cells[target_id] = (" → ".join(parts), "\n".join(tips), all(below_flags))
+    return {"times": times, "note": note, "cells": cells}
+
+
+class DirectionWorker(QThread):
+    """Computes the Direction column off the UI thread."""
+
+    result_ready = Signal(int, object)  # generation, compute_directions() result or {'error': str}
+
+    def __init__(self, generation, args):
+        super().__init__()
+        self._generation = generation
+        self._args = args
+
+    def run(self):
+        try:
+            result = compute_directions(*self._args)
+        except Exception as e:
+            logger.error(f"Error calculating target directions: {e}", exc_info=True)
+            result = {"error": str(e)}
+        self.result_ready.emit(self._generation, result)
+
+
+# Running workers, referenced until they finish (a running QThread that's
+# garbage collected - e.g. with its window - aborts the app)
+_direction_workers = set()
+
+
 class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
     WINDOW_POSITION_KEY = "DSOTargetList"
     """Main window for DSO target list management"""
@@ -641,8 +1624,13 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
 
         self.db_manager = DatabaseManager()
         self.targets_data = []
+        # Direction column: results by target id (text, tooltip, below throughout),
+        # and a generation number so a stale worker's result is ignored
+        self._direction_cells = {}
+        self._direction_generation = 0
         self._init_database()
         self._init_ui()
+        theme_manager().theme_changed.connect(self._apply_direction_cells)
         self._load_targets()
     
     def _init_database(self):
@@ -706,10 +1694,10 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         main_layout = QVBoxLayout(central_widget)
         
         # Header
-        header_label = QLabel("DSO Target List")
-        header_label.setAlignment(Qt.AlignCenter)
-        themed_style(header_label, lambda: f"font-size: {font_px(18)}; font-weight: bold; margin: 10px;")
-        main_layout.addWidget(header_label)
+        #header_label = QLabel("DSO Target List")
+        #header_label.setAlignment(Qt.AlignCenter)
+        #themed_style(header_label, lambda: f"font-size: {font_px(18)}; font-weight: bold; margin: 10px;")
+        #main_layout.addWidget(header_label)
         
         # Control panel
         control_group = QGroupBox("Target List Management")
@@ -724,6 +1712,8 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         self.search_box.setClearButtonEnabled(True)
         search_row.addWidget(QLabel("Search:"))
         search_row.addWidget(self.search_box)
+        search_row.addSpacing(20)
+        self._build_direction_controls(search_row)
         search_row.addStretch()
         control_layout.addLayout(search_row)
 
@@ -818,7 +1808,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         self.targets_table.setColumnWidth(5, 90)   # Priority
         self.targets_table.setColumnWidth(6, 100)  # Status
         self.targets_table.setColumnWidth(7, 120)  # Telescope
-        self.targets_table.setColumnWidth(8, 70)   # Direction
+        self.targets_table.setColumnWidth(8, 170)  # Direction (room for "E (below) → SE")
         self.targets_table.setColumnWidth(9, 150)  # Best Months
         self.targets_table.setColumnWidth(10, 100) # Date Added
         
@@ -836,10 +1826,155 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         targets_group.setLayout(targets_layout)
         main_layout.addWidget(targets_group)
         
-        # Status bar
+        # Status bar, with a link to review possible duplicate entries when there are any
+        status_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
-        main_layout.addWidget(self.status_label)
+        status_row.addWidget(self.status_label)
+        self.duplicates_label = QLabel("")
+        self.duplicates_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.duplicates_label.setToolTip("Some entries look like the same object - review them to merge, "
+                                         "delete or fix")
+        self.duplicates_label.linkActivated.connect(lambda _link: self._review_duplicates())
+        self.duplicates_label.hide()
+        status_row.addWidget(self.duplicates_label)
+        status_row.addStretch()
+        main_layout.addLayout(status_row)
     
+    def _build_direction_controls(self, row):
+        """"Direction at:" - which time (or time frame) the Direction column shows."""
+        mode, at, start, end = load_direction_setting()
+        row.addWidget(QLabel("Direction at:"))
+        self.direction_mode_combo = QComboBox()
+        for key, label in DIRECTION_MODES:
+            self.direction_mode_combo.addItem(label, key)
+        self.direction_mode_combo.setToolTip(
+            "When the Direction column shows each target's compass direction.\n"
+            "Dusk and dawn are astronomical twilight (sun 18° below the horizon).\n"
+            "Tonight means the coming night - or, before dawn, the night you're in.")
+        row.addWidget(self.direction_mode_combo)
+
+        def time_edit(hhmm, tooltip):
+            edit = QTimeEdit(QTime.fromString(hhmm, "HH:mm"))
+            edit.setDisplayFormat("HH:mm")
+            edit.setToolTip(tooltip)
+            edit.timeChanged.connect(lambda _t: self._direction_timer.start())
+            return edit
+
+        self.direction_at_edit = time_edit(at, "Time tonight to show directions for")
+        row.addWidget(self.direction_at_edit)
+        self.direction_from_edit = time_edit(start, "Start of the time frame")
+        row.addWidget(self.direction_from_edit)
+        self.direction_to_label = QLabel("to")
+        row.addWidget(self.direction_to_label)
+        self.direction_to_edit = time_edit(end, "End of the time frame (after midnight is fine)")
+        row.addWidget(self.direction_to_edit)
+        self.direction_note_label = QLabel("")
+        themed_style(self.direction_note_label, lambda: f"color: {COLORS['text_secondary']};")
+        row.addWidget(self.direction_note_label)
+
+        # Time edits are applied once they stop changing, not on every step
+        self._direction_timer = QTimer(self)
+        self._direction_timer.setSingleShot(True)
+        self._direction_timer.setInterval(500)
+        self._direction_timer.timeout.connect(self._on_direction_setting_changed)
+        # "Now" moves on: recalculate while the window is open
+        self._direction_now_timer = QTimer(self)
+        self._direction_now_timer.setInterval(NOW_REFRESH_MS)
+        self._direction_now_timer.timeout.connect(self._update_directions)
+
+        index = self.direction_mode_combo.findData(mode)
+        self.direction_mode_combo.setCurrentIndex(max(index, 0))
+        self.direction_mode_combo.currentIndexChanged.connect(lambda _i: self._on_direction_setting_changed())
+        self._show_direction_time_edits()
+
+    def _direction_choice(self):
+        """(mode, at, from, to) currently chosen."""
+        return (self.direction_mode_combo.currentData(),
+                self.direction_at_edit.time().toString("HH:mm"),
+                self.direction_from_edit.time().toString("HH:mm"),
+                self.direction_to_edit.time().toString("HH:mm"))
+
+    def _show_direction_time_edits(self):
+        mode = self.direction_mode_combo.currentData()
+        self.direction_at_edit.setVisible(mode == "time")
+        for widget in (self.direction_from_edit, self.direction_to_label, self.direction_to_edit):
+            widget.setVisible(mode == "frame")
+        if mode == "now":
+            self._direction_now_timer.start()
+        else:
+            self._direction_now_timer.stop()
+
+    def _on_direction_setting_changed(self):
+        self._show_direction_time_edits()
+        save_direction_setting(*self._direction_choice())
+        self._update_directions()
+
+    def _update_directions(self):
+        """Recalculate the Direction column in the background."""
+        self._direction_generation += 1
+        try:
+            with self.db_manager.get_connection() as conn:
+                observer = load_observer(conn)
+                horizon = None
+                if observer:
+                    from HorizonProfile import load_active_horizon
+                    horizon = load_active_horizon(conn)
+        except Exception as e:
+            logger.error(f"Error loading location for directions: {e}")
+            observer = None
+        if not observer:
+            self._direction_cells = {t["id"]: ("Location not set", "Set your location in Settings", False)
+                                     for t in self.targets_data}
+            self.direction_note_label.setText("")
+            self._apply_direction_cells()
+            return
+        targets = [(t["id"], t["ra_deg"], t["dec_deg"]) for t in self.targets_data if has_position(t)]
+        self.direction_note_label.setText("Calculating...")
+        lat, lon, tz_name = observer
+        worker = DirectionWorker(self._direction_generation,
+                                 (targets, lat, lon, tz_name, horizon, *self._direction_choice()))
+        worker.result_ready.connect(self._on_directions_ready)
+        _direction_workers.add(worker)
+        worker.finished.connect(lambda: _direction_workers.discard(worker))
+        worker.start()
+
+    def _on_directions_ready(self, generation, result):
+        if generation != self._direction_generation:
+            return  # A newer calculation is on its way
+        if "error" in result:
+            self.direction_note_label.setText("Couldn't calculate directions")
+            return
+        self._direction_cells = result["cells"]
+        times = result["times"]
+        when = " \u2192 ".join(f"{t:%H:%M}" for _label, t in times)
+        mode = self.direction_mode_combo.currentData()
+        note = {"now": f"(as of {when})", "dusk": f"({when})", "dawn": f"({when})",
+                "night": f"({when})"}.get(mode, "")
+        if result.get("note"):
+            note = f"{note} - {result['note']}" if note else result["note"]
+        self.direction_note_label.setText(note)
+        self._apply_direction_cells()
+
+    def _apply_direction_cells(self):
+        """Fill the Direction column from the latest results."""
+        table = self.targets_table
+        sorting = table.isSortingEnabled()
+        table.setSortingEnabled(False)  # Rows would move while being updated
+        for row in range(table.rowCount()):
+            name_item = table.item(row, 0)
+            item = table.item(row, 8)
+            target = name_item.data(Qt.UserRole) if name_item else None
+            if not target or not item:
+                continue
+            if not has_position(target):
+                text, tooltip, below = "No coordinates", "", False
+            else:
+                text, tooltip, below = self._direction_cells.get(target["id"], ("\u2026", "Calculating...", False))
+            item.setText(text)
+            item.setToolTip(tooltip)
+            item.setForeground(QColor(COLORS['text_disabled'] if below else COLORS['text']))
+        table.setSortingEnabled(sorting)
+
     def _add_new_target(self):
         """Add a new target to the list"""
         dialog = AddTargetDialog(parent=self)
@@ -963,6 +2098,9 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
     def _open_best_dso_tonight(self):
         """Open the Best DSO Tonight window"""
         try:
+            # Imported here: Best DSO Tonight pulls in astropy's table code, which other
+            # tools importing this module's shared helpers shouldn't have to load
+            from BestDSOTonight import BestDSOTonightWindow
             # Create and show the Best DSO Tonight window with target list auto-selected
             self.best_dso_window = BestDSOTonightWindow(use_target_list=True)
             self.best_dso_window.show()
@@ -1097,10 +2235,36 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             self._filter_targets()
             
             self.status_label.setText(f"Loaded {len(self.targets_data)} targets")
+            self._update_duplicates_link()
             
         except Exception as e:
             logger.error(f"Error loading targets: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to load targets: {str(e)}")
+
+    def _update_duplicates_link(self):
+        """Show "N possible duplicates - Review..." when entries look like the same object."""
+        try:
+            with self.db_manager.get_connection() as conn:
+                count = len(find_duplicate_groups(conn))
+        except Exception as e:
+            logger.error(f"Error checking for duplicate targets: {e}")
+            count = 0
+        if not count:
+            self.duplicates_label.hide()
+            return
+        text = f"{count} possible duplicate{'s' if count != 1 else ''}"
+        themed_text(self.duplicates_label, lambda: (
+            f"<span style='color: {COLORS['warning']};'>⚠</span> "
+            f"<a href='review' style='color: {COLORS['link']};'>{text} — Review…</a>"))
+        self.duplicates_label.show()
+
+    def _review_duplicates(self):
+        """Open the review dialog for possible duplicate entries."""
+        dialog = DuplicateReviewDialog(self.db_manager, edit_callback=self._edit_target_with_data,
+                                                        parent=self)
+        dialog.targets_changed.connect(self._load_targets)
+        dialog.exec()
+        self._load_targets()
     
     def _populate_table(self):
         """Populate the targets table with loaded data"""
@@ -1156,14 +2320,8 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             telescope_item.setTextAlignment(Qt.AlignCenter)
             self.targets_table.setItem(row, 7, telescope_item)
 
-            # Direction - calculate current direction
-            ra_deg = target.get("ra_deg", 0)
-            dec_deg = target.get("dec_deg", 0)
-            if ra_deg and dec_deg:
-                direction = self._calculate_current_direction(ra_deg, dec_deg)
-            else:
-                direction = "No coordinates"
-            direction_item = QTableWidgetItem(direction)
+            # Direction - filled in by _update_directions (in the background)
+            direction_item = QTableWidgetItem("")
             direction_item.setTextAlignment(Qt.AlignCenter)
             self.targets_table.setItem(row, 8, direction_item)
 
@@ -1195,6 +2353,10 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
 
         # Set default sort by Priority (column 5) in descending order (Urgent first)
         self.targets_table.sortItems(5, Qt.DescendingOrder)
+
+        # Last results meanwhile (no flicker), then recalculate for any new targets
+        self._apply_direction_cells()
+        self._update_directions()
     
     def _calculate_best_months_for_all(self):
         """Calculate best viewing months for all targets based on user location"""
@@ -1439,67 +2601,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
 
     def azimuth_to_direction(self, az):
         """Convert azimuth to cardinal direction"""
-        directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
-                      'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
-        idx = int((az + 11.25) / 22.5) % 16
-        return directions[idx]
-
-    def _calculate_current_direction(self, ra_deg, dec_deg):
-        """Calculate current direction for a DSO based on current time and user location"""
-        try:
-            # Get user location
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
-                location_row = cursor.fetchone()
-                if not location_row:
-                    cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-                    location_row = cursor.fetchone()
-
-                if not location_row:
-                    return "Location not set"
-
-                lat, lon, timezone_str = location_row
-                if lat is None or lon is None:
-                    return "Location not set"
-
-            # Use DSOVisibilityCalculator to get current azimuth
-            from DSOVisibilityCalculator import DSOVisibilityCalculator
-            from astropy.coordinates import SkyCoord
-            import astropy.units as u
-            from datetime import datetime
-            import pytz
-
-            # Create calculator
-            calculator = DSOVisibilityCalculator(lat, lon)
-
-            # Create coordinate object
-            dso_coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
-
-            # Get current time in user's timezone
-            if timezone_str:
-                try:
-                    user_tz = pytz.timezone(timezone_str)
-                    current_time = datetime.now(user_tz)
-                except:
-                    current_time = datetime.now()
-            else:
-                current_time = datetime.now()
-
-            # Calculate current position
-            date_str = current_time.strftime('%Y-%m-%d')
-            time_range, dso_altaz, sun_altaz = calculator.calculate_altaz_over_time(
-                dso_coord, date_str, 0.25)  # Just get current position
-
-            if len(dso_altaz.az.deg) > 0:
-                current_azimuth = dso_altaz.az.deg[0]
-                return self.azimuth_to_direction(current_azimuth)
-            else:
-                return "Calculation error"
-
-        except Exception as e:
-            logger.debug(f"Error calculating direction: {e}")
-            return "Not available"
+        return compass_direction(az)
 
     def _show_context_menu(self, position):
         """Show context menu when right-clicking on the table"""
@@ -1710,10 +2812,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         """
         try:
             with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) FROM usertargetlist WHERE name = ?", (dso_name,))
-                count = cursor.fetchone()[0]
-                return count > 0
+                return find_existing_target(conn, dso_name) is not None
         except Exception as e:
             logger.error(f"Error checking if DSO is in target list: {str(e)}")
             return False
@@ -1737,10 +2836,16 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             # Reload targets to ensure we have current data
             self._load_targets()
 
-            # Find the row with the matching DSO name
+            # The entry for this object, even if it's listed under another name
+            with self.db_manager.get_connection() as conn:
+                match = find_existing_target(conn, dso_name)
+            if not match:
+                return False
+
             for row in range(self.targets_table.rowCount()):
                 name_item = self.targets_table.item(row, 0)
-                if name_item and name_item.text() == dso_name:
+                row_data = name_item.data(Qt.UserRole) if name_item else None
+                if row_data and row_data.get("id") == match["id"]:
                     # Select the row
                     self.targets_table.selectRow(row)
                     self.targets_table.scrollToItem(name_item)

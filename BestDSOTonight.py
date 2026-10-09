@@ -1926,12 +1926,10 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             bool: True if DSO is in target list, False otherwise
         """
         try:
+            from DSOTargetList import find_existing_target
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) FROM usertargetlist WHERE name = ?", (dso_name,))
-                count = cursor.fetchone()[0]
-                return count > 0
+                return find_existing_target(conn, dso_name) is not None
         except Exception as e:
             logger.error(f"Error checking if DSO is in target list: {str(e)}")
             return False

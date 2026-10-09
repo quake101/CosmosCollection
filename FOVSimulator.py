@@ -2036,61 +2036,27 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
     def _check_if_in_target_list(self):
         """Check if the current DSO is already in the target list."""
+        return self._target_list_entry() is not None
+
+    def _target_list_entry(self):
+        """The current DSO's Target List entry - same name, another designation of
+        the same object, or the same position - or None."""
         try:
+            from DSOTargetList import find_existing_target, delete_target
+            dso_name = self.data.get('name', '').strip()
+            if not dso_name:
+                return None
             with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-                dso_name = self.data.get('name', '').strip()
-                ra_deg = self.data.get('ra_deg')
-                dec_deg = self.data.get('dec_deg')
-                if not dso_name:
-                    return False
-                cursor.execute(
-                    "SELECT COUNT(*) FROM usertargetlist WHERE UPPER(TRIM(name)) = ?",
-                    (dso_name.upper(),)
-                )
-                if cursor.fetchone()[0] > 0:
-                    return True
-                if ra_deg is not None and dec_deg is not None:
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM usertargetlist WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001",
-                        (ra_deg, dec_deg)
-                    )
-                    if cursor.fetchone()[0] > 0:
-                        return True
-                return False
+                return find_existing_target(
+                    conn, dso_name, self.data.get('ra_deg'), self.data.get('dec_deg'))
         except Exception as e:
             logger.error(f"Error checking target list status: {e}")
-            return False
+            return None
 
     def _find_target_list_name(self):
         """Return the stored target list name for the current DSO, or None."""
-        try:
-            with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-                dso_name = self.data.get('name', '').strip()
-                ra_deg = self.data.get('ra_deg')
-                dec_deg = self.data.get('dec_deg')
-                if not dso_name:
-                    return None
-                cursor.execute(
-                    "SELECT name FROM usertargetlist WHERE UPPER(TRIM(name)) = ? LIMIT 1",
-                    (dso_name.upper(),)
-                )
-                result = cursor.fetchone()
-                if result:
-                    return result[0]
-                if ra_deg is not None and dec_deg is not None:
-                    cursor.execute(
-                        "SELECT name FROM usertargetlist WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001 LIMIT 1",
-                        (ra_deg, dec_deg)
-                    )
-                    result = cursor.fetchone()
-                    if result:
-                        return result[0]
-                return None
-        except Exception as e:
-            logger.error(f"Error finding target list name: {e}")
-            return None
+        entry = self._target_list_entry()
+        return entry["name"] if entry else None
 
     def _update_target_list_button(self):
         """Show/hide target list actions based on current list membership."""
@@ -2131,20 +2097,13 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-            with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "DELETE FROM usertargetlist WHERE UPPER(TRIM(name)) = ?",
-                    (dso_name.upper(),)
-                )
-                ra_deg = self.data.get('ra_deg')
-                dec_deg = self.data.get('dec_deg')
-                if ra_deg is not None and dec_deg is not None:
-                    cursor.execute(
-                        "DELETE FROM usertargetlist WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001",
-                        (ra_deg, dec_deg)
-                    )
-                conn.commit()
+            from DSOTargetList import find_existing_target, delete_target
+            entry = self._target_list_entry()
+            if entry:
+                # Just this object's entry (this used to delete every entry with a
+                # matching name or position)
+                with DatabaseManager().get_connection() as conn:
+                    delete_target(conn, entry["id"])
             self._update_target_list_button()
             QMessageBox.information(self, "Success", f"'{dso_name}' removed from target list.")
         except Exception as e:

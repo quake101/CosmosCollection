@@ -6668,16 +6668,16 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         missing = [e for e in self.model.dso_data if e.get('image_count', 0) == 0]
 
         try:
+            from DSOTargetList import TargetListIndex
             with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT LOWER(name) FROM usertargetlist")
-                existing = {row[0] for row in cursor.fetchall()}
+                # Same rules as everywhere else: an object listed under another
+                # spelling or designation ("M17" / "M 17", "IC 4725" / "M 25") counts
+                on_list = TargetListIndex(conn)
+                to_add = [e for e in missing if on_list.match(e.get('name', '')) is None]
         except Exception as e:
             logger.error(f"Error reading target list: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to read target list: {str(e)}")
             return
-
-        to_add = [e for e in missing if e.get('name', '').lower() not in existing]
 
         if not to_add:
             QMessageBox.information(

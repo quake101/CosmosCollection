@@ -1938,77 +1938,27 @@ class DSODetailWindow(QDialog):
 
     def _check_if_in_target_list(self):
         """Check if current DSO is already in the target list"""
+        return self._target_list_entry() is not None
+
+    def _target_list_entry(self):
+        """This DSO's Target List entry - same name, another designation of the
+        same object, or the same position - or None."""
         try:
+            from DSOTargetList import find_existing_target, delete_target
+            dso_name = self.data.get('name', '').strip()
+            if not dso_name:
+                return None
             with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-
-                dso_name = self.data.get('name', '').strip()
-                ra_deg = self.data.get('ra_deg')
-                dec_deg = self.data.get('dec_deg')
-
-                if not dso_name:
-                    return False
-
-                cursor.execute("""
-                    SELECT COUNT(*) FROM usertargetlist
-                    WHERE UPPER(TRIM(name)) = ?
-                """, (dso_name.upper(),))
-
-                if cursor.fetchone()[0] > 0:
-                    return True
-
-                if ra_deg is not None and dec_deg is not None:
-                    cursor.execute("""
-                        SELECT COUNT(*) FROM usertargetlist
-                        WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001
-                    """, (ra_deg, dec_deg))
-
-                    if cursor.fetchone()[0] > 0:
-                        return True
-
-                return False
-
+                return find_existing_target(
+                    conn, dso_name, self.data.get('ra_deg'), self.data.get('dec_deg'))
         except Exception as e:
             logger.error(f"Error checking target list status: {str(e)}")
-            return False
+            return None
 
     def _find_target_list_name(self):
         """Find the actual name used in the target list for this DSO"""
-        try:
-            with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-
-                dso_name = self.data.get('name', '').strip()
-                ra_deg = self.data.get('ra_deg')
-                dec_deg = self.data.get('dec_deg')
-
-                if not dso_name:
-                    return None
-
-                cursor.execute("""
-                    SELECT name FROM usertargetlist
-                    WHERE UPPER(TRIM(name)) = ? LIMIT 1
-                """, (dso_name.upper(),))
-
-                result = cursor.fetchone()
-                if result:
-                    return result[0]
-
-                if ra_deg is not None and dec_deg is not None:
-                    cursor.execute("""
-                        SELECT name FROM usertargetlist
-                        WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001 LIMIT 1
-                    """, (ra_deg, dec_deg))
-
-                    result = cursor.fetchone()
-                    if result:
-                        return result[0]
-
-                return None
-
-        except Exception as e:
-            logger.error(f"Error finding target list name: {str(e)}")
-            return None
+        entry = self._target_list_entry()
+        return entry["name"] if entry else None
 
     def _add_to_target_list(self):
         """Add this DSO to the target list"""
@@ -2095,33 +2045,21 @@ class DSODetailWindow(QDialog):
             if reply != QMessageBox.Yes:
                 return
 
-            with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
+            from DSOTargetList import find_existing_target, delete_target
+            dso_name = self.data.get('name', '').strip()
+            if not dso_name:
+                QMessageBox.warning(self, "Error", "Cannot remove: DSO name not found")
+                return
+            entry = self._target_list_entry()
+            if entry:
+                # Just this object's entry (this used to delete every entry with a
+                # matching name or position)
+                with DatabaseManager().get_connection() as conn:
+                    delete_target(conn, entry["id"])
+            self._update_target_list_buttons()
 
-                dso_name = self.data.get('name', '').strip()
-                ra_deg = self.data.get('ra_deg')
-                dec_deg = self.data.get('dec_deg')
-
-                if not dso_name:
-                    QMessageBox.warning(self, "Error", "Cannot remove: DSO name not found")
-                    return
-
-                cursor.execute("""
-                    DELETE FROM usertargetlist WHERE UPPER(TRIM(name)) = ?
-                """, (dso_name.upper(),))
-
-                if ra_deg is not None and dec_deg is not None:
-                    cursor.execute("""
-                        DELETE FROM usertargetlist
-                        WHERE ABS(ra_deg - ?) < 0.001 AND ABS(dec_deg - ?) < 0.001
-                    """, (ra_deg, dec_deg))
-
-                conn.commit()
-
-                self._update_target_list_buttons()
-
-                QMessageBox.information(self, "Success", f"'{dso_name}' removed from target list")
-                logger.debug(f"Removed {dso_name} from target list")
+            QMessageBox.information(self, "Success", f"'{dso_name}' removed from target list")
+            logger.debug(f"Removed {dso_name} from target list")
 
         except Exception as e:
             logger.error(f"Error removing from target list: {str(e)}", exc_info=True)
