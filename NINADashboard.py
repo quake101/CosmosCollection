@@ -11,7 +11,6 @@ import re
 import sys
 import time
 import warnings
-from collections import deque
 from datetime import datetime
 from io import BytesIO
 
@@ -515,7 +514,7 @@ class NINAStatusWorker(QThread):
     livestack_updated = Signal(bytes, dict, list)  # Emits livestack image, status, and available stacks
     livestack_fetching = Signal(int, int)  # Emits (bytes_received, total_bytes); total_bytes=-1 if unknown
     liveview_updated = Signal(bytes)  # Emits prepared image JPEG frame data
-    guiding_updated = Signal(list)  # Emits guiding graph data points
+    guiding_updated = Signal(dict)  # Emits NINA's guide graph (steps + its RMS)
     event_occurred = Signal(dict)  # Emits new NINA event data
     events_loaded = Signal(list)  # Emits recent past events once on connect (for the event log)
     autofocus_report = Signal(dict)  # Emits the last-af report when an autofocus run completes
@@ -732,7 +731,7 @@ class NINAStatusWorker(QThread):
                 is_guiding = guider.get('Connected', False) and guider_state == 'Guiding'
                 if is_guiding:
                     guiding_data = NINAIntegration.get_guiding_graph_data(self.host, self.port)
-                    if guiding_data and isinstance(guiding_data, list):
+                    if guiding_data:
                         self.guiding_updated.emit(guiding_data)
 
                 # Fetch event history and emit new events
@@ -959,11 +958,14 @@ class GuidingGraph(FigureCanvas):
         self.setParent(parent)
         theme_manager().theme_changed.connect(self._on_theme_changed)
 
-        # Circular buffer for last 5 minutes of data (at ~1 point/sec = 300 points)
-        self.max_points = 300
-        self.ra_data = deque(maxlen=self.max_points)
-        self.dec_data = deque(maxlen=self.max_points)
-        self.time_data = deque(maxlen=self.max_points)
+        # NINA's current guide graph window (replaced on every update)
+        self.max_points = 100  # Empty chart width; NINA's default history size
+        self.ra_data = []
+        self.dec_data = []
+        self.time_data = []
+        self.dither_positions = []
+        self.rms = None  # NINA's RMS for the window, in pixels
+        self._factor, self._unit = 1.0, '"'  # Pixels -> display units
 
         self.ax = None
         self._create_empty_chart()
@@ -1013,21 +1015,64 @@ class GuidingGraph(FigureCanvas):
         self.figure.tight_layout()
         self.draw()
 
-    def update_data(self, guiding_data):
-        """Update the graph with new guiding data points."""
-        if not guiding_data:
-            return
+    def update_data(self, graph):
+        """Show NINA's guide graph: its last HistorySize steps and its own RMS.
 
-        # Process incoming data - NINA API returns list of guide points
-        for point in guiding_data:
-            ra_error = point.get('RADistanceRawDisplay', 0) or point.get('RADistanceDisplay', 0) or 0
-            dec_error = point.get('DECDistanceRawDisplay', 0) or point.get('DECDistanceDisplay', 0) or 0
+        Each poll returns NINA's whole window, so it replaces the data rather
+        than adding to it. Distances are plotted in arcseconds from NINA's raw
+        pixel values and pixel scale (pixels if the scale isn't known).
+        """
+        steps = graph.get('GuideSteps') or []
+        pixel_scale = graph.get('PixelScale') or (graph.get('RMS') or {}).get('Scale')
+        if isinstance(pixel_scale, (int, float)) and pixel_scale > 0:
+            self._factor, self._unit = pixel_scale, '"'
+        else:
+            self._factor, self._unit = 1.0, ' px'
 
-            self.ra_data.append(ra_error)
-            self.dec_data.append(dec_error)
+        self.ra_data.clear()
+        self.dec_data.clear()
+        self.time_data.clear()
+        self.dither_positions = []
+        for step in steps:
+            dither = step.get('Dither')
+            if isinstance(dither, (int, float)) and not math.isnan(dither):
+                # NINA's dither marker (zero distances), not a guide step
+                self.dither_positions.append(len(self.ra_data) - 0.5)
+                continue
+            ra = step.get('RADistanceRaw')
+            dec = step.get('DECDistanceRaw')
+            self.ra_data.append((ra if isinstance(ra, (int, float)) else 0) * self._factor)
+            self.dec_data.append((dec if isinstance(dec, (int, float)) else 0) * self._factor)
             self.time_data.append(len(self.time_data))
+        self.rms = graph.get('RMS') if isinstance(graph.get('RMS'), dict) else None
 
         self._redraw_chart()
+
+    def _rms_values(self):
+        """(RA, Dec, total) RMS in guide camera pixels - NINA's figures when it sent them.
+
+        NINA's RMS is the standard deviation (the mean offset removed) of the
+        guide steps in the window, excluding dither markers.
+        """
+        rms = self.rms or {}
+        if all(isinstance(rms.get(key), (int, float)) for key in ('RA', 'Dec', 'Total')):
+            return rms['RA'], rms['Dec'], rms['Total']
+
+        def std(values):  # Plotted values are in display units; back to pixels
+            pixels = [v / self._factor for v in values]
+            mean = sum(pixels) / len(pixels)
+            return math.sqrt(sum((v - mean) ** 2 for v in pixels) / len(pixels))
+        ra_rms, dec_rms = std(self.ra_data), std(self.dec_data)
+        return ra_rms, dec_rms, math.hypot(ra_rms, dec_rms)
+
+    def _rms_text(self):
+        """The RMS the way NINA shows it: 'RA: 0.11 (0.48")  Dec: 0.12 (0.50")  Tot: 0.16 (0.69")'
+        - pixels, then arcseconds when the pixel scale is known."""
+        parts = []
+        for label, pixels in zip(('RA', 'Dec', 'Tot'), self._rms_values()):
+            arcsec = f' ({pixels * self._factor:.2f}")' if self._unit == '"' else ''
+            parts.append(f'{label}: {pixels:.2f}{arcsec}')
+        return '  '.join(parts)
 
     def _redraw_chart(self):
         """Redraw the chart with current data."""
@@ -1040,6 +1085,10 @@ class GuidingGraph(FigureCanvas):
 
         x_data = list(range(len(self.ra_data)))
 
+        # Dithers, as NINA marks them
+        for position in self.dither_positions:
+            self.ax.axvline(x=position, color=COLORS['text_secondary'], linestyle=':', alpha=0.6, linewidth=1)
+
         # Plot RA and Dec
         self.ax.plot(x_data, list(self.ra_data), color=chart_color('#4488ff'), linewidth=1.5, label='RA')
         self.ax.plot(x_data, list(self.dec_data), color=chart_color('#ff8844'), linewidth=1.5, label='Dec')
@@ -1049,16 +1098,8 @@ class GuidingGraph(FigureCanvas):
         self.ax.axhline(y=-1, color=COLORS['warning'], linestyle='--', alpha=0.5, linewidth=1)
         self.ax.axhline(y=0, color=COLORS['text_secondary'], linestyle='-', alpha=0.3, linewidth=1)
 
-        # Calculate RMS for display
-        if self.ra_data:
-            import math
-            ra_rms = math.sqrt(sum(x**2 for x in self.ra_data) / len(self.ra_data))
-            dec_rms = math.sqrt(sum(x**2 for x in self.dec_data) / len(self.dec_data))
-            total_rms = math.sqrt(ra_rms**2 + dec_rms**2)
-            self.ax.set_title(f'Guiding Performance  |  RMS: {total_rms:.2f}" (RA: {ra_rms:.2f}", Dec: {dec_rms:.2f}")',
-                              color=COLORS['text'], fontsize=chart_font_size(10), fontweight='bold')
-        else:
-            self.ax.set_title('Guiding Performance', color=COLORS['text'], fontsize=chart_font_size(10), fontweight='bold')
+        self.ax.set_title(f'Guiding Performance  |  {self._rms_text()}',
+                          color=COLORS['text'], fontsize=chart_font_size(10), fontweight='bold')
 
         # Axis limits
         self.ax.set_xlim(0, max(len(self.ra_data), 60))
@@ -1066,8 +1107,9 @@ class GuidingGraph(FigureCanvas):
                           abs(min(self.dec_data)), abs(max(self.dec_data))) * 1.2)
         self.ax.set_ylim(-y_max, y_max)
 
-        self.ax.set_ylabel('Deviation (arcsec)', color=COLORS['text'], fontsize=chart_font_size(9))
-        self.ax.set_xlabel('Samples', color=COLORS['text'], fontsize=chart_font_size(9))
+        self.ax.set_ylabel('Deviation (arcsec)' if self._unit == '"' else 'Deviation (pixels)',
+                           color=COLORS['text'], fontsize=chart_font_size(9))
+        self.ax.set_xlabel('Guide steps', color=COLORS['text'], fontsize=chart_font_size(9))
 
         # Style
         self.ax.set_facecolor(COLORS['background_light'])
@@ -1090,6 +1132,8 @@ class GuidingGraph(FigureCanvas):
         self.ra_data.clear()
         self.dec_data.clear()
         self.time_data.clear()
+        self.dither_positions = []
+        self.rms = None
         self._create_empty_chart()
 
 

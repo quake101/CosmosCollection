@@ -1652,7 +1652,11 @@ class NINAIntegration:
             port: The API port number
 
         Returns:
-            list: List of guiding data points (GuideSteps) on success, None on failure
+            dict: NINA's guide graph - 'GuideSteps' (the last HistorySize steps,
+                  distances in pixels as RADistanceRaw/DECDistanceRaw, dithers
+                  marked by a numeric 'Dither'), 'RMS' (NINA's own RA/Dec/Total
+                  RMS over those steps, in pixels) and 'PixelScale' (arcsec per
+                  pixel); None on failure
         """
         url = f"http://{host}:{port}/v2/api/equipment/guider/graph"
         #logger.debug(f"API Request: {url}")
@@ -1662,11 +1666,9 @@ class NINAIntegration:
                 result = json.loads(response.read().decode('utf-8'))
                 #logger.debug(f"API Response: {result}")
                 if result.get('Success'):
-                    resp = result.get('Response', {})
-                    if isinstance(resp, dict):
-                        # Response contains GuideSteps array with the graph data
-                        guide_steps = resp.get('GuideSteps', [])
-                        return guide_steps if isinstance(guide_steps, list) else None
+                    resp = result.get('Response')
+                    if isinstance(resp, dict) and isinstance(resp.get('GuideSteps'), list):
+                        return resp
                     return None
                 return None
         except urllib.error.HTTPError as e:
