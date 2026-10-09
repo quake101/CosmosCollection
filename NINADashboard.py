@@ -48,6 +48,48 @@ from TimeFormatHelper import format_time
 # Set up logging
 logger = logging.getLogger(__name__)
 
+# Threads that have to outlive a stop request or their window. Dropping the last
+# reference to a running QThread destroys it mid-run, which aborts the whole app.
+_running_threads = set()
+
+
+def keep_alive_until_finished(thread):
+    """Hold a reference to a running QThread until it finishes."""
+    _running_threads.add(thread)
+    thread.finished.connect(lambda: _running_threads.discard(thread))
+
+
+def skip_zero_quality(spin):
+    """Step a -1..100 quality spin box straight between -1 (PNG) and 1: NINA
+    doesn't accept a quality of 0."""
+    spin.setProperty("last_quality", spin.value())
+
+    def on_change(value):
+        if value == 0:
+            # Coming down from 1 -> PNG; coming up from PNG (or typed 0) -> 1
+            spin.setValue(-1 if spin.property("last_quality") == 1 else 1)
+            return
+        spin.setProperty("last_quality", value)
+    # Connected first, so the fix happens before other handlers see 0
+    spin.valueChanged.connect(on_change)
+
+
+def valid_size(text):
+    """Whether text is an image size NINA accepts ('WxH', e.g. '1920x1080')."""
+    return re.fullmatch(r'\d+x\d+', str(text).strip()) is not None
+
+
+def finite_number(value):
+    """value if it's a real, finite number, else None.
+
+    NINA sends missing readings (e.g. the temperature of a focuser without a
+    probe) as the string "NaN".
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def format_image_stat(value, decimals=None, allow_negative=True):
     """Format an image-history statistic, returning "--" when it wasn't measured.
 
@@ -507,6 +549,10 @@ class SequencePanel(QWidget):
             self._apply_activity_size()
 
 
+class _NINAUnreachable(Exception):
+    """NINA's API isn't answering (NINA closed, or its PC is off)."""
+
+
 class NINAStatusWorker(QThread):
     """Background thread for polling NINA API endpoints."""
 
@@ -534,6 +580,7 @@ class NINAStatusWorker(QThread):
     HISTORY_THUMBNAILS = 20  # Most thumbnails sent at once (on connect, or after catching up)
     HISTORY_CHECK_SECONDS = 30  # How often to confirm NINA still has our latest image
     SEQUENCE_POLL_SECONDS = 2  # The sequence tree is large; refresh it less often than equipment
+    LIVESTACK_RETRY_SECONDS = 10  # Pause before retrying a failed live stack image download
 
     def __init__(self, host, port):
         super().__init__()
@@ -549,6 +596,7 @@ class NINAStatusWorker(QThread):
         self._last_livestack_hash = None  # Track livestack image hash
         self._last_livestack_count = None  # Track livestack stack count
         self._last_livestack_running = False  # Track if livestack was running
+        self._livestack_retry_at = 0.0  # time.monotonic() before which a failed image fetch isn't retried
         self._livestack_target = None  # User-selected livestack target
         self._livestack_filter = None  # User-selected livestack filter
         self._consecutive_failures = 0  # Track consecutive API failures to detect disconnect
@@ -595,12 +643,22 @@ class NINAStatusWorker(QThread):
 
         while self._running:
             try:
+                # While NINA isn't answering, only check whether it's back (one small
+                # request) rather than a full poll whose every request would time out
+                if self._consecutive_failures and not NINAIntegration.is_reachable(self.host, self.port):
+                    raise _NINAUnreachable()
+
                 # Fetch equipment status
                 status_data = {}
 
                 camera_info = NINAIntegration.get_camera_info(self.host, self.port)
                 if camera_info and isinstance(camera_info, dict):
                     status_data['camera'] = camera_info
+                elif not NINAIntegration.is_reachable(self.host, self.port):
+                    # No answer from NINA itself: skip the rest of this poll. A closed port
+                    # on a PC whose firewall drops connections makes each request wait for
+                    # its whole timeout, so a full poll would take most of a minute.
+                    raise _NINAUnreachable()
 
                 mount_info = NINAIntegration.get_mount_info(self.host, self.port)
                 if mount_info and isinstance(mount_info, dict):
@@ -691,15 +749,18 @@ class NINAStatusWorker(QThread):
                                                  or livestack_info.get('GreenStackCount')
                                                  or livestack_info.get('BlueStackCount'))
 
-                            # Only fetch the image when stack count changes (or first time)
-                            if current_count != self._last_livestack_count:
-                                self._last_livestack_count = current_count
+                            # Only fetch the image when stack count changes (or first time).
+                            # The count is recorded once the image arrives, so a failed
+                            # download is retried (after a pause) rather than waiting
+                            # for the next frame to be stacked.
+                            if (current_count != self._last_livestack_count
+                                    and time.monotonic() >= self._livestack_retry_at):
                                 # Recalculate integration time from full image history
                                 # so mixed-exposure stacks are always accurate
                                 if current_count and actual_target:
                                     history = NINAIntegration.get_all_image_history(self.host, self.port)
                                     integration = NINAIntegration.calculate_integration_from_history(
-                                        history, actual_target, int(current_count))
+                                        history, actual_target, int(current_count), actual_filter)
                                     if integration is not None:
                                         livestack_status['calculated_integration'] = integration
                                 self.livestack_fetching.emit(0, -1)
@@ -709,8 +770,10 @@ class NINAStatusWorker(QThread):
                                     progress_callback=lambda recv, total: self.livestack_fetching.emit(recv, total)
                                 )
                                 if livestack_image:
+                                    self._last_livestack_count = current_count
                                     self.livestack_updated.emit(livestack_image, livestack_status, available_stacks)
                                 else:
+                                    self._livestack_retry_at = time.monotonic() + self.LIVESTACK_RETRY_SECONDS
                                     self.livestack_updated.emit(b'', livestack_status, available_stacks)
                             else:
                                 # Stack count unchanged - emit status only (no image data)
@@ -763,6 +826,8 @@ class NINAStatusWorker(QThread):
                     if image_data:
                         self.liveview_updated.emit(image_data)
 
+            except _NINAUnreachable:
+                self._note_unreachable()
             except Exception as e:
                 logger.error(f"Error in NINA status worker: {e}")
                 self.error_occurred.emit(str(e))
@@ -776,6 +841,14 @@ class NINAStatusWorker(QThread):
                     if not self._running:
                         break
                     self.msleep(50)
+
+    def _note_unreachable(self):
+        """Count a poll NINA didn't answer; two in a row means it's gone."""
+        self._consecutive_failures += 1
+        self._poll_interval = self.POLL_RATE_IDLE
+        if self._consecutive_failures == 2:
+            logger.debug("NINA connection lost (not answering)")
+            self.connection_changed.emit(False, "", self.host, self.port)
 
     def _check_for_new_images(self, status_data):
         """Send images NINA saved since the last poll to the UI.
@@ -834,7 +907,13 @@ class NINAStatusWorker(QThread):
             )
             self.image_fetching.emit(-1, -1)
             if image_data:
-                self.image_updated.emit(image_data, status_data)
+                # status_data's statistics were fetched at the start of this poll,
+                # before the new image was found, so they belong to the previous one
+                image_meta = dict(status_data)
+                stats = NINAIntegration.get_image_statistics(self.host, self.port, self._last_image_index)
+                if stats:
+                    image_meta['statistics'] = stats
+                self.image_updated.emit(image_data, image_meta)
 
     def _history_was_reset(self):
         """Whether NINA no longer has our latest image (its history started over).
@@ -926,6 +1005,7 @@ class NINAStatusWorker(QThread):
         self._livestack_filter = filter_name
         # Reset cached count so the next poll fetches the image for the new selection
         self._last_livestack_count = None
+        self._livestack_retry_at = 0.0
 
     def set_liveview_active(self, active):
         """Start or stop live view polling."""
@@ -1622,12 +1702,13 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._last_update = None
         self._exposure_end_time = None
         self._exposure_total_time = None  # Total exposure duration captured on first detection
+        self._camera_seen_idle = False  # Saw the camera not exposing, so the next exposure's start is seen
         self._current_image_pixmap = None  # Store original pixmap for rescaling
         self._viewing_history_index = None  # Set when viewing a historical image (not the latest)
         self._current_livestack_pixmap = None  # Store original livestack pixmap
         self._current_liveview_pixmap = None  # Store original liveview pixmap
         self._sub_exposure_by_target = {}  # {target_name: latest exposure_time} from image history
-        self._total_integration_by_target = {}  # {target_name: integration seconds from history}
+        self._total_integration_by_target = {}  # {(target, filter): integration seconds from history}
         self._restoring_settings = False  # Guard to prevent re-fetch during settings restore
 
         self._image_fetch_done.connect(self._on_image_fetch_done)
@@ -1744,7 +1825,13 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.camera_target_temp_spinbox.setValue(-10)
         self.camera_target_temp_spinbox.setSuffix("°C")
         self.camera_target_temp_spinbox.setToolTip("Target cooling temperature")
-        self.camera_target_temp_spinbox.valueChanged.connect(self._on_target_temp_changed)
+        # Sent once the value settles, not on every arrow click
+        self._target_temp_timer = QTimer(self)
+        self._target_temp_timer.setSingleShot(True)
+        self._target_temp_timer.setInterval(800)
+        self._target_temp_timer.timeout.connect(self._apply_target_temp)
+        # (a lambda: valueChanged passes the value, which start() would take as the interval)
+        self.camera_target_temp_spinbox.valueChanged.connect(lambda _value: self._target_temp_timer.start())
         cooling_layout.addWidget(self.camera_target_temp_spinbox)
         cooling_layout.addStretch()
         camera_layout.addWidget(cooling_widget, 4, 1)
@@ -1763,6 +1850,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         # Track if user recently changed settings (prevents sync from overriding)
         self._user_changing_cooling = False
         self._user_changing_dewheater = False
+        # A cooling / dew heater request is on its way to NINA (its control stays disabled)
+        self._cooling_request_pending = False
+        self._dewheater_request_pending = False
         # Track the last cooling state we intentionally set (to avoid duplicate API calls)
         self._last_cooling_enabled = None
         self._last_cooling_temp = None
@@ -2066,6 +2156,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
     def _create_image_panel(self, parent_layout):
         """Create the image display panel with tabs for Live View, Latest Image, and Live Stack."""
+        # The size boxes are editable: apply a size once typing pauses, not on every keystroke
+        self._size_timer = QTimer(self)
+        self._size_timer.setSingleShot(True)
+        self._size_timer.setInterval(600)
+        self._size_timer.timeout.connect(self._on_size_changed)
         # Create tab widget instead of group box
         self.image_tabs = QTabWidget()
         self.image_tabs.setDocumentMode(False)
@@ -2106,7 +2201,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.liveview_size_combo.setCurrentText("800x600")
         self.liveview_size_combo.setToolTip("Image size (WxH). Type a custom value or select a preset.")
         self.liveview_size_combo.setFixedWidth(110)
-        self.liveview_size_combo.currentTextChanged.connect(self._on_liveview_quality_changed)
+        self.liveview_size_combo.currentTextChanged.connect(lambda _text: self._size_timer.start())
         liveview_settings_layout.addWidget(self.liveview_size_combo)
 
         self.liveview_toggle_btn = QPushButton("Start")
@@ -2143,7 +2238,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.image_quality_spin = QSpinBox()
         self.image_quality_spin.setRange(-1, 100)
         self.image_quality_spin.setValue(-1)
-        self.image_quality_spin.setToolTip("-1 = PNG (lossless), 1-100 = JPEG quality")
+        self.image_quality_spin.setToolTip("PNG (lossless), or 1-100 = JPEG quality")
+        self.image_quality_spin.setSpecialValueText("PNG")  # -1
+        skip_zero_quality(self.image_quality_spin)
         self.image_quality_spin.valueChanged.connect(self._on_image_quality_changed)
         image_settings_layout.addWidget(self.image_quality_spin)
 
@@ -2154,7 +2251,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.image_size_combo.setCurrentText("800x600")
         self.image_size_combo.setToolTip("Image size (WxH). Type a custom value or select a preset.")
         self.image_size_combo.setFixedWidth(110)
-        self.image_size_combo.currentTextChanged.connect(self._on_image_quality_changed)
+        self.image_size_combo.currentTextChanged.connect(lambda _text: self._size_timer.start())
         image_settings_layout.addWidget(self.image_size_combo)
 
         image_settings_layout.addStretch()
@@ -2220,7 +2317,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.livestack_quality_spin = QSpinBox()
         self.livestack_quality_spin.setRange(-1, 100)
         self.livestack_quality_spin.setValue(100)
-        self.livestack_quality_spin.setToolTip("-1 = PNG (lossless), 1-100 = JPEG quality")
+        self.livestack_quality_spin.setToolTip("PNG (lossless), or 1-100 = JPEG quality")
+        self.livestack_quality_spin.setSpecialValueText("PNG")  # -1
+        skip_zero_quality(self.livestack_quality_spin)
         self.livestack_quality_spin.valueChanged.connect(self._on_livestack_quality_changed)
         livestack_settings_layout.addWidget(self.livestack_quality_spin)
 
@@ -2231,7 +2330,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.livestack_size_combo.setCurrentText("800x600")
         self.livestack_size_combo.setToolTip("Image size (WxH). Type a custom value or select a preset.")
         self.livestack_size_combo.setFixedWidth(110)
-        self.livestack_size_combo.currentTextChanged.connect(self._on_livestack_quality_changed)
+        self.livestack_size_combo.currentTextChanged.connect(lambda _text: self._size_timer.start())
         livestack_settings_layout.addWidget(self.livestack_size_combo)
 
         livestack_settings_layout.addStretch()
@@ -2252,7 +2351,6 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._ls_annot_solution = None
         self._ls_annot_solving = False
         self._ls_annot_renderer = None
-        self._ls_annot_catalog_workers = []  # Kept referenced until their threads exit
 
         self.livestack_label = ZoomableImageWidget(placeholder_text="Live stack not active")
         livestack_layout.addWidget(self.livestack_label, 1)
@@ -2775,10 +2873,24 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
     def _stop_worker(self):
         """Stop the worker thread."""
-        if self.worker:
-            self.worker.stop()
-            self.worker.wait(2000)
-            self.worker = None
+        worker, self.worker = self.worker, None
+        if worker:
+            worker.stop()
+            if not worker.wait(2000):
+                # Still inside a slow request (e.g. NINA unreachable). Stop listening and
+                # let it finish in the background - destroying it mid-run aborts the app.
+                for signal in (worker.connection_changed, worker.status_updated, worker.image_updated,
+                               worker.image_fetching, worker.livestack_updated, worker.livestack_fetching,
+                               worker.liveview_updated, worker.guiding_updated, worker.event_occurred,
+                               worker.events_loaded, worker.autofocus_report, worker.error_occurred,
+                               worker.history_thumbnail, worker.history_reset, worker.sequence_updated):
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore', RuntimeWarning)  # Signals with no connections
+                        try:
+                            signal.disconnect()
+                        except (RuntimeError, TypeError):
+                            pass
+                keep_alive_until_finished(worker)
         # Reset live view UI state
         self.liveview_toggle_btn.setText("Start")
         self.liveview_info_label.setText("")
@@ -2856,6 +2968,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.camera_temp_label.setText("--")
                 self._exposure_end_time = None
                 self._exposure_total_time = None
+                self._camera_seen_idle = False
+                self._last_cooling_enabled = None  # Sync again when the camera reconnects
                 # Disable controls when disconnected (block signals to prevent callbacks)
                 self.camera_cooling_checkbox.blockSignals(True)
                 self.camera_cooling_checkbox.setChecked(False)
@@ -2890,10 +3004,19 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
                         remaining = max(0, (exposure_end - now).total_seconds())
 
-                        # New exposure detected - capture remaining as the total
+                        # New exposure detected
                         if self._exposure_end_time != exposure_end:
+                            saw_start = self._camera_seen_idle or self._exposure_end_time is not None
                             self._exposure_end_time = exposure_end
                             self._exposure_total_time = remaining
+                            if not saw_start:
+                                # Opened mid-exposure: the remaining time isn't the length.
+                                # NINA doesn't report the length, so use the latest
+                                # image's (normally the same sub length) if it fits.
+                                last_exposure = finite_number(
+                                    (status_data.get('statistics') or {}).get('ExposureTime'))
+                                if last_exposure and last_exposure >= remaining:
+                                    self._exposure_total_time = last_exposure
 
                         if self._exposure_total_time and self._exposure_total_time > 0:
                             elapsed = self._exposure_total_time - remaining
@@ -2911,18 +3034,19 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                     self.camera_progress.setValue(0)
                     self._exposure_end_time = None
                     self._exposure_total_time = None
+                    self._camera_seen_idle = True
 
                 # Camera temperature
-                temp = camera.get('Temperature')
+                temp = finite_number(camera.get('Temperature'))
                 if temp is not None:
                     self.camera_temp_label.setText(f"{temp:.1f}°C")
                 else:
                     self.camera_temp_label.setText("--")
 
                 # Sync cooling controls with camera state (skip if user recently changed)
-                self.camera_cooling_checkbox.setEnabled(True)
+                self.camera_cooling_checkbox.setEnabled(not self._cooling_request_pending)
                 self.camera_target_temp_spinbox.setEnabled(True)
-                self.camera_dewheater_checkbox.setEnabled(True)
+                self.camera_dewheater_checkbox.setEnabled(not self._dewheater_request_pending)
 
                 # Only sync cooling on/off state on initial load (when we haven't set it yet)
                 # After user sets it, we respect their choice and don't override
@@ -2939,14 +3063,16 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                     cooling_on = bool(cooling_on_raw)
                     logger.debug(f"[Cooling Sync] API: CoolerOn={cooling_on_raw!r}, CoolerPower={cooler_power}, TargetTemp={target_temp}, AtTarget={at_target}")
 
-                if self._last_cooling_enabled is None and not self._user_changing_cooling:
-                    logger.debug(f"[Cooling Sync] Initial sync - setting checkbox to {cooling_on}")
+                # Follow NINA's cooler state, e.g. when a sequence warms the camera, but not
+                # while a change made here is still taking effect (or being sent)
+                if (not self._user_changing_cooling and not self._cooling_request_pending
+                        and (self._last_cooling_enabled is None
+                             or self.camera_cooling_checkbox.isChecked() != cooling_on)):
+                    logger.debug(f"[Cooling] Sync - setting checkbox to {cooling_on}")
                     # Block signals to prevent triggering callbacks
                     self.camera_cooling_checkbox.blockSignals(True)
                     self.camera_cooling_checkbox.setChecked(cooling_on)
                     self.camera_cooling_checkbox.blockSignals(False)
-                    logger.debug(f"[Cooling Sync] After setChecked({cooling_on}), checkbox is now: {self.camera_cooling_checkbox.isChecked()}")
-                    # Mark as synced so we don't repeat
                     self._last_cooling_enabled = cooling_on
 
                 # Only sync dew heater state if user isn't actively changing it
@@ -3015,9 +3141,13 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 self.mount_slew_btn.setEnabled(self._connected and not at_park and not slewing)
 
                 # Coordinates
-                ra = mount.get('RightAscension', 0) or mount.get('RA', 0)
-                dec = mount.get('Declination', 0) or mount.get('Dec', 0)
-                if ra or dec:
+                ra = finite_number(mount.get('RightAscension'))
+                if ra is None:
+                    ra = finite_number(mount.get('RA'))
+                dec = finite_number(mount.get('Declination'))
+                if dec is None:
+                    dec = finite_number(mount.get('Dec'))
+                if ra is not None and dec is not None:
                     # Convert RA from hours to HH:MM:SS
                     ra_h = int(ra)
                     ra_m = int((ra - ra_h) * 60)
@@ -3086,7 +3216,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                     # RMSError contains RA, Dec, Total objects with Pixel and Arcseconds values
                     rms_total = rms_error.get('Total', {})
                     if isinstance(rms_total, dict):
-                        total_arcsec = rms_total.get('Arcseconds', 0) or 0
+                        total_arcsec = finite_number(rms_total.get('Arcseconds'))
                         if total_arcsec:
                             self.guider_rms_label.setText(f'{total_arcsec:.2f}"')
                         else:
@@ -3214,7 +3344,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                     self.focuser_position_label.setText("--")
 
                 # Temperature
-                temp = focuser.get('Temperature')
+                temp = finite_number(focuser.get('Temperature'))
                 if temp is not None:
                     self.focuser_temp_label.setText(f"{temp:.1f}°C")
                 else:
@@ -3344,7 +3474,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             target = stats.get('TargetName')
             if target:
                 lines.append(f"Target: {target}")
-            exp = stats.get('ExposureTime')
+            exp = finite_number(stats.get('ExposureTime'))
             if exp is not None:
                 lines.append(f"Exposure: {exp:.0f}s")
             filt = stats.get('Filter')
@@ -3360,9 +3490,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 text = format_image_stat(stats.get(key), decimals, allow_negative)
                 if text != "--":
                     lines.append(f"{label}: {text}")
-            temp = stats.get('Temperature')
-            if temp:
-                lines.append(f"Temp: {temp}")
+            temp = finite_number(stats.get('Temperature'))
+            if temp is not None:
+                lines.append(f"Temp: {temp:.1f}°C")
             if lines:
                 item.setToolTip("\n".join(lines))
 
@@ -3441,9 +3571,11 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
     def _on_livestack_updated(self, image_data, status, available_stacks):
         """Handle livestack update from worker."""
-        # Clear fetching status
-        self.status_label.setText("Connected - adaptive polling active")
-        themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+        # Clear our own "Fetching live stack image..." message, but not other
+        # messages (e.g. a sequence or filter change result)
+        if self.status_label.text().startswith("Fetching live stack image"):
+            self.status_label.setText("Connected - adaptive polling active")
+            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
 
         is_running = status.get('running', False)
         if is_running:
@@ -3486,8 +3618,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                     # This handles mid-session exposure changes correctly.
                     # Use integration time calculated from full image history in the worker
                     if 'calculated_integration' in status:
-                        self._total_integration_by_target[target] = status['calculated_integration']
-                    total_secs = self._total_integration_by_target.get(target)
+                        self._total_integration_by_target[(target, filter_name)] = status['calculated_integration']
+                    total_secs = self._total_integration_by_target.get((target, filter_name))
                     if total_secs:
                         if total_secs >= 3600:
                             h = int(total_secs // 3600)
@@ -3664,15 +3796,14 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         # (CatalogQueryWorker's finished(stars, dsos) replaces QThread.finished)
         worker.finished.connect(
             lambda stars, dsos: self._on_livestack_catalog_done(worker, renderer, stars, dsos))
-        self._ls_annot_catalog_workers.append(worker)
+        _running_threads.add(worker)  # Outlives the window if it's closed meanwhile
         worker.start()
 
     def _on_livestack_catalog_done(self, worker, renderer, stars, dsos):
         """Show the annotations once the catalog lookup finishes."""
         # finished is emitted as run() ends; let the thread exit before dropping it
         worker.wait(2000)
-        if worker in self._ls_annot_catalog_workers:
-            self._ls_annot_catalog_workers.remove(worker)
+        _running_threads.discard(worker)
         if renderer is not self._ls_annot_renderer:
             return  # A newer solve replaced it
         renderer.set_objects(stars, dsos)
@@ -3765,37 +3896,68 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.worker.set_livestack_selection(target, filter_name)
 
     def _apply_image_settings_to_worker(self):
-        """Push current quality/size settings to the worker thread."""
+        """Push current quality/size settings to the worker thread (sizes still being
+        typed keep the last complete one)."""
         if hasattr(self, 'worker') and self.worker:
+            image_size = self.image_size_combo.currentText().strip()
+            livestack_size = self.livestack_size_combo.currentText().strip()
             self.worker.set_image_quality_settings(
                 self.image_quality_spin.value(),
-                self.image_size_combo.currentText(),
+                image_size if valid_size(image_size) else self.worker._image_size,
                 self.livestack_quality_spin.value(),
-                self.livestack_size_combo.currentText(),
+                livestack_size if valid_size(livestack_size) else self.worker._livestack_size,
             )
+
+    def _on_size_changed(self):
+        """A size box changed and typing has paused: apply the sizes that are complete."""
+        if valid_size(self.image_size_combo.currentText()):
+            self._on_image_quality_changed()
+        if valid_size(self.livestack_size_combo.currentText()):
+            self._on_livestack_quality_changed()
+        if valid_size(self.liveview_size_combo.currentText()):
+            self._on_liveview_quality_changed()
 
     def _on_image_quality_changed(self):
         """Handle user changing the latest-image quality or size."""
         if self._restoring_settings:
             return
         self._apply_image_settings_to_worker()
-        # Re-fetch current image at new quality/size
+        size_wh = self.image_size_combo.currentText().strip()
+        if not valid_size(size_wh):
+            return
+        # Re-fetch the image being shown (a history image, or the latest) at the new quality/size
         if self._connected and hasattr(self, 'worker') and self.worker:
             host, port = self.worker.host, self.worker.port
-            index = self.worker._last_image_index
+            history_index = self._viewing_history_index
+            index = history_index if history_index is not None else self.worker._last_image_index
             if index >= 0:
                 quality = self.image_quality_spin.value()
-                size_wh = self.image_size_combo.currentText()
 
                 def fetch():
                     data, _ = NINAIntegration.get_image(
                         host, port, index, quality=quality, size_wh=size_wh
                     )
-                    return data
+                    # A history image's info line is rebuilt from its statistics
+                    stats = NINAIntegration.get_image_statistics(host, port, index) if history_index is not None else None
+                    return data, stats, index
 
-                self._run_in_background(
-                    fetch, lambda data: self._image_fetch_done.emit(data) if data else None
-                )
+                self._run_in_background(fetch, self._on_quality_refetch_done)
+
+    def _on_quality_refetch_done(self, result):
+        """Show an image re-fetched at a new quality/size, if it's still the one being viewed."""
+        data, stats, index = result
+        viewing = self._viewing_history_index
+        current = viewing if viewing is not None else (self.worker._last_image_index if self.worker else -1)
+        if not data or index != current:
+            return  # Another image is being shown by now
+        if viewing is not None:
+            self._image_fetch_done.emit((data, stats))
+        else:
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            if not pixmap.isNull():
+                self._current_image_pixmap = pixmap
+                self.image_label.setPixmap(pixmap)
 
     def _on_livestack_quality_changed(self):
         """Handle user changing the livestack quality or size."""
@@ -3838,7 +4000,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
     def _on_liveview_quality_changed(self):
         """Handle user changing the live view quality or size."""
-        if self._restoring_settings:
+        if self._restoring_settings or not valid_size(self.liveview_size_combo.currentText()):
             return
         if hasattr(self, 'worker') and self.worker and self.worker._liveview_active:
             self.worker.set_liveview_settings(
@@ -3872,20 +4034,20 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._handle_autofocus_event(event)
 
         # Map events to user-friendly messages
-        event_messages = {
-            'AUTOFOCUS-FINISHED': ("AutoFocus complete", COLORS['success']),
-            'SEQUENCE-STARTING': ("Sequence started", COLORS['text_secondary']),
-            'SEQUENCE-FINISHED': ("Sequence finished", COLORS['success']),
-            'GUIDER-START': ("Guiding started", COLORS['text_secondary']),
-            'GUIDER-STOP': ("Guiding stopped", COLORS['text_secondary']),
-            'IMAGE-SAVE': ("Image saved", COLORS['text_secondary']),
-            'MOUNT-HOMED': ("Mount homed", COLORS['text_secondary']),
+        event_messages = {  # (message, COLORS key)
+            'AUTOFOCUS-FINISHED': ("AutoFocus complete", 'success'),
+            'SEQUENCE-STARTING': ("Sequence started", 'text_secondary'),
+            'SEQUENCE-FINISHED': ("Sequence finished", 'success'),
+            'GUIDER-START': ("Guiding started", 'text_secondary'),
+            'GUIDER-STOP': ("Guiding stopped", 'text_secondary'),
+            'IMAGE-SAVE': ("Image saved", 'text_secondary'),
+            'MOUNT-HOMED': ("Mount homed", 'text_secondary'),
         }
 
         if event_type in event_messages:
-            message, color = event_messages[event_type]
+            message, color_key = event_messages[event_type]
             self.status_label.setText(message)
-            self.status_label.setStyleSheet(f"color: {color};")
+            themed_style(self.status_label, lambda: f"color: {COLORS[color_key]};")
         elif event_type == 'AUTOFOCUS-STARTING':
             self.status_label.setText("AutoFocus running...")
             themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
@@ -4348,35 +4510,41 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.status_label.setText(f"Setting cooling to {temp}°C...")
         else:
             self.status_label.setText("Disabling cooling...")
+        self._cooling_request_pending = True
+        self.camera_cooling_checkbox.setEnabled(False)  # One request at a time
 
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.set_camera_cooling(host, port, enabled, temp)
 
-        if success:
-            self._last_cooling_enabled = enabled
-            self._last_cooling_temp = temp
-            logger.debug(f"[Cooling] Success - updated last_enabled={enabled}, last_temp={temp}")
-            self.status_label.setText("Cooling " + ("enabled" if enabled else "disabled"))
-            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
-        else:
-            logger.debug(f"[Cooling] Failed - reverting checkbox")
-            self.status_label.setText("Failed to change cooling - check console")
-            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
-            # Revert checkbox state
-            self.camera_cooling_checkbox.blockSignals(True)
-            self.camera_cooling_checkbox.setChecked(not enabled)
-            self.camera_cooling_checkbox.blockSignals(False)
-            # Clear the flag since we reverted
-            self._user_changing_cooling = False
-            self._cooling_change_timer.stop()
+        def done(success):
+            self._cooling_request_pending = False
+            self.camera_cooling_checkbox.setEnabled(True)
+            if success:
+                self._last_cooling_enabled = enabled
+                self._last_cooling_temp = temp
+                logger.debug(f"[Cooling] Success - updated last_enabled={enabled}, last_temp={temp}")
+                self.status_label.setText("Cooling " + ("enabled" if enabled else "disabled"))
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+            else:
+                logger.debug(f"[Cooling] Failed - reverting checkbox")
+                self.status_label.setText("Failed to change cooling - check console")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+                # Revert checkbox state
+                self.camera_cooling_checkbox.blockSignals(True)
+                self.camera_cooling_checkbox.setChecked(not enabled)
+                self.camera_cooling_checkbox.blockSignals(False)
+                # Clear the flag since we reverted
+                self._user_changing_cooling = False
+                self._cooling_change_timer.stop()
+
+        self._run_in_background(lambda: NINAIntegration.set_camera_cooling(host, port, enabled, temp), done)
 
     def _clear_cooling_change_flag(self):
         """Clear the cooling change flag after timeout."""
         logger.debug(f"[Cooling] Timer expired - clearing _user_changing_cooling flag")
         self._user_changing_cooling = False
 
-    def _on_target_temp_changed(self):
-        """Handle target temperature change."""
+    def _apply_target_temp(self):
+        """Send the target temperature once the spin box has settled."""
         if self._updating_camera_controls:
             logger.debug(f"[Cooling] Target temp change ignored - _updating_camera_controls is True")
             return
@@ -4402,17 +4570,19 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.status_label.setText(f"Setting target temp to {temp}°C...")
 
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.set_camera_cooling(host, port, True, temp)
 
-        if success:
-            self._last_cooling_temp = temp
-            logger.debug(f"[Cooling] Target temp success - last_temp={temp}")
-            self.status_label.setText(f"Target temp set to {temp}°C")
-            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
-        else:
-            logger.debug(f"[Cooling] Target temp failed")
-            self.status_label.setText("Failed to set target temperature")
-            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+        def done(success):
+            if success:
+                self._last_cooling_temp = temp
+                logger.debug(f"[Cooling] Target temp success - last_temp={temp}")
+                self.status_label.setText(f"Target temp set to {temp}°C")
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+            else:
+                logger.debug(f"[Cooling] Target temp failed")
+                self.status_label.setText("Failed to set target temperature")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+
+        self._run_in_background(lambda: NINAIntegration.set_camera_cooling(host, port, True, temp), done)
 
     def _on_dewheater_changed(self, state):
         """Handle dew heater checkbox change."""
@@ -4427,25 +4597,31 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         enabled = state == Qt.Checked.value if hasattr(Qt.Checked, 'value') else state == 2
         logger.debug(f"[DewHeater] User changed: enabled={enabled}")
         self.status_label.setText("Turning dew heater " + ("on" if enabled else "off") + "...")
+        self._dewheater_request_pending = True
+        self.camera_dewheater_checkbox.setEnabled(False)  # One request at a time
 
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.set_camera_dew_heater(host, port, enabled)
 
-        if success:
-            logger.debug(f"[DewHeater] Success")
-            self.status_label.setText("Dew heater " + ("enabled" if enabled else "disabled"))
-            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
-        else:
-            logger.debug(f"[DewHeater] Failed - reverting checkbox")
-            self.status_label.setText("Failed to change dew heater")
-            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
-            # Revert checkbox state
-            self._updating_camera_controls = True
-            self.camera_dewheater_checkbox.setChecked(not enabled)
-            self._updating_camera_controls = False
-            # Clear the flag since we reverted
-            self._user_changing_dewheater = False
-            self._dewheater_change_timer.stop()
+        def done(success):
+            self._dewheater_request_pending = False
+            self.camera_dewheater_checkbox.setEnabled(True)
+            if success:
+                logger.debug(f"[DewHeater] Success")
+                self.status_label.setText("Dew heater " + ("enabled" if enabled else "disabled"))
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+            else:
+                logger.debug(f"[DewHeater] Failed - reverting checkbox")
+                self.status_label.setText("Failed to change dew heater")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+                # Revert checkbox state
+                self._updating_camera_controls = True
+                self.camera_dewheater_checkbox.setChecked(not enabled)
+                self._updating_camera_controls = False
+                # Clear the flag since we reverted
+                self._user_changing_dewheater = False
+                self._dewheater_change_timer.stop()
+
+        self._run_in_background(lambda: NINAIntegration.set_camera_dew_heater(host, port, enabled), done)
 
     def _clear_dewheater_change_flag(self):
         """Clear the dew heater change flag after timeout."""
@@ -4460,94 +4636,114 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         settings = dialog.get_settings()
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.capture_image(
-            host, port,
-            duration=settings['duration'],
-            gain=settings['gain'],
-            save=settings['save'],
-            image_type=settings['image_type']
-        )
-        if success:
-            self.status_label.setText(f"Capture started ({settings['duration']}s)")
-            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
-            self.imaging_start_btn.setEnabled(False)
-            self.imaging_stop_btn.setEnabled(True)
-        else:
-            self.status_label.setText("Failed to start capture")
-            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+        self.imaging_start_btn.setEnabled(False)
+
+        def done(success):
+            if success:
+                self.status_label.setText(f"Capture started ({settings['duration']}s)")
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+                self.imaging_stop_btn.setEnabled(True)
+            else:
+                self.status_label.setText("Failed to start capture")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+                self.imaging_start_btn.setEnabled(True)
+
+        self._run_in_background(lambda: NINAIntegration.capture_image(
+            host, port, duration=settings['duration'], gain=settings['gain'],
+            save=settings['save'], image_type=settings['image_type']), done)
 
     def _on_imaging_stop(self):
         """Abort the current exposure."""
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.abort_exposure(host, port)
-        if success:
-            self.status_label.setText("Exposure aborted")
-            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
-            self.imaging_start_btn.setEnabled(True)
-            self.imaging_stop_btn.setEnabled(False)
-        else:
-            self.status_label.setText("Failed to abort exposure")
-            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+        self.imaging_stop_btn.setEnabled(False)
+
+        def done(success):
+            if success:
+                self.status_label.setText("Exposure aborted")
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+                self.imaging_start_btn.setEnabled(True)
+            else:
+                self.status_label.setText("Failed to abort exposure")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+                self.imaging_stop_btn.setEnabled(True)
+
+        self._run_in_background(lambda: NINAIntegration.abort_exposure(host, port), done)
 
     def _on_autofocus_start(self):
         """Start an autofocus run."""
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.start_autofocus(host, port)
-        if success:
-            self.status_label.setText("AutoFocus started")
-            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
-            # Mark running now so the next status poll doesn't flip the buttons back
-            # before AUTOFOCUS-STARTING arrives
-            self._autofocus_running = True
-            self._autofocus_stale_timer.start()
-            self.autofocus_start_btn.setEnabled(False)
-            self.autofocus_cancel_btn.setEnabled(True)
-        else:
-            self.status_label.setText("Failed to start AutoFocus")
-            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+        self.autofocus_start_btn.setEnabled(False)
+
+        def done(success):
+            if success:
+                self.status_label.setText("AutoFocus started")
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+                # Mark running now so the next status poll doesn't flip the buttons back
+                # before AUTOFOCUS-STARTING arrives
+                self._autofocus_running = True
+                self._autofocus_stale_timer.start()
+                self.autofocus_cancel_btn.setEnabled(True)
+            else:
+                self.status_label.setText("Failed to start AutoFocus")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+                self._update_autofocus_buttons()
+
+        self._run_in_background(lambda: NINAIntegration.start_autofocus(host, port), done)
 
     def _on_autofocus_cancel(self):
         """Cancel the running autofocus."""
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.cancel_autofocus(host, port)
-        if success:
-            self.status_label.setText("AutoFocus cancelled")
-            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
-            if self._autofocus_running:
-                self._autofocus_running = False
-                self._autofocus_stale_timer.stop()
-                self.autofocus_graph.end_run('AutoFocus cancelled')
-            self.autofocus_start_btn.setEnabled(True)
-            self.autofocus_cancel_btn.setEnabled(False)
-        else:
-            self.status_label.setText("Failed to cancel AutoFocus")
-            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+        self.autofocus_cancel_btn.setEnabled(False)
+
+        def done(success):
+            if success:
+                self.status_label.setText("AutoFocus cancelled")
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+                if self._autofocus_running:
+                    self._autofocus_running = False
+                    self._autofocus_stale_timer.stop()
+                    self.autofocus_graph.end_run('AutoFocus cancelled')
+                self.autofocus_start_btn.setEnabled(True)
+            else:
+                self.status_label.setText("Failed to cancel AutoFocus")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+                self._update_autofocus_buttons()
+
+        self._run_in_background(lambda: NINAIntegration.cancel_autofocus(host, port), done)
 
     def _on_guiding_start(self):
         """Start guiding."""
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.start_guiding(host, port)
-        if success:
-            self.status_label.setText("Guiding started")
-            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
-            self.guiding_start_btn.setEnabled(False)
-            self.guiding_stop_btn.setEnabled(True)
-        else:
-            self.status_label.setText("Failed to start guiding")
-            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+        self.guiding_start_btn.setEnabled(False)
+
+        def done(success):
+            if success:
+                self.status_label.setText("Guiding started")
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+                self.guiding_stop_btn.setEnabled(True)
+            else:
+                self.status_label.setText("Failed to start guiding")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+                self.guiding_start_btn.setEnabled(True)
+
+        self._run_in_background(lambda: NINAIntegration.start_guiding(host, port), done)
 
     def _on_guiding_stop(self):
         """Stop guiding."""
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.stop_guiding(host, port)
-        if success:
-            self.status_label.setText("Guiding stopped")
-            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
-            self.guiding_start_btn.setEnabled(True)
-            self.guiding_stop_btn.setEnabled(False)
-        else:
-            self.status_label.setText("Failed to stop guiding")
-            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+        self.guiding_stop_btn.setEnabled(False)
+
+        def done(success):
+            if success:
+                self.status_label.setText("Guiding stopped")
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+                self.guiding_start_btn.setEnabled(True)
+            else:
+                self.status_label.setText("Failed to stop guiding")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+                self.guiding_stop_btn.setEnabled(True)
+
+        self._run_in_background(lambda: NINAIntegration.stop_guiding(host, port), done)
 
     def _on_mount_home(self):
         """Home the mount."""
@@ -4658,36 +4854,39 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         logger.debug(f"[FilterWheel] User selected: {filter_name} (ID={filter_id}), last={self._last_filter_id}")
 
-        # Set flag to prevent sync from overriding during change
+        # Set flag to prevent sync from overriding during change (the wheel can take
+        # a while to move, so the request runs in the background)
         self._user_changing_filter = True
         self.filterwheel_combo.setEnabled(False)
         self.status_label.setText(f"Changing to {filter_name}...")
         themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
 
         host, port = NINAIntegration.get_settings()
-        success = NINAIntegration.change_filter(host, port, filter_id)
 
-        if success:
-            self._last_filter_id = filter_id
-            logger.debug(f"[FilterWheel] Success - filter changed to {filter_name}")
-            self.status_label.setText(f"Filter changed to {filter_name}")
-            themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
-        else:
-            logger.debug(f"[FilterWheel] Failed - reverting selection")
-            self.status_label.setText("Failed to change filter")
-            themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
-            # Revert combo selection to last known good filter
-            if self._last_filter_id is not None:
-                self._updating_filterwheel = True
-                for i in range(self.filterwheel_combo.count()):
-                    if self.filterwheel_combo.itemData(i) == self._last_filter_id:
-                        self.filterwheel_combo.setCurrentIndex(i)
-                        break
-                self._updating_filterwheel = False
+        def done(success):
+            if success:
+                self._last_filter_id = filter_id
+                logger.debug(f"[FilterWheel] Success - filter changed to {filter_name}")
+                self.status_label.setText(f"Filter changed to {filter_name}")
+                themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+            else:
+                logger.debug(f"[FilterWheel] Failed - reverting selection")
+                self.status_label.setText("Failed to change filter")
+                themed_style(self.status_label, lambda: f"color: {COLORS['error']};")
+                # Revert combo selection to last known good filter
+                if self._last_filter_id is not None:
+                    self._updating_filterwheel = True
+                    for i in range(self.filterwheel_combo.count()):
+                        if self.filterwheel_combo.itemData(i) == self._last_filter_id:
+                            self.filterwheel_combo.setCurrentIndex(i)
+                            break
+                    self._updating_filterwheel = False
 
-        # Clear the flag and re-enable combo
-        self._user_changing_filter = False
-        self.filterwheel_combo.setEnabled(True)
+            # Clear the flag and re-enable combo
+            self._user_changing_filter = False
+            self.filterwheel_combo.setEnabled(True)
+
+        self._run_in_background(lambda: NINAIntegration.change_filter(host, port, filter_id), done)
 
     def _run_in_background(self, func, callback):
         """Run a function in a background thread and call callback with result on completion."""
@@ -4705,11 +4904,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         worker = BackgroundWorker(func)
         worker.finished_with_result.connect(callback)
         worker.finished.connect(worker.deleteLater)
-        # Keep reference to prevent garbage collection
-        if not hasattr(self, '_background_workers'):
-            self._background_workers = []
-        self._background_workers.append(worker)
-        worker.finished.connect(lambda: self._background_workers.remove(worker) if worker in self._background_workers else None)
+        # Referenced at module level so it survives the window being closed and replaced
+        keep_alive_until_finished(worker)
         worker.start()
 
     def resizeEvent(self, event):

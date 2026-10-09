@@ -11,11 +11,30 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, QThread, Signal
 from PySide6.QtWidgets import QMessageBox
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+
+class _SlewThread(QThread):
+    """Runs a slew that waits for the mount, off the UI thread."""
+
+    slew_done = Signal(bool)
+
+    def __init__(self, host, port, ra_deg, dec_deg):
+        super().__init__()
+        self._args = (host, port, ra_deg, dec_deg)
+
+    def run(self):
+        host, port, ra_deg, dec_deg = self._args
+        self.slew_done.emit(NINAIntegration.slew_mount(host, port, ra_deg, dec_deg, wait_for_result=True))
+
+
+# Slews in progress, referenced until they finish (a running QThread that's
+# garbage collected aborts the app)
+_slew_threads = set()
 
 
 class NINAIntegration:
@@ -89,6 +108,27 @@ class NINAIntegration:
         except Exception as e:
             logger.error(f"Error testing NINA connection: {e}")
             return False, f"Connection test failed: {str(e)}", None
+
+    @staticmethod
+    def is_reachable(host, port, timeout=2):
+        """
+        Quick check that NINA's API answers at all (a tiny version request).
+
+        A closed port on a PC whose firewall drops unanswered connections makes
+        every request wait for its whole timeout, so this uses a short one.
+
+        Returns:
+            bool: True if anything answered
+        """
+        url = f"http://{host}:{port}/v2/api/version"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url), timeout=timeout) as response:
+                response.read()
+            return True
+        except urllib.error.HTTPError:
+            return True  # The API answered, just not with success
+        except Exception:
+            return False
 
     @staticmethod
     def send_to_framing_assistant(ra_deg, dec_deg, target_name, parent_widget=None):
@@ -182,7 +222,8 @@ class NINAIntegration:
             parent_widget: Parent widget for message boxes (optional)
 
         Returns:
-            bool: True if successful, False otherwise
+            bool: True if the slew was started (it finishes in the background and
+                  reports its result in a message box), False if not
         """
         if ra_deg is None or dec_deg is None:
             if parent_widget:
@@ -220,75 +261,40 @@ class NINAIntegration:
 
         logger.info(f"Slewing mount to {target_name}: RA={ra_deg}, Dec={dec_deg}")
 
-        try:
-            success = NINAIntegration.slew_mount(host, port, ra_deg, dec_deg, wait_for_result=True)
+        # The slew waits for the mount (up to 2 minutes), so it runs in the
+        # background; the result is reported when it finishes
+        thread = _SlewThread(host, port, ra_deg, dec_deg)
 
+        def on_done(success):
+            thread.wait()
+            _slew_threads.discard(thread)
+            # The window that asked may have been closed meanwhile
+            parent = parent_widget
+            if parent is not None:
+                import shiboken6
+                if not shiboken6.isValid(parent):
+                    parent = None
             if success:
                 logger.info(f"Slew to {target_name} completed successfully")
-                if parent_widget:
-                    QMessageBox.information(
-                        parent_widget,
-                        "Slew Complete",
-                        f"Mount slew to {target_name} completed."
-                    )
-                return True
+                if parent_widget is not None:
+                    QMessageBox.information(parent, "Slew Complete", f"Mount slew to {target_name} completed.")
             else:
-                if parent_widget:
+                if parent_widget is not None:
                     QMessageBox.warning(
-                        parent_widget,
+                        parent,
                         "Slew Failed",
                         f"Failed to slew to {target_name}.\n\n"
                         "Please check:\n"
+                        "- NINA is running and the Advanced API plugin is enabled\n"
                         "- Mount is connected in NINA\n"
                         "- Mount is not parked\n"
                         "- No other slew operation is in progress"
                     )
-                return False
 
-        except urllib.error.HTTPError as e:
-            if e.code == 409:
-                if parent_widget:
-                    QMessageBox.warning(
-                        parent_widget,
-                        "Slew Failed",
-                        "Mount is not available for slewing.\n\n"
-                        "Please check:\n"
-                        "- Mount is connected in NINA\n"
-                        "- Mount is not parked"
-                    )
-            else:
-                if parent_widget:
-                    QMessageBox.warning(
-                        parent_widget,
-                        "Slew Failed",
-                        f"HTTP error {e.code} when slewing.\n\n"
-                        f"Error: {e.reason}"
-                    )
-            logger.error(f"HTTP error slewing to {target_name}: {e.code} {e.reason}")
-            return False
-
-        except urllib.error.URLError as e:
-            logger.warning(f"Could not connect to NINA: {e}")
-            if parent_widget:
-                QMessageBox.warning(
-                    parent_widget,
-                    "Connection Error",
-                    "Could not connect to NINA.\n\n"
-                    "Please ensure:\n"
-                    "- NINA is running\n"
-                    "- The Advanced API plugin is enabled"
-                )
-            return False
-
-        except Exception as e:
-            logger.error(f"Error slewing to {target_name}: {e}")
-            if parent_widget:
-                QMessageBox.warning(
-                    parent_widget,
-                    "Error",
-                    f"Failed to slew to target: {str(e)}"
-                )
-            return False
+        thread.slew_done.connect(on_done)
+        _slew_threads.add(thread)
+        thread.start()
+        return True
 
     # -------------------------------------------------------------------------
     # Dashboard API Methods
@@ -336,9 +342,11 @@ class NINAIntegration:
             bool: True on success, False on failure
         """
         if enabled:
-            if temperature is not None:
-                # Use minutes=-1 for default duration
-                url = f"http://{host}:{port}/v2/api/equipment/camera/cool?temperature={temperature}&minutes=-1"
+            if temperature is None:
+                logger.warning("Can't enable camera cooling without a target temperature")
+                return False
+            # Use minutes=-1 for default duration
+            url = f"http://{host}:{port}/v2/api/equipment/camera/cool?temperature={temperature}&minutes=-1"
         else:
             # Cancel cooling
             url = f"http://{host}:{port}/v2/api/equipment/camera/cool?cancel=true"
@@ -962,24 +970,32 @@ class NINAIntegration:
         return solution, ""
 
     @staticmethod
-    def calculate_integration_from_history(history, target, stack_count):
+    def calculate_integration_from_history(history, target, stack_count, filter_name=None):
         """
-        Sum ExposureTime for the most recent stack_count LIGHT frames matching target.
+        Sum ExposureTime for the most recent stack_count LIGHT frames of a stack.
 
         Args:
             history: list returned by get_all_image_history
             target: target name string to filter by
             stack_count: number of frames in the current stack
+            filter_name: the stack's filter. Mono stacks are per filter, so only
+                         that filter's frames count; one-shot color stacks (RGB,
+                         R_OSC, ...) have no matching frame filter and use all of
+                         the target's frames.
 
         Returns:
             float total seconds, or None if insufficient data
         """
         frames = [
             img for img in history
-            if img.get('TargetName') == target
+            if str(img.get('TargetName', '')).casefold() == str(target).casefold()
             and isinstance(img.get('ExposureTime'), (int, float))
             and img['ExposureTime'] > 0
         ]
+        if filter_name:
+            same_filter = [img for img in frames if img.get('Filter') == filter_name]
+            if same_filter:
+                frames = same_filter
         if not frames:
             return None
         # Take the most recent stack_count frames (history is oldest-first)
@@ -1053,7 +1069,7 @@ class NINAIntegration:
         while NINAIntegration._image_exists(host, port, high):
             low = high
             high *= 2
-            if high > 1000:  # Safety limit
+            if high > 1_000_000:  # Safety limit (a night is a few hundred images)
                 break
 
         # Binary search between low and high
