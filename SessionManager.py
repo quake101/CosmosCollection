@@ -44,6 +44,20 @@ COMMON_TIMEZONES = [
 DROP_MATCH_MAX_SEPARATION_DEG = 1.0
 
 
+def target_name_match(session_name, target_name):
+    """How well a session's DSO name matches a Target List name: 2 = the same apart
+    from case and spaces ("M31" / "M 31"), 1 = the same once parenthetical common
+    names and punctuation are ignored ("vdB 152" / "vdB 152 (Wolf's Cave Nebula)"),
+    0 = different."""
+    spaced = session_name.replace(" ", "").strip().upper() if session_name else ""
+    if not spaced or not target_name:
+        return 0
+    if target_name.replace(" ", "").strip().upper() == spaced:
+        return 2
+    loose = SessionFileScanner.normalize_object_name(session_name)
+    return 1 if loose and SessionFileScanner.normalize_object_name(target_name) == loose else 0
+
+
 class LocationOverrideWidget(QWidget):
     """Per-session location picker: defaults to the active saved location, with a
     custom lat/lon/name/timezone entry (and map picker) for a one-off override."""
@@ -445,6 +459,11 @@ class SessionFormWidget(QWidget):
         dso_name = summary.get("dso_name")
         if dso_name:
             self.name_edit.setText(dso_name)
+        # Where the subs were pointed (their headers' mean RA/Dec), so later drops
+        # of this target can be matched to the session by position too
+        if summary.get("ra_deg") is not None and summary.get("dec_deg") is not None:
+            self._ra_deg = round(summary["ra_deg"], 6)
+            self._dec_deg = round(summary["dec_deg"], 6)
         camera = summary.get("camera")
         if camera:
             self.camera_edit.setText(camera)
@@ -520,20 +539,24 @@ class SessionFormWidget(QWidget):
         """Auto-link to a Target List entry whose name matches the session's DSO
         name, so a target doesn't have to be planned via "Plan a Session" to get
         linked - typing/scanning in a name that's already on the target list is
-        enough. Matches loosely (case/whitespace-insensitive) since FITS OBJECT
-        headers and target list names often differ in spacing (e.g. "M31" vs "M 31")."""
-        normalized = name.replace(" ", "").strip().upper() if name else ""
-        if not normalized:
+        enough. Matches loosely since FITS OBJECT headers and target list names
+        often differ in spacing (e.g. "M31" vs "M 31"), and target list names often
+        carry a common name ("vdB 152 (Wolf's Cave Nebula)"): a case/whitespace-only
+        match wins, then one ignoring parenthetical names and punctuation."""
+        if not (name or "").strip():
             return None
         try:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT id, name FROM usertargetlist")
-                for target_id, target_name in cursor.fetchall():
-                    if target_name and target_name.replace(" ", "").strip().upper() == normalized:
-                        return target_id
+                targets = cursor.fetchall()
         except Exception as e:
             logger.error(f"Error resolving target list link for '{name}': {e}")
+            return None
+        for wanted in (2, 1):
+            for target_id, target_name in targets:
+                if target_name_match(name, target_name) == wanted:
+                    return target_id
         return None
 
     def validate(self):
@@ -914,23 +937,35 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
 class LinkTargetDialog(WindowPositionMixin, QDialog):
     """Pick a Target List entry to link a session to (sets usersessions.target_id -
     doesn't touch the session's own dso_name/ra_deg/dec_deg, same as the existing
-    automatic name-match linking in AddEditSessionDialog._resolve_target_id_by_name)."""
+    automatic name-match linking in SessionFormWidget._resolve_target_id_by_name).
+
+    Targets whose name or position match the session are suggested at the top and
+    the best one is preselected; any other target can still be picked instead."""
 
     WINDOW_POSITION_KEY = "LinkTargetDialog"
 
-    def __init__(self, db_manager, parent=None):
+    def __init__(self, db_manager, parent=None, session_name=None, ra_deg=None, dec_deg=None,
+                 current_target_id=None):
         super().__init__(parent)
         self.db_manager = db_manager
         self.selected_target = None
+        self._session_name = session_name
+        self._ra_deg, self._dec_deg = ra_deg, dec_deg
+        self._current_target_id = current_target_id
         self.setWindowTitle("Link to Target List")
         self.setModal(True)
-        self.resize(420, 480)  # default size the first time this dialog is ever opened
+        self.resize(460, 480)  # default size the first time this dialog is ever opened
         self._setup_ui()
         self._load_targets()
         self.setup_window_position()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
+
+        self.suggestion_label = QLabel("")
+        self.suggestion_label.setWordWrap(True)
+        themed_style(self.suggestion_label, lambda: f"color: {COLORS['text_secondary']};")
+        layout.addWidget(self.suggestion_label)
 
         search_row = QHBoxLayout()
         search_row.addWidget(QLabel("Search:"))
@@ -957,7 +992,15 @@ class LinkTargetDialog(WindowPositionMixin, QDialog):
         buttons_row.addWidget(self.ok_btn)
         layout.addLayout(buttons_row)
 
+    def _suggestion(self, name, ra_deg, dec_deg):
+        """(name score, separation in degrees or None) for a target, against the session."""
+        separation = None
+        if None not in (self._ra_deg, self._dec_deg, ra_deg, dec_deg):
+            separation = SessionFileScanner.angular_separation_deg(self._ra_deg, self._dec_deg, ra_deg, dec_deg)
+        return target_name_match(self._session_name, name), separation
+
     def _load_targets(self):
+        rows = []
         try:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
@@ -965,18 +1008,60 @@ class LinkTargetDialog(WindowPositionMixin, QDialog):
                     SELECT id, name, dso_type, constellation, magnitude, ra_deg, dec_deg
                     FROM usertargetlist ORDER BY name
                 """)
-                for target_id, name, dso_type, constellation, magnitude, ra_deg, dec_deg in cursor.fetchall():
-                    details = ", ".join(p for p in (dso_type, constellation) if p)
-                    label = f"{name} ({details})" if details else name
-                    if magnitude is not None:
-                        label += f" - Mag {magnitude:.1f}"
-                    item = QListWidgetItem(label)
-                    item.setData(Qt.UserRole, {
-                        "id": target_id, "name": name, "ra_deg": ra_deg, "dec_deg": dec_deg,
-                    })
-                    self.targets_list.addItem(item)
+                rows = cursor.fetchall()
         except Exception as e:
             logger.error(f"Error loading target list for linking: {e}")
+
+        # Suggestions: a matching name, or a position within the same distance the
+        # drop dialog uses to call subs the same target
+        scored = []
+        for row in rows:
+            name_score, separation = self._suggestion(row[1], row[5], row[6])
+            nearby = separation is not None and separation <= DROP_MATCH_MAX_SEPARATION_DEG
+            scored.append((row, name_score, separation if nearby else None))
+        suggested = sorted((entry for entry in scored if entry[1] or entry[2] is not None),
+                           key=lambda entry: (-entry[1], entry[2] if entry[2] is not None else 99))
+        others = [entry for entry in scored if not (entry[1] or entry[2] is not None)]
+
+        best_item = None
+        for (target_id, name, dso_type, constellation, magnitude, ra_deg, dec_deg), name_score, separation \
+                in suggested + others:
+            details = ", ".join(p for p in (dso_type, constellation) if p)
+            label = f"{name} ({details})" if details else name
+            if magnitude is not None:
+                label += f" - Mag {magnitude:.1f}"
+            reasons = []
+            if name_score:
+                reasons.append("same name")
+            if separation is not None:
+                reasons.append(f"{separation * 60:.0f}′ away" if separation < 1 else f"{separation:.1f}° away")
+            if target_id == self._current_target_id:
+                reasons.insert(0, "currently linked")
+            if reasons:
+                label += f"  ({', '.join(reasons)})"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, {
+                "id": target_id, "name": name, "ra_deg": ra_deg, "dec_deg": dec_deg,
+            })
+            if name_score or separation is not None:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                if best_item is None:
+                    best_item = item
+            self.targets_list.addItem(item)
+
+        if best_item is not None:
+            self.targets_list.setCurrentItem(best_item)
+            self.targets_list.scrollToItem(best_item)
+            more = len(suggested) - 1
+            self.suggestion_label.setText(
+                f"Suggested: {best_item.data(Qt.UserRole)['name']}"
+                + (f" ({more} other possible match{'es' if more > 1 else ''} below it)" if more else "")
+                + ". Pick any other target to link that instead.")
+        else:
+            self.suggestion_label.setText(
+                "No target matches this session's name or position - pick one to link.")
 
     def _filter_targets(self, text):
         text = text.strip().lower()
@@ -2775,6 +2860,7 @@ class SessionCalendarWidget(QWidget):
 class SessionManagerWindow(WindowPositionMixin, QMainWindow):
     WINDOW_POSITION_KEY = "SessionManager"
     COLUMNS_SETTING = "session_manager_table_columns_hidden"
+    COLUMN_WIDTHS_SETTING = "session_manager_table_column_widths"
     """Main window for planning and logging observing sessions"""
 
     def __init__(self):
@@ -2934,8 +3020,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         self.sessions_table.setHorizontalHeaderLabels(self._column_labels)
         self.sessions_table.setSortingEnabled(True)
         header = self.sessions_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        for col in range(1, 10):
+        for col in range(len(self._column_labels)):
             header.setSectionResizeMode(col, QHeaderView.Interactive)
         header.setContextMenuPolicy(Qt.CustomContextMenu)
         header.customContextMenuRequested.connect(self._show_column_menu)
@@ -2945,6 +3030,14 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         self.sessions_table.itemDoubleClicked.connect(self._edit_selected_session)
         self.sessions_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.sessions_table.customContextMenuRequested.connect(self._show_context_menu)
+        # Column widths are remembered (restored before hiding columns, so a hidden
+        # column comes back at its saved width)
+        self._fit_name_column_on_load = not self._apply_saved_column_widths()
+        self._column_width_timer = QTimer(self)
+        self._column_width_timer.setSingleShot(True)
+        self._column_width_timer.setInterval(500)
+        self._column_width_timer.timeout.connect(self._save_column_widths)
+        header.sectionResized.connect(lambda *_: self._column_width_timer.start())
         self._apply_saved_column_visibility()
         splitter.addWidget(self.sessions_table)
 
@@ -3062,6 +3155,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
     def _populate_table(self):
         self.sessions_table.setSortingEnabled(False)
         self.sessions_table.setRowCount(len(self.sessions_data))
+        fit_name_column = self._fit_name_column_on_load and bool(self.sessions_data)
 
         for row, session in enumerate(self.sessions_data):
             name_item = QTableWidgetItem(session.get("dso_name", ""))
@@ -3105,6 +3199,11 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             linked_item = QTableWidgetItem("Yes" if session.get("target_id") else "")
             linked_item.setTextAlignment(Qt.AlignCenter)
             self.sessions_table.setItem(row, 9, linked_item)
+
+        if fit_name_column:
+            # No remembered widths yet: size the names column to its contents once
+            self._fit_name_column_on_load = False
+            self.sessions_table.resizeColumnToContents(0)
 
         self.sessions_table.setSortingEnabled(True)
 
@@ -3581,7 +3680,10 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             return
         session_data = self.sessions_table.item(row, 0).data(Qt.UserRole)
 
-        dialog = LinkTargetDialog(self.db_manager, parent=self)
+        ra_deg, dec_deg = self._session_coordinates(session_data)
+        dialog = LinkTargetDialog(self.db_manager, parent=self, session_name=session_data.get("dso_name"),
+                                  ra_deg=ra_deg, dec_deg=dec_deg,
+                                  current_target_id=session_data.get("target_id"))
         if dialog.exec() == QDialog.Accepted and dialog.selected_target:
             target = dialog.selected_target
             try:
@@ -3634,6 +3736,31 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                   if self.sessions_table.isColumnHidden(col)]
         settings = QSettings("CosmosCollection", "CosmosCollection")
         settings.setValue(self.COLUMNS_SETTING, ",".join(hidden))
+
+    def _save_column_widths(self):
+        """Remember the column widths (a hidden column keeps its last saved width)."""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        saved = self._saved_column_widths()
+        widths = []
+        for col in range(self.sessions_table.columnCount()):
+            if self.sessions_table.isColumnHidden(col):
+                widths.append(saved[col] if col < len(saved) else 0)
+            else:
+                widths.append(self.sessions_table.columnWidth(col))
+        settings.setValue(self.COLUMN_WIDTHS_SETTING, ",".join(str(w) for w in widths))
+
+    def _saved_column_widths(self):
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        saved = settings.value(self.COLUMN_WIDTHS_SETTING, "", type=str)
+        return [int(part) if part.strip().isdigit() else 0 for part in saved.split(",")] if saved else []
+
+    def _apply_saved_column_widths(self):
+        """Restore remembered column widths; False if none were saved."""
+        widths = self._saved_column_widths()
+        for col, width in enumerate(widths[:self.sessions_table.columnCount()]):
+            if width > 0:
+                self.sessions_table.setColumnWidth(col, width)
+        return any(width > 0 for width in widths)
 
     def _apply_saved_column_visibility(self):
         settings = QSettings("CosmosCollection", "CosmosCollection")
