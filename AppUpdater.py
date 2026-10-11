@@ -11,7 +11,10 @@ the actual file swap always happens in that separate process, after this
 one has quit.
 
 version.py's VersionManager still owns "is an update available" detection;
-this module only takes over once the user decides to install one.
+this module only takes over once the user decides to install one - plus the
+update reminders (snooze / skip this version) that decide when the automatic
+startup and tray checks tell the user, and UpdateChecker, which runs those
+checks off the UI thread.
 """
 
 import hashlib
@@ -24,11 +27,12 @@ import sys
 import threading
 import time
 import zipfile
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 import requests
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QObject, QSettings, QThread, Signal
 
 from ResourceManager import ResourceManager
 
@@ -364,3 +368,120 @@ class UpdateManager:
 
 # Global instance for easy access, mirroring version.py's version_manager
 update_manager = UpdateManager()
+
+
+# --- Update reminders ---
+# Automatic update notices (the startup check and the tray check) stay quiet
+# while the user has snoozed them or skipped that version, and an ignored
+# notice comes back at most once a day. "Check for Updates" always shows.
+
+# (label, days) offered in the update dialog; None skips that version
+REMIND_CHOICES = (
+    ("Tomorrow", 1),
+    ("In 3 days", 3),
+    ("In a week", 7),
+    ("In a month", 30),
+    ("Skip this version", None),
+)
+NOTICE_INTERVAL = timedelta(days=1)  # How often an ignored notice may come back
+
+
+def _settings():
+    return QSettings("CosmosCollection", "CosmosCollection")
+
+
+def _read_time(settings, key) -> Optional[datetime]:
+    value = settings.value(key, "", type=str)
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+
+
+def update_notice_due(version: str, now: Optional[datetime] = None) -> bool:
+    """Whether an automatic check should tell the user about this version."""
+    now = now or datetime.now()
+    settings = _settings()
+    if version and settings.value("updates/skipped_version", "", type=str) == version:
+        return False
+    remind_after = _read_time(settings, "updates/remind_after")
+    if remind_after and now < remind_after:
+        return False
+    last_notice = _read_time(settings, "updates/last_notice")
+    if (last_notice and settings.value("updates/last_notice_version", "", type=str) == version
+            and now - last_notice < NOTICE_INTERVAL):
+        return False
+    return True
+
+
+def record_update_notice(version: str) -> None:
+    """Note that the user was just told about this version."""
+    settings = _settings()
+    settings.setValue("updates/last_notice", datetime.now().isoformat(timespec="seconds"))
+    settings.setValue("updates/last_notice_version", version or "")
+
+
+def remind_choice_index() -> int:
+    """The Remind me choice the user picked last time."""
+    index = _settings().value("updates/remind_choice", 0, type=int)
+    return index if 0 <= index < len(REMIND_CHOICES) else 0
+
+
+def remind_later(version: str, index: int) -> None:
+    """Apply a REMIND_CHOICES entry: snooze for its days, or skip this version."""
+    settings = _settings()
+    settings.setValue("updates/remind_choice", index)
+    _label, days = REMIND_CHOICES[index]
+    if days is None:
+        settings.setValue("updates/skipped_version", version or "")
+        settings.remove("updates/remind_after")
+    else:
+        until = datetime.now() + timedelta(days=days)
+        settings.setValue("updates/remind_after", until.isoformat(timespec="seconds"))
+    logger.info(f"Update reminder for {version}: {REMIND_CHOICES[index][0]}")
+
+
+def reset_update_reminders() -> None:
+    """Forget any snooze or skipped version."""
+    settings = _settings()
+    for key in ("updates/remind_after", "updates/skipped_version",
+                "updates/last_notice", "updates/last_notice_version"):
+        settings.remove(key)
+
+
+def update_reminder_status() -> Optional[str]:
+    """A sentence describing a snooze or skipped version, or None if neither."""
+    settings = _settings()
+    parts = []
+    remind_after = _read_time(settings, "updates/remind_after")
+    if remind_after and remind_after > datetime.now():
+        parts.append(f"Update reminders are snoozed until {remind_after:%a, %b} {remind_after.day}.")
+    skipped = settings.value("updates/skipped_version", "", type=str)
+    if skipped:
+        parts.append(f"Version {skipped} is skipped - you'll hear about the next one.")
+    return " ".join(parts) or None
+
+
+class UpdateChecker(QObject):
+    """Asks GitHub for the latest release on a background thread (the
+    request can take seconds) and emits checked(version_info) on the UI
+    thread. A daemon thread, so a slow request never holds up quitting."""
+
+    checked = Signal(object)  # version_info dict, passed as-is (not converted to a QVariantMap)
+
+    def start(self, refresh: bool = False) -> None:
+        """refresh=True asks GitHub again instead of using the cached answer."""
+        threading.Thread(target=self._run, args=(refresh,), daemon=True, name="UpdateCheck").start()
+
+    def _run(self, refresh):
+        from version import version_manager
+        try:
+            version_info = version_manager.get_version_info(refresh)
+        except Exception as e:
+            logger.debug(f"Update check failed: {e}")
+            version_info = {'local_version': version_manager.get_local_version(),
+                            'github_available': False, 'update_available': False}
+        try:
+            self.checked.emit(version_info)
+        except RuntimeError:
+            pass  # The window that asked has closed

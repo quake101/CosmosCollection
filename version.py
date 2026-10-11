@@ -10,6 +10,7 @@ import logging
 import subprocess
 import sys
 import os
+import threading
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 
@@ -139,6 +140,9 @@ class VersionManager:
         self.cache_duration = timedelta(hours=6)  # Cache GitHub API response for 6 hours
         self._cached_release_info = None
         self._cache_timestamp = None
+        # Background checks can overlap (startup, window title, tray); the
+        # lock makes a second caller wait for the first request and use its result
+        self._fetch_lock = threading.Lock()
 
     def get_local_version(self) -> str:
         """Get the local fallback version"""
@@ -148,11 +152,19 @@ class VersionManager:
         """Get the build date"""
         return __build_date__
 
-    def get_github_latest_release(self) -> Optional[Dict[Any, Any]]:
+    def get_github_latest_release(self, refresh: bool = False) -> Optional[Dict[Any, Any]]:
         """
-        Fetch the latest release information from GitHub API
-        Returns None if unable to fetch or if cached data is still valid
+        Fetch the latest release information from GitHub API (cached for
+        cache_duration; refresh=True asks GitHub again). Returns None if
+        unable to fetch. A network request - call it off the UI thread
+        (AppUpdater.UpdateChecker does).
         """
+        with self._fetch_lock:
+            if refresh:
+                self._cached_release_info = None
+            return self._fetch_latest_release()
+
+    def _fetch_latest_release(self) -> Optional[Dict[Any, Any]]:
         try:
             # Check if we have valid cached data
             if (self._cached_release_info and self._cache_timestamp and
@@ -191,10 +203,12 @@ class VersionManager:
             logger.debug(f"Unexpected error fetching release info: {e}")
             return None
 
-    def get_version_info(self) -> Dict[str, Any]:
+    def get_version_info(self, refresh: bool = False) -> Dict[str, Any]:
         """
         Get comprehensive version information
-        Returns a dictionary with version details
+        Returns a dictionary with version details ('release_data' is the
+        GitHub release payload, for the installer). A network request -
+        call it off the UI thread.
         """
         version_info = {
             'local_version': self.get_local_version(),
@@ -204,13 +218,15 @@ class VersionManager:
             'github_url': None,
             'github_published_date': None,
             'is_latest': None,
-            'update_available': False
+            'update_available': False,
+            'release_data': None
         }
 
         # Try to get GitHub release info
-        github_release = self.get_github_latest_release()
+        github_release = self.get_github_latest_release(refresh)
         if github_release:
             version_info['github_available'] = True
+            version_info['release_data'] = github_release
             version_info['github_version'] = github_release.get('tag_name', 'Unknown')
             version_info['github_url'] = github_release.get('html_url')
 
@@ -265,9 +281,10 @@ class VersionManager:
             logger.debug(f"Error comparing versions {local_version} vs {github_version}: {e}")
             return True  # Assume no update needed if comparison fails
 
-    def get_version_display_string(self) -> str:
-        """Get a formatted version string for display in the UI"""
-        version_info = self.get_version_info()
+    def get_version_display_string(self, version_info: Optional[Dict[str, Any]] = None) -> str:
+        """Get a formatted version string for display in the UI - from
+        version_info if given, otherwise from a (network) check"""
+        version_info = version_info or self.get_version_info()
 
         if version_info['github_available'] and version_info['github_version']:
             if version_info['update_available']:
@@ -277,9 +294,10 @@ class VersionManager:
         else:
             return f"v{version_info['local_version']}"
 
-    def get_detailed_version_info(self) -> str:
-        """Get detailed version information for the About dialog"""
-        version_info = self.get_version_info()
+    def get_detailed_version_info(self, version_info: Optional[Dict[str, Any]] = None) -> str:
+        """Get detailed version information for the About dialog - from
+        version_info if given, otherwise from a (network) check"""
+        version_info = version_info or self.get_version_info()
 
         details = [f"Local Version: {version_info['local_version']}"]
 

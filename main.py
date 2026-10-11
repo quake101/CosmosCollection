@@ -1161,6 +1161,23 @@ class SettingsDialog(QDialog):
         )
         ui_prefs_layout.addWidget(self.check_updates_checkbox)
 
+        # A snoozed or skipped update (chosen in the update dialog), with a way to undo it
+        self.update_reminder_row = QWidget()
+        update_reminder_layout = QHBoxLayout(self.update_reminder_row)
+        update_reminder_layout.setContentsMargins(20, 0, 0, 0)
+        self.update_reminder_label = QLabel()
+        self.update_reminder_label.setWordWrap(True)
+        themed_style(self.update_reminder_label,
+                     lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; }}")
+        update_reminder_layout.addWidget(self.update_reminder_label, 1)
+        update_reminder_reset = QPushButton("Remind Me Again")
+        update_reminder_reset.setAutoDefault(False)
+        update_reminder_reset.setToolTip("Forget the snooze / skipped version - the next check tells you about updates")
+        update_reminder_reset.clicked.connect(self._reset_update_reminders)
+        update_reminder_layout.addWidget(update_reminder_reset)
+        ui_prefs_layout.addWidget(self.update_reminder_row)
+        self._update_reminder_status()
+
         # Minimize to system tray checkbox
         self.minimize_to_tray_checkbox = QCheckBox("Minimize to system tray")
         self.minimize_to_tray_checkbox.setToolTip(
@@ -1787,6 +1804,17 @@ class SettingsDialog(QDialog):
         layout.addLayout(button_layout)
         self.setLayout(layout)
         
+    def _update_reminder_status(self):
+        from AppUpdater import update_reminder_status
+        status = update_reminder_status()
+        self.update_reminder_label.setText(status or "")
+        self.update_reminder_row.setVisible(bool(status))
+
+    def _reset_update_reminders(self):
+        from AppUpdater import reset_update_reminders
+        reset_update_reminders()
+        self._update_reminder_status()
+
     def _load_current_settings(self):
         """Load current settings from database and QSettings"""
         # Populate location list
@@ -5181,6 +5209,17 @@ def _get_quit_callback(widget):
     return QApplication.instance().quit
 
 
+def run_update_check(owner, on_result, refresh=False):
+    """Check GitHub for a newer release on a background thread, then call
+    on_result(version_info) on the UI thread - unless owner (a QObject) has
+    been closed and deleted by then. refresh=True skips the cached answer."""
+    from AppUpdater import UpdateChecker
+    checker = UpdateChecker(owner)
+    checker.checked.connect(on_result)
+    checker.checked.connect(checker.deleteLater)
+    checker.start(refresh)
+
+
 def offer_update_and_apply(parent, version_info):
     """Shared 'update is available' flow used by the About dialog's Check
     for Updates button, the silent startup check, and the tray check.
@@ -5192,54 +5231,107 @@ def offer_update_and_apply(parent, version_info):
     page" behavior.
     """
     from AppUpdater import update_manager
-    from version import version_manager
-    from UrlOpener import open_url
-
-    github_url = version_info.get('github_url')
 
     if not update_manager.is_supported():
-        msg = QMessageBox(parent)
-        msg.setWindowTitle("Update Available")
-        msg.setText("A new version is available!")
-        msg.setInformativeText(
-            f"Current version: {version_info['local_version']}\n"
-            f"Latest version: {version_info['github_version']}\n\n"
-            f"Would you like to visit the download page?"
-        )
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg.setDefaultButton(QMessageBox.Yes)
-        if msg.exec() == QMessageBox.Yes and github_url:
-            open_url(github_url)
+        UpdateAvailableDialog(parent, version_info, "page").exec()
         return
 
-    release_data = version_manager.get_github_latest_release() or {}
+    release_data = version_info.get('release_data') or {}  # From the (background) check
     zip_asset, sha256_asset, asset_error = update_manager.get_pending_asset(release_data)
 
-    msg = QMessageBox(parent)
-    msg.setWindowTitle("Update Available")
-    msg.setText("A new version is available!")
-    info_text = (
-        f"Current version: {version_info['local_version']}\n"
-        f"Latest version: {version_info['github_version']}"
-    )
-    if asset_error:
-        info_text += f"\n\n{asset_error}"
-    msg.setInformativeText(info_text)
-
-    install_button = None
-    if not asset_error:
-        install_button = msg.addButton("Download && Install", QMessageBox.AcceptRole)
-    notes_button = msg.addButton("Release Notes", QMessageBox.HelpRole)
-    msg.addButton("Later", QMessageBox.RejectRole)
-    msg.setDefaultButton(install_button or notes_button)
-    msg.exec()
-
-    clicked = msg.clickedButton()
-    if clicked == notes_button:
-        if github_url:
-            open_url(github_url)
-    elif install_button is not None and clicked == install_button:
+    dialog = UpdateAvailableDialog(parent, version_info, None if asset_error else "install", asset_error)
+    if dialog.exec() == QDialog.Accepted:
         _download_and_install_update(parent, zip_asset, sha256_asset)
+
+
+class UpdateAvailableDialog(QDialog):
+    """'A new version is available': install it (or open the download page),
+    read the release notes, or choose when to be reminded - or skip this
+    version. Accepted means Download & Install was chosen."""
+
+    def __init__(self, parent, version_info, action, note=None):
+        """action: "install", "page" (open the download page) or None."""
+        super().__init__(parent)
+        from AppUpdater import REMIND_CHOICES, remind_choice_index
+
+        self.setWindowTitle("Update Available")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.version = version_info.get('github_version') or ""
+        self.github_url = version_info.get('github_url')
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 16)
+        layout.setSpacing(12)
+        title = QLabel("A new version is available!")
+        themed_style(title, lambda: f"font-size: {font_size(13)}; font-weight: bold;")
+        layout.addWidget(title)
+        info_text = (
+            f"Current version: {version_info.get('local_version')}\n"
+            f"Latest version: {self.version}"
+        )
+        if note:
+            info_text += f"\n\n{note}"
+        info = QLabel(info_text)
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        remind_row = QHBoxLayout()
+        remind_row.addWidget(QLabel("Remind me:"))
+        self.remind_combo = QComboBox()
+        for label, _days in REMIND_CHOICES:
+            self.remind_combo.addItem(label)
+        self.remind_combo.setCurrentIndex(remind_choice_index())
+        self.remind_combo.setToolTip("When to hear about this update again if you don't install it now")
+        remind_row.addWidget(self.remind_combo)
+        remind_row.addStretch()
+        layout.addLayout(remind_row)
+
+        buttons = QHBoxLayout()
+        notes_button = QPushButton("Release Notes")
+        notes_button.setAutoDefault(False)
+        notes_button.clicked.connect(self._open_release_notes)
+        notes_button.setEnabled(bool(self.github_url))
+        buttons.addWidget(notes_button)
+        buttons.addStretch()
+        self.later_button = QPushButton()
+        self.later_button.setAutoDefault(False)
+        self.later_button.clicked.connect(self._remind_later)
+        buttons.addWidget(self.later_button)
+        if action == "install":
+            main_button = QPushButton("Download && Install")
+            main_button.clicked.connect(self.accept)
+        elif action == "page":
+            main_button = QPushButton("Download Page")
+            main_button.setEnabled(bool(self.github_url))
+            main_button.clicked.connect(self._open_download_page)
+        else:
+            main_button = None
+        if main_button is not None:
+            main_button.setDefault(True)
+            buttons.addWidget(main_button)
+        layout.addLayout(buttons)
+
+        self.remind_combo.currentIndexChanged.connect(self._update_later_button)
+        self._update_later_button()
+
+    def _update_later_button(self):
+        from AppUpdater import REMIND_CHOICES
+        skip = REMIND_CHOICES[self.remind_combo.currentIndex()][1] is None
+        self.later_button.setText("Skip This Version" if skip else "Remind Me Later")
+
+    def _remind_later(self):
+        from AppUpdater import remind_later
+        remind_later(self.version, self.remind_combo.currentIndex())
+        self.reject()
+
+    def _open_release_notes(self):
+        from UrlOpener import open_url
+        open_url(self.github_url)  # The dialog stays open to decide afterwards
+
+    def _open_download_page(self):
+        from UrlOpener import open_url
+        open_url(self.github_url)
+        self.reject()
 
 
 def _download_and_install_update(parent, zip_asset, sha256_asset):
@@ -5327,14 +5419,15 @@ class AboutDialog(QDialog):
         themed_style(title_label, lambda: f"font-size: {font_size(18)}; font-weight: bold; color: {COLORS['text']};")
         About_layout.addWidget(title_label)
 
-        # Version information
+        # Version information - the local version now, the latest release once GitHub answers
         try:
             from version import version_manager
-            version_text = version_manager.get_detailed_version_info()
+            version_text = f"Local Version: {version_manager.get_local_version()}\nChecking for the latest release…"
+            run_update_check(self, self._show_version_details)
         except ImportError:
             version_text = "Version information not available"
 
-        version_label = QLabel(version_text)
+        self.version_label = version_label = QLabel(version_text)
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setWordWrap(True)  # Allow text wrapping if needed
         themed_style(version_label, lambda: f"font-size: {font_size(10)}; color: {COLORS['text_secondary']}; margin: 5px 0px; font-family: monospace;")
@@ -5382,15 +5475,23 @@ class AboutDialog(QDialog):
         button_layout.addStretch()
         About_layout.addLayout(button_layout)
 
-    def _check_updates(self):
-        """Check for updates and show result"""
-        try:
-            from version import version_manager
-            from PySide6.QtWidgets import QMessageBox
+    def _show_version_details(self, version_info):
+        from version import version_manager
+        self.version_label.setText(version_manager.get_detailed_version_info(version_info))
 
-            # Force refresh the GitHub release info
-            version_manager._cached_release_info = None
-            version_info = version_manager.get_version_info()
+    def _check_updates(self):
+        """Ask GitHub again (in the background) and show the result"""
+        self.update_button.setEnabled(False)
+        self.update_button.setText("Checking…")
+        run_update_check(self, self._on_update_check, refresh=True)
+
+    def _on_update_check(self, version_info):
+        """Show the result of Check for Updates"""
+        self.update_button.setEnabled(True)
+        self.update_button.setText("Check for Updates")
+        self._show_version_details(version_info)
+        try:
+            from PySide6.QtWidgets import QMessageBox
 
             if not version_info['github_available']:
                 QMessageBox.information(self, "Update Check",
@@ -5425,14 +5526,14 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         super().__init__()
         logger.debug("Initializing MainWindow")
 
-        # Set window title with version
+        # Set window title with version - the local version now, plus
+        # "(Latest)" / "(Update available: ...)" once GitHub answers
         try:
-            from version import get_version_display
-            window_title = f"Cosmos Collection - {get_version_display()}"
+            from version import version_manager
+            self.setWindowTitle(f"Cosmos Collection - v{version_manager.get_local_version()}")
+            run_update_check(self, self._show_version_in_title)
         except ImportError:
-            window_title = "Cosmos Collection"
-
-        self.setWindowTitle(window_title)
+            self.setWindowTitle("Cosmos Collection")
         self.resize(1200, 800)
         self.setWindowFlags(Qt.Window)
         self.setup_window_position()
@@ -6141,22 +6242,39 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 return
 
             logger.debug("Checking for updates on startup")
-
-            from version import version_manager
-
-            # Get version info
-            version_info = version_manager.get_version_info()
-
-            # Only show message if update is available
-            if version_info.get('github_available') and version_info.get('update_available'):
-                logger.info(f"Update available: {version_info.get('github_version')}")
-                offer_update_and_apply(self, version_info)
-            else:
-                logger.debug("No updates available or unable to check")
+            self._run_update_check(self._on_startup_update_check)
 
         except Exception as e:
             # Silently fail - don't bother user on startup with error messages
             logger.error(f"Error checking for updates on startup: {str(e)}")
+
+    def _run_update_check(self, on_result):
+        """Check GitHub for a newer release in the background; on_result(version_info)."""
+        run_update_check(self, on_result)
+
+    def _show_version_in_title(self, version_info):
+        from version import version_manager
+        self.setWindowTitle(f"Cosmos Collection - {version_manager.get_version_display_string(version_info)}")
+
+    def _automatic_update_due(self, version_info):
+        """Whether an automatic check should mention this update - not while
+        the user has snoozed it or skipped this version, and at most once a day."""
+        if not (version_info.get('github_available') and version_info.get('update_available')):
+            return False
+        from AppUpdater import update_notice_due, record_update_notice
+        version = version_info.get('github_version') or ""
+        if not update_notice_due(version):
+            logger.debug(f"Update {version} available, but reminders are snoozed or it was skipped")
+            return False
+        record_update_notice(version)
+        return True
+
+    def _on_startup_update_check(self, version_info):
+        if self._automatic_update_due(version_info):
+            logger.info(f"Update available: {version_info.get('github_version')}")
+            offer_update_and_apply(self, version_info)
+        else:
+            logger.debug("No update to mention on startup")
 
     def _save_simbad_object_to_database(self, object_data):
         """Save SIMBAD object data to the database.
@@ -6890,36 +7008,38 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             logger.debug("Stopped tray update check timer")
 
     def _check_updates_for_tray(self):
-        """Check for updates and show tray notification if available"""
+        """Check for updates in the background; a tray notification follows if one is available"""
         try:
-            from version import version_manager
+            self._run_update_check(self._on_tray_update_check)
+        except Exception as e:
+            logger.debug(f"Error checking for updates in tray: {e}")
 
-            # Get version info
-            version_info = version_manager.get_version_info()
-
-            # Show tray notification if update is available
-            if version_info.get('github_available') and version_info.get('update_available'):
+    def _on_tray_update_check(self, version_info):
+        """Show a tray notification for an available update, unless the user
+        snoozed it, skipped this version, or was already told today"""
+        try:
+            if not (self._tray_manager and self._tray_manager._tray_icon):
+                return
+            if self._automatic_update_due(version_info):
                 logger.info(f"Update available (tray check): {version_info.get('github_version')}")
-
-                if self._tray_manager and self._tray_manager._tray_icon:
-                    self._tray_manager._tray_icon.showMessage(
-                        "Update Available",
-                        f"Cosmos Collection {version_info['github_version']} is available.\n"
-                        f"Click here to download and install it.",
-                        QSystemTrayIcon.Information,
-                        10000  # Show for 10 seconds
-                    )
-                    # Re-wire the click handler on every check so it always
-                    # offers to update using this check's version info.
-                    try:
-                        self._tray_manager._tray_icon.messageClicked.disconnect()
-                    except (TypeError, RuntimeError):
-                        pass  # nothing was connected yet
-                    self._tray_manager._tray_icon.messageClicked.connect(
-                        lambda vi=version_info: offer_update_and_apply(self, vi)
-                    )
+                self._tray_manager._tray_icon.showMessage(
+                    "Update Available",
+                    f"Cosmos Collection {version_info['github_version']} is available.\n"
+                    f"Click here to install it or choose when to be reminded.",
+                    QSystemTrayIcon.Information,
+                    10000  # Show for 10 seconds
+                )
+                # Re-wire the click handler on every check so it always
+                # offers to update using this check's version info.
+                try:
+                    self._tray_manager._tray_icon.messageClicked.disconnect()
+                except (TypeError, RuntimeError):
+                    pass  # nothing was connected yet
+                self._tray_manager._tray_icon.messageClicked.connect(
+                    lambda vi=version_info: offer_update_and_apply(self, vi)
+                )
             else:
-                logger.debug("Tray update check: no updates available")
+                logger.debug("Tray update check: nothing to mention")
 
         except Exception as e:
             logger.debug(f"Error checking for updates in tray: {e}")
