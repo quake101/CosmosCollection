@@ -84,7 +84,7 @@ from PySide6.QtWidgets import (
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager, WindowPositionMixin
 from ResourceManager import ResourceManager
-from CollageBuilder import CollageBuilderWindow
+from CollageBuilder import open_collage_builder
 from Theme import (
     COLORS, apply_theme, font_size, load_settings as load_theme_settings,
     save_settings as save_theme_settings, theme_manager, themed_style, tint,
@@ -5856,53 +5856,16 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _show_collage_builder(self):
         """Show the Collage Builder window"""
         try:
-            # Get all user images from the database
-            user_images = []
             with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-                # One row per image, named by its primary designation ("M 31") -
-                # joining cataloguenr directly listed each image once per designation
-                cursor.execute("""
-                    SELECT ui.id, ui.image_path, ui.integration_time, ui.equipment,
-                           ui.date_taken, ui.notes,
-                           (SELECT c.catalogue || ' ' || c.designation
-                            FROM cataloguenr c
-                            WHERE c.dsodetailid = ui.dsodetailid
-                            ORDER BY CASE c.catalogue
-                                         WHEN 'M' THEN 1
-                                         WHEN 'NGC' THEN 2
-                                         WHEN 'IC' THEN 3
-                                         ELSE 4
-                                     END, c.designation
-                            LIMIT 1) as dso_name
-                    FROM userimages ui
-                    ORDER BY ui.id DESC
-                """)
-                rows = cursor.fetchall()
-                for row in rows:
-                    user_images.append({
-                        'id': row[0],
-                        'image_path': row[1],
-                        'integration_time': row[2] or '',
-                        'equipment': row[3] or '',
-                        'date_taken': row[4] or '',
-                        'notes': row[5] or '',
-                        'dso_name': row[6] or 'Unknown DSO'
-                    })
-            
-            if not user_images:
-                QMessageBox.information(self, "No Images", 
+                image_count = conn.execute("SELECT COUNT(*) FROM userimages").fetchone()[0]
+            if not image_count:
+                QMessageBox.information(self, "No Images",
                     "No user images found. Add some images to DSO objects first, then you can create collages with them.")
                 return
-            
-            # Create collage builder window with all user images
-            if not hasattr(self, 'collage_builder_window') or not self.collage_builder_window.isVisible():
-                # Use a dummy dsodetailid since we're showing all images
-                self.collage_builder_window = CollageBuilderWindow(user_images, "All DSO Images", None, self)
-            self.collage_builder_window.show()
-            self.collage_builder_window.raise_()
-            self.collage_builder_window.activateWindow()
-            
+
+            # The one Collage Builder window, shared with the Gallery and DSO Detail
+            self.collage_builder_window = open_collage_builder(self)
+
         except Exception as e:
             logger.error(f"Error opening collage builder: {str(e)}", exc_info=True)
             QMessageBox.warning(self, "Error", f"Could not open Collage Builder: {str(e)}")

@@ -805,6 +805,14 @@ class DSODetailWindow(QDialog):
             themed_style(self.favorite_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
             zoom_layout.addWidget(self.favorite_button)
 
+            # Collages: add this image to one, or open one that shows it
+            self.collage_button = QPushButton("Collage")
+            self.collage_button.setToolTip("Add this image to a collage, or open a collage that shows it")
+            collage_menu = QMenu(self.collage_button)
+            collage_menu.aboutToShow.connect(lambda: self._fill_collage_menu(collage_menu))
+            self.collage_button.setMenu(collage_menu)
+            zoom_layout.addWidget(self.collage_button)
+
             zoom_layout.addStretch()
             image_container_layout.addLayout(zoom_layout)
 
@@ -816,6 +824,14 @@ class DSODetailWindow(QDialog):
             self.image_label.installEventFilter(self)  # Install event filter for mouse events
             self.image_label.setMouseTracking(True)  # Enable mouse tracking
             image_container_layout.addWidget(self.image_label)
+
+            # Which collages show this image (links open the Collage Builder on them)
+            self.collages_label = QLabel()
+            self.collages_label.setTextFormat(Qt.RichText)
+            self.collages_label.linkActivated.connect(self._open_collage)
+            themed_style(self.collages_label, lambda: f"color: {COLORS['text_secondary']};")
+            self.collages_label.hide()
+            image_container_layout.addWidget(self.collages_label)
 
             image_container.setLayout(image_container_layout)
             image_layout.addWidget(image_container)
@@ -1686,6 +1702,7 @@ class DSODetailWindow(QDialog):
             self.next_image_button.setEnabled(False)
             self.delete_image_button.setEnabled(False)
             self.image_counter_label.setText("0/0")
+            self._update_collage_links()
         elif image_count == 1:
             self.prev_image_button.setEnabled(False)
             self.next_image_button.setEnabled(False)
@@ -1741,6 +1758,52 @@ class DSODetailWindow(QDialog):
                 self.favorite_button.setText("*")
                 themed_style(self.favorite_button, lambda: f"QPushButton {{ color: {COLORS['text_disabled']}; font-size: {font_size(12)}; }}")
                 self.favorite_button.setToolTip("Mark as favorite")
+        self._update_collage_links()
+
+    def _current_image_id(self):
+        if self.user_images and 0 <= self.current_image_index < len(self.user_images):
+            return self.user_images[self.current_image_index].get('id')
+        return None
+
+    def _fill_collage_menu(self, menu):
+        """Add to Collage / Show in Collage for the image shown."""
+        menu.clear()
+        image_id = self._current_image_id()
+        if image_id is None:
+            menu.addAction("No image to add").setEnabled(False)
+            return
+        from CollageBuilder import add_collage_actions
+        add_collage_actions(menu, self, [image_id])
+
+    def _update_collage_links(self):
+        """'In collages: Messier 2, Galaxies' under the image - each a link."""
+        if not hasattr(self, "collages_label"):
+            return
+        image_id = self._current_image_id()
+        using = []
+        if image_id is not None:
+            try:
+                from CollageBuilder import collages_using
+                with self.db_manager.get_connection() as conn:
+                    using = collages_using(conn, [image_id])
+            except Exception as e:
+                logger.debug(f"Could not look up collages: {e}")
+        if using:
+            from html import escape
+            links = ", ".join(f"<a href='{collage_id}'>{escape(name)}</a>" for collage_id, name in using)
+            self.collages_label.setText(f"In collages: {links}")
+        self.collages_label.setVisible(bool(using))
+
+    def changeEvent(self, event):
+        # Back from the Collage Builder (an image may have been added): refresh the links
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            self._update_collage_links()
+        super().changeEvent(event)
+
+    def _open_collage(self, link):
+        from CollageBuilder import open_collage_builder
+        image_id = self._current_image_id()
+        open_collage_builder(self, int(link), [image_id] if image_id is not None else None)
 
     def _toggle_favorite(self):
         """Toggle the favorite status of the current image"""

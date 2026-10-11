@@ -384,6 +384,14 @@ class DataLoaderRunnable(QRunnable):
                 cursor.execute(query)
                 rows = cursor.fetchall()
 
+                # Which collages show each image (for the card tooltips)
+                try:
+                    from CollageBuilder import collage_names_by_image
+                    in_collages = collage_names_by_image(conn)
+                except Exception as e:
+                    logger.debug(f"Could not look up collages: {e}")
+                    in_collages = {}
+
                 # Convert rows to dictionaries
                 items = []
                 for row in rows:
@@ -399,7 +407,8 @@ class DataLoaderRunnable(QRunnable):
                         'friendly_type': self._get_friendly_type_name(row[5] or ''),
                         'created_date': row[8] or '',
                         'ra_deg': row[9],
-                        'dec_deg': row[10]
+                        'dec_deg': row[10],
+                        'collages': in_collages.get(row[1], [])
                     }
                     items.append(item)
 
@@ -413,6 +422,132 @@ class DataLoaderRunnable(QRunnable):
         except Exception as e:
             # Emit error signal
             self.signals.load_error.emit(str(e))
+
+
+# --- Opening an image or its DSO (shared with the Collage Builder) ---
+
+_open_windows = []  # Windows opened here, kept alive until closed
+
+
+def _keep(window):
+    _open_windows.append(window)
+    window.destroyed.connect(lambda *_args, w=window: _open_windows.remove(w) if w in _open_windows else None)
+
+
+def _format_ra(ra_deg):
+    """RA in degrees as HH:MM:SS.SS"""
+    ra_hours = ra_deg / 15.0
+    hours = int(ra_hours)
+    minutes = int((ra_hours - hours) * 60)
+    seconds = ((ra_hours - hours) * 60 - minutes) * 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
+
+
+def _format_dec(dec_deg):
+    """Dec in degrees as DD:MM:SS.S"""
+    sign = '+' if dec_deg >= 0 else '-'
+    dec_abs = abs(dec_deg)
+    degrees = int(dec_abs)
+    minutes = int((dec_abs - degrees) * 60)
+    seconds = ((dec_abs - degrees) * 60 - minutes) * 60
+    return f"{sign}{degrees:02d}:{minutes:02d}:{seconds:04.1f}"
+
+
+def open_image_viewer(parent, name, image_path, ra_deg=None, dec_deg=None):
+    """Show an image full size in the Image Viewer (loaded in the background,
+    so large files don't freeze the UI). Returns the viewer, or None."""
+    try:
+        from ImageViewer import ImageViewerWindow
+        if not image_path or not os.path.exists(image_path):
+            QMessageBox.warning(parent, "Image Not Found",
+                                f"Image file not found:\n{image_path}\n\n"
+                                f"The file may have been moved or deleted.")
+            return None
+        # (pixmap, title, file_path, parent, dso_ra, dso_dec)
+        viewer = ImageViewerWindow(None, name, image_path, parent, dso_ra=ra_deg, dso_dec=dec_deg)
+        viewer.show()
+        viewer.raise_()
+        viewer.activateWindow()
+        return viewer
+    except Exception as e:
+        QMessageBox.critical(parent, "Error", f"Failed to open image viewer:\n{str(e)}")
+        return None
+
+
+def open_dso_details(parent, dsodetailid, name=None):
+    """Open the DSO Detail window for an object (by dsodetailid)."""
+    try:
+        from DSODetail import DSODetailWindow
+
+        with DatabaseManager().get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
+                       CAST(d.sizemin/60.0 AS REAL) as sizemin,
+                       CAST(d.sizemax/60.0 AS REAL) as sizemax,
+                       d.constellation, d.dsotype, d.dsoclass,
+                       GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
+                           CASE c.catalogue
+                               WHEN 'M' THEN 1
+                               WHEN 'NGC' THEN 2
+                               WHEN 'IC' THEN 3
+                               ELSE 4
+                           END, c.designation) as designations,
+                       ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+                       (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
+                FROM dsodetail d
+                JOIN cataloguenr c ON d.id = c.dsodetailid
+                LEFT JOIN userimages ui ON d.id = ui.dsodetailid AND ui.is_favorite = 1
+                WHERE d.id = ?
+                GROUP BY d.id
+            """, (dsodetailid,))
+            result = cursor.fetchone()
+
+        if not result:
+            QMessageBox.warning(parent, "Error", "Could not load DSO details")
+            return None
+
+        (obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max,
+         constellation, dso_type, dso_class, designations, image_path, integration_time,
+         equipment, date_taken, notes, image_count) = tuple(result)
+
+        # Primary designation for catalogue and id
+        primary_designation = designations.split(',')[0]
+        catalogue, designation = primary_designation.strip().split(' ', 1)
+
+        data = {
+            "name": name or designations,
+            "ra": _format_ra(ra),
+            "dec": _format_dec(dec),
+            "ra_deg": ra,
+            "dec_deg": dec,
+            "magnitude": magnitude,
+            "surface_brightness": surface_brightness,
+            "size_min": size_min if size_min else 0.0,
+            "size_max": size_max if size_max else 0.0,
+            "constellation": constellation,
+            "dso_type": dso_type,
+            "dso_class": dso_class,
+            "designations": designations,
+            "catalogue": catalogue,
+            "id": designation,
+            "dsodetailid": obj_id,
+            "image_path": image_path,
+            "integration_time": integration_time,
+            "equipment": equipment,
+            "date_taken": date_taken,
+            "notes": notes,
+            "image_count": image_count
+        }
+        detail_window = DSODetailWindow(data)
+        _keep(detail_window)
+        detail_window.show()
+        detail_window.raise_()
+        detail_window.activateWindow()
+        return detail_window
+    except Exception as e:
+        QMessageBox.critical(parent, "Error", f"Failed to open DSO details:\n{str(e)}")
+        return None
 
 
 def _load_preview_pixmap(image_path, max_dim=200):
@@ -1154,6 +1289,8 @@ class GalleryCard(QFrame):
             tooltip_lines.append(f"Equipment: {equipment}")
         if self.item_data.get('is_favorite'):
             tooltip_lines.append("Favorite image")
+        if self.item_data.get('collages'):
+            tooltip_lines.append(f"In collages: {', '.join(self.item_data['collages'])}")
         self.setToolTip('\n'.join(tooltip_lines))
 
         # Card styling - card width is thumbnail size + padding (20px for margins and borders)
@@ -1878,142 +2015,12 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
     def _on_card_double_clicked(self, item_data):
         """Handle card double-click - open image viewer"""
-        try:
-            # Import ImageViewerWindow from main
-            from main import ImageViewerWindow
-
-            # Check if image file exists
-            image_path = item_data['image_path']
-            if not os.path.exists(image_path):
-                QMessageBox.warning(self, "Image Not Found",
-                                  f"Image file not found:\n{image_path}\n\n"
-                                  f"The file may have been moved or deleted.")
-                return
-
-            # Open the viewer straight away with no pixmap - it loads the image in
-            # a background thread, so large files don't freeze the UI
-            # (pixmap, title, file_path, parent, dso_ra, dso_dec)
-            ra_deg = item_data.get('ra_deg')
-            dec_deg = item_data.get('dec_deg')
-            self.image_viewer = ImageViewerWindow(
-                None, item_data['name'], image_path, self,
-                dso_ra=ra_deg, dso_dec=dec_deg
-            )
-            self.image_viewer.show()
-            self.image_viewer.raise_()
-            self.image_viewer.activateWindow()
-
-        except ImportError as e:
-            QMessageBox.critical(self, "Error",
-                               f"Failed to import ImageViewerWindow:\n{str(e)}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error",
-                               f"Failed to open image viewer:\n{str(e)}")
+        self.image_viewer = open_image_viewer(self, item_data['name'], item_data['image_path'],
+                                              item_data.get('ra_deg'), item_data.get('dec_deg'))
 
     def _open_dso_details(self, item_data):
         """Open DSO detail window for the selected object"""
-        try:
-            from main import DSODetailWindow
-
-            dsodetailid = item_data['dsodetailid']
-
-            # Query database for full DSO details
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-
-                query = """
-                    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
-                           CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                           CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                           d.constellation, d.dsotype, d.dsoclass,
-                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-                               CASE c.catalogue
-                                   WHEN 'M' THEN 1
-                                   WHEN 'NGC' THEN 2
-                                   WHEN 'IC' THEN 3
-                                   ELSE 4
-                               END, c.designation) as designations,
-                           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
-                           (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-                    FROM dsodetail d
-                    JOIN cataloguenr c ON d.id = c.dsodetailid
-                    LEFT JOIN userimages ui ON d.id = ui.dsodetailid AND ui.is_favorite = 1
-                    WHERE d.id = ?
-                    GROUP BY d.id
-                """
-
-                cursor.execute(query, (dsodetailid,))
-                result = cursor.fetchone()
-
-                if not result:
-                    QMessageBox.warning(self, "Error", "Could not load DSO details")
-                    return
-
-                # Unpack result
-                obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
-                    constellation, dso_type, dso_class, designations, image_path, integration_time, \
-                    equipment, date_taken, notes, image_count = result
-
-                # Get primary designation for catalogue and id
-                primary_designation = designations.split(',')[0]
-                catalogue, designation = primary_designation.strip().split(' ', 1)
-
-                # Format RA/Dec for display
-                ra_str = self._format_ra(ra)
-                dec_str = self._format_dec(dec)
-
-                # Build data dictionary
-                data = {
-                    "name": item_data['name'],
-                    "ra": ra_str,
-                    "dec": dec_str,
-                    "ra_deg": ra,
-                    "dec_deg": dec,
-                    "magnitude": magnitude,
-                    "surface_brightness": surface_brightness,
-                    "size_min": size_min if size_min else 0.0,
-                    "size_max": size_max if size_max else 0.0,
-                    "constellation": constellation,
-                    "dso_type": dso_type,
-                    "dso_class": dso_class,
-                    "designations": designations,
-                    "catalogue": catalogue,
-                    "id": designation,
-                    "dsodetailid": obj_id,
-                    "image_path": image_path,
-                    "integration_time": integration_time,
-                    "equipment": equipment,
-                    "date_taken": date_taken,
-                    "notes": notes,
-                    "image_count": image_count
-                }
-
-                # Create and show detail window
-                detail_window = DSODetailWindow(data)
-                detail_window.show()
-                detail_window.raise_()
-                detail_window.activateWindow()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error",
-                               f"Failed to open DSO details:\n{str(e)}")
-
-    def _format_ra(self, ra_deg):
-        """Format RA in degrees to HH:MM:SS.SS format"""
-        ra_hours = ra_deg / 15.0
-        hours = int(ra_hours)
-        minutes = int((ra_hours - hours) * 60)
-        seconds = ((ra_hours - hours) * 60 - minutes) * 60
-        return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
-
-    def _format_dec(self, dec_deg):
-        """Format Dec in degrees to DD:MM:SS.S format"""
-        sign = '+' if dec_deg >= 0 else '-'
-        dec_abs = abs(dec_deg)
-        degrees = int(dec_abs)
-        minutes = int((dec_abs - degrees) * 60)
-        seconds = ((dec_abs - degrees) * 60 - minutes) * 60
-        return f"{sign}{degrees:02d}:{minutes:02d}:{seconds:04.1f}"
+        open_dso_details(self, item_data['dsodetailid'], item_data['name'])
 
     def _show_card_context_menu(self, item_data, position):
         """Show context menu when right-clicking on a card"""
@@ -2025,6 +2032,12 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         details_action = context_menu.addAction("View DSO Details")
         details_action.triggered.connect(lambda: self._open_dso_details(item_data))
+
+        # Collages: add this image to one, or open one that shows it
+        if item_data.get('imageid') is not None:
+            from CollageBuilder import add_collage_actions
+            context_menu.addSeparator()
+            add_collage_actions(context_menu, self, [item_data['imageid']])
 
         # Show menu at cursor position
         context_menu.exec(position)

@@ -2674,6 +2674,8 @@ class CollageView(QGraphicsView):
             menu.addSeparator()
         if item is not None and item.frame.is_image:
             frame = item.frame
+            self.editor._add_view_actions(menu, frame.image_id)
+            menu.addSeparator()
             if preview_store().error(frame.image_path) == MISSING_FILE:
                 menu.addAction("Locate Image…", lambda: self.editor.locate_image(frame.image_id))
             else:
@@ -4305,6 +4307,8 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         add.setEnabled(self.current is not None)
         if self._is_missing(image_id):
             menu.addAction("Locate Image…", lambda: self.locate_image(image_id))
+        menu.addSeparator()
+        self._add_view_actions(menu, image_id)
         menu.exec(self.library_list.viewport().mapToGlobal(pos))
 
     def _refresh_library_icons(self):
@@ -5480,6 +5484,92 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         except Exception as e:
             logger.error(f"Could not show {path}: {e}")
 
+    # Other windows
+
+    def show_collage(self, collage_id, image_ids=None):
+        """Switch to a collage (database id), selecting the frames that show image_ids."""
+        row = next((i for i, c in enumerate(self.collages) if c.db_id == collage_id), None)
+        if row is None:
+            return False
+        if self.collage_list.currentRow() != row:
+            self.collage_list.setCurrentRow(row)
+        if image_ids:
+            wanted = set(image_ids)
+            uids = {f.uid for f in self.current.frames
+                    if f.image_id in wanted or any((e.get("frame") or {}).get("image_id") in wanted
+                                                   for e in f.merged or [])}
+            self._select_uids(uids)
+            QTimer.singleShot(50, lambda: self._reveal(uids))  # After the view fits the new canvas
+        return True
+
+    def _reveal(self, uids):
+        items = [item for item in self.scene.frame_items() if item.frame.uid in uids]
+        if items:
+            area = items[0].visual_rect()
+            for item in items[1:]:
+                area = area.united(item.visual_rect())
+            self.view.ensureVisible(area, 40, 40)
+
+    def add_to_collage(self, collage_id, image_ids):
+        """Add images from elsewhere (Gallery, DSO Detail) to a collage - None:
+        a new one - filling their catalog tiles if it has them."""
+        if any(i not in self.library for i in image_ids):
+            self._load_library()  # Added since this window opened
+        rows = [self.library[i] for i in image_ids if i in self.library]
+        if not rows:
+            return
+        if collage_id is None:
+            name = self._ask_name("New Collage", self._unique_name(join_names(r["dso_name"] for r in rows) or "Collage"))
+            if not name:
+                return
+            collage = self.create_collage(name)
+        elif self.show_collage(collage_id):
+            collage = self.current
+        else:
+            return
+        new = [r["id"] for r in rows if r["id"] not in collage.image_ids()]
+        if new:
+            self.add_images(new)  # Fills catalog tiles, else free spots; selects them
+            names = join_names(self.library[i]["dso_name"] for i in new)
+            self.status_hint(f"Added {names} to “{collage.name}”")
+        else:
+            self.show_collage(collage.db_id, image_ids)
+
+    def _image_position(self, image_id):
+        """(ra, dec) in degrees of an image's object, or (None, None)."""
+        row = self.library.get(image_id)
+        try:
+            with DatabaseManager().get_connection() as conn:
+                found = conn.execute("SELECT ra, dec FROM dsodetail WHERE id = ?", (row["dsodetailid"],)).fetchone()
+            return (found[0], found[1]) if found else (None, None)
+        except Exception:
+            return None, None
+
+    def view_full_image(self, image_id):
+        row = self.library.get(image_id)
+        if row is not None:
+            from DSOGallery import open_image_viewer
+            ra, dec = self._image_position(image_id)
+            self._viewer = open_image_viewer(self, join_names(self.library[i]["dso_name"]
+                                                              for i in self._group_of.get(image_id, [image_id])),
+                                             row["image_path"], ra, dec)
+
+    def view_dso_details(self, image_id):
+        row = self.library.get(image_id)
+        if row is not None and row["dsodetailid"]:
+            from DSOGallery import open_dso_details
+            open_dso_details(self, row["dsodetailid"], row["dso_name"])
+
+    def _add_view_actions(self, menu, image_id):
+        """View Full Image / View DSO Details for an image (canvas and library menus)."""
+        row = self.library.get(image_id)
+        if row is None:
+            return
+        full = menu.addAction("View Full Image", lambda: self.view_full_image(image_id))
+        full.setEnabled(not self._is_missing(image_id))
+        details = menu.addAction(f"View {row['dso_name']} Details", lambda: self.view_dso_details(image_id))
+        details.setEnabled(bool(row["dsodetailid"]))
+
     # Window
 
     def keyPressEvent(self, event):
@@ -5495,3 +5585,113 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         self._save_dirty()
         QSettings("CosmosCollection", "CosmosCollection").setValue(self.SPLITTER_SETTING, self.splitter.saveState())
         super().closeEvent(event)
+
+
+# --------------------------------------------------------------------
+# The rest of the app: open the Collage Builder, add images to collages
+# --------------------------------------------------------------------
+
+_builder = None  # The Collage Builder window - one, shared by everything that opens it
+
+
+def _main_window():
+    for widget in QApplication.topLevelWidgets():
+        if hasattr(widget, "_show_collage_builder"):
+            return widget
+    return None
+
+
+def open_collage_builder(parent=None, collage_id=None, image_ids=None):
+    """Show the Collage Builder (the open one, or a fresh one), optionally on
+    a collage (database id) with the frames of image_ids selected."""
+    global _builder
+    window = _builder
+    try:
+        alive = window is not None and window.isVisible()
+    except RuntimeError:  # Deleted
+        alive = False
+    if not alive:
+        if window is not None:
+            try:
+                window.deleteLater()  # Closed earlier - start fresh, with current data
+            except RuntimeError:
+                pass
+        window = CollageBuilderWindow([], "All DSO Images", None, _main_window() or parent)
+        _builder = window
+    if window.isMinimized():
+        window.showNormal()
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    if collage_id is not None:
+        window.show_collage(collage_id, image_ids)
+    return window
+
+
+def list_collages(conn):
+    """[(collage id, name)], most recently changed first."""
+    return [tuple(row) for row in conn.execute("SELECT id, name FROM usercollages ORDER BY modified_date DESC")]
+
+
+def collages_using(conn, image_ids):
+    """[(collage id, name)] of the collages showing any of image_ids - in a
+    frame of their own, or merged into another one."""
+    wanted = set(image_ids)
+    found = {}
+    for collage_id, name, image_id, layout in conn.execute("""
+            SELECT uci.collage_id, c.name, uci.userimage_id, uci.layout
+            FROM usercollageimages uci JOIN usercollages c ON c.id = uci.collage_id"""):
+        if image_id in wanted or any((entry.get("frame") or {}).get("image_id") in wanted
+                                     for entry in _json_dict(layout).get("merged") or []):
+            found[collage_id] = name
+    return sorted(found.items(), key=lambda item: natural_key(item[1]))
+
+
+def collage_names_by_image(conn):
+    """{image id: [collage names]} for every image in a collage (merged ones too)."""
+    names = {}
+    for name, image_id, layout in conn.execute("""
+            SELECT c.name, uci.userimage_id, uci.layout
+            FROM usercollageimages uci JOIN usercollages c ON c.id = uci.collage_id"""):
+        ids = [image_id] + [(entry.get("frame") or {}).get("image_id")
+                            for entry in _json_dict(layout).get("merged") or []]
+        for found in ids:
+            if found is not None and name not in names.setdefault(found, []):
+                names[found].append(name)
+    return {image_id: sorted(found, key=natural_key) for image_id, found in names.items()}
+
+
+def add_collage_actions(menu, parent, image_ids):
+    """Add "Add to Collage" and "Show in Collage" submenus for images to a
+    context menu (the Gallery's, DSO Detail's). Returns the collages already
+    showing them."""
+    try:
+        with DatabaseManager().get_connection() as conn:
+            collages, using = list_collages(conn), collages_using(conn, image_ids)
+    except Exception as e:
+        logger.error(f"Could not list collages: {e}", exc_info=True)
+        return []
+    showing = dict(using)
+    add = menu.addMenu("Add to Collage")
+    for collage_id, name in collages:
+        if collage_id in showing:  # Already in it: go and see it instead
+            add.addAction(f"{name} (already in it)",
+                          lambda checked=False, c=collage_id: open_collage_builder(parent, c, image_ids))
+        else:
+            add.addAction(name, lambda checked=False, c=collage_id: add_to_collage(parent, c, image_ids))
+    if collages:
+        add.addSeparator()
+    add.addAction("New Collage\u2026", lambda: add_to_collage(parent, None, image_ids))
+    if using:
+        show = menu.addMenu("Show in Collage")
+        for collage_id, name in using:
+            show.addAction(name, lambda checked=False, c=collage_id: open_collage_builder(parent, c, image_ids))
+    return using
+
+
+def add_to_collage(parent, collage_id, image_ids):
+    """Add images to a collage (None: a new one, named in the Collage
+    Builder), shown in the Collage Builder - where it can be undone."""
+    window = open_collage_builder(parent)
+    window.add_to_collage(collage_id, image_ids)
+    return window
