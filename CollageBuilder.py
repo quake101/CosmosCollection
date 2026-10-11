@@ -120,6 +120,7 @@ class Frame:
     label_visible: bool = None  # None: the collage's setting
     label_position: str = None  # None: the collage's setting
     label_content: str = None   # "number" / "name" (number and name); None: the collage's setting
+    annotations: bool = None    # Plate-solve annotations; None: the collage's setting
     common_name: str = ""       # Automatic: the DSO(s)' common names ("Bode's Galaxy & Cigar Galaxy")
     slot: str = None            # Catalog slot this frame fills ("M 12"), if any
     slot_name: str = None       # The slot object's common name ("Gumball Globular")
@@ -145,7 +146,8 @@ class Frame:
     uid: int = field(default_factory=lambda: next(_frame_ids))  # identifies the frame on the canvas
 
     LAYOUT_KEYS = ("kind", "x", "y", "w", "h", "fit", "crop_x", "crop_y", "zoom", "rotation", "label",
-                   "label_visible", "label_position", "label_content", "slot", "slot_name", "slot_dso", "merged",
+                   "label_visible", "label_position", "label_content", "annotations", "slot", "slot_name",
+                   "slot_dso", "merged",
                    "premerge_rect",
                    "border_width", "border_color", "corner_radius", "shadow",
                    "text", "font_family", "font_size", "text_color", "bold", "italic", "align", "text_box")
@@ -188,6 +190,9 @@ class Frame:
         self.fit, self.crop_x, self.crop_y, self.zoom, self.label = FIT_FILL, 0.5, 0.5, 1.0, None
 
 
+ANNOTATION_LAYERS = (("dsos", "DSO markers and names"), ("stars", "Star names (online lookup)"),
+                     ("grid", "Coordinate grid"), ("lines", "Constellation lines"))
+DEFAULT_ANNOTATION_LAYERS = {"dsos": True, "stars": False, "grid": False, "lines": False}
 LABEL_CONTENTS = (("number", "Number (“M 81”)"), ("name", "Number and name"))
 PLACEHOLDER_STYLES = (("number", "Number (“M 12”)"),
                       ("name", "Number and name"),
@@ -207,12 +212,14 @@ class Collage:
     rule: dict = None           # The suggestion it was made from, e.g. {"key": "catalog:M", "seen": [ids]}
     background2: str = None     # Second gradient color; None: a solid background
     gradient: str = "vertical"  # vertical / horizontal / diagonal / radial
+    annotations: bool = False   # Plate-solve annotations on (plate-solved) images
+    annotation_layers: dict = field(default_factory=lambda: dict(DEFAULT_ANNOTATION_LAYERS))
     frames: list = field(default_factory=list)  # paint order, bottom first
     db_id: int = None
     dsodetailid: object = None
 
     SETTINGS = ("width", "height", "background", "show_labels", "label_position", "label_content",
-                "placeholder_style", "rule", "background2", "gradient")
+                "placeholder_style", "rule", "background2", "gradient", "annotations", "annotation_layers")
 
     def canvas_rect(self):
         return QRectF(0, 0, self.width, self.height)
@@ -339,6 +346,10 @@ def load_collages(conn, dsodetailid=None):
             collage.show_labels = bool(settings.get("show_labels", True))
             if settings.get("label_position") in LABEL_POSITIONS:
                 collage.label_position = settings["label_position"]
+            collage.annotations = bool(settings.get("annotations", False))
+            if isinstance(settings.get("annotation_layers"), dict):
+                collage.annotation_layers = {key: bool(settings["annotation_layers"].get(key, default))
+                                             for key, default in DEFAULT_ANNOTATION_LAYERS.items()}
             if settings.get("label_content") in dict(LABEL_CONTENTS):
                 collage.label_content = settings["label_content"]
             if settings.get("placeholder_style") in dict(PLACEHOLDER_STYLES):
@@ -373,6 +384,7 @@ def save_collage(conn, collage):
     placeholders = [dict(frame.layout(), z=z) for z, frame in enumerate(collage.frames) if not frame.is_image]
     settings = json.dumps({"show_labels": collage.show_labels, "label_position": collage.label_position,
                            "label_content": collage.label_content,
+                           "annotations": collage.annotations, "annotation_layers": collage.annotation_layers,
                            "placeholder_style": collage.placeholder_style, "rule": collage.rule,
                            "background2": collage.background2, "gradient": collage.gradient,
                            "placeholders": placeholders})
@@ -952,14 +964,11 @@ CATALOG_NUMBER_NAME = re.compile(
     r"|\b(?:M|NGC|IC|Sh2|C)[\s-]?\d+\b")  # ...or the designation itself ("Spiral Galaxy M106")
 
 
-def read_capture_date(path):
-    """DATE-OBS from a FITS or XISF header, as text ("" if none). FITS headers
-    are 80-character text cards, read directly - astropy takes seconds to
-    import just for this."""
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".xisf":
-        from SessionFileScanner import extract_xisf_header
-        return str(extract_xisf_header(path).get("DATE-OBS") or "")
+def read_fits_cards(path):
+    """A FITS file's primary header as {keyword: value} (numbers as numbers,
+    quoted strings unquoted). Header cards are 80-character text, read
+    directly - astropy takes seconds to import just for this."""
+    cards = {}
     with open(path, "rb") as file:
         for _block in range(64):  # Headers are a few 2880-byte blocks
             block = file.read(2880)
@@ -967,14 +976,29 @@ def read_capture_date(path):
                 break
             for start in range(0, len(block) - 79, 80):
                 card = block[start:start + 80].decode("ascii", "replace")
-                if card.startswith("DATE-OBS="):
-                    value = card[10:].strip()
-                    if value.startswith("'"):  # A quoted string; "/" starts a comment only outside quotes
-                        return value[1:].split("'")[0].strip()
-                    return value.split("/")[0].strip()
                 if card.startswith("END") and not card[3:].strip():
-                    return ""
-    return ""
+                    return cards
+                if card[8:10] != "= ":
+                    continue
+                key, value = card[:8].strip(), card[10:].strip()
+                if value.startswith("'"):  # A quoted string; "/" starts a comment only outside quotes
+                    cards[key] = value[1:].split("'")[0].strip()
+                    continue
+                value = value.split("/")[0].strip()
+                try:
+                    cards[key] = int(value) if re.fullmatch(r"[+-]?\d+", value) else float(value)
+                except ValueError:
+                    cards[key] = value
+    return cards
+
+
+def read_capture_date(path):
+    """DATE-OBS from a FITS or XISF header, as text ("" if none)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xisf":
+        from SessionFileScanner import extract_xisf_header
+        return str(extract_xisf_header(path).get("DATE-OBS") or "")
+    return str(read_fits_cards(path).get("DATE-OBS") or "")
 
 
 def image_year_and_time(row, header_reader=read_capture_date):
@@ -1397,21 +1421,28 @@ def paint_text(painter, rect, frame, editing=False):
     painter.restore()
 
 
-def paint_element(painter, frame, image, settings, placeholder=None, device_scale=1.0, editing=False):
+def paint_element(painter, frame, image, settings, placeholder=None, device_scale=1.0, editing=False,
+                  annotation=None):
     """Draw a frame at its place on the canvas, rotated about its center."""
     rect = frame.rect()
     if not frame.rotation % 360:
-        paint_frame(painter, rect, frame, image, settings, placeholder, device_scale, editing)
+        paint_frame(painter, rect, frame, image, settings, placeholder, device_scale, editing, annotation)
         return
     painter.save()
     painter.translate(rect.center())
     painter.rotate(frame.rotation)
     local = QRectF(-rect.width() / 2, -rect.height() / 2, rect.width(), rect.height())
-    paint_frame(painter, local, frame, image, settings, placeholder, device_scale, editing)
+    paint_frame(painter, local, frame, image, settings, placeholder, device_scale, editing, annotation)
     painter.restore()
 
 
-def paint_frame(painter, rect, frame, image, settings, placeholder=None, device_scale=1.0, editing=False):
+def show_annotations(frame, settings):
+    """Whether a frame shows plate-solve annotations (its own setting, else the collage's)."""
+    return frame.is_image and (settings.get("annotations", False) if frame.annotations is None else frame.annotations)
+
+
+def paint_frame(painter, rect, frame, image, settings, placeholder=None, device_scale=1.0, editing=False,
+                annotation=None):
     """Draw a frame's image (QImage or QPixmap, None if unavailable), style and
     label into rect - or its placeholder tile or text. settings:
     Collage.render_settings(). device_scale is device pixels per rect unit: the
@@ -1446,6 +1477,9 @@ def paint_frame(painter, rect, frame, image, settings, placeholder=None, device_
             painter.drawImage(target, piece, QRectF(piece.rect()))
         else:
             painter.drawPixmap(target, piece, QRectF(piece.rect()))
+        if annotation is not None:
+            paint_annotations(painter, frame, annotation, settings.get("annotation_layers") or DEFAULT_ANNOTATION_LAYERS,
+                              image, source, target)
     elif placeholder:
         painter.fillRect(rect, QColor(128, 128, 128, 70))
         font = QFont()
@@ -1686,6 +1720,390 @@ def preview_store():
 
 
 # --------------------------------------------------------------------
+# Annotations - what plate-solved images show, from their .wcs solutions
+# --------------------------------------------------------------------
+
+MAX_ANNOTATED_DSOS = 30   # Brightest objects per image, so busy fields stay readable
+UNSOLVED = "Not plate solved"
+
+
+def read_wcs_header(path):
+    """An image's plate solution as WCS keywords: its .wcs file (written by
+    ASTAP, or by a solve here), else a FITS file's own header - or None."""
+    wcs_file = os.path.splitext(path)[0] + ".wcs"
+    header = {}
+    if os.path.isfile(wcs_file):
+        try:
+            with open(wcs_file, "r", errors="replace") as file:
+                text = file.read()
+            # One card per line, or 80-character cards run together
+            lines = text.splitlines() if "\n" in text else [text[i:i + 80] for i in range(0, len(text), 80)]
+            for line in lines:
+                if "=" not in line[:10]:
+                    continue
+                key, value = line.split("=", 1)
+                value = value.strip()
+                if value.startswith("'"):
+                    header[key.strip()] = value[1:].split("'")[0].strip()
+                    continue
+                value = value.split("/")[0].strip()
+                try:
+                    header[key.strip()] = float(value) if re.search(r"[.eE]", value) else int(value)
+                except ValueError:
+                    header[key.strip()] = value
+        except OSError:
+            header = {}
+    elif os.path.splitext(path)[1].lower() in (".fits", ".fit", ".fts") and os.path.isfile(path):
+        header = read_fits_cards(path)
+    solved = "CRVAL1" in header and "CRPIX1" in header and ("CD1_1" in header or "CDELT1" in header)
+    return header if solved else None
+
+
+def image_pixel_size(path):
+    """(width, height) of an image file, read from its header - not decoded."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".fits", ".fit", ".fts"):
+        cards = read_fits_cards(path)
+        return int(cards.get("NAXIS1", 0)), int(cards.get("NAXIS2", 0))
+    if ext == ".xisf":
+        from SessionFileScanner import read_xisf_xml
+        _root, image, _ns = read_xisf_xml(path)
+        width, height = (image.get("geometry", "0:0").split(":") + ["0"])[:2] if image is not None else (0, 0)
+        return int(width), int(height)
+    from PySide6.QtGui import QImageReader
+    size = QImageReader(path).size()
+    return size.width(), size.height()
+
+
+def write_wcs_file(path, wcs_header):
+    """Save a plate solution next to the image as a .wcs file (like ASTAP
+    does), so it's found next time - here and in the Image Viewer."""
+    wcs_file = os.path.splitext(path)[0] + ".wcs"
+    lines = []
+    for key, value in wcs_header.items():
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Z0-9_-]{1,8}", key):
+            continue
+        text = f"'{value}'" if isinstance(value, str) else repr(float(value)) if isinstance(value, float) else str(value)
+        lines.append(f"{key:<8}= {text}")
+    lines.append("END")
+    with open(wcs_file, "w") as file:
+        file.write("\n".join(lines) + "\n")
+
+
+@dataclass
+class AnnotationData:
+    """What a plate-solved image can show: its solution (pixel <-> sky, for
+    the full-size image as displayed) and the objects in it."""
+    wcs: object               # AnnotationOverlay.WCSTransform
+    width: int
+    height: int
+    dsos: list                # CelestialObject, brightest first
+    stars: list = None        # None until looked up (online)
+
+    @property
+    def degrees_per_pixel(self):
+        w = self.wcs
+        return math.sqrt(abs(w.cd1_1 * w.cd2_2 - w.cd1_2 * w.cd2_1)) or 1e-4
+
+
+def _dsos_in_view(wcs, width, height):
+    """Catalog objects inside the image, brightest first (the local catalog)."""
+    import sqlite3
+    from AnnotationOverlay import CelestialObject
+    from ResourceManager import ResourceManager, attach_update_catalogs
+    min_ra, max_ra, min_dec, max_dec = wcs.get_field_of_view()
+    conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+    try:
+        attach_update_catalogs(conn)
+        rows = conn.execute("""
+            SELECT d.ra, d.dec, d.magnitude, d.dsotype, COALESCE(d.sizemax, d.sizemin) / 60.0,
+                   d.sizemin / 60.0, d.positionangle,
+                   (SELECT c.catalogue || ' ' || c.designation FROM cataloguenr c WHERE c.dsodetailid = d.id
+                    ORDER BY CASE c.catalogue WHEN 'M' THEN 1 WHEN 'NGC' THEN 2 WHEN 'IC' THEN 3 ELSE 4 END
+                    LIMIT 1)
+            FROM dsodetail d
+            WHERE d.ra BETWEEN ? AND ? AND d.dec BETWEEN ? AND ?
+        """, (min_ra, max_ra, min_dec, max_dec)).fetchall()
+    finally:
+        conn.close()
+    found, names = [], set()
+    for ra, dec, magnitude, kind, size, minor, angle, name in rows:
+        if ra is None or dec is None or not name or name in names:
+            continue
+        x, y = wcs.sky_to_pixel(ra, dec)
+        if x is not None and 0 <= x <= width and 0 <= y <= height:
+            names.add(name)
+            item = CelestialObject(name=name, ra=ra, dec=dec, magnitude=magnitude, obj_type=kind, size=size)
+            item.minor, item.angle = minor, angle  # Minor axis (arcmin), position angle (deg, N through E)
+            found.append(item)
+    found.sort(key=lambda o: (o.magnitude if o.magnitude is not None else 99, -(o.size or 0)))
+    return found[:MAX_ANNOTATED_DSOS]
+
+
+def _stars_cache_file(path):
+    key = f"stars|{os.path.normcase(os.path.abspath(path))}|{os.path.getmtime(os.path.splitext(path)[0] + '.wcs') if os.path.isfile(os.path.splitext(path)[0] + '.wcs') else 0}"
+    return preview_cache_dir() / f"{hashlib.sha1(key.encode('utf-8')).hexdigest()}.json"
+
+
+def _bright_stars(wcs, width, height, path):
+    """Named bright stars in the image from SIMBAD (online), cached on disk."""
+    from AnnotationOverlay import CelestialObject, CatalogQueryWorker
+    cache = _stars_cache_file(path)
+    if cache.exists():
+        try:
+            return [CelestialObject(**star) for star in json.loads(cache.read_text())]
+        except (ValueError, TypeError):
+            pass
+    min_ra, max_ra, min_dec, max_dec = wcs.get_field_of_view()
+    radius = max(abs(max_ra - min_ra), abs(max_dec - min_dec)) / 2
+    lookup = CatalogQueryWorker(wcs, magnitude_limit=8.0)
+    stars = [star for star in lookup._query_stars((min_ra + max_ra) / 2, (min_dec + max_dec) / 2, radius)
+             if (lambda x, y: x is not None and 0 <= x <= width and 0 <= y <= height)(*wcs.sky_to_pixel(star.ra, star.dec))]
+    try:
+        cache.write_text(json.dumps([asdict(star) for star in stars]))
+    except OSError:
+        pass
+    return stars
+
+
+def load_annotation_data(path, want_stars=False):
+    """AnnotationData for an image, or None if it isn't plate solved. Safe in
+    a worker thread (its own database connection)."""
+    from AnnotationOverlay import WCSTransform, flip_wcs_rows
+    header = read_wcs_header(path) if path else None
+    if header is None:
+        return None
+    width, height = image_pixel_size(path)
+    if width <= 0 or height <= 0:
+        return None
+    if os.path.splitext(path)[1].lower() in (".fits", ".fit", ".fts"):
+        header = flip_wcs_rows(header, height)  # FITS rows are shown top-down (as in the Image Viewer)
+    wcs = WCSTransform(header, width, height)
+    data = AnnotationData(wcs, width, height, _dsos_in_view(wcs, width, height))
+    if want_stars:
+        data.stars = _bright_stars(wcs, width, height, path)
+    return data
+
+
+class _AnnotationSignals(QObject):
+    loaded = Signal(str, object, str)  # path, AnnotationData (None: not solved), error
+
+
+class _AnnotationTask(QRunnable):
+    def __init__(self, path, want_stars, signals):
+        super().__init__()
+        self.path, self.want_stars, self.signals = path, want_stars, signals
+
+    def run(self):
+        try:
+            data, error = load_annotation_data(self.path, self.want_stars), ""
+        except Exception as e:
+            data, error = None, str(e)
+            logger.warning(f"Could not load annotations for {self.path}: {e}")
+        try:
+            self.signals.loaded.emit(self.path, data, error)
+        except RuntimeError:
+            pass
+
+
+class AnnotationStore(QObject):
+    """AnnotationData by image path, loaded in the background on request.
+    ready(path) fires when one is known (solved or not)."""
+
+    ready = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._data = {}       # path -> AnnotationData, or None if not plate solved
+        self._stars = set()   # paths whose data includes stars
+        self._pending = {}    # path -> wants stars
+        self._signals = _AnnotationSignals()
+        self._signals.loaded.connect(self._on_loaded)
+        self._pool = QThreadPool()
+        self._pool.setMaxThreadCount(2)
+
+    def get(self, path, want_stars=False):
+        """The image's AnnotationData, None if not plate solved, or None while loading (see known())."""
+        if not path:
+            return None
+        known = path in self._data
+        if not known or (want_stars and self._data[path] is not None and path not in self._stars):
+            if path not in self._pending or (want_stars and not self._pending[path]):
+                self._pending[path] = want_stars
+                self._pool.start(_AnnotationTask(path, want_stars, self._signals))
+        return self._data.get(path)
+
+    def known(self, path):
+        return path in self._data
+
+    def is_solved(self, path):
+        """True / False, or None if not checked yet."""
+        return (self._data[path] is not None) if path in self._data else None
+
+    def forget(self, path):
+        """Reload next time (e.g. after a new plate solve)."""
+        self._data.pop(path, None)
+        self._stars.discard(path)
+
+    def _on_loaded(self, path, data, _error):
+        wanted_stars = self._pending.pop(path, False)
+        self._data[path] = data
+        if data is not None and wanted_stars:
+            self._stars.add(path)
+        self.ready.emit(path)
+
+
+_annotation_store = None
+
+
+def annotation_store():
+    global _annotation_store
+    if _annotation_store is None:
+        _annotation_store = AnnotationStore()
+    return _annotation_store
+
+
+def paint_annotations(painter, frame, data, layers, image, source, target):
+    """Annotations on a frame's image in the collage-label style: white
+    outlined names on translucent boxes and subtle white markers. source is
+    the part of `image` (any size of the plate-solved file) drawn into target."""
+    if source.width() <= 0 or source.height() <= 0:
+        return
+    k = image.width() / data.width                       # drawn image px per solved px
+    sx, sy = target.width() / source.width(), target.height() / source.height()
+
+    def place(px, py):
+        return QPointF(target.left() + (px * k - source.left()) * sx, target.top() + (py * k - source.top()) * sy)
+
+    per_px = k * sx                                       # canvas units per solved px
+    short = min(target.width(), target.height())
+    font_px = max(5.0, short * LABEL_SCALE * 0.75)
+    line = max(0.6, font_px * 0.08)
+    painter.save()
+    painter.setClipRect(target, Qt.IntersectClip)
+    painter.setRenderHint(QPainter.Antialiasing)
+
+    def stroke(path_or_draw, width=line, alpha=220):
+        """White line with a dark edge, readable on any image."""
+        for color, w in ((QColor(0, 0, 0, 150), width * 2.6), (QColor(255, 255, 255, alpha), width)):
+            pen = QPen(color, w)
+            pen.setJoinStyle(Qt.RoundJoin)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            path_or_draw()
+
+    def name(text, at, size, anchor=None):
+        """A name at `at` - kept upright when the frame is rotated, turning
+        about `anchor` (its marker) so it stays beside it."""
+        font = QFont()
+        font.setPixelSize(max(4, round(size)))
+        metrics = QFontMetricsF(font)
+        pad = size * 0.22
+        width_, height_ = metrics.horizontalAdvance(text), metrics.height()
+        painter.save()
+        if frame.rotation % 360:
+            pivot = anchor or at
+            painter.translate(pivot)
+            painter.rotate(-frame.rotation)
+            painter.translate(-pivot)
+        painter.fillRect(QRectF(at.x() - pad, at.y() - pad, width_ + 2 * pad, height_ + 2 * pad), QColor(0, 0, 0, 110))
+        path = QPainterPath()
+        path.addText(at.x(), at.y() + metrics.ascent(), font, text)
+        outline = QPen(QColor(0, 0, 0), max(0.8, size * 0.1))
+        outline.setJoinStyle(Qt.RoundJoin)
+        painter.strokePath(path, outline)
+        painter.fillPath(path, QColor(255, 255, 255))
+        painter.restore()
+
+    wcs = data.wcs
+    if layers.get("grid"):
+        min_ra, max_ra, min_dec, max_dec = wcs.get_field_of_view()
+        span = max(abs(max_ra - min_ra), abs(max_dec - min_dec))
+        step = next((s for s in (5.0, 1.0, 0.5, 0.25, 0.1, 0.05) if span / s >= 3), 0.05)
+
+        def curve(points):
+            mapped = [place(*p) for p in points if p[0] is not None]
+            if len(mapped) > 1:
+                stroke(lambda: painter.drawPolyline(mapped), line * 0.6, 90)
+
+        value = math.floor(min_ra / step) * step
+        while value <= max_ra + step:
+            curve([wcs.sky_to_pixel(value, min_dec + (max_dec - min_dec) * i / 40) for i in range(41)])
+            value += step
+        value = math.floor(min_dec / step) * step
+        while value <= max_dec + step:
+            curve([wcs.sky_to_pixel(min_ra + (max_ra - min_ra) * i / 40, value) for i in range(41)])
+            value += step
+    if layers.get("lines"):
+        from AnnotationOverlay import CONSTELLATION_LINES
+        for _name, ra1, dec1, ra2, dec2 in CONSTELLATION_LINES:
+            a, b = wcs.sky_to_pixel(ra1, dec1), wcs.sky_to_pixel(ra2, dec2)
+            if a[0] is not None and b[0] is not None:
+                start, end = place(*a), place(*b)
+                stroke(lambda: painter.drawLine(start, end), line, 120)
+    if layers.get("stars") and data.stars:
+        for star in data.stars:
+            x, y = wcs.sky_to_pixel(star.ra, star.dec)
+            if x is None:
+                continue
+            at = place(x, y)
+            radius = font_px * 0.35
+            stroke(lambda: painter.drawEllipse(at, radius, radius), line * 0.8)
+            name(star.name, QPointF(at.x() + radius * 1.6, at.y() - font_px * 0.45), font_px * 0.75, at)
+    if layers.get("dsos", True):
+        own = set(re.split(r", | & ", frame.label_text() or ""))  # Already named by the frame's label
+        for dso in data.dsos:
+            x, y = wcs.sky_to_pixel(dso.ra, dso.dec)
+            if x is None:
+                continue
+            at = place(x, y)
+            # The object's own size where the catalog knows it
+            radius = (dso.size or 0) / 60 / 2 / data.degrees_per_pixel * per_px
+            radius = min(max(radius, font_px * 0.6), short * 0.45)
+            kind = (dso.obj_type or "").upper()
+            if "GALXY" in kind or "GX" in kind:
+                # Its shape and tilt on the sky: major axis at the position angle
+                # (from north through east), as north and east lie in this image
+                shape = (getattr(dso, "minor", None) or 0) / dso.size if dso.size else 0.6
+                north, east = wcs.sky_to_pixel(dso.ra, dso.dec + 0.01), wcs.sky_to_pixel(
+                    dso.ra + 0.01 / max(0.01, math.cos(math.radians(dso.dec))), dso.dec)
+                turn = 0.0
+                if north[0] is not None and east[0] is not None:
+                    n_vec, e_vec = place(*north) - at, place(*east) - at
+                    n_len, e_len = math.hypot(n_vec.x(), n_vec.y()) or 1, math.hypot(e_vec.x(), e_vec.y()) or 1
+                    pa = math.radians(getattr(dso, "angle", None) or 0)
+                    ax = n_vec.x() / n_len * math.cos(pa) + e_vec.x() / e_len * math.sin(pa)
+                    ay = n_vec.y() / n_len * math.cos(pa) + e_vec.y() / e_len * math.sin(pa)
+                    turn = math.degrees(math.atan2(ay, ax))
+                minor_radius = max(radius * min(max(shape, 0.15), 1.0), font_px * 0.35)
+
+                def galaxy():
+                    painter.save()
+                    painter.translate(at)
+                    painter.rotate(turn)
+                    painter.drawEllipse(QPointF(0, 0), radius, minor_radius)
+                    painter.restore()
+                stroke(galaxy)
+            elif "CL" in kind and "NB" not in kind:
+                def dashed():
+                    pen = painter.pen()
+                    pen.setStyle(Qt.DashLine)
+                    painter.setPen(pen)
+                    painter.drawEllipse(at, radius, radius)
+                stroke(dashed)
+            elif "NB" in kind or "SNREM" in kind:
+                box = QRectF(at.x() - radius, at.y() - radius, radius * 2, radius * 2)
+                stroke(lambda: painter.drawRoundedRect(box, radius * 0.25, radius * 0.25))
+            else:
+                stroke(lambda: painter.drawEllipse(at, radius, radius))
+            if dso.name not in own:
+                name(dso.name, QPointF(at.x() + radius * 0.75 + font_px * 0.3, at.y() - radius * 0.75 - font_px * 0.6),
+                     font_px, at)
+    painter.restore()
+
+
+# --------------------------------------------------------------------
 # Canvas
 # --------------------------------------------------------------------
 
@@ -1718,7 +2136,7 @@ class FrameItem(QGraphicsItem):
                      frame.image_path, frame.slot, frame.slot_name, frame.border_width, frame.border_color,
                      frame.corner_radius, frame.shadow, frame.text, frame.font_family, frame.font_size,
                      frame.text_color, frame.bold, frame.italic, frame.align, frame.text_box, frame.rotation,
-                     frame.label_content, frame.common_name,
+                     frame.label_content, frame.common_name, frame.annotations,
                      labels, pixmap_key)
         if signature != self._signature:
             self._signature = signature
@@ -1771,8 +2189,13 @@ class FrameItem(QGraphicsItem):
         pixel_ratio = device.devicePixelRatioF() if device is not None else 1.0
         transform = painter.worldTransform()
         device_scale = (math.hypot(transform.m11(), transform.m12()) or 1.0) * pixel_ratio  # Rotation-proof
-        paint_frame(painter, self.frame_rect(), self.frame, pixmap, scene.paint_settings,
-                    placeholder=placeholder, device_scale=device_scale, editing=True)
+        settings = scene.paint_settings
+        annotation = None
+        if show_annotations(self.frame, settings):
+            layers = settings.get("annotation_layers") or DEFAULT_ANNOTATION_LAYERS
+            annotation = annotation_store().get(self.frame.image_path, want_stars=layers.get("stars", False))
+        paint_frame(painter, self.frame_rect(), self.frame, pixmap, settings,
+                    placeholder=placeholder, device_scale=device_scale, editing=True, annotation=annotation)
 
 
 class CollageScene(QGraphicsScene):
@@ -1789,6 +2212,7 @@ class CollageScene(QGraphicsScene):
         self.spacing_marks = []  # Equal gaps found while moving
         self.grid_size = 0       # Shown grid spacing (0: no grid)
         self.paint_settings = {}  # The collage's render_settings(), refreshed by sync()
+        annotation_store().ready.connect(self._on_preview_ready)
         preview_store().ready.connect(self._on_preview_ready)
 
     def set_collage(self, collage):
@@ -1806,7 +2230,8 @@ class CollageScene(QGraphicsScene):
     def _labels(self):
         """Collage settings that change how frames look."""
         c = self.collage
-        return (c.show_labels, c.label_position, c.label_content, c.placeholder_style, c.background, c.background2)
+        return (c.show_labels, c.label_position, c.label_content, c.placeholder_style, c.background, c.background2,
+                c.annotations, tuple(sorted((c.annotation_layers or {}).items())))
 
     def sync(self):
         """Match the items to the collage's frames (by uid)."""
@@ -1839,7 +2264,11 @@ class CollageScene(QGraphicsScene):
         frame = frame or item.frame
         store = preview_store()
         pixmap = store.preview(frame.image_path)
-        item.sync(frame, self._labels(), pixmap.cacheKey() if pixmap is not None else store.error(frame.image_path))
+        notes = annotation_store()
+        # Annotations arriving (or a new plate solve) repaint the frame
+        annotated = (notes.known(frame.image_path), id(notes.get(frame.image_path)) if notes.known(frame.image_path) else 0)
+        item.sync(frame, self._labels() + annotated,
+                  pixmap.cacheKey() if pixmap is not None else store.error(frame.image_path))
 
     def _on_preview_ready(self, path):
         if self.collage is None:
@@ -2675,6 +3104,8 @@ class CollageView(QGraphicsView):
         if item is not None and item.frame.is_image:
             frame = item.frame
             self.editor._add_view_actions(menu, frame.image_id)
+            if self.editor._solve_state(frame.image_path) in ("unsolved", "failed"):
+                menu.addAction("Plate Solve (for Annotations)", lambda: self.editor.plate_solve([frame.image_id]))
             menu.addSeparator()
             if preview_store().error(frame.image_path) == MISSING_FILE:
                 menu.addAction("Locate Image…", lambda: self.editor.locate_image(frame.image_id))
@@ -3239,11 +3670,12 @@ class ExportWorker(QThread):
     progress = Signal(int, int, str)  # frames done, total, name being drawn
     done = Signal(bool, str, int)     # success, error message ("cancelled"), images that couldn't be read
 
-    def __init__(self, state, path, scale=1.0):
+    def __init__(self, state, path, scale=1.0, annotations=None):
         super().__init__()
         self.state = state
         self.path = path
         self.scale = scale
+        self.annotations = dict(annotations or {})  # image path -> AnnotationData already loaded
         self._cancelled = False
 
     def cancel(self):
@@ -3292,7 +3724,14 @@ class ExportWorker(QThread):
                         logger.warning(f"Collage export: can't read {frame.image_path}: {error}")
                 if loaded is None:
                     missing += 1
-                paint_element(painter, frame, loaded, settings, device_scale=self.scale)
+                annotation = None
+                if loaded is not None and show_annotations(frame, settings):
+                    layers = settings.get("annotation_layers") or DEFAULT_ANNOTATION_LAYERS
+                    if frame.image_path not in self.annotations:
+                        self.annotations[frame.image_path] = load_annotation_data(
+                            frame.image_path, layers.get("stars", False))
+                    annotation = self.annotations[frame.image_path]
+                paint_element(painter, frame, loaded, settings, device_scale=self.scale, annotation=annotation)
         finally:
             painter.end()
 
@@ -3325,6 +3764,9 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         self._groups = {}             # file -> ids of the library entries using it
         self._common_by_dso = {}      # dsodetailid -> common name ("Bode's Galaxy")
         self.copied_style = None      # Copy Style / Paste Style
+        self._solve_queue = []        # (image id, path) waiting to be plate solved - the first is being solved
+        self._solver = None           # The running PlateSolverWorker
+        self._solve_failures = {}     # path -> why its plate solve failed
         self.snap_options = self._load_snap_options()
         self._suggestion_data = None  # SuggestionWorker results, for new-match offers
         self._suggestions_by_key = {}
@@ -3354,6 +3796,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         self.scene.grid_size = self.snap_options["grid_size"] if self.snap_options["grid"] else 0
         self.grid_size_spin.setEnabled(self.snap_options["grid"])
         preview_store().ready.connect(self._on_preview_ready)
+        annotation_store().ready.connect(self._on_annotation_ready)
         theme_manager().theme_changed.connect(self._on_theme_changed)
         self._load_library()
         self._load_collages()
@@ -3731,6 +4174,33 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         labels_layout.addWidget(self.label_content_combo)
         layout.addWidget(labels_box)
 
+        notes_box = QGroupBox("Annotations")
+        notes_layout = QVBoxLayout(notes_box)
+        self.annotations_check = QCheckBox("Show on plate-solved images")
+        self.annotations_check.setToolTip("Mark the objects in each image (from its plate solve) -\n"
+                                          "each image can also be switched on or off by itself")
+        self.annotations_check.toggled.connect(self._on_annotations_changed)
+        notes_layout.addWidget(self.annotations_check)
+        self.layer_checks = {}
+        for key, label in ANNOTATION_LAYERS:
+            check = QCheckBox(label)
+            check.toggled.connect(self._on_annotations_changed)
+            self.layer_checks[key] = check
+            row = QHBoxLayout()
+            row.addSpacing(18)
+            row.addWidget(check)
+            notes_layout.addLayout(row)
+        self.solved_label = QLabel()
+        self.solved_label.setWordWrap(True)
+        themed_style(self.solved_label, lambda: f"color: {COLORS['text_secondary']};")
+        notes_layout.addWidget(self.solved_label)
+        self.solve_all_button = QPushButton("Plate Solve Unsolved…")
+        self.solve_all_button.setToolTip("Plate solve this collage's unsolved images in the background\n"
+                                         "(ASTAP, else astrometry.net - as in the Image Viewer)")
+        self.solve_all_button.clicked.connect(self._solve_all_unsolved)
+        notes_layout.addWidget(self.solve_all_button)
+        layout.addWidget(notes_box)
+
         self.slots_box = QGroupBox("Catalog Placeholders")
         slots_layout = QVBoxLayout(self.slots_box)
         self.slots_info = QLabel()
@@ -3913,6 +4383,26 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         self.frame_label_content.activated.connect(self._on_frame_label_changed)
         form.addRow("Shows:", self.frame_label_content)
         layout.addWidget(self.label_box)
+
+        self.notes_group = QGroupBox("Annotations")
+        form = QFormLayout(self.notes_group)
+        self.frame_annotations = QComboBox()
+        self.frame_annotations.addItem("Collage setting", None)
+        self.frame_annotations.addItem("Show", True)
+        self.frame_annotations.addItem("Hide", False)
+        self.frame_annotations.activated.connect(self._on_frame_annotations_changed)
+        form.addRow("Show:", self.frame_annotations)
+        self.frame_solve_label = QLabel()
+        self.frame_solve_label.setWordWrap(True)
+        themed_style(self.frame_solve_label, lambda: f"color: {COLORS['text_secondary']};")
+        form.addRow(self.frame_solve_label)
+        self.frame_solve_button = QPushButton("Plate Solve")
+        self.frame_solve_button.setToolTip("Find where this image is in the sky, so it can be annotated")
+        self.frame_solve_button.clicked.connect(
+            lambda: self.plate_solve([item.frame.image_id for item in self.scene.selected_frame_items()
+                                      if item.frame.is_image]))
+        form.addRow(self.frame_solve_button)
+        layout.addWidget(self.notes_group)
 
         self.objects_box = QGroupBox("Objects")
         objects_layout = QVBoxLayout(self.objects_box)
@@ -4785,6 +5275,171 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         collage.label_content = self.label_content_combo.currentData() or "number"
         self.commit("Labels", before)
 
+    # Annotations and plate solving
+
+    def _on_annotations_changed(self, *_args):
+        collage = self.current
+        if collage is None or self._updating_panels:
+            return
+        before = collage.state()
+        collage.annotations = self.annotations_check.isChecked()
+        collage.annotation_layers = {key: check.isChecked() for key, check in self.layer_checks.items()}
+        self.commit("Annotations", before)
+
+    def _on_frame_annotations_changed(self, index):
+        value = self.frame_annotations.itemData(index)
+        self._change_selected("Annotations", lambda f: setattr(f, "annotations", value) if f.is_image else None)
+
+    def _solve_state(self, path):
+        """"solved", "unsolved", "solving", "queued", "failed" or "checking"."""
+        if self._solver is not None and self._solve_queue and self._solve_queue[0][1] == path:
+            return "solving"
+        if any(queued == path for _id, queued in self._solve_queue):
+            return "queued"
+        solved = annotation_store().is_solved(path)
+        if solved is None:
+            annotation_store().get(path)  # Find out (in the background)
+            return "checking"
+        if solved:
+            return "solved"
+        return "failed" if path in self._solve_failures else "unsolved"
+
+    def _update_annotation_panel(self):
+        collage = self.current
+        if collage is None:
+            return
+        paths = list(dict.fromkeys(f.image_path for f in collage.frames if f.is_image))
+        states = [self._solve_state(path) for path in paths]
+        solved = states.count("solved")
+        waiting = states.count("solving") + states.count("queued")
+        text = f"{solved} of {len(paths)} images plate solved"
+        if waiting:
+            text += f" · solving {waiting}…"
+        elif states.count("checking"):
+            text += " · checking…"
+        self.solved_label.setText(text)
+        unsolved = states.count("unsolved") + states.count("failed")
+        if waiting:
+            self.solve_all_button.setText("Stop Plate Solving")
+            self.solve_all_button.setEnabled(True)
+        else:
+            self.solve_all_button.setText(f"Plate Solve {unsolved} Unsolved…" if unsolved
+                                          else "All Images Plate Solved")
+            self.solve_all_button.setEnabled(bool(unsolved))
+
+    def _update_frame_solve(self, frames):
+        images = [f for f in frames if f.is_image]
+        self.notes_group.setVisible(bool(images))
+        if not images:
+            return
+        values = {f.annotations for f in images}
+        self.frame_annotations.setCurrentIndex(
+            combo_index(self.frame_annotations, values.pop()) if len(values) == 1 else -1)
+        if len(images) == 1:
+            path = images[0].image_path
+            failure = self._solve_failures.get(path)
+            self.frame_solve_label.setText({
+                "solved": "Plate solved ✓", "unsolved": "Not plate solved - no annotations yet.",
+                "solving": "Plate solving…", "queued": "Waiting to be plate solved…",
+                "checking": "Checking for a plate solve…",
+                "failed": f"Plate solve failed: {failure}" if failure else "Plate solve failed."}[self._solve_state(path)])
+        else:
+            count = sum(1 for f in images if self._solve_state(f.image_path) == "solved")
+            self.frame_solve_label.setText(f"{count} of {len(images)} plate solved")
+        unsolved = [f for f in images if self._solve_state(f.image_path) in ("unsolved", "failed")]
+        self.frame_solve_button.setVisible(bool(unsolved))
+        self.frame_solve_button.setText("Plate Solve" if len(unsolved) <= 1 else f"Plate Solve {len(unsolved)}")
+
+    def _on_annotation_ready(self, path):
+        if self.current is not None and any(f.image_path == path for f in self.current.frames):
+            self._update_annotation_panel()
+            if any(item.frame.image_path == path for item in self.scene.selected_frame_items()):
+                self._update_frame_solve([item.frame for item in self.scene.selected_frame_items()])
+
+    def _solve_all_unsolved(self):
+        if self._solver is not None:  # The button reads "Stop Plate Solving"
+            self.stop_plate_solving()
+            return
+        collage = self.current
+        if collage is None:
+            return
+        ids, paths = [], set()
+        for frame in collage.frames:
+            if (frame.is_image and frame.image_path not in paths
+                    and self._solve_state(frame.image_path) in ("unsolved", "failed")):
+                ids.append(frame.image_id)
+                paths.add(frame.image_path)
+        if not ids:
+            return
+        reply = QMessageBox.question(
+            self, "Plate Solve",
+            f"Plate solve {len(ids)} image{'s' if len(ids) != 1 else ''}?\n\n"
+            "This runs in the background with ASTAP (seconds each), or astrometry.net if ASTAP isn't "
+            "installed (online - can take minutes each). You can keep working, and stop at any time.")
+        if reply == QMessageBox.Yes:
+            self.plate_solve(ids)
+
+    def plate_solve(self, image_ids):
+        """Plate solve images in the background, one at a time; each solution is
+        saved next to the image (.wcs) and its annotations appear."""
+        for image_id in image_ids:
+            row = self.library.get(image_id)
+            if row is None or not row["image_path"] or \
+                    self._solve_state(row["image_path"]) not in ("unsolved", "failed"):
+                continue
+            self._solve_failures.pop(row["image_path"], None)
+            self._solve_queue.append((image_id, row["image_path"]))
+        self._start_next_solve()
+        self._refresh_panels()
+
+    def _start_next_solve(self):
+        if self._solver is not None or not self._solve_queue:
+            return
+        from PlateSolver import PlateSolverWorker
+        image_id, path = self._solve_queue[0]
+        ra, dec = self._image_position(image_id)
+        hints = {"ra": ra, "dec": dec, "radius": 15} if ra is not None and dec is not None else None
+        worker = PlateSolverWorker(path, hints)
+        worker.solve_finished.connect(self._on_solved)
+        worker.progress.connect(self._on_solve_progress)
+        keep_alive_until_finished(worker)
+        self._solver = worker
+        worker.start()
+
+    def _on_solve_progress(self, message):
+        if self._solve_queue:
+            name = self.library.get(self._solve_queue[0][0], {}).get("dso_name", "")
+            self.status_hint(f"Plate solving {name}: {message}")
+
+    def _on_solved(self, result):
+        image_id, path = self._solve_queue.pop(0) if self._solve_queue else (None, None)
+        self._solver = None
+        name = self.library.get(image_id, {}).get("dso_name", "the image")
+        if path is not None:
+            if result.success and result.wcs_header:
+                if read_wcs_header(path) is None:  # ASTAP saves one; an online solve doesn't
+                    try:
+                        write_wcs_file(path, result.wcs_header)
+                    except OSError as e:
+                        logger.warning(f"Could not save the plate solve for {path}: {e}")
+                annotation_store().forget(path)
+                annotation_store().get(path)
+                self.status_hint(f"Plate solved {name} ✓")
+            else:
+                message = (result.error_message or "No solution").strip().splitlines()[0]
+                self._solve_failures[path] = message
+                self.status_hint(f"Couldn't plate solve {name}: {message}")
+        self._start_next_solve()
+        self._refresh_panels()
+
+    def stop_plate_solving(self):
+        """Drop the waiting images; the one being solved finishes on its own."""
+        if self._solve_queue:
+            self._solve_queue = self._solve_queue[:1] if self._solver is not None else []
+        if self._solver is not None:
+            self._solver.cancel()
+        self._refresh_panels()
+
     # Panels
 
     def _refresh_panels(self):
@@ -4817,6 +5472,12 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                 self.label_position_combo.setEnabled(collage.show_labels)
                 self.label_content_combo.setCurrentIndex(max(0, self.label_content_combo.findData(collage.label_content)))
                 self.label_content_combo.setEnabled(collage.show_labels)
+                self.annotations_check.setChecked(collage.annotations)
+                layers = collage.annotation_layers or DEFAULT_ANNOTATION_LAYERS
+                for key, check in self.layer_checks.items():
+                    check.setChecked(bool(layers.get(key)))
+                    check.setEnabled(collage.annotations)
+                self._update_annotation_panel()
                 frames = sum(1 for frame in collage.frames if frame.is_image)
                 self.canvas_info.setText(f"{frames} image{'s' if frames != 1 else ''}")
                 self.export_button.setEnabled(bool(collage.frames))
@@ -4925,6 +5586,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                 self.frame_label_text.setText(one_image.label or "" if one_image is not None else "")
                 self.frame_label_text.setPlaceholderText(one_image.dso_name if one_image is not None else "")
 
+            self._update_frame_solve(frames)
             choices = self.merge_choices()
             merged = single.merged_names() if single is not None else []
             self.objects_box.setVisible(bool(choices or merged))
@@ -5431,7 +6093,12 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
-        worker = ExportWorker(collage.state(), path, scale)
+        notes = annotation_store()
+        layers = collage.annotation_layers or DEFAULT_ANNOTATION_LAYERS
+        ready = {f.image_path: notes.get(f.image_path) for f in collage.frames
+                 if show_annotations(f, collage.render_settings()) and notes.is_solved(f.image_path)
+                 and (not layers.get("stars") or notes.get(f.image_path).stars is not None)}
+        worker = ExportWorker(collage.state(), path, scale, ready)
         self._export_job = (worker, progress, path, f"{round(collage.width * scale)} × {round(collage.height * scale)}")
         worker.progress.connect(self._on_export_progress)
         worker.done.connect(self._on_export_done)
