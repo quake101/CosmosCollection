@@ -193,6 +193,19 @@ class DatabaseManager:
                     )
                 """)
 
+                # Canvas collages (Collage Builder): canvas size, collage-wide settings
+                # (JSON) and each image's frame (JSON). layout_version NULL marks a
+                # collage from the old grid editor, converted when it's opened.
+                for table, column in (("usercollages", "canvas_width INTEGER"),
+                                      ("usercollages", "canvas_height INTEGER"),
+                                      ("usercollages", "settings TEXT"),
+                                      ("usercollages", "layout_version INTEGER"),
+                                      ("usercollageimages", "layout TEXT")):
+                    try:
+                        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+
                 # Create usersessions table for planned/logged observing sessions
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS usersessions (

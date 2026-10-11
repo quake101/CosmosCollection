@@ -84,7 +84,7 @@ from PySide6.QtWidgets import (
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager, WindowPositionMixin
 from ResourceManager import ResourceManager
-from CollageBuilder import CollageBuilder, CollageBuilderWindow
+from CollageBuilder import CollageBuilderWindow
 from Theme import (
     COLORS, apply_theme, font_size, load_settings as load_theme_settings,
     save_settings as save_theme_settings, theme_manager, themed_style, tint,
