@@ -238,6 +238,12 @@ class DatabaseManager:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_target_id ON usersessions(target_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_session_date ON usersessions(session_date)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_status ON usersessions(status)")
+                # The session's framing saved from the FOV Simulator (mosaic, rotation,
+                # equipment - JSON, see FOVSimulator.py)
+                try:
+                    cursor.execute("ALTER TABLE usersessions ADD COLUMN framing TEXT")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
 
                 # Create usersessionfiles table for FITS/XISF subs scanned into a session
                 cursor.execute("""

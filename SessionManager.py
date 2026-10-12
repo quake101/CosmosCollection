@@ -1394,7 +1394,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
     (saving any pending edits first)."""
 
     WINDOW_POSITION_KEY = "SessionDetailsDialog"
-    OVERVIEW_TAB, OBSERVATIONS_TAB, FILTERS_TAB, FILES_TAB = range(4)
+    OVERVIEW_TAB, OBSERVATIONS_TAB, FILTERS_TAB, FILES_TAB, FRAMING_TAB = range(5)
 
     def __init__(self, session_data, start_tab=0, start_add=False, parent=None):
         super().__init__(parent)
@@ -1406,6 +1406,8 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         self._deleted_ids = []
         self._files = []
         self._session_meta = {}
+        self._framing = None          # The framing saved from the FOV Simulator, if any
+        self._fov_window = None
         self._obs_dirty = False
         self._added_any = False
         self._scan_thread = None
@@ -1433,6 +1435,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         self.tabs.addTab(self._build_observations_tab(), "Observations")
         self.tabs.addTab(self._build_filters_tab(), "Filter Summary")
         self.tabs.addTab(self._build_files_tab(), "Files")
+        self.tabs.addTab(self._build_framing_tab(), "Framing")
         layout.addWidget(self.tabs, 1)
 
         buttons = QHBoxLayout()
@@ -1552,6 +1555,213 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         layout.addWidget(self.files_table)
         return tab
 
+    def _build_framing_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.framing_summary_label = QLabel()
+        self.framing_summary_label.setWordWrap(True)
+        self.framing_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.framing_summary_label)
+
+        buttons = QHBoxLayout()
+        open_btn = QPushButton("Open in FOV Simulator")
+        open_btn.setToolTip("See the framing on the sky - change it there and Save to Session again")
+        open_btn.clicked.connect(self._open_framing_in_fov)
+        buttons.addWidget(open_btn)
+        self.framing_widgets = []
+        copy_btn = QPushButton("Copy Panels")
+        copy_btn.setToolTip("Copy the panel names and positions, to paste elsewhere")
+        copy_btn.clicked.connect(self._copy_panels)
+        export_btn = QPushButton("Export CSV...")
+        export_btn.setToolTip("Save the panels (name, RA, Dec, rotation) as a CSV file for other software")
+        export_btn.clicked.connect(self._export_panels)
+        buttons.addWidget(copy_btn)
+        buttons.addWidget(export_btn)
+        self.framing_widgets += [copy_btn, export_btn]
+        from NINAIntegration import NINAIntegration
+        if NINAIntegration.is_enabled():
+            self.nina_panel_btn = QPushButton("NINA")
+            self.nina_panel_btn.setToolTip("Send the selected panel to NINA - only when you click")
+            nina_menu = QMenu(self.nina_panel_btn)
+            nina_menu.addAction("Send Panel to Framing Assistant").triggered.connect(self._send_panel_to_nina)
+            nina_menu.addAction("Slew to Panel").triggered.connect(self._slew_to_panel)
+            self.nina_panel_btn.setMenu(nina_menu)
+            buttons.addWidget(self.nina_panel_btn)
+        else:
+            self.nina_panel_btn = None
+        buttons.addStretch()
+        remove_btn = QPushButton("Remove Framing")
+        remove_btn.clicked.connect(self._remove_framing)
+        buttons.addWidget(remove_btn)
+        self.framing_widgets.append(remove_btn)
+        layout.addLayout(buttons)
+
+        self.panels_table = _make_table(["Panel", "Name", "RA", "Dec", "Subs", "Integration"])
+        self.panels_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.panels_table.itemSelectionChanged.connect(self._update_panel_buttons)
+        layout.addWidget(self.panels_table, 1)
+        self.framing_widgets.append(self.panels_table)
+        self.panels_note = QLabel()
+        self.panels_note.setWordWrap(True)
+        themed_style(self.panels_note, lambda: f"color: {COLORS['text_secondary']};")
+        layout.addWidget(self.panels_note)
+        return tab
+
+    # ---- Framing ----------------------------------------------------------
+
+    def _framing_panels(self):
+        from FOVSimulator import framing_panels
+        return framing_panels(self._framing, self.session_data.get("dso_name")) if self._framing else []
+
+    def _refresh_framing(self):
+        """The saved framing, its panels and how many subs each has."""
+        from FOVSimulator import framing_summary, load_session_framing, match_panels, format_ra, format_dec
+        import json
+        subs = []
+        try:
+            with self.db_manager.get_connection() as conn:
+                self._framing = load_session_framing(conn, self.session_id)
+                if self._framing:
+                    for header, object_name, seconds in conn.execute(
+                            "SELECT header_json, object_name, exptime_seconds FROM usersessionfiles "
+                            "WHERE session_id = ? AND frame_type = 'Light'", (self.session_id,)):
+                        ra = dec = None
+                        try:
+                            values = json.loads(header) if header else {}
+                            ra, dec = float(values["RA"]), float(values["DEC"])
+                        except (ValueError, KeyError, TypeError):
+                            pass
+                        subs.append({"ra": ra, "dec": dec, "object": object_name, "seconds": seconds})
+        except Exception as e:
+            logger.error(f"Error loading the session's framing: {e}")
+            self._framing = None
+        framing = self._framing
+        for widget in self.framing_widgets:
+            widget.setVisible(framing is not None)
+        if self.nina_panel_btn is not None:
+            self.nina_panel_btn.setVisible(framing is not None)
+        if not framing:
+            self.framing_summary_label.setText(
+                "No framing saved for this session.\n\nOpen the FOV Simulator, set up the frame or mosaic "
+                "(rotation, panels, where it sits), and use Save to Session.")
+            self.panels_table.setRowCount(0)
+            self.panels_note.setText("")
+            return
+        width, height = framing["panel_width"] * 60, framing["panel_height"] * 60
+        equipment = " + ".join(part for part in (framing.get("telescope"), framing.get("camera"),
+                                                 None if (framing.get("barlow") or "").startswith("None")
+                                                 else framing.get("barlow")) if part)
+        self.framing_summary_label.setText(
+            f"<b>{framing_summary(framing)}</b> - each frame {width:.1f}' × {height:.1f}'<br>"
+            f"Center: {format_ra(framing['ra'])}, {format_dec(framing['dec'])}<br>"
+            f"Equipment: {equipment or 'unknown'}<br>Saved: {framing.get('saved', '')}")
+        counts, unmatched = match_panels(framing, subs)
+        panels = self._framing_panels()
+        self.panels_table.setRowCount(len(panels))
+        for row, panel in enumerate(panels):
+            count = counts.get(panel["number"], {"subs": 0, "seconds": 0})
+            self.panels_table.setItem(row, 0, _table_item(str(panel["number"]), Qt.AlignCenter, user_data=panel))
+            self.panels_table.setItem(row, 1, _table_item(panel["name"]))
+            self.panels_table.setItem(row, 2, _table_item(format_ra(panel["ra"]), tooltip=f"{panel['ra']:.5f}°"))
+            self.panels_table.setItem(row, 3, _table_item(format_dec(panel["dec"]), tooltip=f"{panel['dec']:.5f}°"))
+            self.panels_table.setItem(row, 4, _table_item(str(count["subs"]), Qt.AlignRight | Qt.AlignVCenter))
+            self.panels_table.setItem(row, 5, _table_item(format_duration(count["seconds"]) if count["subs"] else "—",
+                                                          Qt.AlignRight | Qt.AlignVCenter))
+        notes = ["Subs are matched to the panel nearest where they were taken (from their headers), "
+                 "or by \"Panel N\" in their object name."] if len(panels) > 1 else []
+        if unmatched:
+            notes.append(f"{unmatched} light sub{'s' if unmatched != 1 else ''} didn't match a panel.")
+        self.panels_note.setText(" ".join(notes))
+        self._update_panel_buttons()
+
+    def _selected_panel(self):
+        row = self.panels_table.currentRow()
+        item = self.panels_table.item(row, 0) if row >= 0 else None
+        return item.data(Qt.UserRole) if item else None
+
+    def _update_panel_buttons(self):
+        if self.nina_panel_btn is not None:
+            has_panel = self._selected_panel() is not None
+            self.nina_panel_btn.setEnabled(has_panel)
+            self.nina_panel_btn.setToolTip("Send the selected panel to NINA - only when you click"
+                                           if has_panel else "Select a panel first")
+
+    def _panels_text(self, separator):
+        lines = [separator.join(("Panel", "Name", "RA (deg)", "Dec (deg)", "RA", "Dec", "Rotation (deg)"))]
+        from FOVSimulator import format_ra, format_dec
+        for panel in self._framing_panels():
+            lines.append(separator.join((str(panel["number"]), panel["name"], f"{panel['ra']:.6f}",
+                                         f"{panel['dec']:.6f}", format_ra(panel["ra"]), format_dec(panel["dec"]),
+                                         str(self._framing.get("rotation", 0)))))
+        return lines
+
+    def _copy_panels(self):
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText("\n".join(self._panels_text("\t")))
+
+    def _export_panels(self):
+        from FOVSimulator import short_object_name
+        name = short_object_name(self.session_data.get("dso_name"))
+        path, _ = QFileDialog.getSaveFileName(self, "Export Panels", f"{name} panels.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        import csv
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                for line in self._panels_text("\t"):
+                    writer.writerow(line.split("\t"))
+        except OSError as e:
+            QMessageBox.warning(self, "Export Failed", f"Couldn't save {path}:\n{e}")
+
+    def _send_panel_to_nina(self):
+        from NINAIntegration import NINAIntegration
+        panel = self._selected_panel()
+        if panel is None:
+            return
+        NINAIntegration.frame_with_rotation(panel["ra"], panel["dec"], panel["name"],
+                                            self._framing.get("rotation", 0), self)
+
+    def _slew_to_panel(self):
+        from NINAIntegration import NINAIntegration
+        panel = self._selected_panel()
+        if panel is not None:
+            NINAIntegration.slew_to_coordinates(panel["ra"], panel["dec"], panel["name"], self)
+
+    def _remove_framing(self):
+        if QMessageBox.question(self, "Remove Framing",
+                                "Remove this session's saved framing? Its subs are kept.") != QMessageBox.Yes:
+            return
+        from FOVSimulator import save_session_framing
+        try:
+            with self.db_manager.get_connection() as conn:
+                save_session_framing(conn, self.session_id, None)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            QMessageBox.critical(self, "Error", f"Couldn't remove the framing: {e}")
+            return
+        self._refresh_framing()
+
+    def _open_framing_in_fov(self):
+        """The FOV Simulator with this session's framing (or a fresh one to make it)."""
+        from DSOTargetList import find_full_dso_data
+        data = find_full_dso_data(self.db_manager, self.session_data.get("dso_name", ""), self.session_data)
+        if not data:
+            QMessageBox.warning(self, "Object Not Found",
+                                f"Could not find {self.session_data.get('dso_name', 'this object')} in the DSO catalogue.")
+            return
+        from FOVSimulator import AladinLiteWindow
+        # A child of this dialog, so it can be used while the dialog is open
+        self._fov_window = AladinLiteWindow(data, self, framing=self._framing, session_id=self.session_id)
+        self._fov_window.show()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # Back from the FOV Simulator: a framing may have been saved
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow() and hasattr(self, "panels_table"):
+            self._refresh_framing()
+
     # ---- Data -----------------------------------------------------------
 
     def _reload_from_db(self):
@@ -1630,6 +1840,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         self._refresh_filter_table()
         self._refresh_files_table()
         self._refresh_summary()
+        self._refresh_framing()
         has_observations = bool(self._observations)
         self.form.filters_edit.setReadOnly(has_observations)
         self.form.filters_edit.setToolTip(
@@ -3659,8 +3870,10 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                                 f"Could not find {session.get('dso_name', 'this object')} in the DSO catalogue.")
             return
         try:
-            from main import AladinLiteWindow
-            AladinLiteWindow(data, self).show()
+            from FOVSimulator import AladinLiteWindow, load_session_framing
+            with self.db_manager.get_connection() as conn:
+                framing = load_session_framing(conn, session["id"])
+            AladinLiteWindow(data, self, framing=framing, session_id=session["id"]).show()
         except Exception as e:
             logger.error(f"Error opening FOV Simulator: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to open FOV Simulator: {e}")

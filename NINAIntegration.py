@@ -211,6 +211,57 @@ class NINAIntegration:
             return False
 
     @staticmethod
+    def set_framing_rotation(rotation_deg):
+        """
+        Turn the Framing Assistant's frame to a camera rotation. Only changes
+        the Framing Assistant - nothing moves. It needs the Framing Assistant's
+        sky image, so send coordinates first (and give NINA a moment to load it).
+
+        Args:
+            rotation_deg: Rotation in degrees, as NINA shows it
+
+        Returns:
+            bool: True if NINA accepted it
+        """
+        host, port = NINAIntegration.get_settings()
+        url = (f"http://{host}:{port}/v2/api/framing/set-rotation?"
+               f"{urllib.parse.urlencode({'rotation': rotation_deg})}")
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url), timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+            if result.get('Success'):
+                logger.info(f"Set NINA framing rotation to {rotation_deg}°")
+                return True
+            logger.warning(f"NINA didn't set the framing rotation: {result.get('Error', 'Unknown error')}")
+        except Exception as e:
+            logger.warning(f"Could not set the NINA framing rotation: {e}")
+        return False
+
+    @staticmethod
+    def frame_with_rotation(ra_deg, dec_deg, target_name, rotation_deg=None, parent_widget=None):
+        """
+        Send a frame to NINA's Framing Assistant: its center, then (if given) the
+        camera rotation - once NINA has had a moment to load the sky image the
+        rotation needs. If NINA still can't take it, says what to set by hand.
+
+        Returns:
+            bool: True if NINA took the coordinates
+        """
+        if not NINAIntegration.send_to_framing_assistant(ra_deg, dec_deg, target_name, parent_widget):
+            return False
+        if rotation_deg is not None:
+            from PySide6.QtCore import QTimer
+
+            def turn():
+                if not NINAIntegration.set_framing_rotation(rotation_deg) and parent_widget is not None:
+                    QMessageBox.information(
+                        parent_widget, "Set the Rotation in NINA",
+                        f"NINA has {target_name}. Set the Framing Assistant's rotation to {rotation_deg}° - "
+                        "it hadn't loaded the sky image yet, so it couldn't be set from here.")
+            QTimer.singleShot(3000, turn)
+        return True
+
+    @staticmethod
     def slew_to_coordinates(ra_deg, dec_deg, target_name, parent_widget=None):
         """
         Slew mount to specified coordinates with confirmation dialog.

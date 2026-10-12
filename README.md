@@ -2,266 +2,112 @@
 
 A personal astrophotography catalog and session planning tools for organizing and exploring your celestial images.
 
-## Overview
-
-Cosmos Collection is designed to help astrophotographers manage their image collections with features tailored specifically for astronomical photography. Keep track of your deep sky objects, planetary shots, and wide-field captures all in one place.
+**[Download the latest release](https://github.com/quake101/CosmosCollection/releases)** for Windows, macOS or Linux.
 
 ## Features
 
-- **Image Catalog**: Organize your astrophotography images with metadata
-- **Search & Filter**: Find images by object type, date, equipment, or other criteria
-- **Image Data Management**: Track technical details like exposure settings, equipment used, and capture conditions
-- **DSO Visibility Calculator**: Used to determine when DSOs are optimally visible
-- **Best DSO Tonight**: Calculates and displays the best Deep Sky Objects visible from user's location tonight
-- **DSO Target List**: DSO Target management list for planning observing sessions.
-- **Telescope FOV Simulator**: Visualize future astrophotography sessions and what equipment to use.
-- **Collage Builder**: Create collages of your DSO images.
-- **Image Gallery**: View all your images in a gallery view. (With filters)
-- **Weather Forecast**: 7 day weather forecast with astro related scoring. The weather detail window shows hourly forecast per day.
-- **Session Manager**: Manage sessions/observations, drag and drop a observation night's data to create/update sessions. Hand a session's data (lights, darks, flats) to Siril or PixInsight for stacking/processing.
-- **Light Quality Review**: Grades a session's light frames and displays graph, grouped by obervations.
+**Catalog**
+- **Image Catalog**: Organize your astrophotography images by object, with equipment, integration time, dates and notes.
+- **Image Gallery & Viewer**: Browse all your images with filters; view them with plate-solved annotations.
+- **Collage Builder**: Arrange your images on a canvas, or start from suggestions like a Messier poster.
+- **Plate Solving**: Solve your images with ASTAP or astrometry.net to show annotations in the viewer and collages.
+
+**Planning**
+- **DSO Detail**: Everything about an object in one place: your images, visibility, and links to the other tools.
+- **Best DSO Tonight**: The best objects visible from your location tonight, with the Moon's phase and distance.
+- **DSO Visibility Calculator**: When an object is best placed, with support for your custom horizon.
+- **DSO Target List**: Keep a list of all the targets you wish to image/observe, with duplicate checks.
+- **FOV Simulator**: Frame targets with your telescope and camera, including mosaics, rotation and a night-sky view.
+- **Weather Forecast**: 7-day forecast with an astro score, and hourly details per day.
+- **Locations & Equipment**: Save several observing locations (pick them on a map) with custom horizons imported from NINA or Stellarium, and your telescopes, cameras, eyepieces and barlows/reducers.
+
+**Imaging**
+- **Session Manager**: Drop a night's files to create or update sessions, plan them on a calendar with weather and visibility, save mosaic panels and track their progress, and hand them to Siril or PixInsight for stacking.
+- **Light Quality Review**: Grade a session's light frames with graphs, grouped by night.
+- **NINA Integration**: A live dashboard, plus sending targets, panels and slews to NINA.
+
+*Also: FITS and XISF support, SIMBAD lookup for objects not in the catalogs, finding moved images, backup & restore, themes, a system tray with the weather, automatic updates and a [command line interface](docs/CLI.md).*
 
 ## Screenshots
-  ### DSO Detail
-  ![DSO detail](screenshots/DSO-Detail.jpg)
 
-  ### DSO Visibility Calculator
-  ![DSO visibility calculator showing optimal viewing times](screenshots/DSO-Visibility-Calculator.jpg)
-
-  ### Best DSO Tonight
-  ![Best DSO Tonight](screenshots/Best-DSO-Tonight.jpg)
-
-  ### DSO Target List
-  ![DSO Target List](screenshots/DSO-Target-List.jpg)
-
-  ### Telescope FOV Simulator (Aladin-Lite)
-  ![FOV simulator preview](screenshots/Aladin-Lite-Telescope-FOV.jpg)
-
-  ### DSO Image Gallery
-  ![DSO Image Gallery](screenshots/DSO-Image-Gallery.jpg)
-
-  ### Image Viewer
-  ![Image Viewer](screenshots/Image-Viewer.jpg)
-
-  ### Weather Overview
-  ![Weather Overview](screenshots/Weather-Overview.jpg)
-
-  ### Weather Details
-  ![Weather Details](screenshots/Weather-Details.jpg)
-
-  ### NINA Dashboard
-  ![Nina Dashboard](screenshots/NINA-Dashboard.jpg)
-
-  ### Session Manager
-  ![Session Manager](screenshots/Session-Manager.jpg)
-  
-  ### Light Quaility Review
-  ![Light Quaility Review](screenshots/Light-Frame-Quality-Review.jpg)
+<table>
+  <tr>
+    <td align="center"><a href="screenshots/DSO-Detail.jpg"><img src="screenshots/DSO-Detail.jpg" width="400" alt="DSO Detail"></a><br>DSO Detail</td>
+    <td align="center"><a href="screenshots/Best-DSO-Tonight.jpg"><img src="screenshots/Best-DSO-Tonight.jpg" width="400" alt="Best DSO Tonight"></a><br>Best DSO Tonight</td>
+  </tr>
+  <tr>
+    <td align="center"><a href="screenshots/DSO-Visibility-Calculator.jpg"><img src="screenshots/DSO-Visibility-Calculator.jpg" width="400" alt="DSO Visibility Calculator"></a><br>DSO Visibility Calculator</td>
+    <td align="center"><a href="screenshots/DSO-Target-List.jpg"><img src="screenshots/DSO-Target-List.jpg" width="400" alt="DSO Target List"></a><br>DSO Target List</td>
+  </tr>
+  <tr>
+    <td align="center"><a href="screenshots/Aladin-Lite-Telescope-FOV.jpg"><img src="screenshots/Aladin-Lite-Telescope-FOV.jpg" width="400" alt="FOV Simulator"></a><br>FOV Simulator</td>
+    <td align="center"><a href="screenshots/DSO-Image-Gallery.jpg"><img src="screenshots/DSO-Image-Gallery.jpg" width="400" alt="Image Gallery"></a><br>Image Gallery</td>
+  </tr>
+  <tr>
+    <td align="center"><a href="screenshots/Image-Viewer.jpg"><img src="screenshots/Image-Viewer.jpg" width="400" alt="Image Viewer"></a><br>Image Viewer</td>
+    <td align="center"><a href="screenshots/Session-Manager.jpg"><img src="screenshots/Session-Manager.jpg" width="400" alt="Session Manager"></a><br>Session Manager</td>
+  </tr>
+  <tr>
+    <td align="center"><a href="screenshots/Light-Frame-Quality-Review.jpg"><img src="screenshots/Light-Frame-Quality-Review.jpg" width="400" alt="Light Quality Review"></a><br>Light Quality Review</td>
+    <td align="center"><a href="screenshots/NINA-Dashboard.jpg"><img src="screenshots/NINA-Dashboard.jpg" width="400" alt="NINA Dashboard"></a><br>NINA Dashboard</td>
+  </tr>
+  <tr>
+    <td align="center"><a href="screenshots/Weather-Overview.jpg"><img src="screenshots/Weather-Overview.jpg" width="400" alt="Weather Overview"></a><br>Weather Overview</td>
+    <td align="center"><a href="screenshots/Weather-Details.jpg"><img src="screenshots/Weather-Details.jpg" width="400" alt="Weather Details"></a><br>Weather Details</td>
+  </tr>
+</table>
 
 ## Getting Started
 
-### Download Latest Release
+1. Download the zip for your system from the [Releases](https://github.com/quake101/CosmosCollection/releases) page: `CosmosCollection-Windows.zip`, `CosmosCollection-macOS.zip` or `CosmosCollection-Linux.zip`.
+2. Extract it and run the application.
+3. In **Settings**, add your observing location. The planning tools use it for what's visible and when.
+4. Add your telescopes and cameras, then add your images to their objects.
 
-1. Go to the [Releases](https://github.com/quake101/CosmosCollection/releases) page
-2. Download the latest version for your operating system:
-   - Windows: `CosmosCollection-Windows.zip`
-   - macOS: `CosmosCollection-macOS.zip`
-   - Linux: `CosmosCollection-Linux.zip`
-3. Extract the downloaded file
-4. Run the application executable
+The app checks for updates and can install them for you.
 
-#### macOS First Launch
+<details>
+<summary><b>macOS: first launch</b></summary>
 
-The app is ad-hoc signed but not notarized, so macOS will still flag it as being from an unidentified developer the first time. Right-click (or Control-click) `CosmosCollection.app` and choose **Open**, then confirm in the dialog that appears — this only needs to be done once.
+The app is ad-hoc signed but not notarized, so macOS flags it as being from an unidentified developer the first time. Right-click (or Control-click) `CosmosCollection.app`, choose **Open**, and confirm. You only need to do this once.
 
-If macOS still won't open it after that, clear the quarantine flag from Terminal:
+If macOS still won't open it, clear the quarantine flag from Terminal:
 ```bash
 xattr -cr /path/to/CosmosCollection.app
 ```
+</details>
 
-#### Linux System Requirements
+<details>
+<summary><b>Linux: required system libraries</b></summary>
 
-Before running Cosmos Collection on Linux, you need to install the required Qt system libraries:
+Install the Qt cursor library once before the first run:
 
-**Ubuntu/Debian:**
 ```bash
-sudo apt-get update
+# Ubuntu/Debian
 sudo apt-get install libxcb-cursor0
-```
 
-**Fedora/RHEL:**
-```bash
+# Fedora/RHEL
 sudo dnf install xcb-util-cursor
-```
 
-**Arch Linux:**
-```bash
+# Arch Linux
 sudo pacman -S xcb-util-cursor
 ```
 
-This is a one-time system setup required for Qt 6.5+ applications.
-
-**CachyOS / Arch Linux — QtWebEngine features (Map Picker, FOV Simulator):**
-
-The Location Manager's map picker and the FOV Simulator both use QtWebEngine, whose bundled binary is linked against an older `libxml2.so.2`. Rolling-release distros like CachyOS ship a newer `libxml2` that only provides `libxml2.so.16`, so these features fail to open with an error like:
-
-```
-ERROR:__main__:QtWebEngine not available: libxml2.so.2: cannot open shared object file: No such file or directory
-```
-
-Fix by installing the legacy compatibility package:
+**CachyOS / Arch: Map Picker or FOV Simulator won't open.** These use QtWebEngine, which needs the older `libxml2.so.2`. If you see `libxml2.so.2: cannot open shared object file`, install the compatibility package:
 ```bash
 sudo pacman -S libxml2-legacy
 ```
+</details>
 
-### Building from Source
+## More
 
-If you prefer to build from source:
-
-#### Prerequisites
-
-- Python 3.x
-- Required dependencies (see requirements.txt)
-- **Linux only**: System Qt libraries (see Linux System Requirements above)
-
-#### Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/quake101/CosmosCollection.git
-   cd CosmosCollection
-   ```
-2. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-3. Run the application:
-   ```
-   python main.py
-   ```
-
-**CachyOS / Arch Linux — Python version:**
-
-CachyOS is rolling-release and typically ships the newest Python (e.g. 3.14) before pinned dependencies like `PySide6==6.9.0` and `numpy==2.2.5` publish wheels for it, causing `pip install -r requirements.txt` to fail with "No matching distribution found" or a build error. Use [uv](https://github.com/astral-sh/uv) to get a compatible Python (3.12) for the virtual environment instead:
-
-```bash
-uv python install 3.12
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -r requirements.txt
-```
-
-## Usage
-
-Launch Cosmos Collection and start building your personal astrophotography catalog by importing your images and adding relevant metadata for each capture.
-
-## Command Line Interface
-
-Cosmos Collection supports command line operations for scripting and automation.
-
-### Using the CLI
-
-**Compiled Release:** Use the `CosmosCollection-CLI` executable included in the release:
-```bash
-# Windows
-CosmosCollection-CLI.exe --list-dsos
-
-# Linux
-./CosmosCollection-CLI --list-dsos
-
-# macOS (bundled inside the .app)
-./CosmosCollection.app/Contents/MacOS/CosmosCollection-CLI --list-dsos
-```
-
-**From Source:** Use Python directly:
-```bash
-python main.py --list-dsos
-```
-
-### Add an Image
-
-```bash
-# Basic usage (from source)
-python main.py --add-image --dso "M31" --image "/path/to/image.jpg"
-
-# Basic usage (compiled release)
-CosmosCollection-CLI --add-image --dso "M31" --image "/path/to/image.jpg"
-
-# With full metadata
-python main.py --add-image --dso "NGC 7000" --image "/path/to/image.tif" \
-    --equipment "Telescope: AT72ED, Camera: ASI2600" \
-    --integration "3600" \
-    --date "2024-01-15" \
-    --notes "First light!" \
-    --set-favorite
-```
-
-**Options:**
-| Option | Description |
-|--------|-------------|
-| `--dso NAME` | DSO name (required) - e.g., M31, NGC 7000, IC 1396 |
-| `--image PATH` | Path to the image file (required) |
-| `--equipment TEXT` | Equipment used (optional) |
-| `--integration SECONDS` | Integration time in seconds (optional) |
-| `--date YYYY-MM-DD` | Date the image was taken (optional) |
-| `--notes TEXT` | Notes about the image (optional) |
-| `--set-favorite` | Set this image as the favorite for the DSO |
-
-### Search for DSOs
-
-```bash
-# From source
-python main.py --search-dso "M31"
-
-# Compiled release
-CosmosCollection-CLI --search-dso "M31"
-CosmosCollection-CLI --search-dso "Orion"
-CosmosCollection-CLI --search-dso "NGC 70"
-```
-
-### List All DSOs
-
-```bash
-# From source
-python main.py --list-dsos
-
-# Compiled release
-CosmosCollection-CLI --list-dsos
-```
-
-### Help
-
-```bash
-# From source
-python main.py --help
-
-# Compiled release
-CosmosCollection-CLI --help
-```
+- [Building from source](docs/BUILDING.md)
+- [Command line interface](docs/CLI.md): add images and search objects from scripts
 
 ## Contributing
 
-This is a personal project for astrophotography organization and session planning tool. This should be viewed as a "rolling release" style project. Feel free to fork and adapt for your own use.
+This is a personal project, developed as a rolling release. Feel free to fork it and adapt it for your own use.
 
 ## License
 
-MIT License
-
-Copyright (c) 2025 Cosmos Collection
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+MIT. See [LICENSE](LICENSE).
