@@ -47,6 +47,75 @@ NIGHT_VIEW_FOV = 110.0                          # Night View: a wide look at the
 COMPASS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
 
 
+# Camera presets: (heading, [(name as shown, sensor width mm, height mm, pixel size µm or None)]).
+# Sizes are resolution x pixel size. The FOV Simulator lists them; the Equipment window
+# offers them (named without the size, see preset_camera_name) when adding a camera.
+CAMERA_PRESET_GROUPS = (
+    ("DSLR CAMERAS", (
+        ("Canon Full Frame (36x24mm)", 36, 24, None),
+        ("Canon APS-C (22.3x14.9mm)", 22.3, 14.9, None),
+        ("Canon APS-H (28.7x19mm)", 28.7, 19.0, None),
+        ("Nikon Full Frame (35.9x24mm)", 35.9, 24.0, None),
+        ("Nikon APS-C (23.5x15.6mm)", 23.5, 15.6, None),
+        ("Sony Full Frame (35.8x23.8mm)", 35.8, 23.8, None),
+        ("Sony APS-C (23.5x15.6mm)", 23.5, 15.6, None),
+    )),
+    ("ZWO ASI CAMERAS", (
+        ("ASI6200MM Pro (36x24mm)", 36.0, 24.0, 3.76),
+        ("ASI2600MM Pro (23.5x15.7mm)", 23.5, 15.7, 3.76),
+        ("ASI533MM Pro (11.3x11.3mm)", 11.3, 11.3, 3.76),
+        ("ASI294MM Pro (19.1x13.0mm)", 19.1, 13.0, 4.63),
+        ("ASI183MM Pro (13.2x8.8mm)", 13.2, 8.8, 2.4),
+        ("ASI585MC (11.1x6.3mm)", 11.1, 6.3, 2.9),
+        ("ASI662MC (5.6x3.2mm) (Seestar S30)", 5.6, 3.2, 2.9),
+        ("IMX585 (11.1x6.3mm) (Seestar S30 Pro)", 11.1, 6.3, 2.9),
+        ("ASI385MC (7.3x4.1mm)", 7.3, 4.1, 3.75),
+        ("ASI462MC (5.6x3.2mm) (Seestar S50)", 5.6, 3.2, 2.9),
+        ("OS08B10 (11.1x6.3mm) (Seestar S50 Pro)", 11.1, 6.3, 2.9),
+        ("ASI224MC (4.9x3.7mm)", 4.9, 3.7, 3.75),
+        ("ASI120MM (4.8x3.6mm)", 4.8, 3.6, 3.75),
+    )),
+    ("QHY CAMERAS", (
+        ("QHY600M (36x24mm)", 36.0, 24.0, 3.76),
+        ("QHY268M (23.5x15.7mm)", 23.5, 15.7, 3.76),
+        ("QHY294M (19.1x13.0mm)", 19.1, 13.0, 4.63),
+        ("QHY183M (13.2x8.8mm)", 13.2, 8.8, 2.4),
+        ("QHY174M (11.3x7.1mm)", 11.3, 7.1, 5.86),
+    )),
+    ("SBIG CAMERAS", (
+        ("SBIG STF-8300M (17.96x13.52mm)", 17.96, 13.52, 5.4),
+        ("SBIG ST-2000XM (11.8x8.9mm)", 11.8, 8.9, 7.4),
+    )),
+    ("ATIK CAMERAS", (
+        ("Atik 460EX (12.5x10.0mm)", 12.5, 10.0, 4.54),
+        ("Atik 383L+ (17.6x13.5mm)", 17.6, 13.5, 5.4),
+    )),
+    ("VAONIS CAMERAS", (
+        ("IMX585 (11.1x6.3mm) (Vaonis Vespera II)", 11.1, 6.3, 2.9),
+    )),
+    ("CELESTRON CAMERAS", (
+        ("IMX178 (7.4x4.9mm) (Celestron Origin)", 7.4, 4.9, 2.4),
+        ("IMX678 (7.7x4.3mm) (Celestron Origin Mark II)", 7.7, 4.3, 2.0),
+    )),
+    ("DWARFLAB CAMERAS", (
+        ("IMX678 (7.7x4.3mm) (Dwarf 3)", 7.7, 4.3, 2.0),
+        ("IMX662 (5.6x3.2mm) (Dwarf Mini)", 5.6, 3.2, 2.9),
+        ("OV50Q40 (9.8x7.4mm) (Draco)", 9.8, 7.4, 1.2),
+    )),
+)
+
+
+def preset_camera_name(text):
+    """A preset's name without its size: 'ASI462MC (5.6x3.2mm) (Seestar S50)' -> 'ASI462MC (Seestar S50)'."""
+    return re.sub(r"\s*\([\d.]+x[\d.]+mm\)", "", text).strip()
+
+
+def camera_presets():
+    """{name without size: (sensor width, height, pixel size or None, name as listed)}."""
+    return {preset_camera_name(text): (width, height, pixel, text)
+            for _heading, cameras in CAMERA_PRESET_GROUPS for text, width, height, pixel in cameras}
+
+
 def tangent_to_radec(ra0, dec0, x, y):
     """Sky position at tangent-plane coordinates x (east) and y (north) around
     ra0/dec0 - the inverse gnomonic projection, so frames stay true
@@ -878,64 +947,12 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self.camera_combo.addItem("10mm Eyepiece (50° AFOV)", {"type": "eyepiece", "focal_length": 10, "apparent_fov": 50})
         self.camera_combo.addItem("6mm Eyepiece (50° AFOV)", {"type": "eyepiece", "focal_length": 6, "apparent_fov": 50})
 
-        # DSLR cameras
-        self.camera_combo.addItem("--- DSLR CAMERAS ---", None)
-        self.camera_combo.addItem("Canon Full Frame (36x24mm)", {"type": "camera", "sensor_width": 36, "sensor_height": 24})
-        self.camera_combo.addItem("Canon APS-C (22.3x14.9mm)", {"type": "camera", "sensor_width": 22.3, "sensor_height": 14.9})
-        self.camera_combo.addItem("Canon APS-H (28.7x19mm)", {"type": "camera", "sensor_width": 28.7, "sensor_height": 19.0})
-        self.camera_combo.addItem("Nikon Full Frame (35.9x24mm)", {"type": "camera", "sensor_width": 35.9, "sensor_height": 24.0})
-        self.camera_combo.addItem("Nikon APS-C (23.5x15.6mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.6})
-        self.camera_combo.addItem("Sony Full Frame (35.8x23.8mm)", {"type": "camera", "sensor_width": 35.8, "sensor_height": 23.8})
-        self.camera_combo.addItem("Sony APS-C (23.5x15.6mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.6})
-
-        # ZWO cameras
-        self.camera_combo.addItem("--- ZWO ASI CAMERAS ---", None)
-        self.camera_combo.addItem("ASI6200MM Pro (36x24mm)", {"type": "camera", "sensor_width": 36.0, "sensor_height": 24.0})
-        self.camera_combo.addItem("ASI2600MM Pro (23.5x15.7mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.7})
-        self.camera_combo.addItem("ASI533MM Pro (11.3x11.3mm)", {"type": "camera", "sensor_width": 11.3, "sensor_height": 11.3})
-        self.camera_combo.addItem("ASI294MM Pro (19.1x13.0mm)", {"type": "camera", "sensor_width": 19.1, "sensor_height": 13.0})
-        self.camera_combo.addItem("ASI183MM Pro (13.2x8.8mm)", {"type": "camera", "sensor_width": 13.2, "sensor_height": 8.8})
-        self.camera_combo.addItem("ASI585MC (11.1x6.3mm)", {"type": "camera", "sensor_width": 11.1, "sensor_height": 6.3})
-        self.camera_combo.addItem("ASI662MC (5.6x3.2mm) (Seestar S30)", {"type": "camera", "sensor_width": 5.6, "sensor_height": 3.2})
-        self.camera_combo.addItem("IMX585 (11.1x6.3mm) (Seestar S30 Pro)", {"type": "camera", "sensor_width": 11.1, "sensor_height": 6.3})
-        self.camera_combo.addItem("ASI385MC (7.3x4.1mm)", {"type": "camera", "sensor_width": 7.3, "sensor_height": 4.1})
-        self.camera_combo.addItem("ASI462MC (5.6x3.2mm) (Seestar S50)", {"type": "camera", "sensor_width": 5.6, "sensor_height": 3.2})
-        self.camera_combo.addItem("OS08B10 (11.1x6.3mm) (Seestar S50 Pro)", {"type": "camera", "sensor_width": 11.1, "sensor_height": 6.3})
-        self.camera_combo.addItem("ASI224MC (4.9x3.7mm)", {"type": "camera", "sensor_width": 4.9, "sensor_height": 3.7})
-        self.camera_combo.addItem("ASI120MM (4.8x3.6mm)", {"type": "camera", "sensor_width": 4.8, "sensor_height": 3.6})
-
-        # QHY cameras
-        self.camera_combo.addItem("--- QHY CAMERAS ---", None)
-        self.camera_combo.addItem("QHY600M (36x24mm)", {"type": "camera", "sensor_width": 36.0, "sensor_height": 24.0})
-        self.camera_combo.addItem("QHY268M (23.5x15.7mm)", {"type": "camera", "sensor_width": 23.5, "sensor_height": 15.7})
-        self.camera_combo.addItem("QHY294M (19.1x13.0mm)", {"type": "camera", "sensor_width": 19.1, "sensor_height": 13.0})
-        self.camera_combo.addItem("QHY183M (13.2x8.8mm)", {"type": "camera", "sensor_width": 13.2, "sensor_height": 8.8})
-        self.camera_combo.addItem("QHY174M (11.3x7.1mm)", {"type": "camera", "sensor_width": 11.3, "sensor_height": 7.1})
-
-        # SBIG cameras
-        self.camera_combo.addItem("--- SBIG CAMERAS ---", None)
-        self.camera_combo.addItem("SBIG STF-8300M (17.96x13.52mm)", {"type": "camera", "sensor_width": 17.96, "sensor_height": 13.52})
-        self.camera_combo.addItem("SBIG ST-2000XM (11.8x8.9mm)", {"type": "camera", "sensor_width": 11.8, "sensor_height": 8.9})
-
-        # Atik cameras
-        self.camera_combo.addItem("--- ATIK CAMERAS ---", None)
-        self.camera_combo.addItem("Atik 460EX (12.5x10.0mm)", {"type": "camera", "sensor_width": 12.5, "sensor_height": 10.0})
-        self.camera_combo.addItem("Atik 383L+ (17.6x13.5mm)", {"type": "camera", "sensor_width": 17.6, "sensor_height": 13.5})
-
-        # Vaonis cameras
-        self.camera_combo.addItem("--- VAONIS CAMERAS ---", None)
-        self.camera_combo.addItem("IMX585 (11.1x6.3mm) (Vaonis Vespera II)", {"type": "camera", "sensor_width": 11.1, "sensor_height": 6.3})
-
-        # Celestron cameras
-        self.camera_combo.addItem("--- CELESTRON CAMERAS ---", None)
-        self.camera_combo.addItem("IMX178 (7.4x4.9mm) (Celestron Origin)", {"type": "camera", "sensor_width": 7.4, "sensor_height": 4.9})
-        self.camera_combo.addItem("IMX678 (7.7x4.3mm) (Celestron Origin Mark II)", {"type": "camera", "sensor_width": 7.7, "sensor_height": 4.3})
-
-        # DwarfLab cameras
-        self.camera_combo.addItem("--- DWARFLAB CAMERAS ---", None)
-        self.camera_combo.addItem("IMX678 (7.7x4.3mm) (Dwarf 3)", {"type": "camera", "sensor_width": 7.7, "sensor_height": 4.3})
-        self.camera_combo.addItem("IMX662 (5.6x3.2mm) (Dwarf Mini)", {"type": "camera", "sensor_width": 5.6, "sensor_height": 3.2})
-        self.camera_combo.addItem("OV50Q40 (9.8x7.4mm) (Draco)", {"type": "camera", "sensor_width": 9.8, "sensor_height": 7.4})
+        # Camera presets
+        for heading, cameras in CAMERA_PRESET_GROUPS:
+            self.camera_combo.addItem(f"--- {heading} ---", None)
+            for text, width, height, pixel_size in cameras:
+                self.camera_combo.addItem(text, {"type": "camera", "sensor_width": width, "sensor_height": height,
+                                                 "pixel_size": pixel_size})
 
         self.camera_combo.currentTextChanged.connect(self._on_camera_changed)
 
@@ -1370,9 +1387,9 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
                 # Load user cameras
                 cursor.execute("""
-                    SELECT id, name, sensor_width, sensor_height
+                    SELECT id, name, sensor_width, sensor_height, pixel_size
                     FROM userequipment
-                    WHERE equipment_type = 'camera'
+                    WHERE equipment_type = 'camera' AND COALESCE(is_active, 1) = 1
                     ORDER BY name ASC
                 """)
                 user_cameras = cursor.fetchall()
@@ -1381,7 +1398,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 cursor.execute("""
                     SELECT id, name, focal_length, apparent_fov
                     FROM userequipment
-                    WHERE equipment_type = 'eyepiece'
+                    WHERE equipment_type = 'eyepiece' AND COALESCE(is_active, 1) = 1
                     ORDER BY name ASC
                 """)
                 user_eyepieces = cursor.fetchall()
@@ -1389,13 +1406,14 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 # Add user cameras section if there are any
                 if user_cameras:
                     self.camera_combo.addItem("--- YOUR CAMERAS ---", None)
-                    for eq_id, name, sensor_width, sensor_height in user_cameras:
+                    for eq_id, name, sensor_width, sensor_height, pixel_size in user_cameras:
                         if sensor_width and sensor_height:
                             display_text = f"{name} ({sensor_width}x{sensor_height}mm)"
                             self.camera_combo.addItem(display_text, {
                                 "type": "camera",
                                 "sensor_width": sensor_width,
                                 "sensor_height": sensor_height,
+                                "pixel_size": pixel_size,
                                 "source": "user",
                                 "id": eq_id
                             })
@@ -1429,7 +1447,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 cursor.execute("""
                     SELECT id, name, factor, equipment_type
                     FROM userequipment
-                    WHERE equipment_type IN ('barlow', 'reducer')
+                    WHERE equipment_type IN ('barlow', 'reducer') AND COALESCE(is_active, 1) = 1
                     ORDER BY equipment_type, factor DESC
                 """)
                 user_barlows = cursor.fetchall()
@@ -1635,7 +1653,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                     SELECT e.id, e.equipment_type
                     FROM userequipment e
                     JOIN telescope_equipment te ON e.id = te.equipment_id
-                    WHERE te.telescope_id = ?
+                    WHERE te.telescope_id = ? AND COALESCE(e.is_active, 1) = 1
                     ORDER BY e.name ASC
                 """, (telescope_id,))
 
@@ -1749,11 +1767,14 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             logger.debug(f"Camera FOV calculation: {sensor_width}x{sensor_height}mm sensor, {effective_fl}mm effective FL{barlow_text}, FOV={fov_width_arcmin:.1f}'x{fov_height_arcmin:.1f}'")
 
             barlow_details = f" + {barlow_factor}x" if barlow_factor != 1.0 else ""
+            pixel_size = camera_data.get('pixel_size')
             return {
                 'width_arcmin': fov_width_arcmin,
                 'height_arcmin': fov_height_arcmin,
                 'type': 'camera',
-                'details': f"{sensor_width}×{sensor_height}mm sensor{barlow_details}"
+                'details': f"{sensor_width}×{sensor_height}mm sensor{barlow_details}",
+                # Arcseconds per pixel, when the camera's pixel size is known
+                'pixel_scale': 206.265 * pixel_size / effective_fl if pixel_size else None,
             }
 
         return None
@@ -2472,6 +2493,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 else:
                     fov_str = f"{telescope_fov_data['width_arcmin']:.1f}'×{telescope_fov_data['height_arcmin']:.1f}'"
                 info_parts.append(f"{telescope_name} ({telescope_fl}mm): {fov_str} {telescope_fov_data['details']}")
+                if telescope_fov_data.get('pixel_scale'):
+                    info_parts.append(f"Pixel scale: {telescope_fov_data['pixel_scale']:.2f}\"/px")
 
                 if self.show_telescope_fov.isChecked() and self._rotation():
                     info_parts.append(f"Rotation {self._rotation()}°")

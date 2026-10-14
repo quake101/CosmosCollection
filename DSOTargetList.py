@@ -2032,13 +2032,9 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         dialog.months_edit.setText(target_data.get("best_months", ""))
         dialog.notes_edit.setPlainText(target_data.get("notes", ""))
 
-        # Set telescope selection
-        telescope_id = target_data.get("telescope_id")
-        if telescope_id is not None:
-            index = dialog.telescope_combo.findData(telescope_id)
-            if index >= 0:
-                dialog.telescope_combo.setCurrentIndex(index)
-        else:
+        # Set telescope selection (a disabled one is kept)
+        from EquipmentManager import select_telescope
+        if not select_telescope(dialog.telescope_combo, self.db_manager, target_data.get("telescope_id")):
             dialog.telescope_combo.setCurrentIndex(0)  # "Any"
 
         if dialog.exec() == QDialog.Accepted:
@@ -2906,13 +2902,9 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             dialog.months_edit.setText(target_data.get("best_months", ""))
             dialog.notes_edit.setPlainText(target_data.get("notes", ""))
 
-            # Set telescope selection
-            telescope_id = target_data.get("telescope_id")
-            if telescope_id is not None:
-                index = dialog.telescope_combo.findData(telescope_id)
-                if index >= 0:
-                    dialog.telescope_combo.setCurrentIndex(index)
-            else:
+            # Set telescope selection (a disabled one is kept)
+            from EquipmentManager import select_telescope
+            if not select_telescope(dialog.telescope_combo, self.db_manager, target_data.get("telescope_id")):
                 dialog.telescope_combo.setCurrentIndex(0)  # "Any"
 
             if dialog.exec() == QDialog.Accepted:

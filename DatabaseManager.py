@@ -238,6 +238,16 @@ class DatabaseManager:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_target_id ON usersessions(target_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_session_date ON usersessions(session_date)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_status ON usersessions(status)")
+                # Equipment can be disabled (kept, but not offered) like telescopes
+                try:
+                    cursor.execute("ALTER TABLE userequipment ADD COLUMN is_active INTEGER DEFAULT 1")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                # A camera's pixel size (microns) - for the FOV Simulator's pixel scale
+                try:
+                    cursor.execute("ALTER TABLE userequipment ADD COLUMN pixel_size REAL")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
                 # The session's framing saved from the FOV Simulator (mosaic, rotation,
                 # equipment - JSON, see FOVSimulator.py)
                 try:

@@ -448,11 +448,8 @@ class SessionFormWidget(QWidget):
         self._ra_deg = target_data.get("ra_deg")
         self._dec_deg = target_data.get("dec_deg")
         self._target_id = target_data.get("id")
-        telescope_id = target_data.get("telescope_id")
-        if telescope_id is not None:
-            index = self.telescope_combo.findData(telescope_id)
-            if index >= 0:
-                self.telescope_combo.setCurrentIndex(index)
+        from EquipmentManager import select_telescope
+        select_telescope(self.telescope_combo, self.db_manager, target_data.get("telescope_id"))
 
     def _populate_from_parsed_metadata(self, summary):
         self._scanned_aggregate = summary
@@ -514,11 +511,8 @@ class SessionFormWidget(QWidget):
                 h, mnt = (int(p) for p in end_time.split(":")[:2])
                 self.end_time_edit.setTime(QTime(h, mnt))
 
-        telescope_id = session_data.get("telescope_id")
-        if telescope_id is not None:
-            index = self.telescope_combo.findData(telescope_id)
-            if index >= 0:
-                self.telescope_combo.setCurrentIndex(index)
+        from EquipmentManager import select_telescope
+        select_telescope(self.telescope_combo, self.db_manager, session_data.get("telescope_id"))
 
         self.camera_edit.setText(session_data.get("camera") or "")
         self.filters_edit.setText(session_data.get("filters_used") or "")
