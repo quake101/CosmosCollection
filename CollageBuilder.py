@@ -1583,18 +1583,9 @@ def find_moved_images(old_path, new_path, missing):
 
 
 def preview_cache_dir():
-    """The platform's cache folder - disposable data, kept out of the Windows
-    roaming profile and out of backups of ~/Library/Application Support."""
-    from pathlib import Path
-    if sys.platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "CosmosCollection" / "cache"
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Caches" / "CosmosCollection"
-    else:
-        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "cosmoscollection"
-    path = base / "collage_previews"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    """Where collage previews are cached (the platform's cache folder)."""
+    from ResourceManager import ResourceManager
+    return ResourceManager.get_cache_dir("collage_previews")
 
 
 def _cache_file(path):

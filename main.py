@@ -30,42 +30,25 @@ if getattr(sys, 'frozen', False):
     except Exception as e:
         print(f"Warning: Could not configure SSL certificates: {e}")
 
-# The embedded Chromium (QtWebEngine) renderer was terminating (exit code 18) before it could
-# render Aladin Lite. This is a sandbox initialization failure, not the GPU blocklist issue it
-# was previously assumed to be: --disable-gpu-sandbox alone did not stop the crash, but
-# --no-sandbox does, and it also restores full hardware-accelerated WebGL (verified against real
-# rendering, not just "page loaded"). The disabled sandbox only applies to Aladin Lite's fixed,
-# non-user-supplied aladin.u-strasbg.fr URL.
-# NOTE: this must stay the only place QTWEBENGINE_CHROMIUM_FLAGS is set — a later
-# assignment near QApplication startup used to clobber this and re-enable the crash-prone path.
-#
-# --enable-logging/--log-file: app.exec() has crashed (SIGABRT) with no Python-level cause and no
-# Windows "Application Error" event, which points to a Chromium-internal CHECK()/fatal-assertion
-# failure (likely GPU/WebGL, given it happened while Aladin Lite was actively rendering) rather
-# than memory corruption. Chromium prints the fatal message to its own log right before abort()-ing;
-# without this flag that message is lost, leaving faulthandler's single app.exec() frame as the
-# only clue. This captures it to chromium_debug.log next to crash.log for the next occurrence.
-#
-# --disable-gpu-compositing: on Linux, bleeding-edge Mesa builds (e.g. rolling-release distros
-# like CachyOS) have shipped GPU tile-rasterization/compositor bugs that render QtWebEngine
-# content as blocky, wrong-colored garbage instead of the actual page -- reported here on the
-# "Select Location from Map" (Leaflet) dialog. This forces Chromium to composite the final frame
-# on the CPU instead of the GPU, which works around that corruption. It does not disable WebGL
-# itself (still GPU-rendered, just software-composited afterward), so Aladin Lite keeps working.
-#
-# --disable-gpu-rasterization --disable-zero-copy: on native Wayland sessions (CachyOS's default),
-# --disable-gpu-compositing alone turned the corruption into a solid black map instead of fixing
-# it. That's a known Chromium/Wayland/Mesa combination: with compositing forced onto the CPU but
-# tile rasterization and zero-copy GPU->CPU tile transport left on, the compositor can't read the
-# GPU-rasterized tiles back into CPU memory and silently paints black instead of falling back.
-# Disabling rasterization and zero-copy too keeps the whole raster+composite pipeline on the CPU
-# so there's no GPU-to-CPU handoff left to fail. Still doesn't touch WebGL, so Aladin Lite is
-# unaffected.
+# QtWebEngine (Chromium) flags. Set here, before Qt starts, and nowhere else: a later
+# update once overwrote these and brought the crashes back.
+#   --no-sandbox: Chromium's sandbox failed to start here (renderer exit code 18), so the
+#     FOV Simulator's sky and the map picker never drew. Applies to every web view.
+#   --enable-logging --log-file --log-level=1: Chromium writes its fatal-error message to
+#     chromium_debug.log just before it aborts - the only clue when the app crashes inside
+#     app.exec() while a sky view is drawing. Level 1 keeps warnings and errors, not the
+#     info lines (every web page console message).
+#   Linux only - --disable-gpu-compositing --disable-gpu-rasterization --disable-zero-copy:
+#     some Mesa builds (e.g. CachyOS, especially under Wayland) draw web views as garbled or
+#     solid black. These keep drawing on the CPU (WebGL is unaffected). Elsewhere they'd only
+#     cost frame rate.
 from ResourceManager import ResourceManager as _ResourceManager
 _chromium_log_path = os.path.join(str(_ResourceManager.get_data_dir()), 'chromium_debug.log')
+_gpu_workarounds = ('--disable-gpu-compositing --disable-gpu-rasterization --disable-zero-copy '
+                    if sys.platform.startswith('linux') else '')
 os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
-    f'--no-sandbox --disable-gpu-compositing --disable-gpu-rasterization --disable-zero-copy '
-    f'--enable-logging --log-file={_chromium_log_path}'
+    f'--no-sandbox {_gpu_workarounds}'
+    f'--enable-logging --log-level=1 --log-file={_chromium_log_path}'
 )
 
 # Core PySide6 imports (always needed)

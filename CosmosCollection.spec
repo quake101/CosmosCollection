@@ -20,6 +20,7 @@ a = Analysis(
     datas=[
         ('catalogs', 'catalogs'),
         ('images', 'images'),
+        ('web', 'web'),  # Aladin Lite for the FOV Simulator (LGPL-3.0, see web/aladin/README.txt)
         (cert_file, 'certifi'),
     ] + astroquery_datas,
     hiddenimports=[

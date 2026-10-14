@@ -85,7 +85,20 @@ class ResourceManager:
         # Create directory if it doesn't exist
         config_dir.mkdir(parents=True, exist_ok=True)
         return config_dir
-    
+
+    def get_cache_dir(self, *path_parts):
+        """The platform's cache folder (or a folder in it) - disposable data, kept out
+        of the Windows roaming profile and out of backups of ~/Library/Application Support."""
+        if sys.platform == "win32":
+            base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "CosmosCollection" / "cache"
+        elif sys.platform == "darwin":
+            base = Path.home() / "Library" / "Caches" / "CosmosCollection"
+        else:
+            base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "cosmoscollection"
+        path = base.joinpath(*path_parts)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def open_file_manager(self, path):
         """Open the system file manager at the specified path"""
         try:

@@ -20,6 +20,7 @@ from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 from DatabaseManager import DatabaseManager
 from HorizonProfile import load_active_horizon
+from ResourceManager import ResourceManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, contrast_text, font_px, font_size, themed_style, theme_manager
 from UrlOpener import open_url
@@ -252,17 +253,55 @@ def _observer_frame(lat, lon, when):
     return AltAz(obstime=when, location=EarthLocation(lat=lat * u.deg, lon=lon * u.deg))
 
 
+_SKY_MATRICES = {}
+
+
+def sky_matrix(lat, lon, when):
+    """The rotation taking alt/az unit vectors (x north, y east, z zenith) to RA/Dec
+    ones, seen from lat/lon at 'when' (astropy Time). Seeing the sky from the ground
+    at a moment is (to within about 20", the aberration of light) a rotation, so one
+    astropy transform of three directions gives every conversion as quick matrix math."""
+    key = (round(lat, 6), round(lon, 6), round(float(when.jd), 8))
+    matrix = _SKY_MATRICES.get(key)
+    if matrix is None:
+        sky = SkyCoord(alt=[0.0, 0.0, 90.0] * u.deg, az=[0.0, 90.0, 0.0] * u.deg,
+                       frame=_observer_frame(lat, lon, when)).icrs
+        ra, dec = sky.ra.rad, sky.dec.rad
+        columns = np.array([np.cos(dec) * np.cos(ra), np.cos(dec) * np.sin(ra), np.sin(dec)])
+        left, _scale, right = np.linalg.svd(columns)
+        matrix = left @ right  # The nearest true rotation
+        if len(_SKY_MATRICES) > 512:
+            _SKY_MATRICES.clear()
+        _SKY_MATRICES[key] = matrix
+    return matrix
+
+
+def _unit(longitudes, latitudes):
+    lon, lat = np.radians(longitudes), np.radians(latitudes)
+    return np.array([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)])
+
+
+def _angles(vectors):
+    """(longitude 0-360, latitude) in degrees of unit vectors (3 x n)."""
+    x, y, z = vectors
+    return np.degrees(np.arctan2(y, x)) % 360.0, np.degrees(np.arcsin(np.clip(z, -1.0, 1.0)))
+
+
 def altaz_to_radec(lat, lon, when, alts, azs):
     """RA and Dec arrays (degrees) of altitudes/azimuths seen from lat/lon at 'when' (astropy Time)."""
-    sky = SkyCoord(alt=np.asarray(alts, dtype=float) * u.deg, az=np.asarray(azs, dtype=float) * u.deg,
-                   frame=_observer_frame(lat, lon, when)).icrs
-    return sky.ra.deg, sky.dec.deg
+    return _angles(sky_matrix(lat, lon, when) @ _unit(np.asarray(azs, dtype=float), np.asarray(alts, dtype=float)))
 
 
 def radec_to_altaz(lat, lon, when, ra, dec):
     """(altitude, azimuth) in degrees of a sky position seen from lat/lon at 'when'."""
-    seen = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs").transform_to(_observer_frame(lat, lon, when))
-    return float(seen.alt.deg), float(seen.az.deg)
+    az, alt = _angles(sky_matrix(lat, lon, when).T @ _unit(np.atleast_1d(float(ra)), np.atleast_1d(float(dec))))
+    return float(alt[0]), float(az[0])
+
+
+def sky_turn(lat, lon, earlier, later):
+    """The rotation (3 x 3) taking where things were on the sky at 'earlier' to the
+    same place over the ground at 'later' - how a ground-fixed view moves."""
+    return sky_matrix(lat, lon, later) @ sky_matrix(lat, lon, earlier).T
 
 
 def zenith_up_rotation(lat, lon, when, ra, dec):
@@ -275,6 +314,9 @@ def zenith_up_rotation(lat, lon, when, ra, dec):
 # The time slider: one night, local noon to noon, in 5-minute steps
 NIGHT_STEP_MINUTES = 5
 NIGHT_STEPS = 24 * 60 // NIGHT_STEP_MINUTES
+NIGHT_MINUTES = 24 * 60               # The slider moves a minute at a time
+PLAY_MINUTES_PER_STEP = 1             # Play: a minute per step...
+PLAY_INTERVAL_MS = 40                 # ...25 steps a second
 SUNRISE_ALT = -0.833                  # The sun's top at the horizon, with refraction
 ASTRONOMICAL_DARK_ALT = -18.0
 
@@ -480,7 +522,6 @@ def sky_lines(lat, lon, when, horizon=True, meridian=False, profile=None, ra=Non
     "blocked": polygons of sky the custom horizon hides, "meridian": north -
     zenith - south (or None), "labels": [{"text", "ra", "dec", "color"}],
     "target_alt", "target_az"}. All in one coordinate transform."""
-    frame = AltAz(obstime=when, location=EarthLocation(lat=lat * u.deg, lon=lon * u.deg))
     parts = {}      # name -> (start, end) into the arrays below
     alts, azs = [], []
 
@@ -520,8 +561,8 @@ def sky_lines(lat, lon, when, horizon=True, meridian=False, profile=None, ra=Non
         add("label:zenith", [90.0], [0.0])
         labels.append(("label:zenith", "Zenith", MERIDIAN_COLOR))
 
-    sky = SkyCoord(alt=np.asarray(alts) * u.deg, az=np.asarray(azs) * u.deg, frame=frame).icrs
-    points = np.column_stack([sky.ra.deg, sky.dec.deg]).round(5).tolist()
+    ras, decs = altaz_to_radec(lat, lon, when, alts, azs)
+    points = np.column_stack([ras, decs]).round(5).tolist()
 
     def part(name):
         if name not in parts:
@@ -531,8 +572,7 @@ def sky_lines(lat, lon, when, horizon=True, meridian=False, profile=None, ra=Non
 
     target_alt = target_az = None
     if ra is not None and dec is not None:
-        target = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs").transform_to(frame)
-        target_alt, target_az = float(target.alt.deg), float(target.az.deg)
+        target_alt, target_az = radec_to_altaz(lat, lon, when, ra, dec)
     return {
         "horizon": part("horizon"),
         "custom": part("custom"),
@@ -730,8 +770,33 @@ var rotateSeq = 0;
 // its wheel zooms and coasting pans keep animating after their events.
 var lastView = '', overlaysDirty = true, reportedView = null, reportedAt = 0;
 function refresh() { overlaysDirty = true; }
+
+// Night View: the view is level with the ground - zenith straight up
+function positionAngleTo(ra1, dec1, ra2, dec2) {
+    var r = Math.PI / 180, dra = (ra2 - ra1) * r;
+    return Math.atan2(Math.sin(dra) * Math.cos(dec2 * r),
+                      Math.cos(dec1 * r) * Math.sin(dec2 * r) - Math.sin(dec1 * r) * Math.cos(dec2 * r) * Math.cos(dra)) / r;
+}
+function levelRotation(ra, dec) {
+    // Aladin's rotation turns north counterclockwise; up must point at the zenith
+    var z = state.night.zenith;
+    return -positionAngleTo(ra, dec, z[0], z[1]);
+}
+function nearZenith(ra, dec) {
+    var z = state.night.zenith, r = Math.PI / 180;
+    var cos = Math.sin(dec * r) * Math.sin(z[1] * r) + Math.cos(dec * r) * Math.cos(z[1] * r) * Math.cos((ra - z[0]) * r);
+    return cos > 0.99996;  // Within half a degree: "up" isn't defined there
+}
+function keepLevel(c) {
+    if (!state.night || dragging || nearZenith(c[0], c[1])) return;
+    var want = levelRotation(c[0], c[1]);
+    var off = ((want - aladin.getRotation()) % 360 + 540) % 360 - 180;
+    if (Math.abs(off) > 0.05) turnView(want);
+}
+
 function watchView() {
     if (aladin) {
+        keepLevel(aladin.getRaDec());
         var c = aladin.getRaDec(), f = aladin.getFov(), host = document.getElementById('labels');
         // Where the sky lands on screen - also changes when Aladin's canvas settles its size
         var p0 = pixel(c[0], c[1]), p1 = pixel(c[0], c[1] + (c[1] > 0 ? -1 : 1) * f[0] / 8);
@@ -761,8 +826,27 @@ function applyState() {
 }
 
 // Called from Qt
+window.ccReady = true;  // The cc* functions below are here (Qt checks before calling them)
 window.ccSetFrames = function (frames) { state.frames = frames; applyState(); };
-window.ccSetSky = function (sky) { state.sky = sky; applyState(); };
+window.ccSetSky = function (sky) { state.sky = sky; state.night = null; applyState(); };
+// Night View, one time step: the sky turns over the ground (turn: a 3x3 rotation), the
+// view stays on the same piece of ground and level, and the lines and twilight follow -
+// all in this one update, so they move together
+window.ccNightStep = function (turn, zenith, sky, tint) {
+    state.night = {zenith: zenith};
+    if (aladin) {
+        var c = aladin.getRaDec(), r = Math.PI / 180;
+        var v = [Math.cos(c[1] * r) * Math.cos(c[0] * r), Math.cos(c[1] * r) * Math.sin(c[0] * r), Math.sin(c[1] * r)];
+        var w = [0, 1, 2].map(function (i) { return turn[i][0] * v[0] + turn[i][1] * v[1] + turn[i][2] * v[2]; });
+        var ra = ((Math.atan2(w[1], w[0]) / r) % 360 + 360) % 360;
+        var dec = Math.asin(Math.max(-1, Math.min(1, w[2]))) / r;
+        aladin.gotoRaDec(ra, dec);
+        if (!nearZenith(ra, dec)) turnView(levelRotation(ra, dec));
+    }
+    state.sky = sky;
+    applyState();
+    window.ccTint(tint);
+};
 window.ccZoom = function (fov) { if (aladin) aladin.setFoV(fov); else config.fov = fov; };
 window.ccCenter = function (fov) {
     if (!aladin) return;
@@ -826,6 +910,96 @@ if (typeof A !== 'undefined') {
 """
 
 
+ALADIN_BUNDLED = ("web", "aladin", "aladin-3.8.2.js")   # Shipped with the app (LGPL-3.0, see its README)
+WEB_CACHE_BYTES = 300 * 1024 * 1024                       # The sky view's disk cache: Aladin + sky images seen
+
+
+def bundled_aladin_script():
+    """The Aladin Lite script shipped with the app, or None (then it's loaded online)."""
+    path = ResourceManager.get_resource_path(*ALADIN_BUNDLED)
+    return path if path.is_file() else None
+
+
+def viewer_page_url(config):
+    """Our viewer page as a local file that loads the bundled Aladin Lite, with
+    config in the URL - or None when the script isn't bundled. (Not setHtml: Qt
+    caps that at 2 MB, and a page set that way can't load a local script.)"""
+    script = bundled_aladin_script()
+    if script is None:
+        return None
+    html = (PAGE_TEMPLATE.replace("__SCRIPT__", QUrl.fromLocalFile(str(script)).toString())
+            .replace("__CONFIG__", "JSON.parse(decodeURIComponent(location.hash.slice(1)))"))
+    page = ResourceManager.get_cache_dir("web") / "fov_viewer.html"
+    try:
+        if not page.is_file() or page.read_text(encoding="utf-8") != html:
+            temporary = page.with_suffix(".tmp")
+            temporary.write_text(html, encoding="utf-8")
+            temporary.replace(page)  # Whole, even with two windows opening at once
+    except OSError as e:
+        logger.warning(f"Couldn't write the viewer page ({e}) - loading Aladin Lite online")
+        return None
+    url = QUrl.fromLocalFile(str(page))
+    url.setFragment(json.dumps(config), QUrl.DecodedMode)
+    return url
+
+
+_web_profile = None
+_web_pages = []
+
+
+def web_profile():
+    """The web profile for sky views: a disk cache in the cache folder keeps Aladin
+    Lite and the sky images already looked at between sessions (Qt's default profile
+    keeps nothing)."""
+    global _web_profile
+    if _web_profile is None:
+        from PySide6.QtWebEngineCore import QWebEngineProfile
+        from PySide6.QtWidgets import QApplication
+        folder = ResourceManager.get_cache_dir("web")
+        profile = QWebEngineProfile("CosmosCollection")
+        profile.setPersistentStoragePath(str(folder / "profile"))
+        profile.setCachePath(str(folder / "http"))
+        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+        profile.setHttpCacheMaximumSize(WEB_CACHE_BYTES)
+        profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
+        _web_profile = profile
+        QApplication.instance().aboutToQuit.connect(_release_web_pages)
+    return _web_profile
+
+
+# Console messages from the sky page that are expected and harmless: Aladin asks every
+# mirror of a survey for its details to find the fastest, and some (e.g. IRSA) refuse
+# requests from web pages - Aladin just skips those
+_EXPECTED_PAGE_MESSAGES = ("blocked by CORS policy", "Change url of", "Failed to load resource")
+
+
+def new_web_page(view):
+    """A page for a web view that uses the cached profile, its console going to our log."""
+    from PySide6.QtWebEngineCore import QWebEnginePage
+
+    class SkyPage(QWebEnginePage):
+        def javaScriptConsoleMessage(self, level, message, line, source):
+            # Instead of Qt printing "js: ..." to the console
+            expected = any(text in message for text in _EXPECTED_PAGE_MESSAGES)
+            if level == QWebEnginePage.JavaScriptConsoleMessageLevel.ErrorMessageLevel and not expected:
+                logger.warning(f"Sky viewer: {message} ({source.rsplit('/', 1)[-1].split('#')[0]}:{line})")
+            else:
+                logger.debug(f"Sky viewer: {message}")
+
+    page = SkyPage(web_profile(), view)
+    _web_pages.append(page)
+    return page
+
+
+def _release_web_pages():
+    """Qt needs a profile's pages gone before the profile goes: on quitting, release them."""
+    import shiboken6
+    for page in _web_pages:
+        if shiboken6.isValid(page):
+            shiboken6.delete(page)
+    _web_pages.clear()
+
+
 def viewer_page(config):
     """The viewer page's HTML for config ({"ra", "dec", "target", "fov",
     "survey", "colors"})."""
@@ -881,8 +1055,6 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self.night_noon = None        # Local noon starting that night (the slider's left end)
         self.live = True              # The time follows the clock (else it's the slider's)
         self._shown_time = None       # The time the horizon/meridian (and Night View) show
-        self._reanchoring = False     # Night View: moving the view with the sky, waiting on the page
-        self._reanchor_again = False
         self._rotate_seq = None       # The last rotation report handled
         self._page_error = False
         self.session_id = session_id
@@ -1139,14 +1311,14 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self.now_button.clicked.connect(self._go_now)
         time_layout.addWidget(self.now_button)
         self.play_button = QPushButton("▶ Play")
-        self.play_button.setToolTip("Watch the night go by (an hour in about 2 seconds)")
+        self.play_button.setToolTip("Watch the night go by (an hour in about 2½ seconds)")
         self.play_button.clicked.connect(self._toggle_play)
         time_layout.addWidget(self.play_button)
         layout.addLayout(time_layout)
         self.time_widgets = (self.night_view_check, self.night_label, self.night_date, self.time_slider,
                              self.time_label, self.now_button, self.play_button)
         self.play_timer = QTimer(self)
-        self.play_timer.setInterval(150)
+        self.play_timer.setInterval(PLAY_INTERVAL_MS)
         self.play_timer.timeout.connect(self._play_step)
 
         # Initialize web view as None initially - we'll create it safely later
@@ -1234,6 +1406,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 raise Exception(f"QWebEngineView not available: {ie}")
 
             self.web_view = QWebEngineView()
+            self.web_view.setPage(new_web_page(self.web_view))  # Disk-cached: quicker next time
             self.web_view.setMinimumSize(400, 300)
             # No browser menu (Back, Reload, Inspect...) - it isn't a web page to the user
             self.web_view.setContextMenuPolicy(Qt.NoContextMenu)
@@ -1335,6 +1508,9 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             logger.debug("Cleaning up Aladin Lite window")
             self.sky_timer.stop()
             self.play_timer.stop()
+            # Blanking the view below counts as a page load: nothing goes to the page from here on
+            self._closing = True
+            self.page_loaded = False
             # Stop any pending JavaScript operations
             if hasattr(self, 'web_view') and self.web_view:
                 self.web_view.stop()
@@ -1706,6 +1882,12 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self._save_aladin_settings()
         self._update_aladin_view()
 
+    def _log_fov_once(self, message):
+        """Log a field-of-view calculation when it changes (the info line recalculates it on every zoom)."""
+        if message != getattr(self, "_last_fov_log", None):
+            self._last_fov_log = message
+            logger.debug(message)
+
     def _calculate_telescope_fov(self):
         """Calculate telescope FOV based on selected telescope and camera/eyepiece"""
         if not self.selected_telescope:
@@ -1741,7 +1923,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             true_fov_arcmin = true_fov_deg * 60
 
             barlow_text = f" with {barlow_factor}x" if barlow_factor != 1.0 else ""
-            logger.debug(f"Eyepiece FOV calculation: {eyepiece_fl}mm eyepiece{barlow_text}, {apparent_fov}° AFOV, {magnification:.1f}x mag, {true_fov_arcmin:.1f}' true FOV")
+            self._log_fov_once(f"Eyepiece FOV calculation: {eyepiece_fl}mm eyepiece{barlow_text}, {apparent_fov}° AFOV, {magnification:.1f}x mag, {true_fov_arcmin:.1f}' true FOV")
 
             barlow_details = f" + {barlow_factor}x" if barlow_factor != 1.0 else ""
             return {
@@ -1764,7 +1946,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             fov_height_arcmin = fov_height_rad * (180 / math.pi) * 60
 
             barlow_text = f" with {barlow_factor}x" if barlow_factor != 1.0 else ""
-            logger.debug(f"Camera FOV calculation: {sensor_width}x{sensor_height}mm sensor, {effective_fl}mm effective FL{barlow_text}, FOV={fov_width_arcmin:.1f}'x{fov_height_arcmin:.1f}'")
+            self._log_fov_once(f"Camera FOV calculation: {sensor_width}x{sensor_height}mm sensor, {effective_fl}mm effective FL{barlow_text}, FOV={fov_width_arcmin:.1f}'x{fov_height_arcmin:.1f}'")
 
             barlow_details = f" + {barlow_factor}x" if barlow_factor != 1.0 else ""
             pixel_size = camera_data.get('pixel_size')
@@ -1876,14 +2058,21 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             "colors": page_colors(),
         }
         self.page_loaded = False
-        self.web_view.setHtml(viewer_page(config), QUrl(ALADIN_BASE_URL))
-        self._test_connectivity_async()
+        url = viewer_page_url(config)
+        if url is not None:
+            self.web_view.setUrl(url)  # Aladin Lite from the app's own copy
+        else:
+            self.web_view.setHtml(viewer_page(config), QUrl(ALADIN_BASE_URL))
+            self._test_connectivity_async()
 
     def _run_js(self, code, callback=None):
         """Run JavaScript in the viewer page once it has loaded (before that,
         _on_load_finished pushes everything anyway)."""
-        if self.web_view is None or not self.page_loaded:
+        if self.web_view is None or not self.page_loaded or getattr(self, "_closing", False):
             return
+        if callback is None:
+            # Only on our viewer page (not a blank or error page): it sets ccReady
+            code = f"if (window.ccReady) {{ {code} }}"
         if callback is None:
             self.web_view.page().runJavaScript(code)
         else:
@@ -2204,14 +2393,24 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 "targetAlt": lines["target_alt"], "color": HORIZON_COLOR}
 
     def _push_sky(self):
-        """Draw the horizon/meridian (and Night View's path and twilight) for the chosen time."""
+        """Draw the horizon/meridian (and Night View's path and twilight) for the chosen time.
+        In Night View the view also turns with the sky, in the same page update."""
+        previous = self._shown_time
         self._shown_time = self._sky_time()
         payload = self._sky_overlay()
-        self._run_js(f"ccSetSky({json.dumps(payload)})")
+        night_view = self.night_view_check.isChecked() and self.observer_lat is not None
         tint = 0.0
-        if self.night_view_check.isChecked() and self.night is not None:
+        if night_view and self.night is not None:
             tint = sky_tint(float(self.night["sun_alt"][self._time_index()]))
-        self._run_js(f"ccTint({tint:.3f})")
+        if night_view:
+            now = Time(self._shown_time)
+            turn = sky_turn(self.observer_lat, self.observer_lon, Time(previous or self._shown_time), now)
+            zenith_ra, zenith_dec = altaz_to_radec(self.observer_lat, self.observer_lon, now, [90.0], [0.0])
+            self._run_js(f"ccNightStep({json.dumps(turn.round(12).tolist())}, "
+                         f"[{float(zenith_ra[0])}, {float(zenith_dec[0])}], {json.dumps(payload)}, {tint:.3f})")
+        else:
+            self._run_js(f"ccSetSky({json.dumps(payload)})")
+            self._run_js(f"ccTint({tint:.3f})")
         if payload and self.live:
             self.sky_timer.start()
         else:
@@ -2257,7 +2456,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             return datetime.now().astimezone()
         if self.live or self.night_noon is None:
             return datetime.now(self.observer_tz)
-        return self.night_noon + timedelta(minutes=self.time_slider.value() * NIGHT_STEP_MINUTES)
+        return self.night_noon + timedelta(minutes=self.time_slider.value())
 
     def _time_index(self):
         """The slider step nearest the shown time."""
@@ -2277,9 +2476,15 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         noon = self._tonight_noon(now)
         if self.night is None or noon != self.night_noon:
             self._load_night(noon)
-        self.time_slider.setValue(self._time_index())
-        self.time_slider.set_now(self._time_index())
+        minute = self._minute_now()
+        self.time_slider.setValue(minute)
+        self.time_slider.set_now(minute)
         self._time_changed()
+
+    def _minute_now(self):
+        """Minutes from the slider's noon to now (None outside the night shown)."""
+        minutes = (datetime.now(self.observer_tz) - self.night_noon).total_seconds() / 60.0
+        return round(minutes) if 0 <= minutes <= NIGHT_MINUTES else None
 
     def _on_time_slider(self, value):
         self.live = False
@@ -2294,27 +2499,23 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self._time_changed()
 
     def _update_now_mark(self):
-        now = datetime.now(self.observer_tz)
-        minutes = (now - self.night_noon).total_seconds() / 60.0 if self.night_noon else -1
-        self.time_slider.set_now(round(minutes / NIGHT_STEP_MINUTES) if 0 <= minutes <= 24 * 60 else None)
+        self.time_slider.set_now(self._minute_now() if self.night_noon else None)
 
     def _toggle_play(self):
         if self.play_timer.isActive():
             self.play_timer.stop()
             self.play_button.setText("▶ Play")
             return
-        if self.time_slider.value() >= NIGHT_STEPS:
+        if self.time_slider.value() >= NIGHT_MINUTES:
             start = self.night["sunset"] if self.night and self.night["sunset"] is not None else 0
-            self.time_slider.setValue(start)
+            self.time_slider.setValue(start * NIGHT_STEP_MINUTES)
         self.live = False
         self.play_button.setText("⏸ Pause")
         self.play_timer.start()
 
     def _play_step(self):
-        if self._reanchoring:
-            return  # Let the view catch up
-        value = self.time_slider.value() + 1
-        if value > NIGHT_STEPS:
+        value = self.time_slider.value() + PLAY_MINUTES_PER_STEP
+        if value > NIGHT_MINUTES:
             self._toggle_play()
             return
         self.time_slider.setValue(value)
@@ -2336,39 +2537,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         if self.night is not None:
             text += f" · {sky_state(float(self.night['sun_alt'][self._time_index()]))}"
         self.time_label.setText(("Now: " if self.live else "") + text)
-        if self.night_view_check.isChecked() and self.page_loaded:
-            self._reanchor()
-        else:
-            self._push_sky()
-
-    def _reanchor(self):
-        """Night View: keep the view on the same piece of ground as the sky turns."""
-        if self._reanchoring:
-            self._reanchor_again = True
-            return
-        self._reanchoring = True
-        self._run_js("ccView()", self._on_reanchor_view)
-
-    def _on_reanchor_view(self, view):
-        try:
-            if (view and self._shown_time is not None and self.observer_lat is not None
-                    and self.night_view_check.isChecked()):  # (It may have been turned off meanwhile)
-                current = json.loads(view)
-                alt, az = radec_to_altaz(self.observer_lat, self.observer_lon, Time(self._shown_time),
-                                         float(current["ra"]), float(current["dec"]))
-                when = Time(self._sky_time())
-                ras, decs = altaz_to_radec(self.observer_lat, self.observer_lon, when, [alt], [az])
-                ra, dec = float(ras[0]), float(decs[0])
-                rotation = zenith_up_rotation(self.observer_lat, self.observer_lon, when, ra, dec)
-                self._run_js(f"ccSetView({ra}, {dec}, {rotation}, null)")
-        except Exception as e:
-            logger.error(f"Error moving the Night View: {e}", exc_info=True)
-        finally:
-            self._push_sky()
-            self._reanchoring = False
-            if self._reanchor_again:
-                self._reanchor_again = False
-                self._reanchor()
+        self._push_sky()  # In Night View this also turns the view with the sky
 
     def _on_night_view_toggled(self, checked):
         """Night View: look at the target's part of the sky from the ground."""
@@ -2401,19 +2570,6 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             if center_ra is not None:
                 self._run_js(f"ccSetView({center_ra}, {center_dec}, 0, {self.current_fov})")
         self._push_sky()
-
-    def _level_view(self, report):
-        """Night View: keep the zenith up as the view is panned."""
-        if not (self.night_view_check.isChecked() and self.observer_lat is not None) or self._reanchoring:
-            return
-        try:
-            ra, dec = float(report["ra"]), float(report["dec"])
-            rotation = zenith_up_rotation(self.observer_lat, self.observer_lon,
-                                          Time(self._shown_time or self._sky_time()), ra, dec)
-        except (KeyError, TypeError, ValueError):
-            return
-        if abs((rotation - float(report.get("rot", 0)) + 180) % 360 - 180) > 0.5:
-            self._run_js(f"ccRotate({rotation})")
 
     def _on_show_horizon_toggled(self):
         """Handle Virtual Horizon checkbox toggle."""
@@ -2461,8 +2617,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         if report.get("fov") and float(report["fov"]) != self.view_fov:
             self.view_fov = float(report["fov"])
             self._update_fov_info()
-        if "ra" in report:
-            self._level_view(report)
+
 
     def _on_theme_changed(self):
         self._run_js(f"ccColors({json.dumps(page_colors())})")
@@ -2532,6 +2687,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
     def _on_load_started(self):
         """Handle web page load started"""
+        if getattr(self, "_closing", False):
+            return  # Clearing the view on closing - not a load
         logger.debug("Aladin Lite: Load started")
         self._renderer_crashed = False
         if self.web_placeholder:
@@ -2541,6 +2698,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
     def _on_load_progress(self, progress):
         """Handle web page load progress"""
+        if getattr(self, "_closing", False):
+            return
         logger.debug(f"Aladin Lite: Load progress {progress}%")
         # Chromium still reports load progress after a renderer crash; don't stomp the crash message.
         if self.web_placeholder and not self._renderer_crashed:
@@ -2585,8 +2744,11 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
     def _on_load_finished(self, success):
         """Handle web page load finished"""
-        logger.debug(f"Aladin Lite: Load finished, success={success}")
         self.loading_timeout.stop()
+        if getattr(self, "_closing", False):
+            logger.debug("Sky view cleared")  # The blank page the window clears itself with on closing
+            return
+        logger.debug(f"Aladin Lite: Load finished, success={success}")
 
         if not success:
             logger.error("Failed to load Aladin Lite")
@@ -3047,9 +3209,10 @@ class SaveFramingDialog(QDialog):
 
 
 class NightSlider(QWidget):
-    """One night, local noon to noon, in NIGHT_STEP_MINUTES steps - painted with
-    how dark the sky is, when the target is up (a green strip), when it crosses
-    the meridian, and now. Emits moved(step) when the user changes it."""
+    """One night, local noon to noon, a minute at a time - painted with how dark
+    the sky is, when the target is up (a green strip), when it crosses the
+    meridian, and now. Its value is minutes from noon; emits moved(minute) when
+    the user changes it. (The night profile it paints is every NIGHT_STEP_MINUTES.)"""
 
     moved = Signal(int)
     SKY_COLORS = ((SUNRISE_ALT, "#6f93bd"), (-6.0, "#4a6488"), (-12.0, "#30425f"),
@@ -3071,7 +3234,7 @@ class NightSlider(QWidget):
         return self._value
 
     def setValue(self, value):
-        self._value = max(0, min(NIGHT_STEPS, int(value)))
+        self._value = max(0, min(NIGHT_MINUTES, int(value)))
         self.update()
 
     def set_now(self, index):
@@ -3087,13 +3250,17 @@ class NightSlider(QWidget):
     def _band(self):
         return QRectF(6, 4, self.width() - 12, 16)
 
-    def _x(self, index):
+    def _x(self, minute):
         band = self._band()
-        return band.left() + band.width() * index / NIGHT_STEPS
+        return band.left() + band.width() * minute / NIGHT_MINUTES
 
-    def _index(self, x):
+    def _step_x(self, index):
+        """x of a night-profile sample."""
+        return self._x(index * NIGHT_STEP_MINUTES)
+
+    def _minute(self, x):
         band = self._band()
-        return round((x - band.left()) / max(band.width(), 1) * NIGHT_STEPS)
+        return round((x - band.left()) / max(band.width(), 1) * NIGHT_MINUTES)
 
     @classmethod
     def _sky_color(cls, sun_alt):
@@ -3110,24 +3277,24 @@ class NightSlider(QWidget):
         if night is not None:
             # The sky's darkness through the night
             for i in range(NIGHT_STEPS):
-                left, right = self._x(i), self._x(i + 1)
+                left, right = self._step_x(i), self._step_x(i + 1)
                 painter.fillRect(QRectF(left, band.top(), right - left + 0.6, band.height()),
                                  self._sky_color(float(night["sun_alt"][i])))
             # When the target is up
             if night.get("target_up") is not None:
                 for i in range(NIGHT_STEPS):
                     if night["target_up"][i]:
-                        left, right = self._x(i), self._x(i + 1)
+                        left, right = self._step_x(i), self._step_x(i + 1)
                         painter.fillRect(QRectF(left, band.bottom() - 4, right - left + 0.6, 4), QColor(80, 190, 110))
             # Dusk and dawn
             painter.setPen(QPen(QColor(255, 255, 255, 150), 1))
             for key in ("dusk", "dawn"):
                 if night.get(key) is not None:
-                    x = self._x(night[key])
+                    x = self._step_x(night[key])
                     painter.drawLine(QPointF(x, band.top()), QPointF(x, band.bottom()))
             # The meridian crossing
             if night.get("transit") is not None:
-                x = self._x(night["transit"])
+                x = self._step_x(night["transit"])
                 painter.setPen(QPen(QColor(MERIDIAN_COLOR), 2))
                 painter.drawLine(QPointF(x, band.top() - 2), QPointF(x, band.bottom() + 2))
         else:
@@ -3142,7 +3309,7 @@ class NightSlider(QWidget):
         painter.setFont(font)
         if night is not None:
             for i in range(0, NIGHT_STEPS + 1, 3 * 60 // NIGHT_STEP_MINUTES):
-                x = self._x(i)
+                x = self._step_x(i)
                 painter.drawLine(QPointF(x, band.bottom() + 1), QPointF(x, band.bottom() + 4))
                 text = hour_label(night["times"][i])
                 width = painter.fontMetrics().horizontalAdvance(text)
@@ -3166,42 +3333,46 @@ class NightSlider(QWidget):
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
 
-    def _describe(self, index):
+    def _describe(self, minute):
         night = self.night
         if night is None:
             return ""
-        index = max(0, min(NIGHT_STEPS, index))
-        parts = [format_time(night["times"][index]), sky_state(float(night["sun_alt"][index]))]
+        minute = max(0, min(NIGHT_MINUTES, minute))
+        index = round(minute / NIGHT_STEP_MINUTES)
+        moment = night["times"][0] + timedelta(minutes=minute)
+        parts = [format_time(moment), sky_state(float(night["sun_alt"][index]))]
         if night.get("target_alt") is not None:
             parts.append(f"{self.target_name} alt {float(night['target_alt'][index]):.0f}°")
         if night.get("transit") == index:
             parts.append("crosses the meridian")
         return " · ".join(parts)
 
-    def _move_to(self, index):
-        index = max(0, min(NIGHT_STEPS, index))
-        if index != self._value:
-            self.setValue(index)
-            self.moved.emit(index)
+    def _move_to(self, minute):
+        minute = max(0, min(NIGHT_MINUTES, minute))
+        if minute != self._value:
+            self.setValue(minute)
+            self.moved.emit(minute)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self._move_to(self._index(event.position().x()))
+            self._move_to(self._minute(event.position().x()))
 
     def mouseMoveEvent(self, event):
-        index = self._index(event.position().x())
+        minute = self._minute(event.position().x())
         if event.buttons() & Qt.LeftButton:
-            self._move_to(index)
-        QToolTip.showText(event.globalPosition().toPoint(), self._describe(index), self)
+            self._move_to(minute)
+        QToolTip.showText(event.globalPosition().toPoint(), self._describe(minute), self)
 
     def wheelEvent(self, event):
-        steps = 1 if event.angleDelta().y() > 0 else -1
-        self._move_to(self._value + steps)
+        step = NIGHT_STEP_MINUTES if event.angleDelta().y() > 0 else -NIGHT_STEP_MINUTES
+        self._move_to(self._value + step)
         event.accept()
 
     def keyPressEvent(self, event):
-        moves = {Qt.Key_Left: -1, Qt.Key_Right: 1, Qt.Key_PageDown: -12, Qt.Key_PageUp: 12,
-                 Qt.Key_Home: -NIGHT_STEPS, Qt.Key_End: NIGHT_STEPS}
+        # Arrows: 5 minutes (Shift: 1), Page Up/Down: an hour
+        step = 1 if event.modifiers() & Qt.ShiftModifier else NIGHT_STEP_MINUTES
+        moves = {Qt.Key_Left: -step, Qt.Key_Right: step, Qt.Key_PageDown: -60, Qt.Key_PageUp: 60,
+                 Qt.Key_Home: -NIGHT_MINUTES, Qt.Key_End: NIGHT_MINUTES}
         if event.key() in moves:
             self._move_to(self._value + moves[event.key()])
         else:
