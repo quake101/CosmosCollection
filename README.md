@@ -106,7 +106,7 @@ sudo pacman -S libxml2-legacy
 
 ## Contributing
 
-This is a personal project, developed as a rolling release. Feel free to fork it and adapt it for your own use.
+This is a personal project, developed as a rolling release. Contributions are welcome or feel free to fork it and adapt it for your own use. Not a delevoper, submit your feedback and/or idea as an [issue](issues).
 
 ## License
 
