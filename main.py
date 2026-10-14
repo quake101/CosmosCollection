@@ -4155,8 +4155,12 @@ class AboutDialog(QDialog):
         themed_style(desc_label, lambda: f"font-size: {font_size(11)}; color: {COLORS['text_secondary']}; margin: 10px 0px;")
         About_layout.addWidget(desc_label)
 
-        # GitHub link
-        link_label = QLabel(f'<a href="https://github.com/quake101/CosmosCollection" style="color: {COLORS["link"]};">Visit GitHub Repository</a>')
+        # GitHub links: the repository, and sponsoring the project
+        link_label = QLabel(
+            f'<a href="https://github.com/quake101/CosmosCollection" style="color: {COLORS["link"]};">Visit GitHub Repository</a>'
+            f' &nbsp;·&nbsp; '
+            f'<a href="https://github.com/sponsors/quake101" style="color: {COLORS["link"]};">Sponsor on GitHub &#9829;</a>')
+        link_label.setToolTip("Sponsoring helps keep Cosmos Collection going")
         link_label.setAlignment(Qt.AlignCenter)
         link_label.setOpenExternalLinks(True)
         link_label.setTextFormat(Qt.RichText)
