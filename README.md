@@ -45,15 +45,19 @@ A personal astrophotography catalog and session planning tools for organizing an
   </tr>
   <tr>
     <td align="center"><a href="screenshots/Image-Viewer.jpg"><img src="screenshots/Image-Viewer.jpg" width="400" alt="Image Viewer"></a><br>Image Viewer</td>
-    <td align="center"><a href="screenshots/Session-Manager.jpg"><img src="screenshots/Session-Manager.jpg" width="400" alt="Session Manager"></a><br>Session Manager</td>
+    <td align="center"><a href="screenshots/Collage-Builder.jpg"><img src="screenshots/Collage-Builder.jpg" width="400" alt="Collage Builder"></a><br>Collage Builder</td>
   </tr>
   <tr>
+    <td align="center"><a href="screenshots/Session-Manager.jpg"><img src="screenshots/Session-Manager.jpg" width="400" alt="Session Manager"></a><br>Session Manager</td>
     <td align="center"><a href="screenshots/Light-Frame-Quality-Review.jpg"><img src="screenshots/Light-Frame-Quality-Review.jpg" width="400" alt="Light Quality Review"></a><br>Light Quality Review</td>
-    <td align="center"><a href="screenshots/NINA-Dashboard.jpg"><img src="screenshots/NINA-Dashboard.jpg" width="400" alt="NINA Dashboard"></a><br>NINA Dashboard</td>
   </tr>
   <tr>
     <td align="center"><a href="screenshots/Weather-Overview.jpg"><img src="screenshots/Weather-Overview.jpg" width="400" alt="Weather Overview"></a><br>Weather Overview</td>
     <td align="center"><a href="screenshots/Weather-Details.jpg"><img src="screenshots/Weather-Details.jpg" width="400" alt="Weather Details"></a><br>Weather Details</td>
+  </tr>
+  <tr>
+    <td align="center"><a href="screenshots/NINA-Dashboard.jpg"><img src="screenshots/NINA-Dashboard.jpg" width="400" alt="NINA Dashboard"></a><br>NINA Dashboard</td>
+    <td></td>
   </tr>
 </table>
 
@@ -107,6 +111,10 @@ sudo pacman -S libxml2-legacy
 ## Contributing
 
 This is a personal project, developed as a rolling release. Contributions are welcome or feel free to fork it and adapt it for your own use. Not a developer? Submit your feedback and/or idea as an [issue](https://github.com/quake101/CosmosCollection/issues).
+
+## Support
+
+If Cosmos Collection is useful to you, you can help keep it going by [sponsoring on GitHub](https://github.com/sponsors/quake101) ♥ or [buying me a beer](https://buymeacoffee.com/quake101) 🍺.
 
 ## License
 
