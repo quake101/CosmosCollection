@@ -32,6 +32,7 @@ class CelestialObject:
     magnitude: float = None
     obj_type: str = None  # 'galaxy', 'nebula', 'cluster', 'star', etc.
     size: float = None  # arcminutes
+    dsodetailid: int = None  # The catalog entry (deep-sky objects only)
 
 
 @dataclass
@@ -396,7 +397,12 @@ def image_pixel_size(path):
         width, height = (image.get("geometry", "0:0").split(":") + ["0"])[:2] if image is not None else (0, 0)
         return int(width), int(height)
     from PySide6.QtGui import QImageReader
-    size = QImageReader(path).size()
+    from ImageLoader import QT_IMAGE_IO_LOCK
+    # Runs in worker threads: unlocked, it deadlocked the app against another
+    # thread's read_image_file() (one holding the GIL inside Qt, the other
+    # needing it back from Qt) when the Collage Builder opened
+    with QT_IMAGE_IO_LOCK:
+        size = QImageReader(path).size()
     return size.width(), size.height()
 
 
@@ -474,7 +480,7 @@ def _dsos_in_view(wcs, width, height):
     try:
         attach_update_catalogs(conn)
         rows = conn.execute("""
-            SELECT d.ra, d.dec, d.magnitude, d.dsotype, COALESCE(d.sizemax, d.sizemin) / 60.0,
+            SELECT d.id, d.ra, d.dec, d.magnitude, d.dsotype, COALESCE(d.sizemax, d.sizemin) / 60.0,
                    d.sizemin / 60.0, d.positionangle,
                    (SELECT c.catalogue || ' ' || c.designation FROM cataloguenr c WHERE c.dsodetailid = d.id
                     ORDER BY CASE c.catalogue WHEN 'M' THEN 1 WHEN 'NGC' THEN 2 WHEN 'IC' THEN 3 ELSE 4 END
@@ -485,13 +491,14 @@ def _dsos_in_view(wcs, width, height):
     finally:
         conn.close()
     found, names = [], set()
-    for ra, dec, magnitude, kind, size, minor, angle, name in rows:
+    for dsodetailid, ra, dec, magnitude, kind, size, minor, angle, name in rows:
         if ra is None or dec is None or not name or name in names or (kind or "").upper() in NOT_DSO_TYPES:
             continue
         x, y = wcs.sky_to_pixel(ra, dec)
         if x is not None and 0 <= x <= width and 0 <= y <= height:
             names.add(name)
-            item = CelestialObject(name=name, ra=ra, dec=dec, magnitude=magnitude, obj_type=kind, size=size)
+            item = CelestialObject(name=name, ra=ra, dec=dec, magnitude=magnitude, obj_type=kind, size=size,
+                                   dsodetailid=dsodetailid)
             item.minor, item.angle = minor, angle  # Minor axis (arcmin), position angle (deg, N through E)
             found.append(item)
     found.sort(key=_annotation_priority)
@@ -936,13 +943,17 @@ class PlateSolveQueue(QObject):
         wanted = None if paths is None else set(paths)
         return sum(1 for entry in self._queue if wanted is None or entry[0] in wanted)
 
-    def add(self, path, hints=None, name=""):
+    def add(self, path, hints=None, name="", first=False):
         """Queue an unsolved (or failed) image; hints: {"ra", "dec", "radius"} in
-        degrees. Returns whether it was queued."""
+        degrees. first: ahead of the waiting images (someone is waiting for this
+        one). Returns whether it was queued."""
         if not path or self.state(path) not in ("unsolved", "failed"):
             return False
         self._failures.pop(path, None)
-        self._queue.append([path, hints, name])
+        if first:
+            self._queue.insert(1 if self._worker is not None else 0, [path, hints, name])
+        else:
+            self._queue.append([path, hints, name])
         self.changed.emit(path)
         self._start_next()
         return True

@@ -5315,7 +5315,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         logger.debug("Creating detail window")
         # Create the window in a new thread
         detail_window = DSODetailWindow(data)
-        detail_window.image_added.connect(self._refresh_data)
         detail_window.show()
         logger.debug("Detail window shown")
 
@@ -5593,34 +5592,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             ext = os.path.splitext(file_path)[1].lower()
             if ext in SUPPORTED_IMAGE_EXTENSIONS:
                 event.acceptProposedAction()
-                self._show_add_image_dialog(file_path)
-
-    def _show_add_image_dialog(self, file_path=None):
-        """Show dialog to add a new image to a DSO"""
-        try:
-            from DSOGallery import AddImageDialog
-        except ImportError as e:
-            QMessageBox.warning(self, "Import Error", f"Could not load the Add Image dialog: {e}")
-            return
-
-        dialog = AddImageDialog(self)
-        if file_path:
-            dialog.set_file_path(file_path)
-        if dialog.exec() == QDialog.Accepted:
-            self._add_image_to_database(dialog.get_image_data())
-
-    def _add_image_to_database(self, image_data):
-        """Add an image to the database and refresh the DSO list"""
-        try:
-            from DSOGallery import insert_user_image
-            insert_user_image(self.db_manager, image_data)
-
-            QMessageBox.information(self, "Image Added", "Image successfully added to database.")
-            self._refresh_data()
-
-        except Exception as e:
-            logger.error(f"Error adding image to database: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to add image to database:\n{str(e)}")
+                from DSOGallery import import_image
+                # Deferred: a dialog shown inside dropEvent keeps the source app's drag (e.g. Explorer) blocked
+                QTimer.singleShot(0, lambda: import_image(self, file_path))
 
     def _setup_system_tray_if_enabled(self):
         """Initialize system tray if the setting is enabled"""

@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QFrame, QGridLayout, QMenu, QApplication,
                                QDialog, QFileDialog, QFormLayout, QDialogButtonBox,
                                QCompleter, QSlider, QProgressDialog, QPlainTextEdit,
-                               QSizePolicy, QCheckBox, QToolButton, QProgressBar)
+                               QSizePolicy, QCheckBox, QToolButton, QProgressBar,
+                               QListWidget, QListWidgetItem)
 from PySide6.QtCore import QSettings
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QFontMetricsF
 
@@ -39,24 +40,215 @@ SOLVE_BADGES = {"unsolved": "Not solved", "queued": "Waiting to solve", "solving
                 "failed": "Solve failed"}
 
 
-def insert_user_image(db_manager, image_data):
-    """Insert an AddImageDialog.get_image_data() result into userimages and commit."""
+def insert_user_image(db_manager, image_data, others=None):
+    """Insert an AddImageDialog.get_image_data() result into userimages and commit:
+    a row for its DSO, plus one (with the same details) for each of the other
+    objects chosen in it ('also_dsodetailids') that doesn't have this image yet.
+    others: rows for just these other objects instead. Returns the new rows'
+    ids, its DSO's first."""
+    if others is None:
+        targets = [(image_data['dsodetailid'], False)] + \
+                  [(dsodetailid, True) for dsodetailid in image_data.get('also_dsodetailids', [])]
+    else:
+        targets = [(dsodetailid, True) for dsodetailid in others]
+    details = (image_data['image_path'], image_data['integration_time'], image_data['equipment'],
+               image_data['date_taken'], image_data['notes'])
+    ids = []
     with db_manager.get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO userimages (
-                dsodetailid, image_path, integration_time,
-                equipment, date_taken, notes, created_date
-            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-        """, (
-            image_data['dsodetailid'],
-            image_data['image_path'],
-            image_data['integration_time'],
-            image_data['equipment'],
-            image_data['date_taken'],
-            image_data['notes']
-        ))
+        for dsodetailid, other in targets:
+            if other:
+                cursor.execute("SELECT 1 FROM userimages WHERE dsodetailid = ? AND image_path = ?",
+                               (dsodetailid, image_data['image_path']))
+                if cursor.fetchone():
+                    continue
+            cursor.execute("""
+                INSERT INTO userimages (
+                    dsodetailid, image_path, integration_time,
+                    equipment, date_taken, notes, created_date
+                ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+            """, (dsodetailid, *details))
+            ids.append(cursor.lastrowid)
         conn.commit()
+    return ids
+
+
+def refresh_open_image_views():
+    """The main window's image counts and an open gallery don't watch the
+    database, so refresh whichever of them are open."""
+    for widget in QApplication.topLevelWidgets():
+        name = type(widget).__name__
+        try:
+            if name == "DSOGalleryWindow" and widget.isVisible():
+                widget._refresh_gallery()
+            elif name == "MainWindow":
+                widget._refresh_data()
+        except Exception as e:
+            logger.warning(f"Could not refresh {name} after adding an image: {e}")
+
+
+def import_image(parent, file_path=None, dsodetailid=None, session=None):
+    """Add an image to the collection - how every window does it (the gallery,
+    the main window, an object's details, a finished session): the Add Image
+    dialog, pre-filled with file_path, a DSO and/or a Session Manager session,
+    then saved to its DSO and the other objects in it that were chosen.
+    Returns the new userimages id for its DSO, or None if nothing was added."""
+    dialog = AddImageDialog(parent)
+    try:
+        if dsodetailid is not None:
+            dialog.select_dso(dsodetailid)  # Before the file, so it isn't guessed from it
+        if file_path:
+            dialog.set_file_path(file_path)
+        if session:
+            dialog.prefill_from_session(session)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        image_data = dialog.get_image_data()
+        hints = dialog.solve_hints()
+        offer_later = not image_data['objects_known'] and dialog.offer_objects_later()
+    finally:
+        dialog.deleteLater()
+    try:
+        ids = insert_user_image(DatabaseManager(), image_data)
+    except Exception as e:
+        logger.error(f"Error adding image {image_data['image_path']}: {e}", exc_info=True)
+        QMessageBox.critical(parent, "Error", f"Failed to add the image:\n{e}")
+        return None
+    refresh_open_image_views()
+
+    message = (f"{os.path.basename(image_data['image_path'])} was added to "
+               f"{_join_names(image_data['dso_names'])}.")
+    if offer_later:
+        # Added before its plate solve finished - offer the other objects in it then
+        _ObjectsOffer(image_data, hints)
+        message += "\n\nAny other objects in it will be offered when its plate solve finishes."
+    QMessageBox.information(parent, "Image Added", message)
+    return ids[0]
+
+
+def _join_names(names):
+    """'M 42', 'M 42 and M 43', 'M 42, M 43 and NGC 1977'."""
+    names = list(names)
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+# An object in an image is checked by default if it's in Messier's catalog,
+# or an NGC/IC object at least this fraction of the image's short side across
+NOTABLE_OBJECT_SIZE = 0.05
+
+
+def _is_notable(obj, data):
+    name = obj.name or ""
+    if name.startswith("M "):
+        return True
+    if not name.startswith(("NGC ", "IC ")) or not obj.size:
+        return False
+    return obj.size / 60 >= NOTABLE_OBJECT_SIZE * min(data.width, data.height) * data.degrees_per_pixel
+
+
+def _fill_objects_list(list_widget, data, exclude, checks):
+    """List the catalog objects in a plate-solved image (AnnotationData) as
+    checkboxes, leaving out the dsodetailids in exclude; checks: dsodetailid ->
+    checked, for ones the user already chose (others: checked if notable).
+    Returns how many are listed."""
+    list_widget.clear()
+    seen = set(exclude)
+    for obj in data.dsos:
+        if obj.dsodetailid is None or obj.dsodetailid in seen:
+            continue
+        seen.add(obj.dsodetailid)
+        text = obj.name
+        if obj.size:
+            text += f"  ({obj.size:.0f}′)" if obj.size >= 1 else f"  ({obj.size * 60:.0f}″)"  # Arcminutes
+        item = QListWidgetItem(text)
+        item.setData(Qt.UserRole, obj.dsodetailid)
+        item.setData(Qt.UserRole + 1, obj.name)
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if checks.get(obj.dsodetailid, _is_notable(obj, data)) else Qt.Unchecked)
+        list_widget.addItem(item)
+    return list_widget.count()
+
+
+def _checked_objects(list_widget):
+    """[(dsodetailid, name)] of the checked objects in a _fill_objects_list list."""
+    items = (list_widget.item(row) for row in range(list_widget.count()))
+    return [(item.data(Qt.UserRole), item.data(Qt.UserRole + 1)) for item in items
+            if item.checkState() == Qt.Checked]
+
+
+class _ObjectsOffer(QObject):
+    """For an image added before its plate solve finished: waits for the solve
+    (starting it if need be), then offers the other notable objects in it."""
+
+    _waiting = set()  # Keeps the offers alive until they're done
+
+    def __init__(self, image_data, hints):
+        super().__init__()
+        self.image_data = image_data
+        self.path = image_data['image_path']
+        self.hints = hints
+        self._queued = False
+        _ObjectsOffer._waiting.add(self)
+        plate_solve_queue().changed.connect(self._check)
+        self._check(self.path)
+
+    def _check(self, path):
+        if path != self.path:
+            return
+        queue = plate_solve_queue()
+        state = queue.state(path)
+        if state == "solved":
+            data = annotation_store().get(path)
+            if data is not None:
+                self._done()
+                self._offer(data)
+        elif state in ("unsolved", "failed"):
+            if self._queued or not queue.add(path, self.hints, self.image_data['dso_names'][0], first=True):
+                self._done()  # Couldn't be solved, or the solve was stopped
+            else:
+                self._queued = True
+
+    def _done(self):
+        plate_solve_queue().changed.disconnect(self._check)
+        _ObjectsOffer._waiting.discard(self)
+
+    def _offer(self, data):
+        attached = {self.image_data['dsodetailid'], *self.image_data['also_dsodetailids']}
+        dialog = QDialog(QApplication.activeWindow())
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.setWindowTitle("Other Objects in the Image")
+        layout = QVBoxLayout(dialog)
+        label = QLabel(f"{os.path.basename(self.path)} is plate solved. It also shows these objects - "
+                       f"add the image to them too?")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        objects = QListWidget()
+        if not _fill_objects_list(objects, data, attached, {}) or not _checked_objects(objects):
+            dialog.deleteLater()  # Nothing notable - not worth interrupting for
+            return
+        layout.addWidget(objects)
+        buttons = QDialogButtonBox()
+        buttons.addButton("Add to Checked", QDialogButtonBox.AcceptRole)
+        buttons.addButton("Not Now", QDialogButtonBox.RejectRole)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def add():
+            chosen = [dsodetailid for dsodetailid, _name in _checked_objects(objects)]
+            if not chosen:
+                return
+            try:
+                insert_user_image(DatabaseManager(), self.image_data, others=chosen)
+            except Exception as e:
+                logger.error(f"Error adding {self.path} to other objects: {e}", exc_info=True)
+                QMessageBox.critical(dialog, "Error", f"Failed to add the image:\n{e}")
+                return
+            refresh_open_image_views()
+
+        dialog.accepted.connect(add)
+        dialog.resize(360, 320)
+        dialog.show()
 
 
 class ThumbnailCache:
@@ -597,6 +789,17 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self._date_auto_filled = False
         self._integration_auto_filled = False
         self._matching_sessions = []  # Session Manager sessions found for the current DSO
+        self._dso_positions = {}  # dsodetailid -> (ra, dec) degrees
+        self._dso_indexes = {}    # dsodetailid -> dso_combo index
+        # Finding the other objects in the image by plate solving it
+        self._solved_data = None  # The selected file's AnnotationData, once solved
+        self._object_checks = {}  # dsodetailid -> checked, as the user left them
+        self._solves_tried = set()  # (path, hint) solves started, so a failure isn't retried
+        self._solves_queued = set()  # Paths this dialog queued - stopped if it's cancelled
+        self._can_solve_blind = None  # ASTAP is available (no position needed)
+        self._objects_timer = QTimer(self)
+        self._objects_timer.setSingleShot(True)
+        self._objects_timer.timeout.connect(self._update_objects)
 
         self.setAcceptDrops(True)
         self._init_ui()
@@ -604,6 +807,8 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self._load_equipment_list()
         self._update_preview()
         self.setup_window_position()
+        plate_solve_queue().changed.connect(self._on_solve_changed)
+        plate_solve_queue().progress.connect(self._on_solve_progress)
 
     def _init_ui(self):
         """Create the dialog UI"""
@@ -699,6 +904,22 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self.session_import_btn.clicked.connect(self._show_session_import_menu)
         self.session_import_btn.hide()
         right_col.addWidget(self.session_import_btn)
+
+        # The other catalog objects in the image, found by plate solving it
+        # in the background - the image can be added to them too
+        self.objects_status = QLabel("")
+        themed_style(self.objects_status, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_size(9)};")
+        self.objects_status.setWordWrap(True)
+        self.objects_status.setMaximumWidth(260)
+        self.objects_status.hide()
+        right_col.addWidget(self.objects_status)
+        self.objects_list = QListWidget()
+        self.objects_list.setMaximumWidth(260)
+        self.objects_list.setMaximumHeight(130)
+        self.objects_list.setToolTip("The image is also added to the checked objects")
+        self.objects_list.itemChanged.connect(self._on_object_checked)
+        self.objects_list.hide()
+        right_col.addWidget(self.objects_list)
         right_col.addStretch()
 
         top_row.addLayout(right_col)
@@ -790,7 +1011,9 @@ class AddImageDialog(WindowPositionMixin, QDialog):
                                    ELSE 4
                                END, c.designation) as name,
                            d.constellation,
-                           d.dsotype
+                           d.dsotype,
+                           d.ra,
+                           d.dec
                     FROM dsodetail d
                     JOIN cataloguenr c ON d.id = c.dsodetailid
                     GROUP BY d.id
@@ -811,10 +1034,13 @@ class AddImageDialog(WindowPositionMixin, QDialog):
                 self.dso_data = []
 
                 for row in rows:
-                    dsodetailid, name, constellation, dsotype = row
+                    dsodetailid, name, constellation, dsotype, ra, dec = row
                     display_text = f"{name} ({constellation})"
+                    self._dso_indexes[dsodetailid] = self.dso_combo.count()
                     self.dso_combo.addItem(display_text, dsodetailid)
                     self.dso_data.append((dsodetailid, name))
+                    if ra is not None and dec is not None:
+                        self._dso_positions[dsodetailid] = (ra, dec)
 
                 # Setup completer for search functionality
                 completer = QCompleter([self.dso_combo.itemText(i) for i in range(self.dso_combo.count())])
@@ -875,6 +1101,10 @@ class AddImageDialog(WindowPositionMixin, QDialog):
     def set_file_path(self, path):
         """Set the selected file path, refresh the preview and try to auto-detect
         the DSO and capture info (telescope/camera/date) from the file's metadata"""
+        if path != self.selected_file:
+            self._stop_solves(keep=path)
+            self._solved_data = None
+            self._object_checks = {}
         self.selected_file = path
         self.file_path_edit.setText(path)
         self._clear_error(self.file_path_edit)
@@ -883,6 +1113,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self._try_auto_detect_dso()
         self._try_auto_detect_capture_info()
         self._check_for_matching_sessions()
+        self._objects_timer.start(0)
 
     def _read_capture_header(self):
         """Read FITS/XISF header keywords (OBJECT, TELESCOP, INSTRUME, DATE-OBS,
@@ -985,6 +1216,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
             self.dso_combo.lineEdit().clear()
             self._dso_auto_selected = False
             self.detected_label.hide()
+        self._objects_timer.start(0)
 
     def _try_auto_detect_capture_info(self):
         """Fill telescope/camera/date from the file's FITS/XISF header, each
@@ -1119,7 +1351,16 @@ class AddImageDialog(WindowPositionMixin, QDialog):
             self.detected_label.show()
             self._clear_error(self.dso_combo)
             self._check_for_matching_sessions()
+            self._objects_timer.start(0)
         self._import_session_data(session)
+
+    def select_dso(self, dsodetailid):
+        """Choose the DSO to add the image to, as if the user picked it."""
+        index = self._dso_indexes.get(dsodetailid)
+        if index is None:
+            return
+        self.dso_combo.setCurrentIndex(index)
+        self._on_dso_manually_changed(index)
 
     def _import_session_data(self, session):
         """Apply a chosen session's telescope/camera/date/integration time.
@@ -1160,6 +1401,139 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self.detected_label.hide()
         self._clear_error(self.dso_combo)
         self._check_for_matching_sessions()
+        self._objects_timer.start(0)
+
+    # --- The other objects in the image (plate solve) ---------------------
+
+    def solve_hints(self):
+        """Where to plate solve the selected file near: {"ra", "dec", "radius"}
+        (degrees) from where its FITS/XISF header says it was pointed, else
+        the chosen DSO's position - None if neither is known."""
+        from SessionFileScanner import _file_coordinates
+        position = _file_coordinates(self._capture_header) if self._capture_header else None
+        if position is None:
+            position = self._dso_positions.get(self.dso_combo.currentData())
+        return {"ra": position[0], "dec": position[1], "radius": 15} if position else None
+
+    def _solve_attempt(self, hints):
+        return self.selected_file, (round(hints["ra"], 3), round(hints["dec"], 3)) if hints else None
+
+    def offer_objects_later(self):
+        """Whether to offer the other objects in the image after it's added
+        (they weren't known yet): its plate solve is under way, or hasn't been
+        tried near where it points."""
+        if plate_solve_queue().state(self.selected_file) in ("queued", "solving", "checking", "solved"):
+            return True
+        hints = self.solve_hints()
+        return hints is not None and self._solve_attempt(hints) not in self._solves_tried
+
+    def _main_dso_name(self):
+        """The chosen DSO's main designation ('M 42'), or ''."""
+        index = self.dso_combo.currentIndex()
+        return self.dso_data[index][1].split(',')[0].strip() if 0 <= index < len(self.dso_data) else ""
+
+    def _blind_solving(self):
+        """Whether the image can be solved without knowing where it points
+        (ASTAP; astrometry.net could, but uploads - wait for the DSO instead)."""
+        if self._can_solve_blind is None:
+            from PlateSolver import PlateSolver, solver_order
+            self._can_solve_blind = "astap" in solver_order() and PlateSolver().is_astap_available()
+        return self._can_solve_blind
+
+    def _show_objects_status(self, text, tooltip=""):
+        self.objects_status.setText(text)
+        self.objects_status.setToolTip(tooltip)
+        self.objects_status.setVisible(bool(text))
+
+    def _on_solve_changed(self, path):
+        if path == self.selected_file and self._objects_timer is not None:
+            self._objects_timer.start(0)
+
+    def _on_solve_progress(self, path, _name, message):
+        if path == self.selected_file and plate_solve_queue().state(path) == "solving":
+            self._show_objects_status("Finding the objects in this image (plate solving)…", message)
+
+    def _update_objects(self):
+        """Show the other objects in the selected file once it's plate solved,
+        starting the solve if it isn't (and can be)."""
+        path = self.selected_file
+        if not path:
+            self._show_objects_status("")
+            self.objects_list.hide()
+            return
+        queue = plate_solve_queue()
+        state = queue.state(path)
+        if state == "solved":
+            data = annotation_store().get(path)
+            if data is not None:
+                self._show_objects(data)
+                return
+            state = "checking"  # Being read - ready() comes back here
+        self._solved_data = None
+        self.objects_list.hide()
+        if state == "checking":
+            self._show_objects_status("Checking for a plate solve…")
+            return
+        if state in ("queued", "solving"):
+            self._show_objects_status("Finding the objects in this image (plate solving)…")
+            return
+        hints = self.solve_hints()
+        attempt = self._solve_attempt(hints)
+        if attempt not in self._solves_tried and (hints or self._blind_solving()):
+            self._solves_tried.add(attempt)
+            if queue.add(path, hints, self._main_dso_name() or os.path.basename(path), first=True):
+                self._solves_queued.add(path)
+                self._show_objects_status("Finding the objects in this image (plate solving)…")
+                return
+        if state == "failed":
+            self._show_objects_status("Couldn't plate solve this image to find the other objects in it.",
+                                      queue.failure(path) or "")
+        elif hints is None:
+            self._show_objects_status("Choose the DSO to also find the other objects in this image.")
+        else:
+            self._show_objects_status("")
+
+    def _show_objects(self, data):
+        """List the solved image's other objects (choosing its DSO from them,
+        if none is chosen yet)."""
+        self._solved_data = data
+        if self.dso_combo.currentIndex() < 0:
+            best = next((obj for obj in data.dsos if obj.dsodetailid in self._dso_indexes), None)
+            if best is not None:
+                self.dso_combo.setCurrentIndex(self._dso_indexes[best.dsodetailid])
+                self._dso_auto_selected = True
+                self.detected_label.setText("Found by plate solving the image — please verify this is correct.")
+                self.detected_label.show()
+                self._clear_error(self.dso_combo)
+                self._check_for_matching_sessions()
+        self.objects_list.blockSignals(True)
+        count = _fill_objects_list(self.objects_list, data, {self.dso_combo.currentData()}, self._object_checks)
+        self.objects_list.blockSignals(False)
+        self.objects_list.setVisible(count > 0)
+        self._show_objects_status("Also add it to these objects in the image:" if count
+                                  else "No other catalog objects are in this image.")
+
+    def _on_object_checked(self, item):
+        self._object_checks[item.data(Qt.UserRole)] = item.checkState() == Qt.Checked
+
+    def _stop_solves(self, keep=None):
+        """Stop the plate solves this dialog started (but keep's), if still waiting or running."""
+        stopping = [path for path in self._solves_queued if path != keep]
+        if stopping:
+            plate_solve_queue().stop(stopping)
+        self._solves_queued.difference_update(stopping)
+
+    def done(self, result):
+        # Added: its solve carries on (the other objects are offered after it).
+        # Cancelled: nobody is waiting for it.
+        if self._objects_timer is not None:
+            self._objects_timer.stop()
+            self._objects_timer = None
+            if result != QDialog.Accepted:
+                self._stop_solves()
+            plate_solve_queue().changed.disconnect(self._on_solve_changed)
+            plate_solve_queue().progress.disconnect(self._on_solve_progress)
+        super().done(result)
 
     def _fill_today_date(self):
         """Fill the date field with today's date"""
@@ -1218,9 +1592,15 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self.accept()
 
     def get_image_data(self):
-        """Return the entered image data"""
+        """Return the entered image data: also_dsodetailids are the other objects
+        in it chosen; objects_known: whether they were known (it was solved)."""
+        known = self._solved_data is not None
+        others = _checked_objects(self.objects_list) if known else []
         return {
             'dsodetailid': self.dso_combo.currentData(),
+            'also_dsodetailids': [dsodetailid for dsodetailid, _name in others],
+            'dso_names': [self._main_dso_name()] + [name for _dsodetailid, name in others],
+            'objects_known': known,
             'image_path': self.selected_file,
             'equipment': ', '.join(filter(None, [self.telescope_combo.currentText().strip(),
                                                      self.camera_combo.currentText().strip()])),
@@ -1602,7 +1982,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         # Add Image button - an action, apart from the filters
         add_image_btn = QPushButton("Add Image")
-        add_image_btn.clicked.connect(self._show_add_image_dialog)
+        add_image_btn.clicked.connect(lambda: import_image(self))
         filters_layout.addWidget(add_image_btn)
         controls_layout.addLayout(filters_layout)
 
@@ -2504,31 +2884,6 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.equipment_combo.setCurrentText("All")
         self._apply_filters()
 
-    def _show_add_image_dialog(self, file_path=None):
-        """Show dialog to add a new image to a DSO"""
-        dialog = AddImageDialog(self)
-        if file_path:
-            dialog.set_file_path(file_path)
-        if dialog.exec() == QDialog.Accepted:
-            image_data = dialog.get_image_data()
-            self._add_image_to_database(image_data)
-
-    def _add_image_to_database(self, image_data):
-        """Add an image to the database and refresh the gallery"""
-        try:
-            insert_user_image(self.db_manager, image_data)
-
-            # Show success message
-            QMessageBox.information(self, "Image Added",
-                                   f"Image successfully added to database.")
-
-            # Refresh the gallery data
-            self._refresh_gallery()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error",
-                               f"Failed to add image to database:\n{str(e)}")
-
     def _refresh_gallery(self):
         """Reload gallery data from database"""
         # Clear current data
@@ -2633,7 +2988,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             ext = os.path.splitext(file_path)[1].lower()
             if ext in self._SUPPORTED_DROP_EXTENSIONS:
                 event.acceptProposedAction()
-                self._show_add_image_dialog(file_path)
+                # Deferred: a dialog shown inside dropEvent keeps the source app's drag (e.g. Explorer) blocked
+                QTimer.singleShot(0, lambda: import_image(self, file_path))
 
     def closeEvent(self, event):
         """Handle window close - cleanup thread pool and cursor"""

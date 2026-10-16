@@ -32,37 +32,8 @@ logger = logging.getLogger(__name__)
 def add_session_image_to_gallery(parent, session, file_path=None):
     """Open the gallery's Add Image dialog pre-filled from the session (and
     the given file, e.g. a Siril stack), then save it. True if an image was added."""
-    from DSOGallery import AddImageDialog, insert_user_image
-
-    dialog = AddImageDialog(parent)
-    if file_path:
-        dialog.set_file_path(file_path)
-    dialog.prefill_from_session(session)
-    if dialog.exec() != QDialog.Accepted:
-        return False
-    try:
-        insert_user_image(DatabaseManager(), dialog.get_image_data())
-    except Exception as e:
-        logger.error(f"Error adding session image to gallery: {e}", exc_info=True)
-        QMessageBox.critical(parent, "Error", f"Failed to add the image to the gallery:\n{e}")
-        return False
-    _refresh_open_image_views()
-    QMessageBox.information(parent, "Image Added", "The image was added to your gallery.")
-    return True
-
-
-def _refresh_open_image_views():
-    """The main window's image counts and an open gallery don't watch the
-    database, so refresh whichever of them are open."""
-    for widget in QApplication.topLevelWidgets():
-        name = type(widget).__name__
-        try:
-            if name == "DSOGalleryWindow" and widget.isVisible():
-                widget._refresh_gallery()
-            elif name == "MainWindow":
-                widget._refresh_data()
-        except Exception as e:
-            logger.warning(f"Could not refresh {name} after adding an image: {e}")
+    from DSOGallery import import_image
+    return import_image(parent, file_path, session=session) is not None
 
 
 def _format_clock(seconds):

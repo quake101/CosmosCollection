@@ -262,7 +262,6 @@ class DSODetailWindow(QDialog):
     """
     Detail window for DSO objects with image support including FITS files.
     """
-    image_added = Signal()
 
     def __init__(self, data: dict, parent=None):
         super().__init__(None)
@@ -1174,112 +1173,40 @@ class DSODetailWindow(QDialog):
             QMessageBox.critical(self, "Error", f"Failed to save image information: {str(e)}")
 
     def _add_user_image(self, file_name=None):
-        """Add a user image for the object and all its designations.
+        """Add an image to this object with the Add Image dialog (file_name:
+        pre-selected, e.g. dropped), then show it."""
+        from DSOGallery import import_image
+        try:
+            with self.db_manager.get_connection() as conn:
+                row = conn.execute("""
+                    SELECT d.id
+                    FROM dsodetail d
+                    JOIN cataloguenr c ON d.id = c.dsodetailid
+                    WHERE c.catalogue = ? AND c.designation = ?
+                """, (self.data['catalogue'], self.data['id'])).fetchone()
+        except Exception as e:
+            logger.error(f"Error finding {self.data['name']} to add an image: {e}", exc_info=True)
+            row = None
+        if not row:
+            QMessageBox.critical(self, "Error",
+                                 f"Could not add image: no database entry was found for {self.data['name']}.")
+            return
 
-        Args:
-            file_name: Pre-selected image path (e.g. from drag-and-drop). If not
-                given, prompts the user with a file picker.
-        """
-        # Get the image file
-        if not file_name:
-            file_name, _ = QFileDialog.getOpenFileName(
-                self,
-                f"Select Image for {self.data['name']}",
-                os.path.expanduser("~"),  # Start in user's home directory
-                "Image Files (*.png *.jpg *.jpeg *.tif *.tiff *.fits *.fit *.fts *.xisf);;Regular Images (*.png *.jpg *.jpeg *.tif *.tiff);;FITS Files (*.fits *.fit *.fts);;XISF Files (*.xisf);;All Files (*)"
-            )
-
-        if file_name:
-            try:
-                # Store in database using DatabaseManager
-                with self.db_manager.get_connection() as conn:
-                    cursor = conn.cursor()
-
-                    # Get the dsodetailid for this object
-                    cursor.execute("""
-                        SELECT d.id
-                        FROM dsodetail d
-                        JOIN cataloguenr c ON d.id = c.dsodetailid
-                        WHERE c.catalogue = ? AND c.designation = ?
-                    """, (self.data['catalogue'], self.data['id']))
-                    result = cursor.fetchone()
-
-                    if result:
-                        dsodetailid = result[0]
-
-                        # Get all designations for this object
-                        cursor.execute("""
-                            SELECT c.catalogue, c.designation
-                            FROM cataloguenr c
-                            WHERE c.dsodetailid = ?
-                        """, (dsodetailid,))
-                        all_designations = cursor.fetchall()
-
-                        logger.debug(f"Found {len(all_designations)} designations for this object")
-
-                        # Insert new image record with blank metadata (user will fill in after)
-                        cursor.execute("""
-                            INSERT INTO userimages (
-                                dsodetailid, image_path, integration_time,
-                                equipment, date_taken, notes, created_date
-                            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-                        """, (
-                            dsodetailid, file_name,
-                            '',  # Blank integration time
-                            '',  # Blank equipment
-                            '',  # Blank date
-                            ''   # Blank notes
-                        ))
-
-                        # Get the ID of the newly inserted image
-                        new_image_id = cursor.lastrowid
-
-                        # Log all designations that will share this image
-                        for catalogue, designation in all_designations:
-                            logger.debug(f"Image will be available for {catalogue} {designation}")
-
-                        conn.commit()
-
-                        # Reload all user images to get the updated list
-                        self._load_user_images()
-
-                        # Navigate to the newly added image (it will be the last one)
-                        if self.user_images:
-                            # Find the index of the newly added image
-                            for i, img in enumerate(self.user_images):
-                                if img['id'] == new_image_id:
-                                    # Show loading state
-                                    self.image_label.setText("Loading image...")
-                                    themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
-
-                                    self.current_image_index = i
-                                    self._load_user_image(img['image_path'])
-                                    self._load_current_image_info()
-                                    self._update_image_navigation()
-                                    break
-
-                        # Show the image information form
-                        self.info_form_container.setVisible(True)
-
-                        logger.debug(f"Successfully added user image for {len(all_designations)} designations")
-
-                        # Emit signal to notify that an image was added
-                        self.image_added.emit()
-
-                        QMessageBox.information(
-                            self, "Image Added",
-                            f"{os.path.basename(file_name)} was successfully added to {self.data['name']}."
-                        )
-                    else:
-                        logger.error(f"Could not find dsodetailid for {self.data['name']}")
-                        QMessageBox.critical(
-                            self, "Error",
-                            f"Could not add image: no database entry was found for {self.data['name']}."
-                        )
-
-            except Exception as e:
-                logger.error(f"Error adding user image: {str(e)}", exc_info=True)
-                QMessageBox.critical(self, "Error", f"Failed to add image: {str(e)}")
+        new_image_id = import_image(self, file_name or None, dsodetailid=row[0])
+        if new_image_id is None:
+            return
+        # Show the new image (it may have been added to another object instead)
+        self._load_user_images()
+        for i, img in enumerate(self.user_images):
+            if img['id'] == new_image_id:
+                self.image_label.setText("Loading image...")
+                themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
+                self.current_image_index = i
+                self._load_user_image(img['image_path'])
+                self._load_current_image_info()
+                self._update_image_navigation()
+                self.info_form_container.setVisible(True)
+                break
 
     def _load_user_image(self, image_path):
         """Load and display a user image with caching (supports FITS files) - async version"""
@@ -2116,4 +2043,5 @@ class DSODetailWindow(QDialog):
             ext = os.path.splitext(file_path)[1].lower()
             if ext in SUPPORTED_IMAGE_EXTENSIONS:
                 event.acceptProposedAction()
-                self._add_user_image(file_path)
+                # Deferred: a dialog shown inside dropEvent keeps the source app's drag (e.g. Explorer) blocked
+                QTimer.singleShot(0, lambda: self._add_user_image(file_path))

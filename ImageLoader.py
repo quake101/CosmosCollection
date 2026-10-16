@@ -14,8 +14,8 @@ import logging
 import threading
 
 import numpy as np
-from PySide6.QtCore import Qt, QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QImage, QImageReader, QPixmap
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage, QImageReader, QPixmap, QTransform
 
 logger = logging.getLogger(__name__)
 
@@ -144,10 +144,41 @@ def load_astro_qimage(file_path):
     return None if qimage.isNull() else qimage
 
 
+# Never hand Qt's image readers/writers a QIODevice made in Python (a QBuffer,
+# say) on a worker thread: Qt holds its image-format plugin lock while it
+# looks at the device, and a Python-made device takes the GIL to answer - so
+# a main thread holding the GIL while loading any image (an icon, a pixmap)
+# deadlocks the app. QImage.fromData() and file paths use devices Qt makes.
+
+# EXIF orientation -> (clockwise rotation, then horizontal/vertical flip)
+_EXIF_ORIENTATIONS = {2: (0, -1, 1), 3: (180, 1, 1), 4: (0, 1, -1), 5: (90, -1, 1),
+                      6: (90, 1, 1), 7: (90, 1, -1), 8: (270, 1, 1)}
+
+
+def _exif_orientation(data):
+    """The EXIF orientation (1-8) in an image file's bytes - 1 if none. Pillow
+    only reads the header for this."""
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as image:
+            return int(image.getexif().get(0x0112, 1))
+    except Exception:
+        return 1
+
+
+def _apply_orientation(qimage, orientation):
+    rotation, flip_x, flip_y = _EXIF_ORIENTATIONS.get(orientation, (0, 1, 1))
+    if rotation:
+        qimage = qimage.transformed(QTransform().rotate(rotation))
+    if flip_x < 0 or flip_y < 0:
+        qimage = qimage.transformed(QTransform().scale(flip_x, flip_y))
+    return qimage
+
+
 def read_image_file(file_path, max_dim=None, auto_transform=True):
     """Decode a standard image file (PNG, JPEG, TIFF...) into a QImage, scaled
-    to fit max_dim if given - decoded straight at that size where the format
-    allows (JPEG). auto_transform applies the EXIF orientation.
+    to fit max_dim if given. auto_transform applies the EXIF orientation.
 
     The whole file is read in one go first: Qt's readers fetch a file in many
     small pieces, which took about 10x as long from a network drive. Safe to
@@ -155,52 +186,56 @@ def read_image_file(file_path, max_dim=None, auto_transform=True):
     """
     try:
         with open(file_path, 'rb') as f:
-            data = QByteArray(f.read())
+            data = f.read()
     except OSError as e:
         return None, f"Couldn't read the file: {e.strerror or e}"
-    if data.isEmpty():
+    if not data:
         return None, "Empty file"
 
-    buffer = QBuffer()
-    buffer.setData(data)
-    del data
-    buffer.open(QIODevice.ReadOnly)
     # Like reading from the path: the format the extension names, then
     # whatever the content looks like (a PNG named .jpg, say)
-    suffix = os.path.splitext(file_path)[1].lstrip('.').lower().encode()
+    suffix = os.path.splitext(file_path)[1].lstrip('.').lower()
+    qimage = QImage()
     with QT_IMAGE_IO_LOCK:
         QImageReader.setAllocationLimit(1024)  # MB - large stacked images exceed Qt's default
-        for image_format in (suffix, b""):
-            buffer.seek(0)
-            reader = QImageReader(buffer, image_format)
-            reader.setAutoTransform(auto_transform)
-            if max_dim:
-                size = reader.size()
-                if size.isValid() and max(size.width(), size.height()) > max_dim:
-                    reader.setScaledSize(size.scaled(max_dim, max_dim, Qt.KeepAspectRatio))
-            qimage = reader.read()
+        for image_format in (suffix, None):
+            qimage = QImage.fromData(data, image_format) if image_format else QImage.fromData(data)
             if not qimage.isNull():
-                return qimage, None
-            error = reader.errorString()
-    return None, error or "Unknown error"
+                break
+    if qimage.isNull():
+        return None, "Unsupported or damaged image file"
+    if auto_transform:
+        qimage = _apply_orientation(qimage, _exif_orientation(data))
+    if max_dim and max(qimage.width(), qimage.height()) > max_dim:
+        qimage = qimage.scaled(max_dim, max_dim, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return qimage, None
 
 
 def write_image_file(image, file_path, image_format, quality=-1):
-    """Encode a QImage and write it to file_path - encoded in memory, then
-    written in one go, since Qt writes a file in small pieces too. Safe to
-    call from a worker thread. Returns True on success."""
-    buffer = QBuffer()
-    buffer.open(QIODevice.WriteOnly)
-    with QT_IMAGE_IO_LOCK:
-        ok = image.save(buffer, image_format, quality)
-    if not ok:
-        return False
+    """Encode a QImage and write it to file_path - encoded into a local temp
+    file, then written in one go, since Qt writes a file in small pieces too
+    (slow on a network drive). Safe to call from a worker thread. Returns
+    True on success."""
+    import tempfile
+    handle, temp_path = tempfile.mkstemp(suffix=f".{image_format.lower()}")
+    os.close(handle)
     try:
+        with QT_IMAGE_IO_LOCK:
+            ok = image.save(temp_path, image_format, quality)
+        if not ok:
+            return False
+        with open(temp_path, 'rb') as source:
+            encoded = source.read()
         with open(file_path, 'wb') as f:
-            f.write(buffer.data().data())
+            f.write(encoded)
     except OSError as e:
         logger.warning(f"Could not write {file_path}: {e}")
         return False
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
     return True
 
 
