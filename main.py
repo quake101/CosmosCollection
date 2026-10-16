@@ -53,7 +53,7 @@ os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
 
 # Core PySide6 imports (always needed)
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings, Slot, QCoreApplication, QPointF, QRectF, QSize
-from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush, QAction, QKeySequence
+from PySide6.QtGui import QPixmap, QPainter, QIcon, QColor, QBrush, QAction, QKeySequence, QCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableView,
     QVBoxLayout, QWidget, QLabel, QDialog,
@@ -4185,8 +4185,18 @@ class AboutDialog(QDialog):
         link_label = QLabel(
             f'<a href="https://github.com/quake101/CosmosCollection" style="color: {COLORS["link"]};">Visit GitHub Repository</a>'
             f' &nbsp;·&nbsp; '
-            f'<a href="https://github.com/sponsors/quake101" style="color: {COLORS["link"]};">Sponsor on GitHub &#9829;</a>')
-        link_label.setToolTip("Sponsoring helps keep Cosmos Collection going")
+            f'<a href="https://github.com/sponsors/quake101" style="color: {COLORS["link"]};">Sponsor on GitHub &#9829;</a>'
+            f' &nbsp;·&nbsp; '
+            f'<a href="https://buymeacoffee.com/quake101" style="color: {COLORS["link"]};">Buy me a Beer? &#127866;</a>')
+        # QLabel has no per-anchor tooltips, so show one for whichever link is hovered
+        link_tooltips = {
+            "https://github.com/quake101/CosmosCollection": "View the source code, report issues and request features",
+            "https://github.com/sponsors/quake101": "Sponsoring helps keep Cosmos Collection going",
+            "https://buymeacoffee.com/quake101": "Send a one-time thank-you to support development",
+        }
+        link_label.linkHovered.connect(
+            lambda url: QToolTip.showText(QCursor.pos(), link_tooltips.get(url, ""), link_label)
+            if url else QToolTip.hideText())
         link_label.setAlignment(Qt.AlignCenter)
         link_label.setOpenExternalLinks(True)
         link_label.setTextFormat(Qt.RichText)
