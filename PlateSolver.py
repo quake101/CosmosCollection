@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Plate Solver Module for Cosmos Collection
-Provides plate solving functionality using ASTAP (local) or Astrometry.net API (online)
+Provides plate solving with the built-in solver (NativePlateSolver - online star catalog),
+ASTAP (local) or the Astrometry.net API (online)
 """
 
 import os
@@ -107,7 +108,7 @@ class PlateSolveResult:
         self.rotation = None  # Rotation angle in degrees
         self.pixel_scale = None  # arcsec/pixel
         self.wcs_header = None  # WCS header dict
-        self.solver_used = None  # 'ASTAP' or 'astrometry.net'
+        self.solver_used = None  # 'Built-in', 'ASTAP' or 'astrometry.net'
         self.error_message = None
 
     def __repr__(self):
@@ -116,65 +117,150 @@ class PlateSolveResult:
         return f"PlateSolveResult(failed: {self.error_message})"
 
 
+# The solvers, in the order tried by default - the "plate_solver_order"
+# setting reorders them (and can leave the built-in one out)
+SOLVER_NAMES = {"builtin": "Built-in", "astap": "ASTAP", "astrometry": "Astrometry.net"}
+DEFAULT_SOLVER_ORDER = ("builtin", "astap", "astrometry")
+SOLVER_ORDERS = (("builtin,astap,astrometry", "Built-in, then ASTAP, then astrometry.net"),
+                 ("astap,builtin,astrometry", "ASTAP, then built-in, then astrometry.net"),
+                 ("astap,astrometry", "ASTAP, then astrometry.net (no built-in solver)"))
+
+
+def describe_solving():
+    """How images will be plate solved, in a sentence - for confirmations."""
+    notes = {"builtin": "the built-in solver (online star catalog, seconds each)",
+             "astap": "ASTAP (if installed, seconds each)",
+             "astrometry": "astrometry.net (online, with an API key - can take minutes each)"}
+    steps = [notes[name] for name in solver_order()]
+    return f"This runs in the background with {', then '.join(steps)}."
+
+
+def solver_order():
+    """The solvers to try, in order: some of "builtin", "astap", "astrometry"."""
+    try:
+        from PySide6.QtCore import QSettings
+        value = QSettings("CosmosCollection", "CosmosCollection").value("plate_solver_order", "", type=str)
+    except Exception:
+        value = ""
+    order = [name for name in value.split(",") if name in SOLVER_NAMES]
+    return order or list(DEFAULT_SOLVER_ORDER)
+
+
 class PlateSolverWorker(QThread):
-    """Background worker for plate solving"""
+    """Background worker for plate solving: tries each solver in turn
+    (solver_order()) until one solves the image."""
 
     solve_finished = Signal(object)  # Emits PlateSolveResult
     progress = Signal(str)  # Progress messages
 
-    def __init__(self, image_path: str, hints: Dict[str, Any] = None):
+    def __init__(self, image_path: str, hints: Dict[str, Any] = None, fresh: bool = False):
+        """hints: {"ra", "dec"} (degrees) of the image's object - the built-in
+        solver needs them - plus optional "radius" (degrees, ASTAP's search)
+        and "scale" (arcsec/pixel). fresh: solve again even if the image has a
+        saved solution, and replace it."""
         super().__init__()
         self.image_path = image_path
         self.hints = hints or {}
+        self.fresh = fresh
         self._cancelled = False
 
     def cancel(self):
         self._cancelled = True
 
-    def run(self):
-        """Run plate solving in background"""
-        solver = PlateSolver()
-        astap_error = None
+    def _save_solution(self, result):
+        """Save a solution next to the image (.wcs) if the solver didn't (ASTAP
+        does; the others don't), so every window finds it next time."""
+        if not (result.success and result.wcs_header) or result.solver_used == 'ASTAP':
+            return
+        from AnnotationOverlay import read_wcs_header, write_wcs_file
+        try:
+            if self.fresh or read_wcs_header(self.image_path) is None:
+                write_wcs_file(self.image_path, result.wcs_header)
+        except OSError as e:
+            logger.warning(f"Could not save the plate solve for {self.image_path}: {e}")
 
-        # Try ASTAP first
-        self.progress.emit("Checking for ASTAP solver...")
-        if solver.is_astap_available():
-            self.progress.emit("Solving with ASTAP...")
-            result = solver.solve_with_astap(self.image_path, self.hints)
+    def _solve_builtin(self):
+        """The built-in solver's result - None if it can't be used (no position hint)."""
+        if self.hints.get('ra') is None or self.hints.get('dec') is None:
+            return None
+        result = PlateSolveResult()
+        result.solver_used = 'Built-in'
+        from NativePlateSolver import solve, SolveFailed
+        self.progress.emit("Solving with the built-in solver...")
+        try:
+            header, info = solve(self.image_path, self.hints['ra'], self.hints['dec'],
+                                 scale=self.hints.get('scale'),
+                                 progress=lambda message: self.progress.emit(f"Built-in solver: {message}"),
+                                 cancelled=lambda: self._cancelled)
+        except SolveFailed as e:
+            result.error_message = str(e)
+            return result
+        except Exception as e:
+            logger.exception("Built-in plate solve failed")
+            result.error_message = f"Unexpected error: {e}"
+            return result
+        result.success = True
+        result.wcs_header = header
+        result.ra_center, result.dec_center = header['CRVAL1'], header['CRVAL2']
+        result.pixel_scale = info['scale']
+        return result
+
+    def run(self):
+        """Run plate solving in background. Always reports a result - the
+        plate solve queue waits for it before solving the next image."""
+        try:
+            self._run_solvers()
+        except Exception as e:
+            logger.exception(f"Plate solving {self.image_path} failed")
+            failed = PlateSolveResult()
+            failed.error_message = f"Unexpected error: {e}"
+            self.solve_finished.emit(failed)
+
+    def _run_solvers(self):
+        solver = PlateSolver()
+        errors = []
+        result = None
+        for name in solver_order():
+            if self._cancelled:
+                errors.append("Cancelled")
+                break
+            try:
+                if name == "builtin":
+                    result = self._solve_builtin()
+                    if result is None:
+                        errors.append("Built-in: needs the image's object (its position) to search near")
+                        continue
+                elif name == "astap":
+                    if not solver.is_astap_available():
+                        errors.append("ASTAP: not installed or not found")
+                        continue
+                    self.progress.emit("Solving with ASTAP...")
+                    result = solver.solve_with_astap(self.image_path, self.hints, use_saved=not self.fresh)
+                else:
+                    # Online - only with a usable API key
+                    key_problem = solver.astrometry_key_problem()
+                    if key_problem:
+                        logger.info(f"Skipping astrometry.net: {key_problem}")
+                        errors.append(f"Astrometry.net: {key_problem}")
+                        continue
+                    self.progress.emit("Solving with Astrometry.net (this may take a few minutes)...")
+                    result = solver.solve_with_astrometry_net(self.image_path, self.hints)
+            except Exception as e:
+                # One solver failing unexpectedly doesn't stop the others
+                logger.exception(f"{SOLVER_NAMES[name]} plate solve of {self.image_path} failed")
+                result = PlateSolveResult()
+                result.error_message = f"Unexpected error: {e}"
             if result.success:
+                self._save_solution(result)
                 self.solve_finished.emit(result)
                 return
-            astap_error = result.error_message
-            self.progress.emit(f"ASTAP failed: {astap_error}")
-        else:
-            astap_error = "ASTAP not installed or not found"
-            self.progress.emit("ASTAP not found, trying online solver...")
+            errors.append(f"{SOLVER_NAMES[name]}: {result.error_message or 'No solution'}")
+            self.progress.emit(f"{SOLVER_NAMES[name]} failed: {result.error_message or 'no solution'}")
 
-        if self._cancelled:
-            result = PlateSolveResult()
-            result.error_message = "Cancelled"
-            self.solve_finished.emit(result)
-            return
-
-        # Fall back to astrometry.net - only with a usable API key
-        key_problem = solver.astrometry_key_problem()
-        if key_problem:
-            result = PlateSolveResult()
-            result.solver_used = 'astrometry.net'
-            result.error_message = f"ASTAP: {astap_error}\n\nAstrometry.net: {key_problem}"
-            logger.info(f"Skipping astrometry.net: {key_problem}")
-            self.solve_finished.emit(result)
-            return
-
-        self.progress.emit("Solving with Astrometry.net (this may take a few minutes)...")
-        result = solver.solve_with_astrometry_net(self.image_path, self.hints)
-
-        # If astrometry.net also failed, include both error messages
-        if not result.success and astap_error:
-            astrometry_error = result.error_message
-            result.error_message = f"ASTAP: {astap_error}\n\nAstrometry.net: {astrometry_error}"
-
-        self.solve_finished.emit(result)
+        failed = PlateSolveResult()
+        failed.solver_used = result.solver_used if result is not None else None
+        failed.error_message = "\n\n".join(errors) or "No plate solver is available"
+        self.solve_finished.emit(failed)
 
 
 class PlateSolver:
@@ -294,13 +380,15 @@ class PlateSolver:
         """Check if ASTAP is available"""
         return self.astap_path is not None
 
-    def solve_with_astap(self, image_path: str, hints: Dict[str, Any] = None) -> PlateSolveResult:
+    def solve_with_astap(self, image_path: str, hints: Dict[str, Any] = None,
+                         use_saved: bool = True) -> PlateSolveResult:
         """
         Solve image using ASTAP
 
         Args:
             image_path: Path to image file
             hints: Optional dict with 'ra', 'dec', 'radius' (search radius in degrees)
+            use_saved: return the image's saved .wcs solution, if it has one, without solving
 
         Returns:
             PlateSolveResult
@@ -310,7 +398,7 @@ class PlateSolver:
 
         # Check for existing WCS file first (cached solution)
         wcs_file = Path(image_path).with_suffix('.wcs')
-        if wcs_file.exists():
+        if use_saved and wcs_file.exists():
             logger.info(f"Found existing WCS file: {wcs_file}")
             result.wcs_header = self._parse_wcs_file(wcs_file)
             if result.wcs_header and result.wcs_header.get('CRVAL1') is not None:
@@ -400,8 +488,10 @@ class PlateSolver:
                 # line of the .ini it writes, which would otherwise be left behind
                 error_detail = self._read_astap_ini_error(ini_file)
                 if not error_detail:
-                    error_detail = (process.stderr.strip() or process.stdout.strip()
-                                    or f"No solution (exit code {process.returncode})")
+                    # The end of its log says why ("...,29d,30d,No solution found!")
+                    output = (process.stderr.strip() or process.stdout.strip()).splitlines()
+                    error_detail = (output[-1].split(",")[-1].strip() if output
+                                    else f"No solution (exit code {process.returncode})")
                 result.error_message = f"ASTAP solve failed: {error_detail}"
                 logger.warning(f"ASTAP failed - no WCS file produced. Error: {error_detail}")
                 try:

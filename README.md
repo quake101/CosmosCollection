@@ -10,7 +10,7 @@ A personal astrophotography catalog and session planning tools for organizing an
 - **Image Catalog**: Organize your astrophotography images by object, with equipment, integration time, dates and notes.
 - **Image Gallery & Viewer**: Browse all your images with filters; view them with plate-solved annotations.
 - **Collage Builder**: Arrange your images on a canvas, or start from suggestions like a Messier poster.
-- **Plate Solving**: Solve your images with ASTAP or astrometry.net to show annotations in the viewer and collages.
+- **Plate Solving**: Solve your images with the built-in solver (nothing to install), ASTAP or astrometry.net to show annotations in the gallery, viewer, collages and NINA live stack.
 
 **Planning**
 - **DSO Detail**: Everything about an object in one place: your images, visibility, and links to the other tools.
@@ -111,3 +111,5 @@ This is a personal project, developed as a rolling release. Contributions are we
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+The built-in plate solver's star-pattern matching follows [twirl](https://github.com/lgrcia/twirl) by Lionel Garcia (MIT), with reference stars from [Gaia DR3](https://www.cosmos.esa.int/gaia) and [Tycho-2](https://cdsarc.cds.unistra.fr/viz-bin/cat/I/259) through [VizieR](https://vizier.cds.unistra.fr/).

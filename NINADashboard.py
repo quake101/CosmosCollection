@@ -38,6 +38,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QIcon, QColor
 
 from NINAIntegration import NINAIntegration
+from AnnotationOverlay import (AnnotationData, WCSTransform, paint_annotations, saved_annotation_layers,
+                               screen_name_px, stars_in_view)
 from WindowPositionManager import WindowPositionMixin
 from Theme import (
     COLORS, adapt_color, chart_background, chart_color, chart_font_size, font_px, theme_manager,
@@ -346,7 +348,7 @@ class ZoomableImageWidget(QWidget):
         self._pan_offset = QPointF(0, 0)
         self._last_mouse_pos = None
         self._placeholder_text = placeholder_text
-        self._overlay = None  # AnnotationRenderer drawn over the image, in image pixels
+        self._overlay = None  # (AnnotationData, layers) drawn over the image
 
         self.setMinimumSize(200, 150)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -370,9 +372,10 @@ class ZoomableImageWidget(QWidget):
         """Size of the displayed image (QSize; empty when there's none)."""
         return self._pixmap.size() if self._pixmap and not self._pixmap.isNull() else QSize()
 
-    def setOverlay(self, renderer):
-        """Draw an AnnotationRenderer over the image (None to remove it)."""
-        self._overlay = renderer
+    def setOverlay(self, data, layers=None):
+        """Draw annotations over the image: AnnotationData (solved for this
+        image, at any size) and the layers to show. None removes them."""
+        self._overlay = (data, layers or {}) if data is not None else None
         self.update()
 
     def _reset_view(self):
@@ -422,11 +425,10 @@ class ZoomableImageWidget(QWidget):
         painter.drawPixmap(target_rect, self._pixmap, source_rect)
 
         # Annotations follow the image's zoom and pan
-        if self._overlay is not None and self._overlay.wcs is not None:
-            painter.save()
-            painter.setClipRect(target_rect)  # No labels for objects just outside the frame
-            self._overlay.render(painter, effective_zoom, x, y)
-            painter.restore()
+        if self._overlay is not None:
+            data, layers = self._overlay
+            paint_annotations(painter, data, layers, self._pixmap.width(), source_rect, target_rect,
+                              font_px=screen_name_px(target_rect))
 
         # Draw zoom indicator if zoomed
         if self._zoom != 1.0:
@@ -2299,7 +2301,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self.livestack_annotations_check.setToolTip(
             "Label stars, deep-sky objects and the coordinate grid on the live stack.\n"
             "NINA plate-solves the stack's first frame once per stack.\n"
-            "Which layers show is set in the image viewer's Annotations dialog.")
+            "Which layers show is set with the Image Viewer's Layers menu.")
         self.livestack_annotations_check.toggled.connect(self._on_livestack_annotations_toggled)
         selection_layout.addWidget(self.livestack_annotations_check)
         self.livestack_annotations_status = QLabel("")
@@ -2350,7 +2352,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._ls_annot_count = None
         self._ls_annot_solution = None
         self._ls_annot_solving = False
-        self._ls_annot_renderer = None
+        self._ls_annot_data = None          # AnnotationData for the displayed stack
+        self._ls_annot_star_lookup = None   # The AnnotationData whose stars are being looked up
 
         self.livestack_label = ZoomableImageWidget(placeholder_text="Live stack not active")
         livestack_layout.addWidget(self.livestack_label, 1)
@@ -3697,11 +3700,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.livestack_label.setOverlay(None)
             self.livestack_annotations_status.setText("")
             return
-        if self._ls_annot_renderer is not None:
-            self._apply_livestack_annotation_layers()
+        if self._ls_annot_data is not None:
             self._sync_livestack_annotation_wcs()
-            self.livestack_label.setOverlay(self._ls_annot_renderer)
-            self._show_livestack_annotation_count()
+            self._show_livestack_annotations()
         elif self._ls_annot_key is not None:
             self._start_livestack_solve()
         else:
@@ -3712,7 +3713,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._ls_annot_key = None
         self._ls_annot_count = None
         self._ls_annot_solution = None
-        self._ls_annot_renderer = None
+        self._ls_annot_data = None
         self.livestack_label.setOverlay(None)
         if self.livestack_annotations_check.isChecked():
             self.livestack_annotations_status.setText("Waiting for the live stack")
@@ -3736,8 +3737,9 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
         if not self.livestack_annotations_check.isChecked():
             return
-        if self._ls_annot_renderer is not None:
+        if self._ls_annot_data is not None:
             self._sync_livestack_annotation_wcs()  # The stack image may have changed size
+            self._show_livestack_annotations()     # ...and the layers may have changed
         elif not self._ls_annot_solving and self._ls_annot_count:
             self._start_livestack_solve()
 
@@ -3769,7 +3771,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._run_in_background(solve, self._on_livestack_solved)
 
     def _on_livestack_solved(self, result):
-        """Set up the annotations from NINA's plate solve and look up the objects in view."""
+        """Look up the objects in view of NINA's plate solve."""
         key, solution, error = result
         self._ls_annot_solving = False
         if key != self._ls_annot_key:
@@ -3781,67 +3783,87 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.livestack_annotations_status.setText(f"Plate solve failed: {error}")
             return
 
-        from AnnotationOverlay import AnnotationRenderer, CatalogQueryWorker
-        self._ls_annot_solution = solution
-        renderer = AnnotationRenderer()
-        self._ls_annot_renderer = renderer
-        self._apply_livestack_annotation_layers()
-        if not self._sync_livestack_annotation_wcs():
+        size = self.livestack_label.pixmapSize()
+        width, height = size.width(), size.height()
+        header = nina_solution_to_wcs_header(solution, width, height) if not size.isEmpty() else None
+        if header is None:
             self.livestack_annotations_status.setText("Plate solve result incomplete")
-            self._ls_annot_renderer = None
             return
-
+        self._ls_annot_solution = solution
         self.livestack_annotations_status.setText("Looking up objects...")
-        worker = CatalogQueryWorker(renderer.wcs, magnitude_limit=8.0)
-        # (CatalogQueryWorker's finished(stars, dsos) replaces QThread.finished)
-        worker.finished.connect(
-            lambda stars, dsos: self._on_livestack_catalog_done(worker, renderer, stars, dsos))
-        _running_threads.add(worker)  # Outlives the window if it's closed meanwhile
-        worker.start()
 
-    def _on_livestack_catalog_done(self, worker, renderer, stars, dsos):
-        """Show the annotations once the catalog lookup finishes."""
-        # finished is emitted as run() ends; let the thread exit before dropping it
-        worker.wait(2000)
-        _running_threads.discard(worker)
-        if renderer is not self._ls_annot_renderer:
+        def look_up():
+            try:
+                return solution, AnnotationData.from_header(header, width, height), ""
+            except Exception as e:
+                logger.warning(f"Live stack object lookup failed: {e}")
+                return solution, None, str(e)
+
+        self._run_in_background(look_up, self._on_livestack_lookup_done)
+
+    def _on_livestack_lookup_done(self, result):
+        """Show the annotations once the objects in view are known."""
+        solution, data, error = result
+        if solution is not self._ls_annot_solution:
             return  # A newer solve replaced it
-        renderer.set_objects(stars, dsos)
+        if data is None:
+            self.livestack_annotations_status.setText(f"Couldn't look up objects: {error}")
+            return
+        self._ls_annot_data = data
+        self._sync_livestack_annotation_wcs()
         if self.livestack_annotations_check.isChecked():
-            self.livestack_label.setOverlay(renderer)
-            self._show_livestack_annotation_count()
+            self._show_livestack_annotations()
 
-    def _show_livestack_annotation_count(self):
-        renderer = self._ls_annot_renderer
-        if renderer is not None:
-            self.livestack_annotations_status.setText(
-                f"{len(renderer.dsos)} objects, {len(renderer.stars)} stars")
+    def _show_livestack_annotations(self):
+        """Draw the annotations with the layers chosen in the Image Viewer's
+        Layers menu, looking up stars (online) when they're wanted."""
+        data = self._ls_annot_data
+        if data is None:
+            return
+        layers = saved_annotation_layers()
+        self.livestack_label.setOverlay(data, layers)
+        count = len(data.dsos)
+        text = f"{count} object{'s' if count != 1 else ''}"
+        need_stars = layers["stars"] and data.stars is None
+        if need_stars:
+            text += ", looking up stars..."
+        elif layers["stars"]:
+            text += f", {len(data.stars)} star{'s' if len(data.stars) != 1 else ''}"
+        self.livestack_annotations_status.setText(text)
+        if need_stars:
+            self._look_up_livestack_stars(data)
+
+    def _look_up_livestack_stars(self, data):
+        if self._ls_annot_star_lookup is data:
+            return  # Already looking
+        self._ls_annot_star_lookup = data
+        wcs, width, height = data.wcs, data.width, data.height
+        self._run_in_background(lambda: (data, stars_in_view(wcs, width, height)), self._on_livestack_stars)
+
+    def _on_livestack_stars(self, result):
+        data, stars = result
+        data.stars = stars or []  # None: SIMBAD couldn't be reached
+        if self._ls_annot_star_lookup is data:
+            self._ls_annot_star_lookup = None
+        if data is self._ls_annot_data and self.livestack_annotations_check.isChecked():
+            self._show_livestack_annotations()
 
     def _sync_livestack_annotation_wcs(self):
         """Fit the plate solution to the displayed stack image's size."""
-        renderer, solution = self._ls_annot_renderer, self._ls_annot_solution
+        data, solution = self._ls_annot_data, self._ls_annot_solution
         size = self.livestack_label.pixmapSize()
-        if renderer is None or solution is None or size.isEmpty():
+        if data is None or solution is None or size.isEmpty():
             return False
-        if renderer.wcs is not None and (renderer.wcs.width, renderer.wcs.height) == (size.width(), size.height()):
+        if (data.width, data.height) == (size.width(), size.height()):
             return True
         header = nina_solution_to_wcs_header(solution, size.width(), size.height())
         if header is None:
             return False
-        renderer.set_wcs(header, size.width(), size.height())
+        # The objects are where they were on the sky - only the mapping to pixels changes
+        data.wcs = WCSTransform(header, size.width(), size.height())
+        data.width, data.height = size.width(), size.height()
         self.livestack_label.update()
         return True
-
-    def _apply_livestack_annotation_layers(self):
-        """Use the layers chosen in the image viewer's Annotations dialog."""
-        renderer = self._ls_annot_renderer
-        if renderer is None:
-            return
-        settings = QSettings("CosmosCollection", "CosmosCollection")
-        renderer.show_dsos = settings.value("annotation_show_dsos", True, type=bool)
-        renderer.show_stars = settings.value("annotation_show_stars", True, type=bool)
-        renderer.show_constellation_lines = settings.value("annotation_show_constellations", True, type=bool)
-        renderer.show_grid = settings.value("annotation_show_grid", True, type=bool)
 
     def _update_livestack_combos(self, available_stacks, status):
         """Update the livestack target and filter comboboxes."""

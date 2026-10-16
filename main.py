@@ -616,8 +616,10 @@ class SimbadQueryWorker(QThread):
             )
 
             # Try to query by identifier
+            from OnlineLimits import online_request
             try:
-                result = custom_simbad.query_object(self.search_term)
+                with online_request("simbad"):
+                    result = custom_simbad.query_object(self.search_term)
             except Exception as query_error:
                 # PyInstaller builds have hit certificate-chain failures here. Retry
                 # unverified on this Simbad instance's session only - never patch
@@ -626,7 +628,8 @@ class SimbadQueryWorker(QThread):
                     raise
                 logger.warning(f"SIMBAD SSL verification failed ({query_error}); retrying without verification")
                 self._disable_session_verification(custom_simbad._session)
-                result = custom_simbad.query_object(self.search_term)
+                with online_request("simbad"):
+                    result = custom_simbad.query_object(self.search_term)
 
             if result is None or len(result) == 0:
                 logger.debug(f"No SIMBAD data found for {self.search_term}")
@@ -1316,7 +1319,7 @@ class SettingsDialog(QDialog):
 
         self.integrations_list = QListWidget()
         self.integrations_list.setMinimumWidth(180)
-        self.integrations_list.addItems(["NINA", "ASTAP", "Astrometry.net", "PixInsight", "Siril",
+        self.integrations_list.addItems(["NINA", "Plate Solving", "ASTAP", "Astrometry.net", "PixInsight", "Siril",
                                          "OpenWeather", "VisualCrossing", "WeatherAPI"])
         integrations_left_layout.addWidget(self.integrations_list)
         integrations_layout.addWidget(integrations_left_panel)
@@ -1395,6 +1398,42 @@ class SettingsDialog(QDialog):
 
         nina_layout.addStretch()
         self.integrations_stack.addWidget(nina_page)
+
+        # Plate solving page - which solvers are tried, in what order
+        from PlateSolver import SOLVER_ORDERS
+        solving_page = QWidget()
+        solving_page_layout = QVBoxLayout(solving_page)
+
+        solving_title = QLabel("Plate Solving")
+        themed_style(solving_title, lambda: f"font-weight: bold; font-size: {font_size(11)};")
+        solving_page_layout.addWidget(solving_title)
+
+        solver_order_layout = QHBoxLayout()
+        solver_order_label = QLabel("Try solvers:")
+        solver_order_label.setMinimumWidth(120)
+        self.solver_order_combo = QComboBox()
+        for value, label in SOLVER_ORDERS:
+            self.solver_order_combo.addItem(label, value)
+        solver_order_layout.addWidget(solver_order_label)
+        solver_order_layout.addWidget(self.solver_order_combo)
+        solver_order_layout.addStretch()
+        solving_page_layout.addLayout(solver_order_layout)
+
+        solving_help = QLabel(
+            "Plate solving finds where an image is in the sky, so its objects can be annotated. "
+            "Each solver is tried in turn until one solves the image.<br><br>"
+            "<b>Built-in</b> needs nothing installed: it matches the image's stars with an online star "
+            "catalog (Gaia, or Tycho-2 for wide fields) near the image's object. Usually seconds.<br>"
+            "<b>ASTAP</b> works offline once installed (see its page), and doesn't need to know the object.<br>"
+            "<b>Astrometry.net</b> is online and needs a free API key (see its page). It can take minutes."
+        )
+        solving_help.setWordWrap(True)
+        solving_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        themed_style(solving_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; margin-left: 120px; }}")
+        solving_page_layout.addWidget(solving_help)
+
+        solving_page_layout.addStretch()
+        self.integrations_stack.addWidget(solving_page)
 
         # ASTAP page
         astap_page = QWidget()
@@ -1854,6 +1893,9 @@ class SettingsDialog(QDialog):
                 self.precip_unit_combo.setCurrentIndex(index)
 
             # Load plate solving settings
+            from PlateSolver import solver_order
+            order_index = self.solver_order_combo.findData(",".join(solver_order()))
+            self.solver_order_combo.setCurrentIndex(max(0, order_index))
             astap_path = settings.value("astap_path", "", type=str)
             self.astap_path_input.setText(astap_path)
 
@@ -2249,6 +2291,7 @@ class SettingsDialog(QDialog):
             settings.setValue("precip_visibility_unit", self.precip_unit_combo.currentText())
 
             # Save plate solving settings
+            settings.setValue("plate_solver_order", self.solver_order_combo.currentData())
             settings.setValue("astap_path", self.astap_path_input.text().strip())
             settings.setValue("astrometry_api_key", self.astrometry_api_key_input.text().strip())
 

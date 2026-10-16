@@ -9,26 +9,33 @@ import os
 import re
 import logging
 from datetime import datetime
-from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool, QRunnable, QObject
+from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool, QRunnable, QObject, QRectF
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QGroupBox,
                                QMessageBox, QScrollArea, QComboBox, QLineEdit,
                                QFrame, QGridLayout, QMenu, QApplication,
                                QDialog, QFileDialog, QFormLayout, QDialogButtonBox,
                                QCompleter, QSlider, QProgressDialog, QPlainTextEdit,
-                               QSizePolicy)
+                               QSizePolicy, QCheckBox, QToolButton, QProgressBar)
 from PySide6.QtCore import QSettings
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QPainter, QColor, QFont, QFontMetricsF
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, font_px, font_size, themed_style
 from ImageLoader import load_astro_pixmap
+from PlateSolver import describe_solving
+from AnnotationOverlay import (ANNOTATION_LAYERS, DEFAULT_ANNOTATION_LAYERS, annotation_store, paint_annotations,
+                               plate_solve_queue)
 
 logger = logging.getLogger(__name__)
 
 # Image extensions supported for DSO images throughout the gallery
 SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.fits', '.fit', '.fts', '.xisf'}
+
+# Thumbnail badges for images without a plate solve (while annotations are shown)
+SOLVE_BADGES = {"unsolved": "Not solved", "queued": "Waiting to solve", "solving": "Solving…",
+                "failed": "Solve failed"}
 
 
 def insert_user_image(db_manager, image_data):
@@ -1244,6 +1251,8 @@ class GalleryCard(QFrame):
         super().__init__(parent)
         self.item_data = item_data
         self.thumbnail_size = thumbnail_size
+        self._thumb = None                    # The plain thumbnail (shown as is, or annotated)
+        self._annotations = (None, {}, None)  # AnnotationData, layers, plate solve state
         self._init_ui()
 
     def _init_ui(self):
@@ -1291,7 +1300,8 @@ class GalleryCard(QFrame):
             tooltip_lines.append("Favorite image")
         if self.item_data.get('collages'):
             tooltip_lines.append(f"In collages: {', '.join(self.item_data['collages'])}")
-        self.setToolTip('\n'.join(tooltip_lines))
+        self._tooltip = '\n'.join(tooltip_lines)
+        self.setToolTip(self._tooltip)
 
         # Card styling - card width is thumbnail size + padding (20px for margins and borders)
         card_width = self.thumbnail_size + 20
@@ -1313,9 +1323,52 @@ class GalleryCard(QFrame):
         """Update thumbnail with actual image"""
         if pixmap and not pixmap.isNull():
             # Scale to fit thumbnail size while maintaining aspect ratio
-            scaled = pixmap.scaled(self.thumbnail_size, self.thumbnail_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.thumbnail_label.setPixmap(scaled)
+            self._thumb = pixmap.scaled(self.thumbnail_size, self.thumbnail_size, Qt.KeepAspectRatio,
+                                        Qt.SmoothTransformation)
+            self._show_thumbnail()
             self.thumbnail_label.setText("")  # Clear placeholder text
+
+    def set_annotations(self, data, layers=None, state=None, failure=None):
+        """Draw plate-solve annotations over the thumbnail (data: AnnotationData,
+        None for none) and a badge when the image isn't plate solved (state:
+        PlateSolveQueue.state(), None for no badge). failure: why its plate
+        solve failed, for the tooltip."""
+        self._annotations = (data, layers or {}, state)
+        reason = f"\nPlate solve failed: {failure}" if state == "failed" and failure else ""
+        self.setToolTip(self._tooltip + reason)
+        self._show_thumbnail()
+
+    def _show_thumbnail(self):
+        """The thumbnail, annotated on a copy - the cached thumbnail stays plain."""
+        if self._thumb is None:
+            return
+        data, layers, state = self._annotations
+        badge = SOLVE_BADGES.get(state)
+        if data is None and badge is None:
+            self.thumbnail_label.setPixmap(self._thumb)
+            return
+        pixmap = QPixmap(self._thumb)
+        painter = QPainter(pixmap)
+        whole = QRectF(pixmap.rect())
+        if data is not None:
+            # Names from Medium thumbnails up
+            paint_annotations(painter, data, layers, pixmap.width(), whole, whole,
+                              font_px=8 + self.thumbnail_size / 100, names=self.thumbnail_size >= 150)
+        if badge is not None:
+            font = QFont()
+            font.setPixelSize(10 if self.thumbnail_size >= 150 else 9)
+            metrics = QFontMetricsF(font)
+            box = QRectF(4, 0, metrics.horizontalAdvance(badge) + 8, metrics.height() + 4)
+            box.moveBottom(pixmap.height() - 4)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 170))
+            painter.drawRoundedRect(box, 3, 3)
+            painter.setFont(font)
+            painter.setPen(QColor(255, 190, 110) if state == "failed" else QColor(235, 235, 235))
+            painter.drawText(box, Qt.AlignCenter, badge)
+        painter.end()
+        self.thumbnail_label.setPixmap(pixmap)
 
     def set_error(self, error_message):
         """Display error on card"""
@@ -1346,6 +1399,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
     WINDOW_POSITION_KEY = "DSOGallery"
     _SUPPORTED_DROP_EXTENSIONS = SUPPORTED_IMAGE_EXTENSIONS
+    ANNOTATIONS_SETTING = "gallery_annotations"
+    LAYERS_SETTING = "gallery_annotation_layers"
 
     def __init__(self):
         """Initialize DSO Image Gallery window"""
@@ -1421,8 +1476,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.resize_timer.setSingleShot(True)
         self.resize_timer.timeout.connect(self._handle_resize)
 
-        # Flag to track if resize is in progress
-        self.resize_in_progress = False
+        # The status text while resizing shows the column count instead
+        self._status_before_resize = None
 
         # Count of outstanding QApplication.setOverrideCursor(WaitCursor) pushes
         # that still need a matching restoreOverrideCursor(). A plain boolean
@@ -1437,6 +1492,27 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.scroll_debounce_timer.setSingleShot(True)
         self.scroll_debounce_timer.timeout.connect(self._on_scroll_debounced)
         self.visible_buffer_rows = 2  # Load this many extra rows above/below visible area
+
+        # Annotations on plate-solved thumbnails (the gallery's own setting and layers)
+        self.annotations_enabled = settings.value(self.ANNOTATIONS_SETTING, False, type=bool)
+        self.annotation_layers = {key: settings.value(f"{self.LAYERS_SETTING}/{key}", default, type=bool)
+                                  for key, default in DEFAULT_ANNOTATION_LAYERS.items()}
+        self._cards_by_path = {}       # image path -> its cards
+        self._changed_paths = set()    # Images whose annotations or solve state changed, to redraw
+        self._solving_name = ""        # The shown image being plate solved
+        self._solve_progress = ""      # ...and what its plate solve is doing
+        self._run_results = [0, 0]     # Solved, failed - since the status bar last showed
+        self._activity_hide = QTimer(self)  # Hides the status bar a moment after the wrap-up shows
+        self._activity_hide.setSingleShot(True)
+        self._activity_hide.setInterval(5000)
+        self._activity_hide.timeout.connect(self._hide_activity)
+        self._annotation_timer = QTimer(self)
+        self._annotation_timer.setSingleShot(True)
+        self._annotation_timer.setInterval(150)
+        self._annotation_timer.timeout.connect(self._redraw_changed_annotations)
+        plate_solve_queue().changed.connect(self._on_annotation_changed)
+        plate_solve_queue().progress.connect(self._on_solve_progress)
+        plate_solve_queue().finished.connect(self._on_solve_finished)
 
         # Enable drag-and-drop of image files from file manager
         self.setAcceptDrops(True)
@@ -1457,23 +1533,31 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.setCentralWidget(central_widget)
 
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(10)
+        main_layout.setSpacing(8)
         main_layout.setContentsMargins(10, 10, 10, 10)
 
-        # Header
-        header_label = QLabel("DSO Image Gallery")
-        header_label.setAlignment(Qt.AlignCenter)
-        themed_style(header_label, lambda: f"font-size: {font_px(18)}; font-weight: bold; margin: 10px;")
-        main_layout.addWidget(header_label)
-
-        # Filters group
-        filters_group = QGroupBox("Search & Filter")
-        filters_layout = QHBoxLayout(filters_group)
+        # Controls: one panel, a row of filters (which images show) over a row
+        # of view options (how they show) - the window title names the gallery
+        controls = QFrame()
+        controls.setObjectName("galleryControls")
+        themed_style(controls, lambda: f"""
+            QFrame#galleryControls {{
+                background-color: {COLORS['background_lighter']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 5px;
+            }}
+        """)
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(8, 6, 8, 6)
+        controls_layout.setSpacing(6)
+        filters_layout = QHBoxLayout()
+        filters_layout.setSpacing(6)
 
         # Search input
-        filters_layout.addWidget(QLabel("Search:"))
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search DSO name...")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setMinimumWidth(180)
         self.search_input.setText(self.current_filters['search'])
         self.search_input.textChanged.connect(lambda: self.search_timer.start(300))
         filters_layout.addWidget(self.search_input)
@@ -1505,18 +1589,34 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.equipment_combo.currentTextChanged.connect(self._on_filter_changed)
         filters_layout.addWidget(self.equipment_combo)
 
+        # Clear filters button
+        clear_btn = QPushButton("Clear Filters")
+        clear_btn.clicked.connect(self._clear_filters)
+        filters_layout.addWidget(clear_btn)
+
+        filters_layout.addStretch()
+
+        # Add Image button - an action, apart from the filters
+        add_image_btn = QPushButton("Add Image")
+        add_image_btn.clicked.connect(self._show_add_image_dialog)
+        filters_layout.addWidget(add_image_btn)
+        controls_layout.addLayout(filters_layout)
+
+        view_layout = QHBoxLayout()
+        view_layout.setSpacing(6)
+
         # Sort dropdown
-        filters_layout.addWidget(QLabel("Sort:"))
+        view_layout.addWidget(QLabel("Sort:"))
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["Name (A-Z)", "Name (Z-A)", "Date Added (Newest)", "Date Added (Oldest)", "Type", "Constellation"])
         self.sort_combo.setMinimumWidth(130)
         if self.current_filters['sort'] in [self.sort_combo.itemText(i) for i in range(self.sort_combo.count())]:
             self.sort_combo.setCurrentText(self.current_filters['sort'])
         self.sort_combo.currentTextChanged.connect(self._on_sort_changed)
-        filters_layout.addWidget(self.sort_combo)
+        view_layout.addWidget(self.sort_combo)
 
         # Thumbnail size selector
-        filters_layout.addWidget(QLabel("Thumbnail Size:"))
+        view_layout.addWidget(QLabel("Thumbnail Size:"))
         self.size_combo = QComboBox()
         for size_name in self.thumbnail_size_options.keys():
             self.size_combo.addItem(size_name)
@@ -1525,20 +1625,59 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         if current_size_name:
             self.size_combo.setCurrentText(current_size_name[0])
         self.size_combo.currentTextChanged.connect(self._on_thumbnail_size_changed)
-        filters_layout.addWidget(self.size_combo)
+        view_layout.addWidget(self.size_combo)
 
-        # Clear filters button
-        clear_btn = QPushButton("Clear Filters")
-        clear_btn.clicked.connect(self._clear_filters)
-        filters_layout.addWidget(clear_btn)
+        divider = QFrame()
+        divider.setFrameShape(QFrame.VLine)
+        divider.setFrameShadow(QFrame.Sunken)
+        view_layout.addSpacing(6)
+        view_layout.addWidget(divider)
+        view_layout.addSpacing(6)
 
-        # Add Image button
-        add_image_btn = QPushButton("Add Image")
-        add_image_btn.clicked.connect(self._show_add_image_dialog)
-        filters_layout.addWidget(add_image_btn)
+        # Annotations: the objects in each plate-solved image, over its thumbnail
+        self.annotations_check = QCheckBox("Show Annotations")
+        self.annotations_check.setToolTip("Mark the objects in each plate-solved image.\n"
+                                          "Names show from Medium thumbnails up.")
+        self.annotations_check.setChecked(self.annotations_enabled)
+        self.annotations_check.toggled.connect(self._on_annotations_toggled)
+        view_layout.addWidget(self.annotations_check)
+        self.layers_button = QToolButton()
+        self.layers_button.setText("Layers")
+        self.layers_button.setToolTip("What the annotations show")
+        self.layers_button.setPopupMode(QToolButton.InstantPopup)
+        layers_menu = QMenu(self.layers_button)
+        self.layer_actions = {}
+        for key, label in ANNOTATION_LAYERS:
+            action = layers_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self.annotation_layers[key])
+            action.toggled.connect(self._on_annotation_layers_changed)
+            self.layer_actions[key] = action
+        # Dark nebulae are among the DSOs
+        self.layer_actions["dark"].setEnabled(self.annotation_layers["dsos"])
+        self.layer_actions["dsos"].toggled.connect(self.layer_actions["dark"].setEnabled)
+        self.layers_button.setMenu(layers_menu)
+        view_layout.addWidget(self.layers_button)
+        self.solve_summary = QLabel()
+        themed_style(self.solve_summary, lambda: f"color: {COLORS['text_secondary']};")
+        # Changing text mustn't change the window's minimum width (that made
+        # resizing jump) - it's cut short when there's no room (full text in the tooltip)
+        self.solve_summary.setMinimumWidth(1)
+        view_layout.addWidget(self.solve_summary)
+        self.solve_button = QPushButton("Plate Solve Unsolved…")
+        self.solve_button.setToolTip("Plate solve the shown images that aren't solved yet, in the background,\n"
+                                     "so they can be annotated")
+        self.solve_button.clicked.connect(self._solve_unsolved)
+        view_layout.addWidget(self.solve_button)
+        view_layout.addStretch()
 
-        filters_layout.addStretch()
-        main_layout.addWidget(filters_group)
+        # Status (how many images show, loading progress)
+        self.status_label = QLabel("Loading...")
+        themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']};")
+        self.status_label.setMinimumWidth(1)  # As the summary: its text changes while resizing
+        view_layout.addWidget(self.status_label)
+        controls_layout.addLayout(view_layout)
+        main_layout.addWidget(controls)
 
         # Scroll area for grid
         self.scroll_area = QScrollArea()
@@ -1555,13 +1694,26 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.scroll_area.setWidget(self.grid_container)
         main_layout.addWidget(self.scroll_area)
 
+        # Status bar - only while plate solving or star name lookups run
+        self.activity_label = QLabel()
+        self.activity_label.setMinimumWidth(1)  # Long messages are cut short, not widening the window
+        self.activity_label.setContentsMargins(6, 0, 0, 0)
+        self.activity_busy = QProgressBar()
+        self.activity_busy.setRange(0, 0)  # Busy, no percentage
+        self.activity_busy.setTextVisible(False)
+        self.activity_busy.setFixedSize(110, 12)
+        self.activity_stop = QPushButton("Stop")
+        self.activity_stop.setToolTip("Stop plate solving the images that are still waiting")
+        self.activity_stop.clicked.connect(lambda: plate_solve_queue().stop(list(self._cards_by_path)))
+        self.statusBar().addWidget(self.activity_label, 1)
+        self.statusBar().addPermanentWidget(self.activity_busy)
+        self.statusBar().addPermanentWidget(self.activity_stop)
+        self.statusBar().hide()
+        self._update_solve_summary()
+
         # Connect scroll bar to lazy loading
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
-        # Status label
-        self.status_label = QLabel("Loading...")
-        self.status_label.setStyleSheet("padding: 5px;")
-        main_layout.addWidget(self.status_label)
 
     def _start_background_data_load(self):
         """Start loading gallery data in background thread"""
@@ -1645,24 +1797,20 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Ensure dropdown view is wide enough to show full text
         self.equipment_combo.view().setMinimumWidth(self.equipment_combo.minimumSizeHint().width())
 
+    def _grid_width(self):
+        """Width the cards can use: the scroll area's, less a scrollbar whether
+        or not one shows - so the column count can't flip back and forth as
+        the scrollbar comes and goes with the number of rows."""
+        return (self.scroll_area.width() - 2 * self.scroll_area.frameWidth()
+                - self.scroll_area.verticalScrollBar().sizeHint().width())
+
     def _calculate_grid_columns(self):
-        """Calculate number of columns based on available width"""
-        # Card width is thumbnail_size + 20px padding (from GalleryCard._init_ui)
-        card_width = self.thumbnail_size + 20
-        grid_spacing = 10  # Grid layout spacing
-        grid_margins = 20  # Grid layout margins (10 left + 10 right)
-
-        # Use viewport width for accurate calculation
-        viewport_width = self.scroll_area.viewport().width()
-        available_width = viewport_width - grid_margins
-
-        # Each card takes up card_width + spacing
-        card_width_with_spacing = card_width + grid_spacing
-
-        # Calculate how many cards fit (no arbitrary cap)
-        columns = max(1, available_width // card_width_with_spacing)
-
-        return columns
+        """How many cards fit across: n cards take n widths and n - 1 gaps."""
+        card_width = self.thumbnail_size + 20  # GalleryCard's fixed width
+        spacing = self.grid_layout.spacing()
+        margins = self.grid_layout.contentsMargins()
+        available = self._grid_width() - margins.left() - margins.right()
+        return max(1, (available + spacing) // (card_width + spacing))
 
     def _push_wait_cursor(self):
         """Push a WaitCursor and track it so it's always paired with a restore."""
@@ -1691,6 +1839,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             item = self.grid_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self._cards_by_path = {}
+        self._update_solve_summary()
 
         # Check if there are items to display
         if not self.filtered_items:
@@ -1779,6 +1929,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         end_idx = min(start_idx + batch_size, len(self.filtered_items))
 
         # Create cards for this batch
+        cols = self.current_columns  # A resize may have changed it since the first batch
         for idx in range(start_idx, end_idx):
             item = self.filtered_items[idx]
             row = idx // cols
@@ -1794,6 +1945,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
             # Store reference
             self.cards.append(card)
+            self._cards_by_path.setdefault(item['image_path'], []).append(card)
 
         # Update progress in status bar
         total = len(self.filtered_items)
@@ -1825,6 +1977,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
             # Load thumbnails in background
             self._load_thumbnails()
+            self._update_solve_summary()
 
     def _load_thumbnails(self):
         """Load all thumbnails, prioritizing visible cards first"""
@@ -1961,6 +2114,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             # Check if card still exists (hasn't been deleted by grid refresh)
             if card and not card.isHidden() and card.parent():
                 card.set_thumbnail(pixmap)
+                self._update_card_annotations(card)
         except RuntimeError:
             # Card was deleted, ignore
             pass
@@ -2033,6 +2187,10 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         details_action = context_menu.addAction("View DSO Details")
         details_action.triggered.connect(lambda: self._open_dso_details(item_data))
 
+        # Annotations need a plate solve
+        if plate_solve_queue().state(item_data['image_path']) in ("unsolved", "failed"):
+            context_menu.addAction("Plate Solve (for Annotations)", lambda: self._plate_solve([item_data]))
+
         # Collages: add this image to one, or open one that shows it
         if item_data.get('imageid') is not None:
             from CollageBuilder import add_collage_actions
@@ -2041,6 +2199,164 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         # Show menu at cursor position
         context_menu.exec(position)
+
+    # Annotations
+
+    def _on_annotations_toggled(self, enabled):
+        self.annotations_enabled = enabled
+        QSettings("CosmosCollection", "CosmosCollection").setValue(self.ANNOTATIONS_SETTING, enabled)
+        self._annotate_all_cards()
+
+    def _on_annotation_layers_changed(self):
+        self.annotation_layers = {key: action.isChecked() for key, action in self.layer_actions.items()}
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        for key, value in self.annotation_layers.items():
+            settings.setValue(f"{self.LAYERS_SETTING}/{key}", value)
+        self._annotate_all_cards()
+
+    def _annotate_all_cards(self):
+        for cards in self._cards_by_path.values():
+            for card in cards:
+                self._update_card_annotations(card)
+        self._update_solve_summary()
+
+    def _update_card_annotations(self, card):
+        """Show (or hide) a card's annotations and plate solve badge."""
+        try:
+            if not self.annotations_enabled:
+                card.set_annotations(None)
+                return
+            path = card.item_data['image_path']
+            queue = plate_solve_queue()
+            data = annotation_store().get(path, want_stars=self.annotation_layers["stars"])
+            card.set_annotations(data, self.annotation_layers, queue.state(path), queue.failure(path))
+        except RuntimeError:
+            pass  # The card was deleted (grid rebuilt)
+
+    def _on_annotation_changed(self, path):
+        """An image's annotations loaded, or its plate solve state changed -
+        redraw it soon (many arrive together)."""
+        if self.annotations_enabled and path in self._cards_by_path:
+            self._changed_paths.add(path)
+            self._annotation_timer.start()
+
+    def _redraw_changed_annotations(self):
+        paths, self._changed_paths = self._changed_paths, set()
+        for path in paths:
+            for card in self._cards_by_path.get(path, []):
+                self._update_card_annotations(card)
+        self._update_solve_summary()
+
+    def _shown_paths(self):
+        return list(dict.fromkeys(item['image_path'] for item in self.filtered_items))
+
+    def _update_solve_summary(self):
+        """How many of the shown images are plate solved, and the button to solve the rest."""
+        enabled = self.annotations_enabled
+        for widget in (self.layers_button, self.solve_summary):
+            widget.setVisible(enabled)
+        self._update_activity()
+        if not enabled or not self.filtered_items:
+            self.solve_summary.setText("")
+            self.solve_button.setVisible(False)
+            return
+        queue = plate_solve_queue()
+        paths = self._shown_paths()
+        states = [queue.state(path) for path in paths]
+        waiting = states.count("solving") + states.count("queued")
+        unsolved = states.count("unsolved") + states.count("failed")
+        text = f"{states.count('solved')} of {len(paths)} shown image{'s' if len(paths) != 1 else ''} plate solved"
+        if states.count("checking"):
+            text += " · checking…"
+        self.solve_summary.setText(text)
+        self.solve_summary.setToolTip(text)
+        self.solve_button.setVisible(bool(waiting or unsolved))
+        self.solve_button.setText("Stop Plate Solving" if waiting else f"Plate Solve {unsolved} Unsolved…")
+
+    def _solve_unsolved(self):
+        queue = plate_solve_queue()
+        paths = self._shown_paths()
+        if queue.waiting(paths):  # The button reads "Stop Plate Solving"
+            queue.stop(paths)
+            return
+        items, seen = [], set()
+        for item in self.filtered_items:
+            path = item['image_path']
+            if path not in seen and queue.state(path) in ("unsolved", "failed"):
+                items.append(item)
+                seen.add(path)
+        if not items:
+            return
+        reply = QMessageBox.question(
+            self, "Plate Solve",
+            f"Plate solve {len(items)} image{'s' if len(items) != 1 else ''}?\n\n"
+            f"{describe_solving()} You can keep browsing, and stop at any time.")
+        if reply == QMessageBox.Yes:
+            self._plate_solve(items)
+
+    def _update_activity(self):
+        """The status bar while shown images are plate solved or have their star
+        names looked up: what's happening, with a busy bar (and Stop while
+        solving). When it's all done, a wrap-up for a moment, then it hides."""
+        paths = list(self._cards_by_path)
+        waiting = plate_solve_queue().waiting(paths)
+        parts = []
+        if waiting:
+            text = f"Plate solving {self._solving_name or 'an image'}"
+            if waiting > 1:
+                text += f" ({waiting - 1} more waiting)"
+            if self._solve_progress:
+                text += f" - {self._solve_progress}"
+            parts.append(text)
+        if self.annotations_enabled and self.annotation_layers["stars"]:
+            done, total = annotation_store().star_progress(paths)
+            if done < total:
+                parts.append(f"Looking up star names online: {done} of {total}…")
+        bar = self.statusBar()
+        self.activity_stop.setVisible(bool(waiting))
+        if parts:
+            self._activity_hide.stop()
+            text = "     ·     ".join(parts)
+            self.activity_label.setText(text)
+            self.activity_label.setToolTip(text)
+            self.activity_busy.show()
+            bar.show()
+        elif bar.isVisible() and not self._activity_hide.isActive():
+            solved, failed = self._run_results
+            if solved or failed:
+                text = f"Plate solving finished: {solved} solved"
+                if failed:
+                    text += f", {failed} couldn't be solved (see their thumbnails' tooltips)"
+                self.activity_label.setText(text)
+                self.activity_label.setToolTip(text)
+                self.activity_busy.hide()
+                self._activity_hide.start()
+            else:
+                self._hide_activity()
+
+    def _hide_activity(self):
+        self.statusBar().hide()
+        self._run_results = [0, 0]
+
+    def _plate_solve(self, items):
+        """Queue images for plate solving, near their objects' positions."""
+        for item in items:
+            ra, dec = item.get('ra_deg'), item.get('dec_deg')
+            hints = {"ra": ra, "dec": dec, "radius": 15} if ra is not None and dec is not None else None
+            name = (item.get('name') or "").split(", ")[0]  # Its main designation ("M 8"), for the status bar
+            plate_solve_queue().add(item['image_path'], hints, name)
+        self._update_solve_summary()
+
+    def _on_solve_progress(self, path, name, message):
+        if path in self._cards_by_path:
+            self._solving_name, self._solve_progress = name, message
+            self._update_activity()
+
+    def _on_solve_finished(self, path, solved, failure, name):
+        if path in self._cards_by_path:
+            self._run_results[0 if solved else 1] += 1
+            self._solving_name = self._solve_progress = ""
+            self._update_solve_summary()
 
     def _on_filter_changed(self):
         """Handle filter combo box changes"""
@@ -2210,70 +2526,59 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             # Trigger a resize check to ensure grid fits current window
             QTimer.singleShot(0, self._handle_resize)
 
+    def _grid_built(self):
+        cards = getattr(self, 'cards', None)
+        return bool(cards) and len(cards) == len(self.filtered_items)
+
     def _handle_resize(self):
-        """Handle deferred resize - recalculate grid if needed"""
-        # Only process if we have data loaded
-        if not self.filtered_items or self.resize_in_progress:
+        """Once resizing pauses: put the cards in the new number of columns."""
+        if self._status_before_resize is not None:
+            self.status_label.setText(self._status_before_resize)
+            self._status_before_resize = None
+        if self.filtered_items:
+            cols = self._calculate_grid_columns()
+            if cols != self.current_columns:
+                self._arrange_cards(cols)
+
+    def _arrange_cards(self, cols):
+        """Move the existing cards into cols columns. Nothing is rebuilt, so
+        it's quick and their thumbnails and annotations stay - and no progress
+        dialog pops up mid-drag (that ended Windows' resize, snapping the
+        window back)."""
+        self.current_columns = cols
+        cards = getattr(self, 'cards', None)
+        if not cards:
             return
-
-        new_cols = self._calculate_grid_columns()
-        # Always update if columns changed, even if grid exists
-        if new_cols != self.current_columns and new_cols > 0:
-            # Set flag to prevent multiple simultaneous resizes
-            self.resize_in_progress = True
-
-            # Show visual feedback - change cursor and status
-            self._push_wait_cursor()
-            old_status = self.status_label.text()
-            self.status_label.setText("Reorganizing gallery layout...")
-            themed_style(self.status_label, lambda: f"padding: 5px; color: {COLORS['warning']};")
-
-            # Schedule grid rebuild after UI update
-            QTimer.singleShot(10, lambda: self._rebuild_grid_for_resize(new_cols, old_status))
-
-    def _rebuild_grid_for_resize(self, new_cols, old_status):
-        """Rebuild grid with new column count and restore status"""
-        self.current_columns = new_cols
-        self._populate_grid()
-
-        # Restore original status after a brief delay
-        QTimer.singleShot(100, lambda: self._restore_status_after_resize(old_status))
-
-    def _restore_status_after_resize(self, old_status):
-        """Restore status label and cursor after resize completes"""
-        self.status_label.setText(old_status)
-        self.status_label.setStyleSheet("padding: 5px;")
-        self.resize_in_progress = False
-        # Restore normal cursor
-        self._pop_wait_cursor()
+        layout = self.grid_layout
+        self.grid_container.setUpdatesEnabled(False)
+        for row in range(layout.rowCount()):
+            layout.setRowStretch(row, 0)
+        for col in range(layout.columnCount()):
+            layout.setColumnStretch(col, 0)
+        for card in cards:
+            layout.removeWidget(card)
+        for index, card in enumerate(cards):
+            layout.addWidget(card, index // cols, index % cols)
+        if self._grid_built():  # Still being built: the last batch adds these
+            layout.setRowStretch(len(cards) // cols + 1, 1)
+            layout.setColumnStretch(cols, 1)
+        self.grid_container.setUpdatesEnabled(True)
+        self._load_visible_thumbnails()
 
     def resizeEvent(self, event):
-        """Handle window resize - defer grid recalculation"""
+        """Show the column count while resizing; rearrange when it pauses."""
         super().resizeEvent(event)
-
-        # Show real-time column count during resize
-        if self.filtered_items and not self.resize_in_progress:
-            current_cols = self._calculate_grid_columns()
-
-            # Calculate pixels needed for next column
-            card_width = self.thumbnail_size + 20  # Card width is thumbnail_size + padding
-            grid_spacing = 10
-            grid_margins = 20
-            viewport_width = self.scroll_area.viewport().width()
-
-            # Width needed for next column
-            card_width_with_spacing = card_width + grid_spacing
-            next_col_viewport_width = (current_cols + 1) * card_width_with_spacing + grid_margins
-            pixels_needed = next_col_viewport_width - viewport_width
-
-            if pixels_needed > 0:
-                self.status_label.setText(f"Columns: {current_cols} | +{pixels_needed}px wider for next column")
-            else:
-                self.status_label.setText(f"Columns: {current_cols}")
-            themed_style(self.status_label, lambda: f"padding: 5px; color: {COLORS['info']};")
-
-        # Restart timer to debounce resize events (300ms delay reduces rebuild frequency)
-        self.resize_timer.start(300)
+        if self._grid_built():
+            cols = self._calculate_grid_columns()
+            card_width = self.thumbnail_size + 20
+            spacing = self.grid_layout.spacing()
+            margins = self.grid_layout.contentsMargins()
+            needed = (cols + 1) * (card_width + spacing) - spacing + margins.left() + margins.right() \
+                - self._grid_width()
+            if self._status_before_resize is None:
+                self._status_before_resize = self.status_label.text()
+            self.status_label.setText(f"Columns: {cols} · {needed}px wider for {cols + 1}")
+        self.resize_timer.start(150)
 
     def dragEnterEvent(self, event):
         """Accept drag if it is a single supported image file"""

@@ -76,7 +76,9 @@ class SimbadQueryThread(QThread):
             result = None
             if self.ra_deg is not None and self.dec_deg is not None:
                 coords = SkyCoord(ra=self.ra_deg*u.degree, dec=self.dec_deg*u.degree, frame='icrs')
-                result = custom_simbad.query_region(coords, radius=3*u.arcmin)
+                from OnlineLimits import online_request
+                with online_request("simbad"):
+                    result = custom_simbad.query_region(coords, radius=3*u.arcmin)
                 if result is not None and len(result) > 0:
                     logger.debug(f"SIMBAD data found for {self.object_name} at coordinates")
                 else:
