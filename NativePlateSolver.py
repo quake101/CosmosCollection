@@ -162,8 +162,9 @@ def _load_luminance(path):
         del data
     else:
         from PySide6.QtGui import QImage
-        image = QImage(path)
-        if image.isNull():
+        from ImageLoader import read_image_file
+        image, _error = read_image_file(path, auto_transform=False)
+        if image is None:
             raise SolveFailed("The image couldn't be read")
         image = image.convertToFormat(QImage.Format_Grayscale16)
         width, height = image.width(), image.height()

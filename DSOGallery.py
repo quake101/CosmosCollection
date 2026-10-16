@@ -8,6 +8,7 @@ import sys
 import os
 import re
 import logging
+import threading
 from datetime import datetime
 from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool, QRunnable, QObject, QRectF
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
@@ -18,12 +19,12 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QCompleter, QSlider, QProgressDialog, QPlainTextEdit,
                                QSizePolicy, QCheckBox, QToolButton, QProgressBar)
 from PySide6.QtCore import QSettings
-from PySide6.QtGui import QPixmap, QPainter, QColor, QFont, QFontMetricsF
+from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QFontMetricsF
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, font_px, font_size, themed_style
-from ImageLoader import load_astro_pixmap
+from ImageLoader import load_astro_pixmap, load_astro_qimage, read_image_file, write_image_file
 from PlateSolver import describe_solving
 from AnnotationOverlay import (ANNOTATION_LAYERS, DEFAULT_ANNOTATION_LAYERS, annotation_store, paint_annotations,
                                plate_solve_queue)
@@ -59,53 +60,66 @@ def insert_user_image(db_manager, image_data):
 
 
 class ThumbnailCache:
-    """Cache for storing generated thumbnails to avoid regeneration"""
+    """Cache for storing generated thumbnails to avoid regeneration. Shared by
+    the worker threads, so every access holds a lock."""
 
     def __init__(self, max_size=200):
-        self._cache = {}  # image_path -> QPixmap
+        self._cache = {}  # (image_path, thumbnail_size) -> QImage
         self._max_size = max_size
         self._access_order = []  # Track access order for LRU eviction
+        self._lock = threading.Lock()
 
-    def get(self, image_path):
-        """Get cached thumbnail for image path"""
-        if image_path in self._cache:
-            # Move to end (most recently used)
-            if image_path in self._access_order:
-                self._access_order.remove(image_path)
-            self._access_order.append(image_path)
-            return self._cache[image_path]
-        return None
+    def get(self, key):
+        """Get cached thumbnail for an (image path, size) key"""
+        with self._lock:
+            if key in self._cache:
+                # Move to end (most recently used)
+                if key in self._access_order:
+                    self._access_order.remove(key)
+                self._access_order.append(key)
+                return self._cache[key]
+            return None
 
-    def put(self, image_path, pixmap):
+    def put(self, key, image):
         """Store thumbnail in cache"""
-        if image_path in self._cache:
-            # Update existing entry
-            if image_path in self._access_order:
-                self._access_order.remove(image_path)
-        elif len(self._cache) >= self._max_size:
-            # Remove least recently used item
-            if self._access_order:
-                lru_path = self._access_order.pop(0)
-                if lru_path in self._cache:
-                    del self._cache[lru_path]
+        with self._lock:
+            if key in self._cache:
+                # Update existing entry
+                if key in self._access_order:
+                    self._access_order.remove(key)
+            elif len(self._cache) >= self._max_size:
+                # Remove least recently used item
+                if self._access_order:
+                    lru_key = self._access_order.pop(0)
+                    self._cache.pop(lru_key, None)
 
-        self._cache[image_path] = pixmap
-        self._access_order.append(image_path)
+            self._cache[key] = image
+            self._access_order.append(key)
 
     def clear(self):
         """Clear all cached thumbnails"""
-        self._cache.clear()
-        self._access_order.clear()
+        with self._lock:
+            self._cache.clear()
+            self._access_order.clear()
+
+
+# How many original images the thumbnail threads load at once - a big stack
+# takes a few hundred MB, read in and decoded
+_ORIGINAL_DECODE_SLOTS = threading.BoundedSemaphore(4)
 
 
 class ThumbnailSignals(QObject):
     """Signals for ThumbnailRunnable (QRunnable doesn't support signals directly)"""
-    thumbnail_ready = Signal(object, QPixmap)  # card, pixmap
+    thumbnail_ready = Signal(object, QImage)   # card, image
     thumbnail_error = Signal(object, str)      # card, error_message
 
 
 class ThumbnailRunnable(QRunnable):
-    """Runnable task for generating a single thumbnail in a thread pool"""
+    """Runnable task for generating a single thumbnail in a thread pool.
+
+    Works in QImage only - PySide holds the GIL for the whole of a QPixmap
+    decode, so decoding large images as QPixmaps here froze the gallery for
+    seconds each. The gallery makes the QPixmap on the UI thread."""
 
     # Map thumbnail sizes to size names for disk cache filenames
     SIZE_NAMES = {
@@ -135,12 +149,13 @@ class ThumbnailRunnable(QRunnable):
         self.cancelled_flag = cancelled_flag
         self.thumbnail_size = thumbnail_size
 
-    def _get_disk_cache_path(self):
-        """Get the path for the disk-cached thumbnail file"""
+    def _get_disk_cache_path(self, size=None):
+        """Get the path for the disk-cached thumbnail file (of this size, by default)"""
+        size = size or self.thumbnail_size
         directory = os.path.dirname(self.image_path)
         basename = os.path.basename(self.image_path)
         name_without_ext = os.path.splitext(basename)[0]
-        size_name = self.SIZE_NAMES.get(self.thumbnail_size, f'{self.thumbnail_size}px')
+        size_name = self.SIZE_NAMES.get(size, f'{size}px')
         cache_filename = f"{name_without_ext}_{size_name}_Thumbnail.jpg"
         return os.path.join(directory, cache_filename)
 
@@ -157,20 +172,35 @@ class ThumbnailRunnable(QRunnable):
 
     def _load_from_disk_cache(self, cache_path):
         """Load thumbnail from disk cache"""
-        try:
-            pixmap = QPixmap(cache_path)
-            if not pixmap.isNull():
-                return pixmap
-        except Exception:
-            pass
-        return None
+        image, _error = read_image_file(cache_path, auto_transform=False)
+        return image
 
-    def _save_to_disk_cache(self, pixmap, cache_path):
+    def _save_to_disk_cache(self, image, cache_path):
         """Save thumbnail to disk cache as JPEG at 85% quality"""
         try:
-            pixmap.save(cache_path, "JPEG", 85)
+            write_image_file(image, cache_path, "JPEG", 85)
         except Exception:
             pass  # Silently fail if we can't save cache
+
+    def _larger_disk_thumbnail(self):
+        """A bigger thumbnail of this image already cached on disk, if any -
+        scaling it down takes milliseconds, where decoding a large original
+        (a big stack or FITS file) takes seconds."""
+        for size in sorted(s for s in self.SIZE_NAMES if s > self.thumbnail_size):
+            path = self._get_disk_cache_path(size)
+            if self._is_disk_cache_valid(path):
+                image = self._load_from_disk_cache(path)
+                if image is not None:
+                    return image
+        return None
+
+    def _decode_original(self, ext):
+        """Decode the original image - at about thumbnail size where the format allows"""
+        if ext in ['.fits', '.fit', '.fts', '.xisf']:
+            return load_astro_qimage(self.image_path)
+        # Not EXIF-rotated, so plate-solve annotations line up with it
+        image, _error = read_image_file(self.image_path, max_dim=self.thumbnail_size, auto_transform=False)
+        return image
 
     def run(self):
         """Generate thumbnail for single image"""
@@ -178,14 +208,14 @@ class ThumbnailRunnable(QRunnable):
         if self.cancelled_flag[0]:
             return
 
-        from PySide6.QtGui import QImageReader
-
         try:
+            cache_key = (self.image_path, self.thumbnail_size)
+
             # Check memory cache first
             if self.cache:
-                cached_pixmap = self.cache.get(self.image_path)
-                if cached_pixmap:
-                    self.signals.thumbnail_ready.emit(self.card, cached_pixmap)
+                cached_image = self.cache.get(cache_key)
+                if cached_image is not None:
+                    self.signals.thumbnail_ready.emit(self.card, cached_image)
                     return
 
             # Check if cancelled
@@ -199,84 +229,57 @@ class ThumbnailRunnable(QRunnable):
 
             # Try loading from disk cache if enabled and valid
             if disk_cache_enabled and self._is_disk_cache_valid(disk_cache_path):
-                disk_pixmap = self._load_from_disk_cache(disk_cache_path)
-                if disk_pixmap and not disk_pixmap.isNull():
+                disk_image = self._load_from_disk_cache(disk_cache_path)
+                if disk_image is not None:
                     # Store in memory cache too
                     if self.cache:
-                        self.cache.put(self.image_path, disk_pixmap)
-                    self.signals.thumbnail_ready.emit(self.card, disk_pixmap)
+                        self.cache.put(cache_key, disk_image)
+                    self.signals.thumbnail_ready.emit(self.card, disk_image)
                     return
 
             # Check if cancelled
             if self.cancelled_flag[0]:
                 return
 
-            if os.path.exists(self.image_path):
-                # Check file size
-                file_size = os.path.getsize(self.image_path)
-                if file_size == 0:
-                    self.signals.thumbnail_error.emit(self.card, "Empty File")
-                    return
-
-                # Get file extension
-                _, ext = os.path.splitext(self.image_path.lower())
-
-                pixmap = None
-
-                # Handle FITS/XISF files
-                if ext in ['.fits', '.fit', '.fts', '.xisf']:
-                    pixmap = load_astro_pixmap(self.image_path)
-                    if pixmap is None:
-                        self.signals.thumbnail_error.emit(self.card, "Image Load Error")
-                        return
-                else:
-                    # Load regular image formats
-                    QImageReader.setAllocationLimit(512)
-
-                    # Try standard QPixmap loading
-                    pixmap = QPixmap(self.image_path)
-
-                    # If failed, try QImageReader
-                    if pixmap.isNull():
-                        try:
-                            reader = QImageReader(self.image_path)
-                            if reader.canRead():
-                                # Set explicit format
-                                if ext in ['.jpg', '.jpeg']:
-                                    reader.setFormat(b"JPEG")
-                                elif ext == '.png':
-                                    reader.setFormat(b"PNG")
-                                elif ext in ['.tiff', '.tif']:
-                                    reader.setFormat(b"TIFF")
-
-                                image = reader.read()
-                                if not image.isNull():
-                                    pixmap = QPixmap.fromImage(image)
-                        except Exception:
-                            pass
-
-                # Check if cancelled before emitting
-                if self.cancelled_flag[0]:
-                    return
-
-                if pixmap and not pixmap.isNull():
-                    # Scale to thumbnail size (gallery card size)
-                    scaled_pixmap = pixmap.scaled(self.thumbnail_size, self.thumbnail_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-                    # Cache the thumbnail in memory
-                    if self.cache:
-                        self.cache.put(self.image_path, scaled_pixmap)
-
-                    # Save to disk cache if enabled
-                    if disk_cache_enabled and disk_cache_path:
-                        self._save_to_disk_cache(scaled_pixmap, disk_cache_path)
-
-                    self.signals.thumbnail_ready.emit(self.card, scaled_pixmap)
-                else:
-                    error_msg = f"Load Error"
-                    self.signals.thumbnail_error.emit(self.card, error_msg)
-            else:
+            if not os.path.exists(self.image_path):
                 self.signals.thumbnail_error.emit(self.card, "File Not Found")
+                return
+
+            # Check file size
+            if os.path.getsize(self.image_path) == 0:
+                self.signals.thumbnail_error.emit(self.card, "Empty File")
+                return
+
+            _, ext = os.path.splitext(self.image_path.lower())
+            image = self._larger_disk_thumbnail() if disk_cache_enabled else None
+            if image is None:
+                with _ORIGINAL_DECODE_SLOTS:
+                    if self.cancelled_flag[0]:
+                        return
+                    image = self._decode_original(ext)
+
+            # Check if cancelled before emitting
+            if self.cancelled_flag[0]:
+                return
+
+            if image is None:
+                is_astro = ext in ['.fits', '.fit', '.fts', '.xisf']
+                self.signals.thumbnail_error.emit(self.card, "Image Load Error" if is_astro else "Load Error")
+                return
+
+            # Scale to thumbnail size (gallery card size)
+            thumbnail = image.scaled(self.thumbnail_size, self.thumbnail_size, Qt.KeepAspectRatio,
+                                     Qt.SmoothTransformation)
+
+            # Cache the thumbnail in memory
+            if self.cache:
+                self.cache.put(cache_key, thumbnail)
+
+            # Save to disk cache if enabled
+            if disk_cache_enabled and disk_cache_path:
+                self._save_to_disk_cache(thumbnail, disk_cache_path)
+
+            self.signals.thumbnail_ready.emit(self.card, thumbnail)
 
         except Exception as e:
             self.signals.thumbnail_error.emit(self.card, f"Error: {str(e)[:20]}")
@@ -570,11 +573,11 @@ def _load_preview_pixmap(image_path, max_dim=200):
     if ext in ('.fits', '.fit', '.fts', '.xisf'):
         return load_astro_pixmap(image_path, max_dim=max_dim)
 
-    pixmap = QPixmap(image_path)
-    if pixmap.isNull():
+    image, _error = read_image_file(image_path, max_dim=max_dim, auto_transform=False)
+    if image is None:
         return None
 
-    return pixmap.scaled(max_dim, max_dim, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return QPixmap.fromImage(image).scaled(max_dim, max_dim, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
 class AddImageDialog(WindowPositionMixin, QDialog):
@@ -1460,6 +1463,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.thumbnails_to_load = 0
         self.thumbnails_loaded = 0
         self.is_loading_thumbnails = False
+        self._finished_cards = set()  # Cards counted in the progress (each once)
 
         # Data loader signals
         self.data_loader_signals = DataLoaderSignals()
@@ -1826,9 +1830,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     def _populate_grid(self):
         """Populate grid with gallery cards"""
         # Close any existing progress dialog
-        if self.thumbnail_progress_dialog:
-            self.thumbnail_progress_dialog.close()
-            self.thumbnail_progress_dialog = None
+        self._close_thumbnail_progress()
         self.is_loading_thumbnails = False
 
         # Disable updates during grid rebuild to prevent excessive repainting
@@ -1885,16 +1887,18 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.thumbnails_to_load = showing
         self.thumbnails_loaded = 0
         self.is_loading_thumbnails = True
+        self._finished_cards = set()
 
         # Create and show progress dialog for loading thumbnails
         if showing > 0:
             self.thumbnail_progress_dialog = QProgressDialog(
                 f"Loading thumbnails... (0/{showing})",
-                None,  # No cancel button
+                "Hide",  # Thumbnails keep loading, with the progress in the status bar
                 0,
                 showing,
                 self
             )
+            self.thumbnail_progress_dialog.canceled.connect(self._hide_thumbnail_progress)
             self.thumbnail_progress_dialog.setWindowTitle("Loading Gallery")
             self.thumbnail_progress_dialog.setWindowModality(Qt.WindowModal)
             self.thumbnail_progress_dialog.setMinimumDuration(500)  # Only show if takes > 500ms
@@ -1968,12 +1972,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                 self._pop_wait_cursor()
 
             # Update status
-            showing = len(self.filtered_items)
-            total = len(self.all_items)
-            if showing == total:
-                self.status_label.setText(f"Showing all {total} image{'s' if total != 1 else ''}")
-            else:
-                self.status_label.setText(f"Showing {showing} of {total} images")
+            self.status_label.setText(self._showing_text())
 
             # Load thumbnails in background
             self._load_thumbnails()
@@ -2108,64 +2107,100 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         """Handle debounced scroll - load newly visible thumbnails"""
         self._load_visible_thumbnails()
 
-    def _on_thumbnail_ready(self, card, pixmap):
+    def _is_current_card(self, card):
+        """Whether a thumbnail result is for a card in the grid now - not one
+        from before a rebuild, whose result was already on its way."""
+        return card in self._cards_by_path.get(card.item_data['image_path'], ())
+
+    def _on_thumbnail_ready(self, card, image):
         """Handle thumbnail loaded successfully"""
+        if not self._is_current_card(card):
+            return
         try:
-            # Check if card still exists (hasn't been deleted by grid refresh)
-            if card and not card.isHidden() and card.parent():
-                card.set_thumbnail(pixmap)
-                self._update_card_annotations(card)
+            card.set_thumbnail(QPixmap.fromImage(image))  # Pixmaps belong on the UI thread
+            self._update_card_annotations(card)
         except RuntimeError:
             # Card was deleted, ignore
             pass
 
-        # Update resize progress if active
-        self._update_thumbnail_progress()
+        self._update_thumbnail_progress(card)
 
     def _on_thumbnail_error(self, card, error_message):
         """Handle thumbnail load error"""
+        if not self._is_current_card(card):
+            return
         try:
-            # Check if card still exists (hasn't been deleted by grid refresh)
-            if card and not card.isHidden() and card.parent():
-                card.set_error(error_message)
+            card.set_error(error_message)
         except RuntimeError:
             # Card was deleted, ignore
             pass
 
-        # Update resize progress if active
-        self._update_thumbnail_progress()
+        self._update_thumbnail_progress(card)
 
-    def _update_thumbnail_progress(self):
+    def _showing_text(self):
+        """Status text for how many of the images are shown"""
+        showing = len(self.filtered_items)
+        total = len(self.all_items)
+        if showing == total:
+            return f"Showing all {total} image{'s' if total != 1 else ''}"
+        return f"Showing {showing} of {total} images"
+
+    def _set_status(self, text):
+        """Show status text - kept for after the resize if one is showing the column count"""
+        if self._status_before_resize is not None:
+            self._status_before_resize = text
+        else:
+            self.status_label.setText(text)
+
+    def _update_thumbnail_progress(self, card):
         """Update the thumbnail loading progress dialog"""
-        if not self.is_loading_thumbnails:
+        if not self.is_loading_thumbnails or card in self._finished_cards:
             return
 
+        self._finished_cards.add(card)
         self.thumbnails_loaded += 1
+        progress = f"Loading thumbnails... ({self.thumbnails_loaded}/{self.thumbnails_to_load})"
 
         # Update dialog if it exists and is visible
         if self.thumbnail_progress_dialog is not None:
             try:
                 self.thumbnail_progress_dialog.setValue(self.thumbnails_loaded)
-                self.thumbnail_progress_dialog.setLabelText(
-                    f"Loading thumbnails... ({self.thumbnails_loaded}/{self.thumbnails_to_load})"
-                )
+                self.thumbnail_progress_dialog.setLabelText(progress)
             except (RuntimeError, AttributeError):
                 # Dialog was deleted or not fully initialized
                 pass
+        elif self._grid_built():
+            # The dialog was hidden: show the progress in the status bar instead
+            self._set_status(f"{self._showing_text()} · {progress}")
 
         # Check if all thumbnails are complete
         if self.thumbnails_loaded >= self.thumbnails_to_load:
             self._finish_thumbnail_loading()
 
+    def _hide_thumbnail_progress(self):
+        """The progress dialog's Hide button: keep loading, with the progress in the status bar"""
+        self.thumbnail_progress_dialog = None
+        if self._grid_built():
+            self._set_status(f"{self._showing_text()} · Loading thumbnails... "
+                             f"({self.thumbnails_loaded}/{self.thumbnails_to_load})")
+
+    def _close_thumbnail_progress(self):
+        """Close the progress dialog - without it counting as Hide (closing emits canceled)"""
+        dialog, self.thumbnail_progress_dialog = self.thumbnail_progress_dialog, None
+        if dialog is not None:
+            dialog.canceled.disconnect(self._hide_thumbnail_progress)
+            dialog.close()
+
     def _finish_thumbnail_loading(self):
         """Close the thumbnail progress dialog and clean up"""
+        was_hidden = self.thumbnail_progress_dialog is None
         self.is_loading_thumbnails = False
         self.thumbnails_to_load = 0
         self.thumbnails_loaded = 0
 
-        if self.thumbnail_progress_dialog:
-            self.thumbnail_progress_dialog.close()
-            self.thumbnail_progress_dialog = None
+        self._close_thumbnail_progress()
+        if was_hidden and self._grid_built():
+            self._set_status(self._showing_text())
 
     def _on_card_double_clicked(self, item_data):
         """Handle card double-click - open image viewer"""
@@ -2372,8 +2407,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             settings = QSettings("CosmosCollection", "CosmosCollection")
             settings.setValue("gallery_thumbnail_size", size_name)
 
-            # Clear thumbnail cache since cached images are at the old size
-            self.thumbnail_cache.clear()
+            # The memory cache is kept - it's keyed by size, so switching back is instant
             self.thumbnail_loaded_indices.clear()
 
             # Cancel pending thumbnail tasks

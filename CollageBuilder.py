@@ -1580,17 +1580,15 @@ def load_preview_qimage(path):
     cache_file = _cache_file(path) if path else None
     if cache_file is None:
         return None, MISSING_FILE
+    from ImageLoader import load_image_qimage, read_image_file, write_image_file
     if cache_file.exists():
-        image = QImage(str(cache_file))
-        if not image.isNull():
+        image, _error = read_image_file(str(cache_file), auto_transform=False)
+        if image is not None:
             return image, None
-    from ImageLoader import load_image_qimage
-    image, error = load_image_qimage(path)
+    image, error = load_image_qimage(path, max_dim=PREVIEW_MAX)
     if image is None:
         return None, error or "Can't read this image"
-    if max(image.width(), image.height()) > PREVIEW_MAX:
-        image = image.scaled(PREVIEW_MAX, PREVIEW_MAX, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    if not image.save(str(cache_file), "JPG", 90):
+    if not write_image_file(image, str(cache_file), "JPG", 90):
         logger.debug(f"Could not cache the preview of {path}")
     return image, None
 
@@ -3320,7 +3318,8 @@ class ExportWorker(QThread):
 
         self.progress.emit(len(frames), len(frames), "")
         image_format = EXPORT_FORMATS.get(os.path.splitext(self.path)[1].lower(), "JPEG")
-        ok = image.save(self.path, image_format, 95 if image_format == "JPEG" else -1)
+        from ImageLoader import write_image_file
+        ok = write_image_file(image, self.path, image_format, 95 if image_format == "JPEG" else -1)
         self.done.emit(ok, "" if ok else f"Couldn't write the {image_format} file", missing)
 
 

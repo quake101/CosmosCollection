@@ -110,109 +110,30 @@ class ImageLoaderThread(QThread):
         self.is_fits = is_fits
 
     def run(self):
-        """Load image in background thread with progressive loading"""
+        """Load the full-resolution image in a background thread"""
         try:
-            from PySide6.QtGui import QImage, QImageReader
-
             if not os.path.exists(self.image_path):
                 self.load_failed.emit(self.image_path, "File not found")
                 return
 
-            file_ext = os.path.splitext(self.image_path)[1].lower()
             file_size_mb = os.path.getsize(self.image_path) / (1024 * 1024)
+            logger.info(f"Image loading: {os.path.basename(self.image_path)} - {file_size_mb:.1f}MB")
 
-            logger.info(f"Image loading: {os.path.basename(self.image_path)} - {file_size_mb:.1f}MB - Format: {file_ext}")
-
-            if file_ext == '.png' and file_size_mb > 2:
-                logger.info(f"Using Pillow loader for PNG file ({file_size_mb:.1f}MB)")
-                try:
-                    success = self._load_with_pillow()
-                    if success:
-                        logger.info("Pillow load completed successfully")
-                        return
-                    else:
-                        logger.warning("Pillow load failed, falling back to Qt")
-                except Exception as e:
-                    logger.warning(f"Pillow not available or failed: {e}, using Qt")
-
-            if self.is_fits:
-                # Returns a QImage detached from numpy memory, so it's safe to
-                # hand across threads (the old loader here wrapped a numpy
-                # buffer without copying, which corrupted colors)
-                from ImageLoader import load_astro_qimage
-                qimage = load_astro_qimage(self.image_path)
-                if qimage is not None:
-                    self.image_loaded.emit(qimage, self.image_path)
-                else:
-                    self.load_failed.emit(self.image_path, "Failed to load FITS file")
+            # FITS/XISF come back as a QImage detached from numpy memory, so
+            # it's safe to hand across threads; other formats are read whole
+            # first, much quicker from a network drive
+            from ImageLoader import load_image_qimage
+            qimage, error = load_image_qimage(self.image_path)
+            if qimage is not None:
+                self.image_loaded.emit(qimage, self.image_path)
+            elif self.is_fits:
+                self.load_failed.emit(self.image_path, error)
             else:
-                QImageReader.setAllocationLimit(1024)
-
-                reader = QImageReader(self.image_path)
-                reader.setAutoTransform(True)
-                reader.setQuality(100)
-
-                if not reader.canRead():
-                    self.load_failed.emit(self.image_path, f"Cannot read image: {reader.errorString()}")
-                    return
-
-                original_size = reader.size()
-                logger.debug(f"Loading full resolution with Qt: {original_size.width()}x{original_size.height()}")
-
-                qimage = reader.read()
-
-                if qimage.isNull():
-                    error_msg = reader.errorString() or "Unknown error"
-                    self.load_failed.emit(self.image_path, f"Failed to load image: {error_msg}")
-                else:
-                    self.image_loaded.emit(qimage, self.image_path)
+                self.load_failed.emit(self.image_path, f"Failed to load image: {error}")
 
         except Exception as e:
             logger.error(f"Error loading image in thread: {str(e)}")
             self.load_failed.emit(self.image_path, str(e))
-
-    def _load_with_pillow(self):
-        """Load image using Pillow (much faster for PNG)"""
-        try:
-            from PIL import Image
-            from PySide6.QtGui import QImage
-
-            logger.debug(f"Loading PNG with Pillow: {self.image_path}")
-
-            with Image.open(self.image_path) as pil_image:
-                original_width, original_height = pil_image.size
-                logger.info(f"Pillow opened image: {original_width}x{original_height}, mode: {pil_image.mode}")
-
-                full_image = pil_image
-                logger.info(f"Converting full resolution to QImage: {original_width}x{original_height}")
-
-                if full_image.mode != 'RGB':
-                    logger.info(f"Converting {full_image.mode} to RGB for consistent color handling")
-                    full_image = full_image.convert('RGB')
-
-                img_data = full_image.tobytes()
-                qimage = QImage(
-                    img_data,
-                    full_image.size[0],
-                    full_image.size[1],
-                    full_image.size[0] * 3,
-                    QImage.Format_RGB888
-                ).copy()
-
-                if not qimage.isNull():
-                    logger.info(f"Emitting full resolution image: {full_image.size[0]}x{full_image.size[1]}")
-                    self.image_loaded.emit(qimage, self.image_path)
-                    logger.info("Pillow load completed successfully")
-                    return True
-                else:
-                    return False
-
-        except ImportError:
-            logger.debug("Pillow not installed")
-            return False
-        except Exception as e:
-            logger.error(f"Error loading with Pillow: {str(e)}")
-            return False
 
 
 class ImageCache:

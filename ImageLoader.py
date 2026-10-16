@@ -11,12 +11,18 @@ numpy array - FITS via astropy.io.fits, XISF via XISFReader.read_xisf_pixels().
 
 import os
 import logging
+import threading
 
 import numpy as np
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import Qt, QBuffer, QByteArray, QIODevice
+from PySide6.QtGui import QImage, QImageReader, QPixmap
 
 logger = logging.getLogger(__name__)
+
+# Qt image file decodes and encodes one at a time, app-wide - several at once
+# on worker threads corrupted the heap now and then (a hard crash). The GIL is
+# released while one runs, so the UI stays responsive meanwhile.
+QT_IMAGE_IO_LOCK = threading.Lock()
 
 FITS_EXTENSIONS = ('.fits', '.fit', '.fts')
 XISF_EXTENSIONS = ('.xisf',)
@@ -138,26 +144,84 @@ def load_astro_qimage(file_path):
     return None if qimage.isNull() else qimage
 
 
-def load_image_qimage(file_path):
+def read_image_file(file_path, max_dim=None, auto_transform=True):
+    """Decode a standard image file (PNG, JPEG, TIFF...) into a QImage, scaled
+    to fit max_dim if given - decoded straight at that size where the format
+    allows (JPEG). auto_transform applies the EXIF orientation.
+
+    The whole file is read in one go first: Qt's readers fetch a file in many
+    small pieces, which took about 10x as long from a network drive. Safe to
+    call from a worker thread. Returns (qimage, None) or (None, error message).
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            data = QByteArray(f.read())
+    except OSError as e:
+        return None, f"Couldn't read the file: {e.strerror or e}"
+    if data.isEmpty():
+        return None, "Empty file"
+
+    buffer = QBuffer()
+    buffer.setData(data)
+    del data
+    buffer.open(QIODevice.ReadOnly)
+    # Like reading from the path: the format the extension names, then
+    # whatever the content looks like (a PNG named .jpg, say)
+    suffix = os.path.splitext(file_path)[1].lstrip('.').lower().encode()
+    with QT_IMAGE_IO_LOCK:
+        QImageReader.setAllocationLimit(1024)  # MB - large stacked images exceed Qt's default
+        for image_format in (suffix, b""):
+            buffer.seek(0)
+            reader = QImageReader(buffer, image_format)
+            reader.setAutoTransform(auto_transform)
+            if max_dim:
+                size = reader.size()
+                if size.isValid() and max(size.width(), size.height()) > max_dim:
+                    reader.setScaledSize(size.scaled(max_dim, max_dim, Qt.KeepAspectRatio))
+            qimage = reader.read()
+            if not qimage.isNull():
+                return qimage, None
+            error = reader.errorString()
+    return None, error or "Unknown error"
+
+
+def write_image_file(image, file_path, image_format, quality=-1):
+    """Encode a QImage and write it to file_path - encoded in memory, then
+    written in one go, since Qt writes a file in small pieces too. Safe to
+    call from a worker thread. Returns True on success."""
+    buffer = QBuffer()
+    buffer.open(QIODevice.WriteOnly)
+    with QT_IMAGE_IO_LOCK:
+        ok = image.save(buffer, image_format, quality)
+    if not ok:
+        return False
+    try:
+        with open(file_path, 'wb') as f:
+            f.write(buffer.data().data())
+    except OSError as e:
+        logger.warning(f"Could not write {file_path}: {e}")
+        return False
+    return True
+
+
+def load_image_qimage(file_path, max_dim=None):
     """Load any supported image (FITS/XISF or a standard format Qt can read)
-    as a full-resolution QImage. Safe to call from a worker thread.
-    Returns (qimage, None) on success or (None, error message) on failure."""
+    as a QImage - full resolution, or scaled to fit max_dim. Safe to call from
+    a worker thread. Returns (qimage, None) on success or (None, error message)
+    on failure."""
     if not file_path or not os.path.exists(file_path):
         return None, "File not found"
 
     ext = os.path.splitext(file_path)[1].lower()
     if ext in FITS_EXTENSIONS + XISF_EXTENSIONS:
         qimage = load_astro_qimage(file_path)
-        return (qimage, None) if qimage is not None else (None, "Failed to load FITS/XISF file")
+        if qimage is None:
+            return None, "Failed to load FITS/XISF file"
+        if max_dim and max(qimage.width(), qimage.height()) > max_dim:
+            qimage = qimage.scaled(max_dim, max_dim, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        return qimage, None
 
-    from PySide6.QtGui import QImageReader
-    QImageReader.setAllocationLimit(1024)  # MB - large stacked images exceed Qt's default
-    reader = QImageReader(file_path)
-    reader.setAutoTransform(True)
-    qimage = reader.read()
-    if qimage.isNull():
-        return None, reader.errorString() or "Unknown error"
-    return qimage, None
+    return read_image_file(file_path, max_dim=max_dim)
 
 
 def load_screen_stretched_qimage(file_path):

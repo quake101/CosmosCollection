@@ -85,7 +85,8 @@ class ImageSaveWorker(QThread):
 
     def run(self):
         try:
-            ok = self.image.save(self.save_path, self.image_format, self.quality)
+            from ImageLoader import write_image_file
+            ok = write_image_file(self.image, self.save_path, self.image_format, self.quality)
         except Exception as e:
             logger.error(f"Failed to save image to {self.save_path}: {e}", exc_info=True)
             ok = False
@@ -1360,7 +1361,8 @@ class ImageViewerWindow(QDialog):
         # "_background" suffix so an existing PNG of the same name isn't overwritten
         source = Path(file_path).resolve()
         png_path = source.with_name(f"{source.stem}_background.png")
-        if not image.save(str(png_path), "PNG"):
+        from ImageLoader import write_image_file
+        if not write_image_file(image, str(png_path), "PNG"):
             logger.error(f"Failed to save background PNG to {png_path}")
             return None
 
