@@ -148,7 +148,7 @@ DSO_QUERY = """
                        END, c.designation)
             FROM cataloguenr c
             WHERE c.dsodetailid = d.id) as designations,
-           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+           ui.image_path, ui.integration_time, ui.date_taken, ui.notes,
            COALESCE(img.image_count, 0) as image_count
     FROM dsodetail d
     LEFT JOIN (SELECT dsodetailid, MIN(id) AS first_id, COUNT(*) AS image_count
@@ -188,7 +188,7 @@ def dso_row_to_dict(row):
     """Convert a DSO_QUERY row into the dict used by the table model and detail window"""
     obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, \
         constellation, dso_type, dso_class, designations, image_path, integration_time, \
-        equipment, date_taken, notes, image_count = row
+        date_taken, notes, image_count = row
 
     designations = designations or ""
     # Primary designation, e.g. "M 31"; a few objects have no number ("Coalsack")
@@ -211,7 +211,6 @@ def dso_row_to_dict(row):
         "designations": designations,
         "image_path": image_path,
         "integration_time": integration_time,
-        "equipment": equipment,
         "date_taken": date_taken,
         "notes": notes,
         "image_count": image_count
@@ -4518,6 +4517,12 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         collage_builder_action.triggered.connect(self._show_collage_builder)
         toolbar.addAction(collage_builder_action)
 
+        # Import Wizard action
+        import_action = QAction("Import Wizard", self)
+        import_action.setToolTip("Find the sessions and finished images in your folders and add them to your collection")
+        import_action.triggered.connect(self._show_import_wizard)
+        toolbar.addAction(import_action)
+
         toolbar.addSeparator()
 
         # DSO Visibility Calculator action
@@ -4708,6 +4713,11 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             QMessageBox.warning(self, "Import Error", f"Could not load Session Manager: {e}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not open Session Manager: {e}")
+
+    def _show_import_wizard(self):
+        """Show the Import Wizard window"""
+        from ImportWizard import open_import_wizard
+        self.import_wizard_window = open_import_wizard(self)
 
     def _show_collage_builder(self):
         """Show the Collage Builder window"""
@@ -5916,7 +5926,7 @@ Examples:
     parser.add_argument('--image', type=str, metavar='PATH',
                         help='Path to the image file')
     parser.add_argument('--equipment', type=str, default='',
-                        help='Equipment used (optional)')
+                        help='Equipment used: "telescope, camera" (optional)')
     parser.add_argument('--integration', type=str, default='',
                         help='Integration time in seconds (optional)')
     parser.add_argument('--date', type=str, default='',
@@ -6040,21 +6050,15 @@ def add_image_cli(args) -> bool:
         with db_manager.get_connection() as conn:
             cursor = conn.cursor()
 
-            cursor.execute("""
-                INSERT INTO userimages (
-                    dsodetailid, image_path, integration_time,
-                    equipment, date_taken, notes, created_date
-                ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-            """, (
-                dso['id'],
-                image_path,
-                args.integration,
-                args.equipment,
-                args.date,
-                args.notes
-            ))
-
-            image_id = cursor.lastrowid
+            # "telescope, camera" - linked to the user's Equipment where it names it
+            import EquipmentMapper
+            import LibraryScanner
+            from DatabaseManager import add_user_image_row
+            telescope_id, telescope_name, camera_id, camera_name = EquipmentMapper.parse_equipment_text(
+                args.equipment, LibraryScanner.load_equipment_info(conn))
+            image_id = add_user_image_row(cursor, dso['id'], image_path, args.integration, args.date, args.notes,
+                                          equipment={"telescope_id": telescope_id, "telescope_name": telescope_name,
+                                                     "camera_id": camera_id, "camera_name": camera_name})
 
             # Set as favorite if requested
             if args.set_favorite:

@@ -17,8 +17,8 @@ from html import escape
 from pathlib import Path
 from datetime import datetime, timezone
 
-from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QSettings, QThread, QRectF
-from PySide6.QtGui import QPixmap, QPainter, QImage
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QSettings, QThread, QRectF, QObject, QRunnable, QThreadPool
+from PySide6.QtGui import QPixmap, QPainter, QImage, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
     QGroupBox, QScrollArea, QFileDialog, QMessageBox, QCheckBox, QProgressBar, QToolButton, QMenu
@@ -44,15 +44,56 @@ logger = logging.getLogger(__name__)
 _orphaned_workers = set()
 
 
+# File Information values may wrap after these (path separators, punctuation -
+# not dots, which would split numbers like 300.00 and file extensions)...
+_WRAP_AFTER = re.compile(r'([\\/_,-])')
+# ...and within any longer run of characters that has none of them
+_LONGEST_UNWRAPPED = 16
+
+
+def _wrappable(text):
+    """Text that wraps to the File Information panel's narrow column - zero-width
+    spaces (places to wrap) after separators and punctuation, and within long
+    runs without any. One unwrappable file name widened the whole table past
+    the panel, cutting off every long value."""
+    text = _WRAP_AFTER.sub('\\1\u200b', text)
+    return re.sub(rf'([^\s\u200b]{{{_LONGEST_UNWRAPPED}}})(?=[^\s\u200b])', '\\1\u200b', text)
+
+
+def _megabytes(count):
+    """A byte count for people: '4.2 MB', '166 MB', '1.2 GB'."""
+    mb = count / (1024 * 1024)
+    if mb >= 1000:
+        return f"{mb / 1024:.1f} GB"
+    return f"{mb:.1f} MB" if mb < 10 else f"{mb:.0f} MB"
+
+
+class _LoadCancelled(Exception):
+    """Raised from a load's progress callback to stop reading the file."""
+
+
 class ImageLoadWorker(QThread):
-    """Decodes an image file (including FITS/XISF) into a QImage off the GUI thread"""
-    image_loaded = Signal(object)  # QImage
-    load_failed = Signal(str)  # error message
+    """Decodes an image file (including FITS/XISF) into a QImage off the GUI
+    thread - for the Image Viewer and DSO Details. Each signal names the file,
+    so a window can ignore a load it no longer wants."""
+    image_loaded = Signal(object, str)  # QImage, file
+    load_failed = Signal(str, str)  # error message, file
+    progress = Signal(str, object, object)  # file, bytes read, file size - when they're equal, it's decoding
 
     def __init__(self, file_path, screen_stretch=False):
         super().__init__()
         self.file_path = file_path
         self.screen_stretch = screen_stretch
+        self._cancelled = False
+
+    def cancel(self):
+        """Stop reading the file (another image is wanted instead)."""
+        self._cancelled = True
+
+    def _progress(self, done, total):
+        if self._cancelled:
+            raise _LoadCancelled()
+        self.progress.emit(self.file_path, done, total)
 
     def run(self):
         try:
@@ -61,14 +102,20 @@ class ImageLoadWorker(QThread):
             if self.screen_stretch and is_astro:
                 qimage, error = load_screen_stretched_qimage(self.file_path)
             else:
-                qimage, error = load_image_qimage(self.file_path)
+                qimage, error = load_image_qimage(self.file_path, progress=self._progress)
+            if self._cancelled:
+                return
             if qimage is not None:
-                self.image_loaded.emit(qimage)
+                self.image_loaded.emit(qimage, self.file_path)
             else:
-                self.load_failed.emit(error)
+                self.load_failed.emit(error, self.file_path)
+        except _LoadCancelled:
+            pass
         except Exception as e:
+            if self._cancelled:
+                return
             logger.error(f"Failed to load image {self.file_path}: {e}", exc_info=True)
-            self.load_failed.emit(str(e))
+            self.load_failed.emit(str(e), self.file_path)
 
 
 class ImageSaveWorker(QThread):
@@ -185,6 +232,98 @@ def read_image_header(file_path):
     if Path(file_path).suffix.lower() in XISF_EXTENSIONS:
         return _read_xisf_header(file_path)
     return _read_fits_header(file_path)
+
+
+def read_file_info(file_path):
+    """What the File Information panel shows from the file system: the file's
+    stat, its FITS/XISF header (else EXIF), and a plate solution saved next to
+    it. Slow from the network drive - opening a file there the first time
+    waits seconds for Windows Defender to scan it - so it's read off the GUI
+    thread (_FileInfoTask). Raises if the file can't be read at all."""
+    info = {'stats': os.stat(file_path), 'header': None, 'exif': None, 'saved_wcs': None}
+    if Path(file_path).suffix.lower() in FITS_EXTENSIONS | XISF_EXTENSIONS:
+        try:
+            info['header'] = read_image_header(file_path)
+        except Exception as e:
+            logger.warning(f"Failed to read header from {file_path}: {e}")
+    if info['header'] is not None:
+        if Path(file_path).with_suffix('.wcs').exists():
+            info['saved_wcs'] = read_wcs_header(file_path)
+    else:
+        info['exif'] = _exif_info(file_path)
+    return info
+
+
+# EXIF tags the File Information panel shows, and their labels
+_EXIF_LABELS = {
+    'Make': 'Camera Make',
+    'Model': 'Camera Model',
+    'DateTime': 'Date Taken',
+    'ExposureTime': 'Exposure Time',
+    'FNumber': 'F-Number',
+    'ISO': 'ISO Speed',
+    'FocalLength': 'Focal Length',
+    'Flash': 'Flash',
+    'WhiteBalance': 'White Balance',
+    'ExposureProgram': 'Exposure Program',
+    'MeteringMode': 'Metering Mode'
+}
+
+
+def _exif_info(file_path):
+    """Basic EXIF information from an image file, {label: text} - or None."""
+    try:
+        from PIL import Image
+        from PIL.ExifTags import TAGS
+        from ImageLoader import header_exif
+
+        # From the header only, as the format its extension names - trying
+        # every format imports all of Pillow's plugins and reads the file with
+        # each, for seconds on a network drive when a file is damaged
+        formats = {'.png': ['PNG'], '.jpg': ['JPEG'], '.jpeg': ['JPEG'], '.tif': ['TIFF'],
+                   '.tiff': ['TIFF']}.get(Path(file_path).suffix.lower())
+        with Image.open(file_path, formats=formats) as img:
+            exif_data = header_exif(img)
+        if not exif_data:
+            return None
+
+        exif_info = {}
+        for tag_id, value in exif_data.items():
+            tag_name = TAGS.get(tag_id, tag_id)
+            if tag_name in _EXIF_LABELS:
+                # Format specific values
+                if tag_name == 'ExposureTime' and isinstance(value, tuple):
+                    value = f"{value[0]}/{value[1]} sec"
+                elif tag_name == 'FNumber' and isinstance(value, tuple):
+                    value = f"f/{value[0]/value[1]:.1f}"
+                elif tag_name == 'FocalLength' and isinstance(value, tuple):
+                    value = f"{value[0]/value[1]:.1f}mm"
+                exif_info[_EXIF_LABELS[tag_name]] = str(value)
+        return exif_info or None
+    except Exception:
+        return None  # No Pillow, or no readable EXIF
+
+
+class _FileInfoSignals(QObject):
+    ready = Signal(str, object)  # file path, read_file_info() result (or the exception)
+
+
+class _FileInfoTask(QRunnable):
+    """Reads a file's information for the File Information panel in the background."""
+
+    def __init__(self, file_path, signals):
+        super().__init__()
+        self.file_path, self.signals = file_path, signals
+
+    def run(self):
+        try:
+            info = read_file_info(self.file_path)
+        except Exception as e:
+            info = e
+        try:
+            self.signals.ready.emit(self.file_path, info)
+        except RuntimeError:
+            pass  # The viewer closed meanwhile
 
 
 def _read_fits_header(file_path):
@@ -630,13 +769,22 @@ class ImageViewerWindow(QDialog):
     zoom_changed = Signal(float)  # Signal for zoom level changes
 
     def __init__(self, pixmap: QPixmap, title: str, file_path: str = None, parent=None,
-                 dso_ra: float = None, dso_dec: float = None, screen_stretch: bool = False):
+                 dso_ra: float = None, dso_dec: float = None, screen_stretch: bool = False, versions=None):
         """pixmap may be None when file_path is given - the window then opens
         straight away and loads the image in a background thread. screen_stretch
         loads a FITS/XISF raw sub with an auto screen stretch (debayered on a color
-        camera) instead of the plain linear one - for reviewing light frames."""
+        camera) instead of the plain linear one - for reviewing light frames.
+        versions: other images of the same object (file paths, file_path among
+        them) to step through with the arrow buttons and keys."""
         super().__init__(parent)
         self.screen_stretch = screen_stretch
+        self.title = title
+        key = lambda path: os.path.normcase(os.path.normpath(path))
+        self.versions = list(versions or []) if file_path and pixmap is None else []
+        self.version_index = next((i for i, path in enumerate(self.versions) if key(path) == key(file_path)), None)
+        if self.version_index is None or len(self.versions) < 2:
+            self.versions = []
+        self._previous_size = None  # The size of the version shown before this one loaded
         self.setWindowTitle(f"{title} - Image Viewer - Cosmos Collection")
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
@@ -684,6 +832,29 @@ class ImageViewerWindow(QDialog):
         reset_button.setToolTip("Reset zoom to 100%")
         reset_button.clicked.connect(self._reset_zoom)
         toolbar.addWidget(reset_button)
+
+        # The object's other images: back and forth through them, in this window
+        if self.versions:
+            toolbar.addSpacing(6)
+            self.previous_version_button = QPushButton("◀")
+            themed_style(self.previous_version_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
+            self.previous_version_button.setFixedSize(30, 30)
+            self.previous_version_button.setToolTip("Previous image of this object (Left arrow)")
+            self.previous_version_button.clicked.connect(lambda: self._show_version(self.version_index - 1))
+            toolbar.addWidget(self.previous_version_button)
+            self.version_label = QLabel()
+            self.version_label.setAlignment(Qt.AlignCenter)
+            toolbar.addWidget(self.version_label)
+            self.next_version_button = QPushButton("▶")
+            themed_style(self.next_version_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
+            self.next_version_button.setFixedSize(30, 30)
+            self.next_version_button.setToolTip("Next image of this object (Right arrow)")
+            self.next_version_button.clicked.connect(lambda: self._show_version(self.version_index + 1))
+            toolbar.addWidget(self.next_version_button)
+            # Shortcuts, so the arrows work whichever control has the focus
+            QShortcut(QKeySequence(Qt.Key_Left), self, lambda: self._show_version(self.version_index - 1))
+            QShortcut(QKeySequence(Qt.Key_Right), self, lambda: self._show_version(self.version_index + 1))
+            toolbar.addSpacing(6)
 
         # Add file-specific buttons if file path is available
         if self.file_path:
@@ -863,6 +1034,11 @@ class ImageViewerWindow(QDialog):
         self.file_info_content.setWordWrap(True)
         self.file_info_content.setAlignment(Qt.AlignTop)
         self.file_info_content.setTextFormat(Qt.RichText)
+        # The file's information is read in the background (read_file_info)
+        self._file_info = None          # (file path, read_file_info() result or exception)
+        self._file_info_reading = None  # The file path being read
+        self._file_info_signals = _FileInfoSignals(self)
+        self._file_info_signals.ready.connect(self._on_file_info_read)
         # The section colors are baked into the rich text, so re-render on theme changes
         theme_manager().theme_changed.connect(self._refresh_file_info)
 
@@ -884,6 +1060,13 @@ class ImageViewerWindow(QDialog):
         self.status_bar.setMinimumWidth(1)  # Long messages are cut short, not widening the window
         themed_style(self.status_bar, lambda: f"font-size: {font_size(10)};")
         status_row.addWidget(self.status_bar, 1)
+        # Loading the image: how much of the file is read, then busy while it decodes
+        self.load_progress = QProgressBar()
+        self.load_progress.setTextVisible(False)
+        self.load_progress.setFixedSize(160, 12)
+        self.load_progress.hide()
+        status_row.addWidget(self.load_progress)
+        self._load_message = None  # The load's progress, for the status bar
         self.solve_busy = QProgressBar()
         self.solve_busy.setRange(0, 0)  # Busy, no percentage
         self.solve_busy.setTextVisible(False)
@@ -918,7 +1101,61 @@ class ImageViewerWindow(QDialog):
 
         # Update status
         self._update_annotation_controls()
+        self._update_version_controls()
         self._update_status()
+
+    def _update_version_controls(self):
+        """Which of the object's images shows (n of N, its file in the title).
+        Stepping waits while a plate solve of this one runs."""
+        if not self.versions:
+            return
+        name = Path(self.file_path).name
+        self.setWindowTitle(f"{self.title} - {name} - Image Viewer - Cosmos Collection")
+        self.version_label.setText(f"{self.version_index + 1} of {len(self.versions)}")
+        self.version_label.setToolTip(name)
+        for button in (self.previous_version_button, self.next_version_button):
+            button.setEnabled(not self._solving)
+
+    def _show_version(self, index):
+        """Show another of the object's images (wrapping around at either end).
+        The current one stays until it loads; one the same size keeps the zoom
+        and position, to compare them."""
+        if not self.versions or self._solving:
+            return
+        index %= len(self.versions)
+        if index == self.version_index:
+            return
+        self._drop_image_load()
+        if self.original_pixmap is not None:
+            self._previous_size = self.original_pixmap.size()
+        self.version_index = index
+        self.file_path = self.versions[index]
+        self.original_pixmap = None
+        self._scaled_cache = None
+        self.plate_solve_result = None
+        self._unsaved_annotations = None
+        self._solve_message_timer.stop()
+        self._clear_solve_message()
+        self._update_version_controls()
+        self._update_annotation_controls()
+        self._start_image_load()
+        if self.file_info_panel.isVisible():
+            self._load_file_information()  # Read alongside the image, not after it
+        self._update_status()
+
+    def _drop_image_load(self):
+        """Stop an image that's still loading: its read stops (decoding can't be
+        interrupted), its result is dropped, and the thread object is kept
+        alive until it finishes."""
+        if self.image_load_worker and self.image_load_worker.isRunning():
+            worker = self.image_load_worker
+            worker.cancel()
+            worker.image_loaded.disconnect()
+            worker.load_failed.disconnect()
+            worker.progress.disconnect()
+            _orphaned_workers.add(worker)
+            worker.finished.connect(lambda: _orphaned_workers.discard(worker))
+        self.image_load_worker = None
 
     def _image_buttons(self):
         """Toolbar buttons that need the image to be loaded"""
@@ -934,18 +1171,45 @@ class ImageViewerWindow(QDialog):
         self.image_load_worker = ImageLoadWorker(self.file_path, screen_stretch=self.screen_stretch)
         self.image_load_worker.image_loaded.connect(self._on_image_loaded)
         self.image_load_worker.load_failed.connect(self._on_image_load_failed)
+        self.image_load_worker.progress.connect(self._on_load_progress)
+        self._load_message = "Loading image..."
+        self.load_progress.setRange(0, 0)  # Busy until the first progress arrives
+        self.load_progress.show()
         self.image_load_worker.start()
 
-    def _on_image_loaded(self, qimage):
+    def _on_load_progress(self, path, done, total):
+        """How much of the file is read (status bar, and over the image area
+        while it's empty) - then decoding, which can't report progress."""
+        if path != self.file_path or self.original_pixmap is not None:
+            return  # From a load that was dropped (another image was wanted)
+        name = Path(self.file_path).name
+        if done < total:
+            percent = int(done * 100 / total) if total else 0
+            self.load_progress.setRange(0, 1000)
+            self.load_progress.setValue(int(done * 1000 / total) if total else 0)
+            self._load_message = f"Loading image... {percent}% ({_megabytes(done)} of {_megabytes(total)})"
+            placeholder = f"Loading {name}...\n\n{percent}%"
+        else:
+            self.load_progress.setRange(0, 0)
+            self._load_message = "Decoding image..."
+            placeholder = f"Loading {name}...\n\nDecoding..."
+        if self.image_label.pixmap().isNull():  # Not still showing the previous image
+            self.image_label.setText(placeholder)
+        self._update_status()
+
+    def _on_image_loaded(self, qimage, path):
         """Show the image once the worker has decoded it"""
+        if path != self.file_path:
+            return  # From a load that was dropped (another image was wanted)
         # QPixmap must be created on the GUI thread
         pixmap = QPixmap.fromImage(qimage)
         if pixmap.isNull():
-            self._on_image_load_failed("Failed to convert image")
+            self._on_image_load_failed("Failed to convert image", path)
             return
 
         self.original_pixmap = pixmap
         self._scaled_cache = None
+        self._end_load_progress()
         self.image_label.setStyleSheet("")
         self.image_label.setText("")
         for button in self._image_buttons():
@@ -954,14 +1218,30 @@ class ImageViewerWindow(QDialog):
         if self.file_info_panel.isVisible():
             self._load_file_information()
 
+        # Another of the object's images: fitted afresh unless it's the same size
+        if self._previous_size is not None and self._previous_size != pixmap.size():
+            self.initial_fit_done = False
+        self._previous_size = None
+
         if self.isVisible():
-            self._do_initial_fit()
+            if self.initial_fit_done:
+                self._update_zoom()
+            else:
+                self._do_initial_fit()
         # Otherwise showEvent does the initial fit
 
-    def _on_image_load_failed(self, error_message):
+    def _on_image_load_failed(self, error_message, path):
         """Show why the image couldn't be loaded"""
+        if path != self.file_path:
+            return
         logger.error(f"Image viewer failed to load {self.file_path}: {error_message}")
+        self._end_load_progress("Couldn't load the image")
         self.image_label.setText(f"Failed to load image:\n{Path(self.file_path).name}\n\n{error_message}")
+        self._update_status()
+
+    def _end_load_progress(self, message=None):
+        self._load_message = message
+        self.load_progress.hide()
 
     def showEvent(self, event):
         """Handle window show event - fit image to window on first show"""
@@ -1168,7 +1448,7 @@ class ImageViewerWindow(QDialog):
     def _update_status(self, annotation_status=None):
         """Update the status bar with current zoom level and image size"""
         if self.original_pixmap is None:
-            self.status_bar.setText("Loading image...")
+            self.status_bar.setText(self._load_message or "Loading image...")
             return
 
         zoom_percent = int(self.zoom_factor * 100)
@@ -1476,13 +1756,25 @@ class ImageViewerWindow(QDialog):
             self._load_file_information()
 
     def _load_file_information(self):
-        """Load and display file information"""
+        """Show the file's information - read in the background (read_file_info)
+        the first time, then from what was read (when the image arrives with
+        its size, or the theme changes)."""
         if not self.file_path or not hasattr(self, 'file_info_content'):
+            return
+        if self._file_info is None or self._file_info[0] != self.file_path:
+            if self._file_info_reading != self.file_path:
+                self._file_info_reading = self.file_path
+                QThreadPool.globalInstance().start(_FileInfoTask(self.file_path, self._file_info_signals))
+            self.file_info_content.setText(escape(f"Reading {Path(self.file_path).name}..."))
+            return
+        info = self._file_info[1]
+        if isinstance(info, Exception):
+            self.file_info_content.setText(f"Error loading file information:<br>{escape(str(info))}")
             return
 
         try:
             # Get file stats
-            file_stats = os.stat(self.file_path)
+            file_stats = info['stats']
             file_path_obj = Path(self.file_path)
 
             # Basic file information
@@ -1504,14 +1796,8 @@ class ImageViewerWindow(QDialog):
             created_time = format_datetime(datetime.fromtimestamp(file_stats.st_ctime), seconds=True)
             modified_time = format_datetime(datetime.fromtimestamp(file_stats.st_mtime), seconds=True)
 
-            # FITS/XISF header - read before the dimensions so they're known
-            # even while the image itself is still loading
-            header = None
-            if file_path_obj.suffix.lower() in FITS_EXTENSIONS | XISF_EXTENSIONS:
-                try:
-                    header = read_image_header(self.file_path)
-                except Exception as e:
-                    logger.warning(f"Failed to read header from {self.file_path}: {e}")
+            # FITS/XISF header - its dimensions show even while the image itself is still loading
+            header = info['header']
 
             # Image dimensions
             if self.original_pixmap:
@@ -1545,16 +1831,24 @@ class ImageViewerWindow(QDialog):
                 if cached_wcs and image_size:
                     cached_wcs = self._wcs_for_display(cached_wcs, image_size[1])
                 sections.extend(build_header_sections(header, image_size, cached_wcs))
-            else:
-                # Try to get EXIF data if available
-                exif_info = self._get_exif_info()
-                if exif_info:
-                    sections.append(("EXIF", list(exif_info.items())))
+            elif info['exif']:
+                sections.append(("EXIF", list(info['exif'].items())))
 
             self.file_info_content.setText(self._file_info_html(sections))
 
         except Exception as e:
             self.file_info_content.setText(f"Error loading file information:<br>{escape(str(e))}")
+
+    def _on_file_info_read(self, path, info):
+        """A file's information arrived from the background read: show it,
+        if it's still this image's."""
+        if self._file_info_reading == path:
+            self._file_info_reading = None
+        if path != self.file_path:
+            return  # Another image is showing now
+        self._file_info = (path, info)
+        if self.file_info_panel.isVisible():
+            self._load_file_information()
 
     @staticmethod
     def _file_info_html(sections):
@@ -1567,8 +1861,7 @@ class ImageViewerWindow(QDialog):
             parts.append(f"<tr><td colspan='2' style='font-weight: bold; color: {COLORS['info']}; "
                          f"padding-top: {padding}px;'>{escape(title)}</td></tr>")
             for label, value in rows:
-                # Zero-width spaces let long paths wrap at their separators
-                value_html = escape(str(value)).replace('\\', '\\​').replace('/', '/​')
+                value_html = escape(_wrappable(str(value)))
                 parts.append(
                     f"<tr><td style='color: {COLORS['text_disabled']}; padding-right: 8px; "
                     f"white-space: nowrap;' valign='top'>{escape(label)}</td>"
@@ -1591,69 +1884,17 @@ class ImageViewerWindow(QDialog):
 
     def _cached_wcs_header(self):
         """WCS keywords from this image's plate solve - the loaded result, or
-        the cached .wcs file next to the image - or None"""
+        the cached .wcs file next to the image (as read_file_info found it) - or None"""
         if self.plate_solve_result and self.plate_solve_result.success and self.plate_solve_result.wcs_header:
             return self.plate_solve_result.wcs_header
-        wcs_file = Path(self.file_path).with_suffix('.wcs')
-        return read_wcs_header(self.file_path) if wcs_file.exists() else None
+        if self._file_info and self._file_info[0] == self.file_path and isinstance(self._file_info[1], dict):
+            return self._file_info[1]['saved_wcs']
+        return None
 
     def _refresh_file_info(self):
         """Re-render the File Information panel (e.g. with the new theme's colors)"""
         if self.file_info_panel.isVisible():
             self._load_file_information()
-
-    def _get_exif_info(self):
-        """Extract basic EXIF information from the image file"""
-        try:
-            from PIL import Image
-            from PIL.ExifTags import TAGS
-
-            # Open image with PIL to read EXIF
-            with Image.open(self.file_path) as img:
-                exif_data = img.getexif()
-
-                if not exif_data:
-                    return None
-
-                # Extract useful EXIF information
-                exif_info = {}
-
-                # Common EXIF tags we want to show
-                useful_tags = {
-                    'Make': 'Camera Make',
-                    'Model': 'Camera Model',
-                    'DateTime': 'Date Taken',
-                    'ExposureTime': 'Exposure Time',
-                    'FNumber': 'F-Number',
-                    'ISO': 'ISO Speed',
-                    'FocalLength': 'Focal Length',
-                    'Flash': 'Flash',
-                    'WhiteBalance': 'White Balance',
-                    'ExposureProgram': 'Exposure Program',
-                    'MeteringMode': 'Metering Mode'
-                }
-
-                for tag_id, value in exif_data.items():
-                    tag_name = TAGS.get(tag_id, tag_id)
-                    if tag_name in useful_tags:
-                        # Format specific values
-                        if tag_name == 'ExposureTime' and isinstance(value, tuple):
-                            value = f"{value[0]}/{value[1]} sec"
-                        elif tag_name == 'FNumber' and isinstance(value, tuple):
-                            value = f"f/{value[0]/value[1]:.1f}"
-                        elif tag_name == 'FocalLength' and isinstance(value, tuple):
-                            value = f"{value[0]/value[1]:.1f}mm"
-
-                        exif_info[useful_tags[tag_name]] = str(value)
-
-                return exif_info if exif_info else None
-
-        except ImportError:
-            # PIL not available
-            return None
-        except Exception as e:
-            # Any other error reading EXIF
-            return None
 
     def _update_annotation_controls(self):
         """As in the gallery: Layers and the solve button show while the
@@ -1695,6 +1936,7 @@ class ImageViewerWindow(QDialog):
         self.solve_stop.setVisible(self._solving)
         self.solve_stop.setEnabled(not self._stopping)
         self._update_annotation_controls()
+        self._update_version_controls()
         self._update_status()
 
     def _stop_plate_solve(self):
@@ -1799,14 +2041,8 @@ class ImageViewerWindow(QDialog):
             self.plate_solve_worker.cancel()
             self.plate_solve_worker.wait(1000)
 
-        # Don't block the close on a slow load - drop its result and keep the
-        # thread object alive until it finishes
-        if self.image_load_worker and self.image_load_worker.isRunning():
-            worker = self.image_load_worker
-            worker.image_loaded.disconnect()
-            worker.load_failed.disconnect()
-            _orphaned_workers.add(worker)
-            worker.finished.connect(lambda: _orphaned_workers.discard(worker))
+        # Don't block the close on a slow load
+        self._drop_image_load()
 
         # Let a save carry on in the background after the window closes, so the
         # file still gets written

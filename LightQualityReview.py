@@ -3,8 +3,8 @@
 Light Quality Review Window
 Grades a session's light frames with FrameQuality - star brightness (clouds),
 star count, FWHM, elongation and sky background, each against the frames that
-share its filter, exposure and binning - and lists them best first, so only
-the best subs get stacked. Measurements are cached per file (keyed by size and
+share its filter, exposure, binning and night, and each night against a typical
+one - and lists them best first, so only the best subs get stacked. Measurements are cached per file (keyed by size and
 modification time), so reopening the review only analyzes new or changed subs.
 """
 
@@ -12,12 +12,14 @@ import os
 import json
 import math
 import time
+import queue
 import shutil
 import logging
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter, OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -33,7 +35,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, Q
                                QAbstractItemView, QSplitter, QGroupBox, QDoubleSpinBox, QProgressBar,
                                QMenu, QMessageBox, QSizePolicy, QGraphicsView, QGraphicsScene, QToolButton,
                                QWidgetAction, QScrollArea, QCheckBox, QFileDialog, QProgressDialog, QSpinBox,
-                               QToolTip)
+                               QToolTip, QFrame)
 
 import FrameQuality
 import SessionFileScanner
@@ -41,7 +43,7 @@ import SessionObservations
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import (COLORS, chart_background, chart_color, chart_font_size, font_size, themed_style,
-                   theme_manager)
+                   theme_manager, tint)
 from SessionManager import format_duration, format_exposure, _retire_thread, _rollback
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,9 @@ def analysis_workers():
     settings = QSettings("CosmosCollection", "CosmosCollection")
     default_threads = max(1, (os.cpu_count() or 4) - 2)
     return max(1, min(settings.value("max_threads", default_threads, type=int), 128))
+
+READ_THREADS = 16                    # files read at once - waiting on a disk or network, not the CPU
+READ_AHEAD_BYTES = 512 * 1024 * 1024  # most file bytes held waiting for an analysis thread
 
 SETTINGS_PREFIX = "light_quality/"
 
@@ -191,7 +196,8 @@ def session_light_files(conn, session_id):
 
 
 def group_key(light):
-    """Frames are graded against others with the same filter, exposure and binning."""
+    """Frames are grouped by filter, exposure and binning - and graded within
+    that by night (FrameQuality.grade_frames)."""
     return (light["filter_name"] or "No filter", light["exptime_seconds"], light["xbinning"] or 1)
 
 
@@ -214,9 +220,16 @@ def grade_session_lights(conn, session_id):
                if version == FrameQuality.ANALYSIS_VERSION}
     if not metrics:
         return lights, {}
-    grades = FrameQuality.grade_frames(((group_key(lights[p]), m) for p, m in metrics.items()),
-                                       saved_grade_settings())
-    return lights, grades
+    return lights, grade_lights(lights, metrics, saved_grade_settings())
+
+
+def grade_lights(lights, metrics, settings):
+    """{path: FrameGrade} for the measured lights. lights: {path: file dict},
+    metrics: {path: FrameMetrics} (paths not in lights are left out)."""
+    paths = [p for p in metrics if p in lights]
+    return FrameQuality.grade_frames(((group_key(lights[p]), metrics[p]) for p in paths), settings,
+                                     gains={p: lights[p]["gain"] for p in paths},
+                                     nights={p: lights[p]["night_date"] for p in paths})
 
 
 # ---- Workers --------------------------------------------------------------------
@@ -242,41 +255,88 @@ class AnalysisWorker(QThread):
     def cancelled(self):
         return self._cancelled
 
-    def run(self):
-        todo = []
-        for path in self.paths:
-            if self._cancelled:
-                return
-            try:
-                stat = os.stat(path)
-            except OSError:
-                self.frame_ready.emit(FrameQuality.FrameMetrics(path=path, error="File not found"), None)
-                continue
-            hit = None if self.force else self.cached.get(path)
-            if (hit and hit[0] == stat.st_size and hit[1] == stat.st_mtime_ns
-                    and hit[2] == FrameQuality.ANALYSIS_VERSION):
-                continue  # already showing the cached measurements
-            todo.append((path, stat.st_size, stat.st_mtime_ns))
-
-        self.checked.emit(len(todo))
-        if not todo or self._cancelled:
-            return
-        pool = ThreadPoolExecutor(max_workers=self.workers)
-        futures, emitted = {}, set()
+    @staticmethod
+    def _stat(path):
         try:
-            futures = {pool.submit(FrameQuality.analyze_file, path): (size, mtime_ns)
-                       for path, size, mtime_ns in todo}
-            for future in as_completed(futures):
+            return os.stat(path)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _read(path):
+        try:
+            return FrameQuality.read_file(path)
+        except Exception:
+            return None  # analyze_file reads it again and reports why
+
+    def run(self):
+        # Files are read on threads of their own, ahead of the analyses: from a
+        # network share a frame spends most of its time waiting for its bytes,
+        # and with one pool doing both the reads were never hidden behind the
+        # analyses (on a NAS, 8 threads analyzed about half as fast as the network).
+        read_threads = max(READ_THREADS, self.workers)
+        readers = ThreadPoolExecutor(max_workers=read_threads)
+        analyzers = ThreadPoolExecutor(max_workers=self.workers)
+        results = queue.Queue()  # (analysis future or None, (size, mtime_ns)) - one per frame started
+
+        def read_then_analyze(path, stamp):
+            if self._cancelled:
+                results.put((None, stamp))
+                return
+            raw = self._read(path)
+            try:
+                analysis = analyzers.submit(FrameQuality.analyze_file, path, raw)
+            except RuntimeError:  # stopped - the analyzers are shut down
+                results.put((None, stamp))
+                return
+            analysis.add_done_callback(lambda future: results.put((future, stamp)))
+
+        try:
+            # A few ms each on a network share - thousands of subs one at a time
+            # would be a long wait before the first analysis starts
+            todo = deque()
+            for path, stat in zip(self.paths, readers.map(self._stat, self.paths)):
                 if self._cancelled:
+                    return
+                if stat is None:
+                    self.frame_ready.emit(FrameQuality.FrameMetrics(path=path, error="File not found"), None)
+                    continue
+                hit = None if self.force else self.cached.get(path)
+                if (hit and hit[0] == stat.st_size and hit[1] == stat.st_mtime_ns
+                        and hit[2] == FrameQuality.ANALYSIS_VERSION):
+                    continue  # already showing the cached measurements
+                todo.append((path, stat.st_size, stat.st_mtime_ns))
+
+            self.checked.emit(len(todo))
+            # Frames read or being read but not analyzed yet, kept to a few per
+            # thread and to READ_AHEAD_BYTES so big subs can't fill memory
+            max_frames = read_threads + 2 * self.workers
+            started = started_bytes = 0
+            stopping = False
+            while True:
+                if self._cancelled and not stopping:
+                    stopping = True
+                    analyzers.shutdown(wait=False, cancel_futures=True)
+                while (todo and not stopping and started < max_frames
+                       and (not started or started_bytes + todo[0][1] <= READ_AHEAD_BYTES)):
+                    path, size, mtime_ns = todo.popleft()
+                    readers.submit(read_then_analyze, path, (size, mtime_ns))
+                    started += 1
+                    started_bytes += size
+                if not started:
                     break
-                self._emit(future, futures[future])
-                emitted.add(future)
+                try:
+                    analysis, stamp = results.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                started -= 1
+                started_bytes -= stamp[0]
+                # Frames already being analyzed when stopped still finish - keep them too
+                if analysis is not None and not analysis.cancelled():
+                    self._emit(analysis, stamp)
         finally:
-            pool.shutdown(wait=True, cancel_futures=True)
-        # Frames already being read when stopped still finish - keep them too
-        for future, stamp in futures.items():
-            if future not in emitted and future.done() and not future.cancelled():
-                self._emit(future, stamp)
+            readers.shutdown(wait=True, cancel_futures=True)
+            analyzers.shutdown(wait=True, cancel_futures=True)
 
     def _emit(self, future, stamp):
         metrics = future.result()
@@ -562,6 +622,7 @@ CHART_RANKED = (FrameQuality.GRADE_GOOD, FrameQuality.GRADE_MARGINAL, FrameQuali
 CHART_MARKER_SIZE = 38     # points^2 - an 8 px marker at typical screen dpi
 CHART_HIGHLIGHT_SIZE = 150
 CHART_CHECKED_SIZE = 95
+CHART_CHECKED_SQUARES_UPTO = 200  # more checked frames than this get a tick on the bottom edge instead
 CHART_HIT_RADIUS_PX = 9    # how close the cursor must be to a point to hover/click it
 
 # What the graph can plot: (key, picker label, axis label). Stars, star
@@ -621,8 +682,9 @@ class QualityChart(FigureCanvas):
 
     def set_points(self, points, value_label, lines=()):
         """points: ChartPoints in capture order. value_label names the y axis.
-        lines: (y, label, kind) reference lines - kind 'median', 'marginal' or
-        'reject' - or None when they depend on a filter not picked."""
+        lines: (y, label, kind[, night]) reference lines - kind 'median',
+        'marginal' or 'reject'; with a night label, only across that night's
+        band - or None when they depend on a filter not picked."""
         self._points = list(points)
         self._value_label = value_label
         self._lines = lines if lines is None else list(lines)
@@ -669,6 +731,16 @@ class QualityChart(FigureCanvas):
             return
 
         x = np.arange(len(self._points), dtype=float)
+        finite = values[~np.isnan(values)]
+        low, high = self._value_range(finite)
+        # Room for the points and any reference line, with a little air
+        low = min([low] + [line[0] for line in (self._lines or [])])
+        high = max([high] + [line[0] for line in (self._lines or [])])
+        pad = (high - low) * 0.08 or abs(high) * 0.05 or 1
+        low, high = low - pad, high + pad
+        # Frames far off the scale sit on its edge - their tooltips keep the real value
+        above, below = finite[finite > high], finite[finite < low]
+        values = np.where(values > high, high - pad * 0.3, np.where(values < low, low + pad * 0.3, values))
         self._draw_nights(ax)
         ax.yaxis.grid(True, color=COLORS['border'], linewidth=0.6, alpha=0.6)
         ax.set_axisbelow(True)
@@ -686,7 +758,13 @@ class QualityChart(FigureCanvas):
                                   markeredgecolor=surface, label=f"{label} ({int(mask.sum())})"))
 
         checked = np.array([p.checked for p in self._points]) & ~np.isnan(values)
-        if checked.any():
+        if checked.sum() > CHART_CHECKED_SQUARES_UPTO:
+            # Thousands of squares merged into a gray band over the points - a tick under each instead
+            ax.vlines(x[checked], 0, 0.025, transform=blended_transform_factory(ax.transData, ax.transAxes),
+                      colors=COLORS['text_secondary'], linewidth=0.8, zorder=4)
+            handles.append(Line2D([], [], linestyle="", marker="|", markersize=8,
+                                  markeredgecolor=COLORS['text_secondary'], label=f"Checked ({int(checked.sum())})"))
+        elif checked.any():
             ax.scatter(x[checked], values[checked], s=CHART_CHECKED_SIZE, marker="s", facecolors="none",
                        edgecolors=COLORS['text_secondary'], linewidths=1.1, zorder=4)
             handles.append(Line2D([], [], linestyle="", marker="s", markersize=8, markerfacecolor="none",
@@ -702,11 +780,13 @@ class QualityChart(FigureCanvas):
                 text.set_color(COLORS['text_secondary'])
 
         ax.set_xlim(-0.5, len(self._points) - 0.5)
-        # Room for the points and any reference line, with a little air
-        ys = list(values[~np.isnan(values)]) + [y for y, _label, _kind in (self._lines or [])]
-        low, high = min(ys), max(ys)
-        pad = (high - low) * 0.08 or abs(high) * 0.05 or 1
-        ax.set_ylim(low - pad, high + pad)
+        ax.set_ylim(low, high)
+        for far, y, va, arrow in ((above, 0.97, "top", "\u25b2"), (below, 0.03, "bottom", "\u25bc")):
+            if far.size:
+                extreme = far.max() if arrow == "\u25b2" else far.min()
+                ax.text(0.5, y, f"{arrow} {far.size:,} off the scale (to {extreme:,.0f})" if abs(extreme) >= 10 else
+                        f"{arrow} {far.size:,} off the scale (to {extreme:.2f})", transform=ax.transAxes,
+                        ha="center", va=va, color=COLORS['text_secondary'], fontsize=chart_font_size(7.5), zorder=6)
         self._xy = np.column_stack([x, values])
         self._highlight = ax.scatter([], [], s=CHART_HIGHLIGHT_SIZE, facecolors="none", edgecolors=COLORS['text'],
                                      linewidths=1.6, zorder=5)
@@ -716,6 +796,20 @@ class QualityChart(FigureCanvas):
                                   props=dict(facecolor=COLORS['text_secondary'], alpha=0.18))
         self.draw_idle()
 
+    @staticmethod
+    def _value_range(values):
+        """The values to fit the scale to: all of them, unless a few far-off
+        ones (a dawn frame at 30 px) would squash the rest into a band - then
+        the middle 98% with room around it."""
+        low, high = float(values.min()), float(values.max())
+        if values.size < 20:
+            return low, high
+        p_low, p_high = (float(v) for v in np.percentile(values, [1, 99]))
+        span = p_high - p_low
+        if span <= 0 or high - low <= 3 * span:
+            return low, high
+        return max(low, p_low - span * 0.25), min(high, p_high + span * 0.25)
+
     def _draw_lines(self, ax, values):
         """The median and the Marginal / Reject limits, labelled at the right end."""
         if self._lines is None:
@@ -723,24 +817,40 @@ class QualityChart(FigureCanvas):
                     ha="left", va="top", color=COLORS['text_secondary'], fontsize=chart_font_size(7.5), zorder=6)
             return
         to_right_edge = blended_transform_factory(ax.transAxes, ax.transData)
-        for y, label, kind in self._lines:
+        runs = {label: (first, last) for first, last, label in self._night_runs()}
+        # Per-night lines are labelled once, on the last night's
+        last_night = max((line[3] for line in self._lines if len(line) > 3 and line[3] in runs),
+                         key=lambda night: runs[night][1], default=None)
+        for y, label, kind, *night in self._lines:
+            night = night[0] if night else None
             if kind == "median":
-                ax.axhline(y, color=COLORS['text_secondary'], linewidth=1, alpha=0.8, zorder=2)
+                style = dict(color=COLORS['text_secondary'], linewidth=1, alpha=0.8, zorder=2)
             else:
-                color = chart_color(COLORS['warning' if kind == "marginal" else 'error'])
-                ax.axhline(y, color=color, linewidth=1, linestyle=(0, (4, 3)), alpha=0.9, zorder=2)
-            # Text in a text color - the line beside it carries the meaning
-            ax.text(0.998, y, label, transform=to_right_edge, ha="right", va="bottom",
-                    color=COLORS['text_secondary'], fontsize=chart_font_size(7), zorder=6)
+                style = dict(color=chart_color(COLORS['warning' if kind == "marginal" else 'error']), linewidth=1,
+                             linestyle=(0, (4, 3)), alpha=0.9, zorder=2)
+            if night is None:
+                ax.axhline(y, **style)
+            elif night in runs:
+                first, last = runs[night]
+                ax.plot([first - 0.5, last + 0.5], [y, y], **style)
+            if night is None or night == last_night:
+                # Text in a text color - the line beside it carries the meaning
+                ax.text(0.998, y, label, transform=to_right_edge, ha="right", va="bottom",
+                        color=COLORS['text_secondary'], fontsize=chart_font_size(7), zorder=6)
 
-    def _draw_nights(self, ax):
-        """Alternate nights shaded, each labelled under its band."""
-        runs = []  # (first index, last index, label)
+    def _night_runs(self):
+        """[first index, last index, label] of each night's run of points."""
+        runs = []
         for i, point in enumerate(self._points):
             if runs and runs[-1][2] == point.night:
                 runs[-1][1] = i
             else:
                 runs.append([i, i, point.night])
+        return runs
+
+    def _draw_nights(self, ax):
+        """Alternate nights shaded, each labelled under its band."""
+        runs = self._night_runs()
         for n, (first, last, _label) in enumerate(runs):
             if n % 2:
                 ax.axvspan(first - 0.5, last + 0.5, color=COLORS['background_lighter'], alpha=0.55,
@@ -844,9 +954,13 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self._preview = None
         self._inspections = OrderedDict()  # path -> rendered preview, the last few frames viewed
         self._shown_path = None
+        self._local_times = {}  # DATE-OBS -> graph tooltip time
+        self._removal_note = ""   # what the last removal took of the bad nights, for the night notice
+        self._dismissed_notice = None  # the notice text the user closed - hidden until it changes
         self._to_analyze = 0
         self._analyzed = 0
         self._started = 0.0
+        self._regrade_seconds = 0.0  # how long the last regrade took
         self._regrade_timer = QTimer(self)
         self._regrade_timer.setSingleShot(True)
         self._regrade_timer.timeout.connect(self._regrade)
@@ -986,6 +1100,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         for button in (self.remove_btn, self.move_btn, self.delete_btn):
             checks.addWidget(button)
         layout.addLayout(checks)
+        layout.addWidget(self._build_night_notice())
 
         # The graph above the frame list - a time series wants the full width
         self.list_splitter = QSplitter(Qt.Vertical)
@@ -1030,6 +1145,77 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         close_btn.clicked.connect(self.reject)
         bottom.addWidget(close_btn)
         layout.addLayout(bottom)
+
+    def _build_night_notice(self):
+        """A bar above the graph and list for nights graded down as a whole -
+        where it can't be missed, as they're often most of the rejects - and
+        what removing them did."""
+        self.night_notice = QFrame()
+        self.night_notice.setObjectName("nightNotice")
+        row = QHBoxLayout(self.night_notice)
+        row.setContentsMargins(10, 6, 10, 6)
+        self.night_notice_label = QLabel()
+        self.night_notice_label.setWordWrap(True)
+        self.night_notice_label.setTextFormat(Qt.RichText)
+        row.addWidget(self.night_notice_label, 1)
+        dismiss = QPushButton("OK")
+        dismiss.setToolTip("Hide this until it has something new to say")
+        dismiss.clicked.connect(self._dismiss_night_notice)
+        row.addWidget(dismiss, 0, Qt.AlignTop)
+        self._notice_kind = "warning"  # or "success" - the COLORS key it's tinted with
+        themed_style(self.night_notice, self._night_notice_style)
+        self.night_notice.hide()
+        return self.night_notice
+
+    def _night_notice_style(self):
+        return (f"#nightNotice {{ background-color: {tint(COLORS[self._notice_kind], 0.16)};"
+                f" border-left: 3px solid {COLORS[self._notice_kind]}; }}"
+                f" #nightNotice QLabel {{ color: {COLORS['text']}; background: transparent; }}")
+
+    def _bad_nights(self):
+        """{night date: (grade, issue, frames)} for the nights graded down as a
+        whole (FrameQuality._check_nights) - Reject when any filter's was."""
+        nights = {}
+        for path, g in self._grades.items():
+            if g.night_grade:
+                night = self._lights[path]["night_date"] or ""
+                grade, issue, count = nights.get(night, (g.night_grade, g.night_issue, 0))
+                if g.night_grade == FrameQuality.GRADE_REJECT:
+                    grade = FrameQuality.GRADE_REJECT
+                nights[night] = (grade, issue, count + 1)
+        return nights
+
+    def _refresh_night_notice(self):
+        if self._analyzing:
+            self.night_notice.hide()  # the nights are judged once every frame is in
+            return
+        rejected, held = [], []
+        for night, (grade, issue, count) in sorted(self._bad_nights().items()):
+            label, why = self._night_label(night), issue.replace("?; ", "? ")
+            if grade == FrameQuality.GRADE_REJECT:
+                rejected.append(f"<b>{label} doesn't match your other nights.</b> {why} "
+                                f"All {count:,} of its frames are Rejects.")
+            else:
+                held.append(f"<b>{label} is a little behind your other nights.</b> {why} "
+                            f"Its {count:,} frames are Marginal at best - still worth stacking with Good + Marginal.")
+        parts = [self._removal_note] if self._removal_note else []
+        parts += rejected
+        if rejected:
+            parts.append("Removing a night like this is expected - it would blur the stack. The other nights "
+                         "are already graded without it, so removing it won't change their grades.")
+        parts += held
+        text = "<br>".join(parts)
+        kind = "warning" if rejected or not self._removal_note else "success"
+        if kind != self._notice_kind:
+            self._notice_kind = kind
+            themed_style(self.night_notice, self._night_notice_style)
+        self.night_notice_label.setText(text)
+        self.night_notice.setVisible(bool(text) and text != self._dismissed_notice)
+
+    def _dismiss_night_notice(self):
+        self._dismissed_notice = self.night_notice_label.text()
+        self._removal_note = ""
+        self.night_notice.hide()
 
     def _build_table(self):
         self.table = QTableWidget(0, len(self.COLUMNS))
@@ -1225,10 +1411,16 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
     def _build_thresholds_box(self):
         box = QGroupBox("Reject when worse than the group's median by")
         grid = QGridLayout(box)
-        note = QLabel("Half of each is Marginal. A brighter sky alone is Marginal at most, though the signal "
+        note = QLabel("Each night is graded against its own frames (for FWHM and eccentricity, against a "
+                      "typical night instead when that's softer), then as a whole against a typical night by "
+                      "its median FWHM and eccentricity - past a line, so is every frame of that night. "
+                      "Half of each is Marginal. A brighter sky alone is Marginal at most, though the signal "
                       "it costs can reject a frame. Fewer stars and less signal only count on their own - "
                       "moonlight causes both. The median leaves out "
-                      "rejected frames, so removing them doesn't turn up new rejects. Satellite trails are "
+                      "rejected frames, so removing them doesn't turn up new rejects. A frame with too few "
+                      "stars to measure a change that small needs a bigger one (3x its own uncertainty, "
+                      "shown in each value's tooltip). Star brightness and sky are only compared between "
+                      "frames with the same gain. Satellite trails are "
                       "a count per frame instead, and make it Marginal at most.")
         note.setWordWrap(True)
         themed_style(note, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_size(8)};")
@@ -1299,7 +1491,12 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             self.progress_bar.setValue(self._analyzed)
             self.status_label.setText(self._progress_text())
         if not self._regrade_timer.isActive():
-            self._regrade_timer.start(500)  # regrading 400 rows per result would stall the UI
+            # Regrading per result would stall the UI. With thousands of rows a regrade
+            # takes a second or more, and the UI thread holds the GIL all that time:
+            # the reads stall, the read-ahead runs dry and analysis slows far more
+            # than the regrade's own share of the time - so space them well apart
+            # (5x apart still cost an 8,000-frame session 40% of its speed).
+            self._regrade_timer.start(min(30000, max(500, int(self._regrade_seconds * 20000))))
 
     def _progress_text(self):
         elapsed = time.perf_counter() - self._started
@@ -1363,11 +1560,11 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             spin.setValue(getattr(defaults, name))
 
     def _regrade(self):
+        started = time.perf_counter()
         self._flush_cache()
-        self._grades = FrameQuality.grade_frames(
-            ((self._groups[path], m) for path, m in self._metrics.items() if path in self._groups),
-            self._grade_settings())
+        self._grades = grade_lights(self._lights, self._metrics, self._grade_settings())
         self._refresh_table()
+        self._regrade_seconds = time.perf_counter() - started
 
     def _refresh_table(self):
         selected = self._selected_paths()
@@ -1435,19 +1632,25 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         fwhm_text = ""
         if fwhm is not None:
             fwhm_text = f"{fwhm:.2f} px" + (f' ({m.fwhm_arcsec:.1f}")' if m.fwhm_arcsec else "")
-        self.table.setItem(row, self.COL_FWHM, SortItem(fwhm_text, fwhm if fwhm is not None else -1))
+        fwhm_item = SortItem(fwhm_text, fwhm if fwhm is not None else -1)
+        if fwhm is not None and m.fwhm_err is not None:
+            fwhm_item.setToolTip(f"±{m.fwhm_err:.2f} px, from {m.measured:,} stars")
+        self.table.setItem(row, self.COL_FWHM, fwhm_item)
 
         ecc = m.eccentricity if ok else None
         ecc_item = SortItem(f"{ecc:.2f}" if ecc is not None else "", ecc if ecc is not None else -1)
         if ecc is not None and m.alignment is not None:
-            ecc_item.setToolTip(f"Alignment {m.alignment:.2f} (0 = random directions, 1 = all one way)")
+            ecc_item.setToolTip((f"±{m.eccentricity_err:.2f}\n" if m.eccentricity_err is not None else "")
+                                + f"Alignment {m.alignment:.2f} (0 = random directions, 1 = all one way)")
         self.table.setItem(row, self.COL_ECC, ecc_item)
 
         outside = relative.get("outside")
         outside_item = SortItem(f"{outside - 100:+.0f}%" if outside is not None else "",
                                 outside if outside is not None else -1)
         if ok and g is not None and g.outside is not None:
-            outside_item.setToolTip(f"{g.outside * 100:.1f}% of the star light is outside the cores")
+            error = FrameQuality.outside_error_at(m, g.medians.get("fwhm_px"))
+            outside_item.setToolTip(f"{g.outside * 100:.1f}%" + (f" ±{error * 100:.1f}%" if error is not None else "")
+                                    + " of the star light is outside the cores")
         self.table.setItem(row, self.COL_OUTSIDE, outside_item)
 
         flux = relative.get("flux")
@@ -1524,17 +1727,29 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             drop = s.star_drop_pct if key == "stars" else s.flux_drop_pct
             return [(100, "Median", "median"), (100 - drop / 2, "Marginal", "marginal"),
                     (100 - drop, "Reject", "reject")]
-        medians = [self._grades[p].medians for p in paths if p in self._grades and self._grades[p].medians]
-        if len({self._groups[p] for p in paths if p in self._grades and self._grades[p].medians}) != 1:
-            return None if medians else []
-        med = medians[0]
+        shown = [p for p in paths if p in self._grades and self._grades[p].medians]
+        if len({self._groups[p] for p in shown}) != 1:
+            return None if shown else []
+        # Each night is graded against its own median - its own lines, across its band
+        by_night = {}
+        for p in shown:
+            by_night.setdefault(self._night_label(self._lights[p]["night_date"]), self._grades[p].medians)
+        return [(y, label, kind, night if len(by_night) > 1 else None)
+                for night, med in by_night.items() for y, label, kind in self._metric_lines(key, med, s)]
+
+    @staticmethod
+    def _metric_lines(key, med, s):
+        """(y, label, kind) median and limits of an absolute measurement. FWHM and
+        eccentricity limits start from a typical night's median where that's
+        softer than this night's (FrameQuality._grade_group)."""
         if key == "fwhm" and med.get("fwhm_px"):
-            m, rise = med["fwhm_px"], s.fwhm_rise_pct / 100
-            return [(m, "Median", "median"), (m * (1 + rise / 2), "Marginal", "marginal"),
-                    (m * (1 + rise), "Reject", "reject")]
+            m, ref, rise = med["fwhm_px"], med.get("fwhm_ref") or med["fwhm_px"], s.fwhm_rise_pct / 100
+            return [(m, "Median", "median"), (ref * (1 + rise / 2), "Marginal", "marginal"),
+                    (ref * (1 + rise), "Reject", "reject")]
         if key == "eccentricity" and med.get("eccentricity") is not None:
-            m, rise = med["eccentricity"], s.eccentricity_rise
-            return [(m, "Median", "median"), (m + rise / 2, "Marginal", "marginal"), (m + rise, "Reject", "reject")]
+            m, ref, rise = med["eccentricity"], med.get("eccentricity_ref", med["eccentricity"]), s.eccentricity_rise
+            return [(m, "Median", "median"), (ref + rise / 2, "Marginal", "marginal"),
+                    (ref + rise, "Reject", "reject")]
         if key == "outside" and med.get("outside_light"):
             m, rise = med["outside_light"] * 100, s.outside_rise_pct / 100
             return [(m, "Median", "median"), (m * (1 + rise / 2), "Marginal", "marginal"),
@@ -1566,6 +1781,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         return relative.get({"stars": "stars", "flux": "flux", "sky": "background", "signal": "signal"}[key])
 
     @staticmethod
+    @lru_cache(maxsize=None)
     def _night_label(night_date):
         try:
             return datetime.strptime(night_date, "%Y-%m-%d").strftime("%b %d")
@@ -1573,7 +1789,14 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             return "No date"
 
     def _local_time(self, date_obs):
-        """DATE-OBS (UTC) as the session's local time, for the graph's tooltips."""
+        """DATE-OBS (UTC) as the session's local time, for the graph's tooltips.
+        Remembered - the graph is redrawn as results arrive, thousands of points at a time."""
+        label = self._local_times.get(date_obs)
+        if label is None:
+            label = self._local_times[date_obs] = self._format_local_time(date_obs)
+        return label
+
+    def _format_local_time(self, date_obs):
         if not date_obs:
             return ""
         try:
@@ -1699,6 +1922,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
                          f"{LIGHT_CHOICE_LABELS[LIGHTS_GOOD_MARGINAL]} ({plural(len(suggested), 'frame')}, "
                          f"{format_duration(self._integration(suggested))})</a>")
         self.guide_label.setText("  ".join(parts))
+        self._refresh_night_notice()
 
     def _update_action_buttons(self):
         # Not mid-analysis: the worker could be reading the very file being moved or deleted
@@ -1925,6 +2149,12 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             return False
 
         self.files_changed = True
+        bad_nights = {night: count for night, (grade, _issue, count) in self._bad_nights().items()
+                      if grade == FrameQuality.GRADE_REJECT}
+        gone = Counter(self._lights[p]["night_date"] or "" for p in changed
+                       if (self._lights[p]["night_date"] or "") in bad_nights)
+        before = {p: g.grade for p, g in self._grades.items() if p not in changed}
+        self._removal_note = ""
         for path in changed:
             for store in (self._lights, self._groups, self._metrics, self._grades, self._inspections):
                 store.pop(path, None)
@@ -1937,6 +2167,17 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             self.details_label.setText("")
         emptied = self._fill_group_combo()  # drops filters with no frames left
         self._regrade()
+        if gone:
+            moved = sum(1 for p, grade in before.items() if p in self._grades and self._grades[p].grade != grade)
+            nights = ", ".join(f"all of {self._night_label(night)} ({count:,} frames)" if count == bad_nights[night] else
+                               f"{count:,} of {self._night_label(night)}'s {bad_nights[night]:,} frames"
+                               for night, count in sorted(gone.items()))
+            self._removal_note = (
+                f"<b>Removed {nights}.</b> The other frames were regraded - "
+                + ("none changed grade, so what's left is ready to stack." if not moved else
+                   f"{moved:,} changed grade, so look them over before stacking."))
+            self._dismissed_notice = None
+            self._refresh_night_notice()
         if emptied is not None:
             # After the caller's own status message, which would otherwise replace this
             QTimer.singleShot(0, lambda: self.status_label.setText(

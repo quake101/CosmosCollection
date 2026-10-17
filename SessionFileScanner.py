@@ -85,6 +85,56 @@ def extract_fits_header(file_path):
         return {kw: header[kw] for kw in FITS_KEYWORDS if kw in header}
 
 
+FITS_BLOCK = 2880
+FITS_CARD = 80
+
+
+def _fits_card_value(text):
+    """The value of a FITS card's value field (after '= '), comment dropped:
+    a string ('' is an escaped quote) or a native number/flag."""
+    text = text.lstrip()
+    if text.startswith("'"):
+        chars, i = [], 1
+        while i < len(text):
+            if text[i] == "'":
+                if text[i + 1:i + 2] == "'":
+                    chars.append("'")
+                    i += 2
+                    continue
+                break
+            chars.append(text[i])
+            i += 1
+        return ''.join(chars).strip()
+    return _coerce_fits_value(text.split('/', 1)[0])
+
+
+def read_fits_header_fast(file_path, max_blocks=40):
+    """Every keyword of a FITS primary header (COMMENT/HISTORY left out), read
+    in 2880-byte blocks up to END - usually one small read, where astropy's
+    fits.open makes several round trips (slow on a network drive). Same value
+    types as extract_fits_header. Raises ValueError if it isn't a FITS file."""
+    result = {}
+    with open(file_path, 'rb') as f:
+        for block_index in range(max_blocks):
+            block = f.read(FITS_BLOCK)
+            if len(block) < FITS_BLOCK:
+                break
+            if block_index == 0 and not block.startswith(b'SIMPLE  ='):
+                raise ValueError(f"Not a FITS file: {file_path}")
+            for start in range(0, FITS_BLOCK, FITS_CARD):
+                card = block[start:start + FITS_CARD].decode('ascii', 'replace')
+                key = card[:8].strip()
+                if key == 'END':
+                    return result
+                if card[8:10] != '= ' or not key or key in result:
+                    continue
+                try:
+                    result[key] = _fits_card_value(card[10:])
+                except Exception:
+                    continue
+    return result
+
+
 def read_xisf_xml(file_path):
     """Read the signature + header-length-prefixed XML header block of an XISF
     file (never the pixel data) and return (root, image_el, ns) - the parsed XML
@@ -110,13 +160,17 @@ def read_xisf_xml(file_path):
     return root, image_el, ns
 
 
-def extract_xisf_header(file_path):
+def extract_xisf_header(file_path, keywords=FITS_KEYWORDS):
     """Read only the XML header block of an XISF file (never the pixel data) and
     return the same shape as extract_fits_header() by mapping FITSKeyword/Property
-    elements onto the equivalent FITS keywords."""
+    elements onto the equivalent FITS keywords. keywords=None keeps every
+    FITS keyword (except COMMENT/HISTORY) and adds the <Image> element's
+    imageType attribute (e.g. 'MasterLight') as '_XISF_IMAGETYPE'."""
     root, image_el, ns = read_xisf_xml(file_path)
 
     result = {}
+    if keywords is None and image_el is not None and image_el.get('imageType'):
+        result['_XISF_IMAGETYPE'] = image_el.get('imageType')
 
     if image_el is not None:
         keyword_els = image_el.findall('xisf:FITSKeyword', ns)
@@ -128,7 +182,11 @@ def extract_xisf_header(file_path):
             if not name or value is None:
                 continue
             name = name.strip().upper()
-            if name in FITS_KEYWORDS and name not in result:
+            if keywords is None:
+                wanted = name not in ('COMMENT', 'HISTORY', '')
+            else:
+                wanted = name in keywords
+            if wanted and name not in result:
                 result[name] = _coerce_fits_value(value)
 
     property_els = []

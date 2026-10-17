@@ -42,6 +42,7 @@ from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, contrast_text, font_px, themed_style, theme_manager
 from DatabaseManager import DatabaseManager
 from PlateSolver import describe_solving
+from SessionObservations import parse_obs_datetime
 from AnnotationOverlay import (ANNOTATION_LAYERS, DEFAULT_ANNOTATION_LAYERS, annotation_store,
                                load_annotation_data, paint_annotations, plate_solve_queue, read_fits_cards)
 
@@ -260,19 +261,22 @@ def _color_name(value):
 
 def load_library(conn):
     """Every user image, as dicts, with its DSO name."""
+    import EquipmentMapper
     cursor = conn.cursor()
     cursor.execute(f"""
-        SELECT ui.id, ui.image_path, ui.dsodetailid, ui.date_taken, ui.equipment,
+        SELECT ui.id, ui.image_path, ui.dsodetailid, ui.date_taken,
                ui.integration_time, ui.is_favorite, ui.created_date, {DSO_NAME_SQL},
-               d.dsotype, d.constellation
+               d.dsotype, d.constellation, {EquipmentMapper.select_sql('ui')}
         FROM userimages ui
         LEFT JOIN dsodetail d ON d.id = ui.dsodetailid
     """)
-    keys = ("id", "image_path", "dsodetailid", "date_taken", "equipment", "integration_time",
+    keys = ("id", "image_path", "dsodetailid", "date_taken", "integration_time",
             "is_favorite", "created_date", "dso_name", "dsotype", "constellation")
     rows = []
     for row in cursor.fetchall():
         image = dict(zip(keys, tuple(row)))
+        # telescope, camera, equipment (both as text), equipment_key ...
+        image.update(EquipmentMapper.image_equipment(tuple(row)[len(keys):]))
         image["image_path"] = image["image_path"] or ""
         image["dso_name"] = image["dso_name"] or "Unknown DSO"
         rows.append(image)
@@ -989,8 +993,8 @@ def image_year_and_time(row, header_reader=read_capture_date):
     ext = os.path.splitext(path)[1].lower()
     if ext in (".fits", ".fit", ".fts", ".xisf") and os.path.isfile(path):
         try:
-            date_obs = header_reader(path)
-            when = datetime.fromisoformat(date_obs[:19]) if date_obs else None
+            # None for a missing or placeholder date ('N/A' from Astro Pixel Processor)
+            when = parse_obs_datetime(header_reader(path))
             if when is not None:
                 return when.year, when.timestamp(), "header"
         except Exception as e:
@@ -1111,8 +1115,10 @@ def build_suggestions(library, object_info, years, times, min_images=MIN_SUGGEST
     for code in sorted({(r.get("constellation") or "").upper() for r in rows} - {""}):
         add(f"constellation:{code}", CONSTELLATIONS.get(code, code),
             [r for r in rows if (r.get("constellation") or "").upper() == code])
-    for equipment in sorted({(r.get("equipment") or "").strip() for r in rows} - {""}, key=str.lower):
-        add(f"equipment:{equipment}", equipment, [r for r in rows if (r.get("equipment") or "").strip() == equipment])
+    # Each telescope and camera - by their Equipment entries, so a rename keeps the collage's rule
+    titles = {r["equipment_key"]: r["equipment"] for r in rows if r.get("equipment")}
+    for key, title in sorted(titles.items(), key=lambda item: item[1].lower()):
+        add(f"equipment:{key}", title, [r for r in rows if r.get("equipment_key") == key])
 
     for suggestion in suggestions:
         if not suggestion.detail:

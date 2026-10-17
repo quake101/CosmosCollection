@@ -35,6 +35,29 @@ class CelestialObject:
     dsodetailid: int = None  # The catalog entry (deep-sky objects only)
 
 
+def _has_matrix(wcs_header: Dict[str, Any], prefix: str) -> bool:
+    """Whether a solution has a CD or PC matrix (any of its CDi_j/PCi_j terms)."""
+    return any(f'{prefix}{i}_{j}' in wcs_header for i in (1, 2) for j in (1, 2))
+
+
+def _cd_matrix(wcs_header: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    """A solution's pixel -> sky matrix (CD1_1, CD1_2, CD2_1, CD2_2), degrees
+    per pixel. Solutions come in three forms: a CD matrix (ASTAP's .wcs files),
+    CDELT scales with a PC rotation matrix (the FITS headers ASTAP and Siril
+    write), or CDELT with a CROTA2 rotation angle (older software)."""
+    if _has_matrix(wcs_header, 'CD'):
+        return tuple(float(wcs_header.get(key, 0)) for key in ('CD1_1', 'CD1_2', 'CD2_1', 'CD2_2'))
+    cdelt1 = float(wcs_header.get('CDELT1', -0.001))
+    cdelt2 = float(wcs_header.get('CDELT2', 0.001))
+    if _has_matrix(wcs_header, 'PC'):
+        # CDELTn scales row n; missing PC terms default to the identity
+        return (cdelt1 * float(wcs_header.get('PC1_1', 1)), cdelt1 * float(wcs_header.get('PC1_2', 0)),
+                cdelt2 * float(wcs_header.get('PC2_1', 0)), cdelt2 * float(wcs_header.get('PC2_2', 1)))
+    rotation = math.radians(float(wcs_header.get('CROTA2', 0)))
+    return (cdelt1 * math.cos(rotation), -cdelt2 * math.sin(rotation),
+            cdelt1 * math.sin(rotation), cdelt2 * math.cos(rotation))
+
+
 @dataclass
 class ConstellationLine:
     """Represents a constellation line segment"""
@@ -65,10 +88,7 @@ class WCSTransform:
         self.crval2 = wcs_header.get('CRVAL2', 0)  # Dec
 
         # CD matrix (degrees per pixel)
-        self.cd1_1 = wcs_header.get('CD1_1', wcs_header.get('CDELT1', -0.001))
-        self.cd1_2 = wcs_header.get('CD1_2', 0)
-        self.cd2_1 = wcs_header.get('CD2_1', 0)
-        self.cd2_2 = wcs_header.get('CD2_2', wcs_header.get('CDELT2', 0.001))
+        self.cd1_1, self.cd1_2, self.cd2_1, self.cd2_2 = _cd_matrix(wcs_header)
 
         # Calculate inverse CD matrix
         det = self.cd1_1 * self.cd2_2 - self.cd1_2 * self.cd2_1
@@ -195,9 +215,9 @@ def flip_wcs_rows(wcs_header: Dict[str, Any], image_height: int) -> Dict[str, An
         flipped['CRPIX2'] = image_height + 1 - wcs_header['CRPIX2']
     # Reversing y negates the matrix's y column. With a PC matrix CDELTn scales
     # rows, so the PC column is negated rather than CDELT2.
-    if 'CD1_1' in wcs_header or 'CD2_2' in wcs_header:
+    if _has_matrix(wcs_header, 'CD'):
         column = {'CD1_2': 0.0, 'CD2_2': 0.0}
-    elif any(key.startswith('PC') for key in wcs_header):
+    elif _has_matrix(wcs_header, 'PC'):
         column = {'PC1_2': 0.0, 'PC2_2': 1.0}  # Missing PC terms default to the identity
     else:
         column = {'CDELT2': 1.0}  # CDELT/CROTA2 form: CDELT2 only appears in the y column
@@ -505,16 +525,19 @@ def _dsos_in_view(wcs, width, height):
     return found[:MAX_ANNOTATED_DSOS]
 
 
-def _stars_cache_file(path):
+def _stars_cache_file(path, wcs):
+    """Keyed by the solution itself (which decides the stars inside the image),
+    whether it came from a .wcs file or a FITS header."""
     from ResourceManager import ResourceManager
-    wcs_file = os.path.splitext(path)[0] + ".wcs"
-    key = f"stars|{os.path.normcase(os.path.abspath(path))}|{os.path.getmtime(wcs_file) if os.path.isfile(wcs_file) else 0}"
+    solution = ",".join(f"{value:.9g}" for value in (wcs.crval1, wcs.crval2, wcs.crpix1, wcs.crpix2, wcs.cd1_1,
+                                                      wcs.cd1_2, wcs.cd2_1, wcs.cd2_2, wcs.width, wcs.height))
+    key = f"stars|{os.path.normcase(os.path.abspath(path))}|{solution}"
     return ResourceManager.get_cache_dir("annotations") / f"{hashlib.sha1(key.encode('utf-8')).hexdigest()}.json"
 
 
 def _bright_stars(wcs, width, height, path):
     """Named bright stars in the image from SIMBAD (online), cached on disk."""
-    cache = _stars_cache_file(path)
+    cache = _stars_cache_file(path, wcs)
     if cache.exists():
         try:
             return [CelestialObject(**star) for star in json.loads(cache.read_text())]

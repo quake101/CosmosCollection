@@ -571,34 +571,38 @@ QStatusBar {{
 QCheckBox, QRadioButton {{
     spacing: 8px;
 }}
-QCheckBox::indicator, QRadioButton::indicator {{
+QCheckBox::indicator, QRadioButton::indicator, QAbstractItemView::indicator {{
     width: 16px; height: 16px;
     border: 1px solid {c['border_light']};
     background-color: {c['background_light']};
 }}
 QCheckBox::indicator {{ border-radius: 3px; }}
+/* Check boxes in lists, tables and trees: smaller, to fit a row */
+QAbstractItemView::indicator {{ width: 13px; height: 13px; border-radius: 3px; }}
 QRadioButton::indicator {{ border-radius: 9px; }}
-QCheckBox::indicator:hover, QRadioButton::indicator:hover {{
+QCheckBox::indicator:hover, QRadioButton::indicator:hover, QAbstractItemView::indicator:hover {{
     border-color: {c['accent']};
 }}
 QCheckBox::indicator:checked, QCheckBox::indicator:indeterminate,
-QRadioButton::indicator:checked {{
+QRadioButton::indicator:checked,
+QAbstractItemView::indicator:checked, QAbstractItemView::indicator:indeterminate {{
     background-color: {c['accent']};
     border-color: {c['accent']};
 }}
-QCheckBox::indicator:indeterminate {{
+QCheckBox::indicator:indeterminate, QAbstractItemView::indicator:indeterminate {{
     image: url("{_theme_image('dash', c['text_on_accent'])}");
 }}
-QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled, QAbstractItemView::indicator:disabled {{
     border-color: {c['border']};
     background-color: {c['background']};
 }}
 QCheckBox::indicator:checked:disabled, QCheckBox::indicator:indeterminate:disabled,
-QRadioButton::indicator:checked:disabled {{
+QRadioButton::indicator:checked:disabled,
+QAbstractItemView::indicator:checked:disabled, QAbstractItemView::indicator:indeterminate:disabled {{
     border-color: {c['border']};
     background-color: {c['border']};
 }}
-QCheckBox::indicator:indeterminate:disabled {{
+QCheckBox::indicator:indeterminate:disabled, QAbstractItemView::indicator:indeterminate:disabled {{
     image: url("{_theme_image('dash', c['text_disabled'])}");
 }}
 
@@ -673,13 +677,13 @@ QDockWidget::close-button:hover, QDockWidget::float-button:hover {{
     if theme_settings.checkbox_style == 'check':
         qss += f"""
 /* Check box marks ---------------------------------------------- */
-QCheckBox::indicator:checked {{
+QCheckBox::indicator:checked, QAbstractItemView::indicator:checked {{
     image: url("{_theme_image('check', c['text_on_accent'])}");
 }}
 QRadioButton::indicator:checked {{
     image: url("{_theme_image('dot', c['text_on_accent'])}");
 }}
-QCheckBox::indicator:checked:disabled {{
+QCheckBox::indicator:checked:disabled, QAbstractItemView::indicator:checked:disabled {{
     image: url("{_theme_image('check', c['text_disabled'])}");
 }}
 QRadioButton::indicator:checked:disabled {{
@@ -689,7 +693,8 @@ QRadioButton::indicator:checked:disabled {{
     else:
         qss += """
 QCheckBox::indicator:checked, QRadioButton::indicator:checked,
-QCheckBox::indicator:checked:disabled, QRadioButton::indicator:checked:disabled { image: none; }
+QCheckBox::indicator:checked:disabled, QRadioButton::indicator:checked:disabled,
+QAbstractItemView::indicator:checked, QAbstractItemView::indicator:checked:disabled { image: none; }
 """
 
     # Headings are set explicitly either way, so a widget-level preview of

@@ -13,7 +13,7 @@ from datetime import datetime, date as date_cls, timedelta
 
 from PySide6.QtCore import (Qt, QDate, QDateTime, QEvent, QTime, QTimer, QPoint, QSettings, Signal, QThread,
                             QStringListModel, QUrl)
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QPen
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QCompleter, QSplitter, QFormLayout, QRadioButton,
                                QListWidget, QListWidgetItem, QProgressDialog,
                                QCalendarWidget, QTabWidget, QTableView, QDateTimeEdit,
-                               QSpinBox, QDoubleSpinBox, QFileDialog, QAbstractItemView)
+                               QSpinBox, QDoubleSpinBox, QFileDialog, QAbstractItemView,
+                               QStyledItemDelegate)
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
@@ -43,19 +44,7 @@ COMMON_TIMEZONES = [
 # treated as the same target - loose enough to absorb framing offsets.
 DROP_MATCH_MAX_SEPARATION_DEG = 1.0
 
-
-def target_name_match(session_name, target_name):
-    """How well a session's DSO name matches a Target List name: 2 = the same apart
-    from case and spaces ("M31" / "M 31"), 1 = the same once parenthetical common
-    names and punctuation are ignored ("vdB 152" / "vdB 152 (Wolf's Cave Nebula)"),
-    0 = different."""
-    spaced = session_name.replace(" ", "").strip().upper() if session_name else ""
-    if not spaced or not target_name:
-        return 0
-    if target_name.replace(" ", "").strip().upper() == spaced:
-        return 2
-    loose = SessionFileScanner.normalize_object_name(session_name)
-    return 1 if loose and SessionFileScanner.normalize_object_name(target_name) == loose else 0
+target_name_match = SessionObservations.target_name_match
 
 
 class LocationOverrideWidget(QWidget):
@@ -222,6 +211,65 @@ def _rollback(db_manager):
         logger.error(f"Error rolling back: {e}")
 
 
+# Sessions still to be imaged - listed above finished ones
+OPEN_STATUSES = ("Planned", "In Progress")
+
+
+class SortItem(QTableWidgetItem):
+    """A table cell that sorts by a number rather than its text ('10.5 h' after
+    '2.0 h'), and within its group: groups keep their order whichever way a
+    column is sorted (open sessions stay above finished ones)."""
+    SORT_ROLE = Qt.UserRole + 1
+    GROUP_ROLE = Qt.UserRole + 2
+
+    def __init__(self, text, sort_key=None, align=None, group=None):
+        super().__init__(text)
+        if sort_key is not None:
+            self.setData(self.SORT_ROLE, sort_key)
+        if group is not None:
+            self.setData(self.GROUP_ROLE, group)
+        if align is not None:
+            self.setTextAlignment(align)
+
+    def __lt__(self, other):
+        group, other_group = self.data(self.GROUP_ROLE), other.data(self.GROUP_ROLE)
+        if group is not None and other_group is not None and group != other_group:
+            table = self.tableWidget()
+            # Qt sorts descending by asking other < self - turn that around to keep groups in place
+            if table is not None and table.horizontalHeader().sortIndicatorOrder() == Qt.DescendingOrder:
+                return group > other_group
+            return group < other_group
+        key, other_key = self.data(self.SORT_ROLE), other.data(self.SORT_ROLE)
+        if key is not None and other_key is not None:
+            try:
+                return key < other_key
+            except TypeError:
+                pass
+        # Not super().__lt__(): PySide sends that back to this override
+        return self.text() < other.text()
+
+
+class GroupDividerDelegate(QStyledItemDelegate):
+    """Draws a line above the first row of a new group (SortItem's), so open and
+    finished sessions read as two blocks. Worked out as it paints, so it follows
+    sorting and filtering - with only one group showing there's no line."""
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        group = index.data(SortItem.GROUP_ROLE)
+        table = self.parent()
+        above = index.row() - 1
+        while above >= 0 and table.isRowHidden(above):
+            above -= 1
+        if group is None or above < 0 or index.siblingAtRow(above).data(SortItem.GROUP_ROLE) == group:
+            return
+        painter.save()
+        painter.setPen(QPen(QColor(COLORS['accent']), 2))
+        y = option.rect.top() + 1
+        painter.drawLine(option.rect.left(), y, option.rect.right(), y)
+        painter.restore()
+
+
 class SessionFormWidget(QWidget):
     """The session's own fields (DSO, schedule, location, equipment, notes), shared
     by AddEditSessionDialog and SessionDetailsDialog's Overview tab. write() never
@@ -322,13 +370,17 @@ class SessionFormWidget(QWidget):
         telescope_row.addWidget(QLabel("Telescope:"))
         self.telescope_combo = QComboBox()
         self._populate_telescope_combo()
-        telescope_row.addWidget(self.telescope_combo)
+        telescope_row.addWidget(self.telescope_combo, 1)
         equipment_layout.addLayout(telescope_row)
 
         camera_row = QHBoxLayout()
         camera_row.addWidget(QLabel("Camera:"))
-        self.camera_edit = QLineEdit()
-        camera_row.addWidget(self.camera_edit)
+        # The user's cameras - or any name typed (saving asks about one that isn't in Equipment)
+        self.camera_combo = QComboBox()
+        self.camera_combo.setEditable(True)
+        self.camera_combo.setInsertPolicy(QComboBox.NoInsert)
+        self._populate_camera_combo()
+        camera_row.addWidget(self.camera_combo, 1)
         equipment_layout.addLayout(camera_row)
 
         filters_row = QHBoxLayout()
@@ -376,6 +428,28 @@ class SessionFormWidget(QWidget):
                     self.telescope_combo.addItem(display_text, tel_id)
         except Exception as e:
             logger.error(f"Error loading telescopes: {e}")
+
+    def _populate_camera_combo(self):
+        self.camera_combo.clear()
+        try:
+            with self.db_manager.get_connection() as conn:
+                for (name,) in conn.execute("SELECT name FROM userequipment WHERE equipment_type = 'camera' "
+                                            "AND COALESCE(is_active, 1) = 1 ORDER BY name COLLATE NOCASE"):
+                    self.camera_combo.addItem(name)
+        except Exception as e:
+            logger.error(f"Error loading cameras: {e}")
+        self.camera_combo.setCurrentIndex(-1)
+        self.camera_combo.lineEdit().clear()
+
+    def _equipment_info(self):
+        """The user's equipment and the names matched to it (LibraryScanner.EquipmentInfo)."""
+        import LibraryScanner
+        try:
+            with self.db_manager.get_connection() as conn:
+                return LibraryScanner.load_equipment_info(conn)
+        except Exception as e:
+            logger.error(f"Error loading the equipment matches: {e}")
+            return LibraryScanner.EquipmentInfo()
 
     def _on_name_text_changed(self, text):
         text = text.strip()
@@ -461,9 +535,18 @@ class SessionFormWidget(QWidget):
         if summary.get("ra_deg") is not None and summary.get("dec_deg") is not None:
             self._ra_deg = round(summary["ra_deg"], 6)
             self._dec_deg = round(summary["dec_deg"], 6)
-        camera = summary.get("camera")
-        if camera:
-            self.camera_edit.setText(camera)
+        # The files' camera and telescope as the user's equipment (through their
+        # matches) - the telescope only when none is chosen yet
+        camera, telescope = summary.get("camera"), summary.get("telescope")
+        if camera or telescope:
+            import EquipmentMapper
+            from EquipmentManager import select_telescope
+            info = self._equipment_info()
+            if camera:
+                self.camera_combo.setCurrentText(EquipmentMapper.display_name(EquipmentMapper.CAMERA, camera, info))
+            telescope_id = EquipmentMapper.resolve(EquipmentMapper.TELESCOPE, telescope, info)
+            if telescope_id is not None and self.telescope_combo.currentData() is None:
+                select_telescope(self.telescope_combo, self.db_manager, telescope_id)
         filters = summary.get("filters_used") or []
         if filters:
             self.filters_edit.setText(", ".join(filters))
@@ -514,7 +597,7 @@ class SessionFormWidget(QWidget):
         from EquipmentManager import select_telescope
         select_telescope(self.telescope_combo, self.db_manager, session_data.get("telescope_id"))
 
-        self.camera_edit.setText(session_data.get("camera") or "")
+        self.camera_combo.setCurrentText(session_data.get("camera") or "")
         self.filters_edit.setText(session_data.get("filters_used") or "")
         self.notes_edit.setPlainText(session_data.get("notes") or "")
 
@@ -557,11 +640,15 @@ class SessionFormWidget(QWidget):
         if not self.name_edit.text().strip():
             QMessageBox.warning(self, "Validation Error", "DSO name is required.")
             return False
-        return True
+        # The camera, linked to the user's Equipment - asking about one that isn't in it
+        from EquipmentManager import choose_equipment
+        return choose_equipment(self, None, self.camera_combo.currentText(), record="session") is not None
 
     def collect(self):
         """The form's values as a usersessions row dict (not validated)."""
+        import EquipmentMapper
         name = self.name_edit.text().strip()
+        camera = self.camera_combo.currentText().strip()
         lat, lon, loc_name, tz, source = self.location_widget.get_location()
         has_times = self.time_checkbox.isChecked()
         aggregate = self._scanned_aggregate or self._existing_aggregate or {}
@@ -581,7 +668,10 @@ class SessionFormWidget(QWidget):
             "location_timezone": tz,
             "location_source": source,
             "telescope_id": self.telescope_combo.currentData(),
-            "camera": self.camera_edit.text().strip(),
+            # The user's camera this names (its own name, or matched to it) - else just the name
+            "camera_id": EquipmentMapper.resolve(EquipmentMapper.CAMERA, camera, self._equipment_info())
+            if camera else None,
+            "camera": camera,
             "filters_used": self.filters_edit.text().strip(),
             "sub_count": aggregate.get("sub_count", 0),
             "integration_seconds": aggregate.get("integration_seconds", 0),
@@ -606,7 +696,7 @@ class SessionFormWidget(QWidget):
                 UPDATE usersessions SET
                     target_id=?, dso_name=?, ra_deg=?, dec_deg=?, status=?, session_date=?,
                     start_time=?, end_time=?, location_lat=?, location_lon=?, location_name=?,
-                    location_timezone=?, location_source=?, telescope_id=?, camera=?, filters_used=?,
+                    location_timezone=?, location_source=?, telescope_id=?, camera_id=?, camera=?, filters_used=?,
                     sub_count=?, integration_seconds=?, earliest_sub_date=?, latest_sub_date=?,
                     notes=?, modified_date=?
                 WHERE id=?
@@ -614,7 +704,7 @@ class SessionFormWidget(QWidget):
                 data["target_id"], data["dso_name"], data["ra_deg"], data["dec_deg"], data["status"],
                 data["session_date"], data["start_time"], data["end_time"], data["location_lat"],
                 data["location_lon"], data["location_name"], data["location_timezone"],
-                data["location_source"], data["telescope_id"], data["camera"], data["filters_used"],
+                data["location_source"], data["telescope_id"], data["camera_id"], data["camera"], data["filters_used"],
                 data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
                 data["latest_sub_date"], data["notes"], data["modified_date"], self.session_id,
             ))
@@ -623,14 +713,14 @@ class SessionFormWidget(QWidget):
                 INSERT INTO usersessions (
                     target_id, dso_name, ra_deg, dec_deg, status, session_date, start_time, end_time,
                     location_lat, location_lon, location_name, location_timezone, location_source,
-                    telescope_id, camera, filters_used, sub_count, integration_seconds,
+                    telescope_id, camera_id, camera, filters_used, sub_count, integration_seconds,
                     earliest_sub_date, latest_sub_date, notes, modified_date
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 data["target_id"], data["dso_name"], data["ra_deg"], data["dec_deg"], data["status"],
                 data["session_date"], data["start_time"], data["end_time"], data["location_lat"],
                 data["location_lon"], data["location_name"], data["location_timezone"],
-                data["location_source"], data["telescope_id"], data["camera"], data["filters_used"],
+                data["location_source"], data["telescope_id"], data["camera_id"], data["camera"], data["filters_used"],
                 data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
                 data["latest_sub_date"], data["notes"], data["modified_date"],
             ))
@@ -812,7 +902,7 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
 
     # Sessions the dropped subs can be suggested for - a Planned one is promoted
     # to In Progress when files are attached
-    OPEN_STATUSES = ("Planned", "In Progress")
+    OPEN_STATUSES = OPEN_STATUSES
 
     def _taken_on(self, session_date):
         """True when the subs could be from the night a session is dated. A
@@ -3223,7 +3313,10 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         ]
         self.sessions_table.setColumnCount(len(self._column_labels))
         self.sessions_table.setHorizontalHeaderLabels(self._column_labels)
+        # Open sessions first (SortItem's groups), each group newest first
+        self.sessions_table.horizontalHeader().setSortIndicator(2, Qt.DescendingOrder)
         self.sessions_table.setSortingEnabled(True)
+        self.sessions_table.setItemDelegate(GroupDividerDelegate(self.sessions_table))
         header = self.sessions_table.horizontalHeader()
         for col in range(len(self._column_labels)):
             header.setSectionResizeMode(col, QHeaderView.Interactive)
@@ -3329,18 +3422,21 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                 "session_date", "start_time", "end_time",
                 "location_lat", "location_lon", "location_name", "location_timezone", "location_source",
                 "telescope_id", "telescope_name",
-                "camera", "filters_used", "sub_count", "integration_seconds",
+                "camera_id", "camera", "filters_used", "sub_count", "integration_seconds",
                 "earliest_sub_date", "latest_sub_date", "notes",
                 "created_date", "modified_date",
             ]
+            import EquipmentMapper
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
+                # camera: its Equipment's name, else the name it was given
+                cursor.execute(f"""
                     SELECT s.id, s.target_id, s.dso_name, s.ra_deg, s.dec_deg, s.status,
                            s.session_date, s.start_time, s.end_time,
                            s.location_lat, s.location_lon, s.location_name, s.location_timezone, s.location_source,
                            s.telescope_id, tel.name as telescope_name,
-                           s.camera, s.filters_used, s.sub_count, s.integration_seconds,
+                           s.camera_id, {EquipmentMapper.session_camera_sql('s')},
+                           s.filters_used, s.sub_count, s.integration_seconds,
                            s.earliest_sub_date, s.latest_sub_date, s.notes,
                            s.created_date, s.modified_date
                     FROM usersessions s
@@ -3363,12 +3459,17 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         fit_name_column = self._fit_name_column_on_load and bool(self.sessions_data)
 
         for row, session in enumerate(self.sessions_data):
-            name_item = QTableWidgetItem(session.get("dso_name", ""))
+            group = 0 if session.get("status") in OPEN_STATUSES else 1
+
+            def cell(text, sort_key=None, align=None):
+                return SortItem(text, sort_key, align, group)
+
+            name_item = cell(session.get("dso_name", ""))
             name_item.setData(Qt.UserRole, session)
             self.sessions_table.setItem(row, 0, name_item)
 
-            self.sessions_table.setItem(row, 1, QTableWidgetItem(session.get("status", "")))
-            self.sessions_table.setItem(row, 2, QTableWidgetItem(session.get("session_date", "")))
+            self.sessions_table.setItem(row, 1, cell(session.get("status", "")))
+            self.sessions_table.setItem(row, 2, cell(session.get("session_date", "")))
 
             start_time = session.get("start_time")
             end_time = session.get("end_time")
@@ -3376,7 +3477,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                 time_text = f"{start_time}-{end_time}"
             else:
                 time_text = start_time or ""
-            self.sessions_table.setItem(row, 3, QTableWidgetItem(time_text))
+            self.sessions_table.setItem(row, 3, cell(time_text))
 
             loc_name = session.get("location_name")
             lat, lon = session.get("location_lat"), session.get("location_lon")
@@ -3386,24 +3487,22 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                 loc_text = f"{lat:.2f}, {lon:.2f}"
             else:
                 loc_text = ""
-            self.sessions_table.setItem(row, 4, QTableWidgetItem(loc_text))
+            self.sessions_table.setItem(row, 4, cell(loc_text))
 
-            self.sessions_table.setItem(row, 5, QTableWidgetItem(session.get("telescope_name") or "Any"))
-            self.sessions_table.setItem(row, 6, QTableWidgetItem(session.get("filters_used") or ""))
+            self.sessions_table.setItem(row, 5, cell(session.get("telescope_name") or "Any"))
+            self.sessions_table.setItem(row, 6, cell(session.get("filters_used") or ""))
 
-            subs_item = QTableWidgetItem(str(session.get("sub_count") or 0))
-            subs_item.setTextAlignment(Qt.AlignCenter)
-            self.sessions_table.setItem(row, 7, subs_item)
+            sub_count = session.get("sub_count") or 0
+            self.sessions_table.setItem(row, 7, cell(str(sub_count), sub_count, Qt.AlignCenter))
 
             integration_seconds = session.get("integration_seconds") or 0
-            integration_item = QTableWidgetItem(f"{integration_seconds / 3600.0:.1f} h" if integration_seconds else "")
+            integration_item = cell(f"{integration_seconds / 3600.0:.1f} h" if integration_seconds else "",
+                                    integration_seconds, Qt.AlignCenter)
             integration_item.setData(Qt.UserRole, integration_seconds)
-            integration_item.setTextAlignment(Qt.AlignCenter)
             self.sessions_table.setItem(row, 8, integration_item)
 
-            linked_item = QTableWidgetItem("Yes" if session.get("target_id") else "")
-            linked_item.setTextAlignment(Qt.AlignCenter)
-            self.sessions_table.setItem(row, 9, linked_item)
+            self.sessions_table.setItem(row, 9, cell("Yes" if session.get("target_id") else "",
+                                                     align=Qt.AlignCenter))
 
         if fit_name_column:
             # No remembered widths yet: size the names column to its contents once

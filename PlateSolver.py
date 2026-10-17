@@ -434,10 +434,12 @@ class PlateSolver:
             if 'ra' in hints and 'dec' in hints:
                 cmd.extend(["-ra", str(hints['ra'] / 15.0)])  # Convert to hours
                 cmd.extend(["-spd", str(hints['dec'] + 90)])  # Convert to SPD
-            if 'radius' in hints:
-                cmd.extend(["-r", str(hints['radius'])])
+                cmd.extend(["-r", str(hints.get('radius', 30))])
             else:
-                cmd.extend(["-r", "30"])  # Default 30 degree search radius
+                # Blind: the whole sky. A radius around no center searches only
+                # near ASTAP's default position, so a blind solve almost never
+                # found anything (seconds to a minute or so with the whole sky)
+                cmd.extend(["-r", "180"])
 
             # Run ASTAP
             logger.info(f"Running ASTAP: {' '.join(cmd)}")

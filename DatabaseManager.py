@@ -12,6 +12,22 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 
+def add_user_image_row(cursor, dsodetailid, image_path, integration_time="", date_taken="", notes="",
+                       session_id=None, equipment=None):
+    """Insert one userimages row (the gallery's image of a DSO); its id. Does not commit.
+    equipment: {"telescope_id", "telescope_name", "camera_id", "camera_name"} - see EquipmentMapper.py."""
+    equipment = equipment or {}
+    cursor.execute("""
+        INSERT INTO userimages (
+            dsodetailid, image_path, integration_time, date_taken, notes, session_id,
+            telescope_id, telescope_name, camera_id, camera_name, created_date
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    """, (dsodetailid, image_path, integration_time, date_taken, notes, session_id,
+          equipment.get("telescope_id"), equipment.get("telescope_name"),
+          equipment.get("camera_id"), equipment.get("camera_name")))
+    return cursor.lastrowid
+
+
 class DatabaseManager:
     """Singleton database manager for the Cosmos Collection application"""
     
@@ -113,6 +129,20 @@ class DatabaseManager:
                 except sqlite3.OperationalError:
                     # Column already exists, ignore
                     pass
+
+                # The Session Manager session an image came from (set by the Add Image
+                # dialog's session prefill and the Import Wizard). No foreign key
+                # enforcement - SessionObservations.delete_session_children clears it.
+                try:
+                    cursor.execute("ALTER TABLE userimages ADD COLUMN session_id INTEGER "
+                                   "REFERENCES usersessions(id) ON DELETE SET NULL")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
+                # The telescope and camera each image was taken with, linked to
+                # the user's Equipment (EquipmentMapper.py) - converted below
+                import EquipmentMapper
+                first_equipment_run = EquipmentMapper.ensure_columns(cursor)
 
                 # Add is_active column to usersettings for multi-location support
                 try:
@@ -254,6 +284,8 @@ class DatabaseManager:
                     cursor.execute("ALTER TABLE usersessions ADD COLUMN framing TEXT")
                 except sqlite3.OperationalError:
                     pass  # Column already exists
+                # The session's camera linked to the user's Equipment (EquipmentMapper.py) - converted below
+                first_session_equipment_run = EquipmentMapper.ensure_session_columns(cursor)
 
                 # Create usersessionfiles table for FITS/XISF subs scanned into a session
                 cursor.execute("""
@@ -286,6 +318,12 @@ class DatabaseManager:
                 SessionObservations.ensure_schema(conn)
 
                 conn.commit()
+
+                # Images and sessions from before the equipment columns: link their names
+                try:
+                    EquipmentMapper.migrate(conn, first_equipment_run, first_session_equipment_run)
+                except Exception as e:
+                    logger.error(f"Couldn't link the gallery images' equipment: {e}", exc_info=True)
                 logger.debug("Database tables initialized successfully")
                 
         except Exception as e:

@@ -494,20 +494,21 @@ def equipment_scales(path):
         from collections import Counter
         from ResourceManager import ResourceManager
         from AnnotationOverlay import read_wcs_header
+        import EquipmentMapper
         conn = sqlite3.connect(str(ResourceManager.get_database_path()))
         try:
-            rows = conn.execute("SELECT image_path, equipment FROM userimages "
-                                "WHERE image_path IS NOT NULL AND image_path != ''").fetchall()
+            rows = [(row[0], EquipmentMapper.image_equipment(row[1:])["equipment_key"]) for row in conn.execute(
+                f"SELECT ui.image_path, {EquipmentMapper.select_sql('ui')} FROM userimages ui "
+                "WHERE ui.image_path IS NOT NULL AND ui.image_path != ''").fetchall()]
         finally:
             conn.close()
         wanted = os.path.normcase(os.path.normpath(path))
-        mine = next((e for p, e in rows if os.path.normcase(os.path.normpath(p)) == wanted), None)
-        if not (mine or "").strip():
+        mine = next((key for p, key in rows if os.path.normcase(os.path.normpath(p)) == wanted), None)
+        if mine is None or mine == "|":  # Not in the gallery, or no telescope or camera
             return []
         found = Counter()
-        for other, equipment in rows:
-            if (equipment or "").strip().casefold() != mine.strip().casefold() or \
-                    os.path.normcase(os.path.normpath(other)) == wanted or not os.path.isfile(other):
+        for other, key in rows:
+            if key != mine or os.path.normcase(os.path.normpath(other)) == wanted or not os.path.isfile(other):
                 continue
             header = read_wcs_header(other)
             if not header:

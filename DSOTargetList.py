@@ -511,7 +511,7 @@ _DSO_DETAIL_QUERY = """
                    WHEN 'IC' THEN 3
                    ELSE 4
                END, c.designation) as designations,
-           ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+           ui.image_path, ui.integration_time, ui.date_taken, ui.notes,
            (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
     FROM dsodetail d
     JOIN cataloguenr c ON d.id = c.dsodetailid
@@ -584,7 +584,8 @@ def _dso_data_by_coordinates(db_manager, target_data):
 def _process_dso_query_result(result, target_data):
     """Process database query result into DSODetailWindow format"""
     try:
-        obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max,             constellation, dso_type, dso_class, designations, image_path, integration_time,             equipment, date_taken, notes, image_count = result
+        (obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, constellation, dso_type, dso_class,
+         designations, image_path, integration_time, date_taken, notes, image_count) = result
 
         # Get the primary designation
         primary_designation = designations.split(',')[0].strip()
@@ -612,7 +613,6 @@ def _process_dso_query_result(result, target_data):
             "dsodetailid": obj_id,
             "image_path": image_path,
             "integration_time": integration_time,
-            "equipment": equipment,
             "date_taken": date_taken,
             "notes": notes if notes else target_data.get("notes", ""),  # Use target notes if DB notes empty
             "image_count": image_count

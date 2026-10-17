@@ -88,6 +88,7 @@ def ensure_schema(conn):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessionfiles_observation_id "
                    "ON usersessionfiles(observation_id)")
 
+    _rekey_whole_second_sub_keys(conn)
     affected_sessions = _backfill_sub_keys(conn)
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_usersessionfiles_session_sub_key "
                    "ON usersessionfiles(session_id, sub_key) WHERE sub_key IS NOT NULL")
@@ -130,6 +131,24 @@ def _backfill_sub_keys(conn):
     return affected
 
 
+def _rekey_whole_second_sub_keys(conn):
+    """Fingerprints made before make_sub_key kept milliseconds ('...T21:04:11|'
+    rather than '...T21:04:11.250|') are made again. The finer keys can't
+    collide where the old ones didn't, so the unique index stays satisfied.
+    Only old keys match, so after the first run this finds nothing."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, date_obs, exptime_seconds, filter_name, frame_type, camera FROM usersessionfiles
+        WHERE sub_key IS NOT NULL AND sub_key NOT LIKE '____-__-__T__:__:__.___|%'
+    """)
+    rows = cursor.fetchall()
+    for file_id, date_obs, exptime, filter_name, frame_type, camera in rows:
+        cursor.execute("UPDATE usersessionfiles SET sub_key = ? WHERE id = ?",
+                       (make_sub_key(date_obs, exptime, filter_name, frame_type, camera), file_id))
+    if rows:
+        logger.info(f"Updated {len(rows)} session file fingerprint(s) to millisecond precision")
+
+
 def migrate(conn):
     """Full startup migration: schema, then assign every session's files to
     observations and recompute totals for any session whose data changed. Commits."""
@@ -142,16 +161,20 @@ def migrate(conn):
     affected |= {row[0] for row in cursor.fetchall()}
     # Sessions whose files were attached before recompute filled in the camera -
     # a direct fill, not a full recompute, so it stays cheap on every startup.
+    # Only the camera: an empty telescope may be the user's own "Any".
     cursor.execute("""
-        UPDATE usersessions SET camera = (
-            SELECT f.camera FROM usersessionfiles f
-            WHERE f.session_id = usersessions.id AND f.camera IS NOT NULL AND f.camera != ''
-            GROUP BY f.camera ORDER BY COUNT(*) DESC LIMIT 1
-        )
+        SELECT id FROM usersessions
         WHERE (camera IS NULL OR TRIM(camera) = '')
           AND EXISTS (SELECT 1 FROM usersessionfiles f
                       WHERE f.session_id = usersessions.id AND f.camera IS NOT NULL AND f.camera != '')
     """)
+    cameraless = [row[0] for row in cursor.fetchall()]
+    if cameraless:
+        import EquipmentMapper  # Here: it imports LibraryScanner, which imports this module
+        import LibraryScanner
+        info = LibraryScanner.load_equipment_info(conn)
+        for session_id in cameraless:
+            EquipmentMapper.fill_session_gear(conn, session_id, info, telescope=False)
     for session_id in sorted(affected):
         assign_files_to_observations(conn, session_id)
         recompute_session_aggregates(conn, session_id, promote=False)
@@ -268,7 +291,9 @@ def exposure_bucket(exposure_seconds):
 def make_sub_key(date_obs, exptime, filter_name, frame_type, camera):
     """Fingerprint of one physical sub, independent of its path: a copied,
     renamed or calibrated copy of a sub keeps these header values. None when the
-    sub has no DATE-OBS (those fall back to path-only matching)."""
+    sub has no DATE-OBS (those fall back to path-only matching). The time keeps
+    milliseconds (SUB_KEY_TIME): sub-second flats and bias frames are often
+    taken several to a second, and whole seconds made them look like copies."""
     dt = parse_obs_datetime(date_obs)
     if dt is None:
         return None
@@ -279,7 +304,7 @@ def make_sub_key(date_obs, exptime, filter_name, frame_type, camera):
     except (TypeError, ValueError):
         exposure = ""
     return "|".join((
-        dt.strftime(DATETIME_FORMAT), exposure, normalize_filter(filter_name),
+        f"{dt.strftime(DATETIME_FORMAT)}.{dt.microsecond // 1000:03d}", exposure, normalize_filter(filter_name),
         (frame_type or "").strip().lower(), (camera or "").strip().lower(),
     ))
 
@@ -504,16 +529,6 @@ def recompute_session_aggregates(conn, session_id, promote=True):
         """, (session_id,))
         earliest, latest = cursor.fetchone()
 
-    # Most common camera across the attached files - only fills an empty
-    # session camera below, never overwrites one the user typed.
-    cursor.execute("""
-        SELECT camera FROM usersessionfiles
-        WHERE session_id = ? AND camera IS NOT NULL AND camera != ''
-        GROUP BY camera ORDER BY COUNT(*) DESC LIMIT 1
-    """, (session_id,))
-    camera_row = cursor.fetchone()
-    file_camera = camera_row[0] if camera_row else None
-
     has_data = bool(obs_ids) or file_count > 0
     new_status = "In Progress" if (promote and has_data and current_status == "Planned") else current_status
     modified = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -522,11 +537,14 @@ def recompute_session_aggregates(conn, session_id, promote=True):
         cursor.execute("""
             UPDATE usersessions SET
                 sub_count = ?, integration_seconds = ?, earliest_sub_date = ?, latest_sub_date = ?,
-                filters_used = ?, status = ?, modified_date = ?,
-                camera = COALESCE(NULLIF(TRIM(camera), ''), ?)
+                filters_used = ?, status = ?, modified_date = ?
             WHERE id = ?
         """, (sub_count, integration_seconds, earliest, latest, ", ".join(filters),
-              new_status, modified, file_camera, session_id))
+              new_status, modified, session_id))
+        # The telescope and camera the files were taken with (through the user's
+        # equipment matches) - only filling an empty one, never one the user chose
+        import EquipmentMapper  # Here: it imports LibraryScanner, which imports this module
+        EquipmentMapper.fill_session_gear(conn, session_id)
     else:
         cursor.execute("""
             UPDATE usersessions SET
@@ -755,6 +773,25 @@ def delete_session_children(conn, session_id):
     """, (session_id,))
     cursor.execute("DELETE FROM usersessionobservations WHERE session_id = ?", (session_id,))
     cursor.execute("DELETE FROM usersessionfiles WHERE session_id = ?", (session_id,))
+    # Images stay in the gallery, no longer linked to it (foreign keys aren't enforced)
+    try:
+        cursor.execute("UPDATE userimages SET session_id = NULL WHERE session_id = ?", (session_id,))
+    except Exception:
+        pass  # A database from before userimages.session_id
+
+
+def target_name_match(session_name, target_name):
+    """How well a session's DSO name matches a Target List name: 2 = the same apart
+    from case and spaces ("M31" / "M 31"), 1 = the same once parenthetical common
+    names and punctuation are ignored ("vdB 152" / "vdB 152 (Wolf's Cave Nebula)"),
+    0 = different."""
+    spaced = session_name.replace(" ", "").strip().upper() if session_name else ""
+    if not spaced or not target_name:
+        return 0
+    if target_name.replace(" ", "").strip().upper() == spaced:
+        return 2
+    loose = SessionFileScanner.normalize_object_name(session_name)
+    return 1 if loose and SessionFileScanner.normalize_object_name(target_name) == loose else 0
 
 
 def _chunks(items, size=500):

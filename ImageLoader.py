@@ -33,6 +33,36 @@ XISF_EXTENSIONS = ('.xisf',)
 # limits are visually identical
 _PERCENTILE_SAMPLE_PIXELS = 1_000_000
 
+# Reads that report progress go in pieces this big. From the NAS, one read of
+# a whole file is fastest (Windows keeps many requests in flight); each piece
+# waits for the last, so small ones are slow: 4 MB pieces read at ~55% of one
+# read's speed, 64 MB at ~87% - with a progress update every half second or so
+_READ_CHUNK = 64 * 1024 * 1024
+
+
+def read_file_bytes(file_path, progress=None, offset=0, size=None):
+    """A file's bytes: size bytes from offset, or the rest of the file. With
+    progress, they're read in pieces, calling progress(done, total) after each
+    - it may raise to stop the read (e.g. a load that's no longer wanted).
+    Without, in one go."""
+    with open(file_path, 'rb') as f:
+        if offset:
+            f.seek(offset)
+        if progress is None:
+            return f.read() if size is None else f.read(size)
+        total = os.fstat(f.fileno()).st_size - offset if size is None else size
+        data = bytearray(total)
+        done = 0
+        progress(done, total)
+        with memoryview(data) as view:
+            while done < total:
+                count = f.readinto(view[done:done + _READ_CHUNK])
+                if not count:
+                    break  # The file is shorter than it said
+                done += count
+                progress(done, total)
+        return data if done == total else data[:done]
+
 
 def _stretch_channel_to_uint8(channel):
     """Linear-stretch a single 2D channel between its 0.25 and 99.75 percentiles
@@ -68,8 +98,13 @@ def stretch_array_to_qimage(image_data):
     if is_rgb:
         h, w = image_data.shape[:2]
         rgb = np.empty((h, w, 3), dtype=np.uint8)
-        for c in range(3):
-            rgb[:, :, c] = _stretch_channel_to_uint8(image_data[:, :, c])
+        # The channels at once - numpy lets go of the GIL for big arrays, so a
+        # large stack stretches in about half the time
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(3) as pool:
+            channels = pool.map(lambda c: _stretch_channel_to_uint8(image_data[:, :, c]), range(3))
+            for c, channel in enumerate(channels):
+                rgb[:, :, c] = channel
         qimage = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
     else:
         img8 = _stretch_channel_to_uint8(image_data)
@@ -79,16 +114,20 @@ def stretch_array_to_qimage(image_data):
     return qimage.copy()
 
 
-def _read_fits_array(file_path):
+def _read_fits_array(file_path, progress=None):
     """Open a FITS file and return its primary image data, normalized down to
     (h, w) or (h, w, 3) - the dimensionality handling FITS files have always
     needed (extra axes, or RGB planes stored channel-first instead of
     interleaved). The returned array is fully materialized (np.array(...))
     while the file is still open, since astropy may hand back a
-    memory-mapped view that becomes invalid once the file is closed."""
+    memory-mapped view that becomes invalid once the file is closed.
+    progress: read the file into memory first, reporting progress (see
+    read_file_bytes) - otherwise astropy memory-maps it."""
+    import io
     from astropy.io import fits
 
-    with fits.open(file_path) as hdul:
+    source = io.BytesIO(read_file_bytes(file_path, progress)) if progress else file_path
+    with fits.open(source) as hdul:
         image_data = None
         for hdu in hdul:
             if hdu.data is not None and len(hdu.data.shape) >= 2:
@@ -108,22 +147,24 @@ def _read_fits_array(file_path):
         return np.array(image_data)
 
 
-def read_astro_array(file_path):
+def read_astro_array(file_path, progress=None):
     """Raw pixel data of a FITS or XISF file as a numpy array - (h, w) or
     (h, w, 3), native dtype and range - or None for other extensions or a
-    file with no image. Raises on unreadable/corrupt files."""
+    file with no image. Raises on unreadable/corrupt files. progress: called
+    as the file is read (see read_file_bytes)."""
     ext = os.path.splitext(file_path)[1].lower()
     if ext in FITS_EXTENSIONS:
-        return _read_fits_array(file_path)
+        return _read_fits_array(file_path, progress)
     if ext in XISF_EXTENSIONS:
         from XISFReader import read_xisf_pixels
-        return read_xisf_pixels(file_path)
+        return read_xisf_pixels(file_path, progress)
     return None
 
 
-def load_astro_qimage(file_path):
+def load_astro_qimage(file_path, progress=None):
     """Decode a FITS or XISF file into a displayable QImage. Unlike QPixmap,
-    QImage is safe to create in a worker thread.
+    QImage is safe to create in a worker thread. progress: called as the file
+    is read (see read_file_bytes).
 
     Returns None on any failure (missing file, unsupported format/compression,
     corrupt data, etc.).
@@ -132,7 +173,7 @@ def load_astro_qimage(file_path):
         return None
 
     try:
-        image_data = read_astro_array(file_path)
+        image_data = read_astro_array(file_path, progress)
         if image_data is None:
             return None
 
@@ -155,6 +196,18 @@ _EXIF_ORIENTATIONS = {2: (0, -1, 1), 3: (180, 1, 1), 4: (0, 1, -1), 5: (90, -1, 
                       6: (90, 1, 1), 7: (90, 1, -1), 8: (270, 1, 1)}
 
 
+def header_exif(image):
+    """An open Pillow image's EXIF, read from its header - never by decoding it.
+    Pillow's own getexif() decodes a whole PNG first, looking for EXIF stored
+    after the pixels: 16 s for a large PNG on the network drive, on whichever
+    thread asked (it hung the Image Viewer). EXIF after a PNG's pixels is rare
+    and against the spec, so it's left out."""
+    if image.format == "PNG" and "exif" not in image.info:
+        from PIL import Image
+        return Image.Exif()
+    return image.getexif()
+
+
 def _exif_orientation(data):
     """The EXIF orientation (1-8) in an image file's bytes - 1 if none. Pillow
     only reads the header for this."""
@@ -162,7 +215,7 @@ def _exif_orientation(data):
         import io
         from PIL import Image
         with Image.open(io.BytesIO(data)) as image:
-            return int(image.getexif().get(0x0112, 1))
+            return int(header_exif(image).get(0x0112, 1))
     except Exception:
         return 1
 
@@ -176,17 +229,17 @@ def _apply_orientation(qimage, orientation):
     return qimage
 
 
-def read_image_file(file_path, max_dim=None, auto_transform=True):
+def read_image_file(file_path, max_dim=None, auto_transform=True, progress=None):
     """Decode a standard image file (PNG, JPEG, TIFF...) into a QImage, scaled
     to fit max_dim if given. auto_transform applies the EXIF orientation.
 
-    The whole file is read in one go first: Qt's readers fetch a file in many
-    small pieces, which took about 10x as long from a network drive. Safe to
-    call from a worker thread. Returns (qimage, None) or (None, error message).
+    The whole file is read first (in large pieces, reporting to progress if
+    given - see read_file_bytes): Qt's readers fetch a file in many small
+    pieces, which took about 10x as long from a network drive. Safe to call
+    from a worker thread. Returns (qimage, None) or (None, error message).
     """
     try:
-        with open(file_path, 'rb') as f:
-            data = f.read()
+        data = read_file_bytes(file_path, progress)
     except OSError as e:
         return None, f"Couldn't read the file: {e.strerror or e}"
     if not data:
@@ -239,24 +292,25 @@ def write_image_file(image, file_path, image_format, quality=-1):
     return True
 
 
-def load_image_qimage(file_path, max_dim=None):
+def load_image_qimage(file_path, max_dim=None, progress=None):
     """Load any supported image (FITS/XISF or a standard format Qt can read)
     as a QImage - full resolution, or scaled to fit max_dim. Safe to call from
-    a worker thread. Returns (qimage, None) on success or (None, error message)
-    on failure."""
+    a worker thread. progress(done, total) is called as the file is read; once
+    done == total it's decoding, which can't report progress. Returns (qimage,
+    None) on success or (None, error message) on failure."""
     if not file_path or not os.path.exists(file_path):
         return None, "File not found"
 
     ext = os.path.splitext(file_path)[1].lower()
     if ext in FITS_EXTENSIONS + XISF_EXTENSIONS:
-        qimage = load_astro_qimage(file_path)
+        qimage = load_astro_qimage(file_path, progress)
         if qimage is None:
             return None, "Failed to load FITS/XISF file"
         if max_dim and max(qimage.width(), qimage.height()) > max_dim:
             qimage = qimage.scaled(max_dim, max_dim, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         return qimage, None
 
-    return read_image_file(file_path, max_dim=max_dim)
+    return read_image_file(file_path, max_dim=max_dim, progress=progress)
 
 
 def load_screen_stretched_qimage(file_path):

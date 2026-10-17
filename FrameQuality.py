@@ -3,8 +3,8 @@
 Frame Quality
 Measures a light frame's stars (count, FWHM, HFR, eccentricity and how aligned
 the elongated stars are), sky background and noise, then grades each frame
-against the others in its group (same filter/exposure/binning) so only the best
-subs get stacked. Pure numpy/astropy - no Qt - so it runs in worker threads and
+against the others in its group (same filter/exposure/binning) and night, and
+each night against a typical one, so only the best subs get stacked. Pure numpy/astropy - no Qt - so it runs in worker threads and
 from the command line:
 
     python FrameQuality.py <folder or files...> [--workers N]
@@ -16,7 +16,7 @@ import sys
 import math
 import time
 import logging
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 
 import numpy as np
 
@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 # 3: eccentricity from adaptive moments; FWHM corrected to the true FWHM
 # 4: outside light stored at fixed radii (outside_profile), read at the group's core radius
 # 5: satellite/plane trails
-ANALYSIS_VERSION = 5
+# 6: each median's measurement error (fwhm_err, eccentricity_err, star_flux_err, outside_profile_err)
+ANALYSIS_VERSION = 6
 
 TILE = 64                 # background mesh tile size (analysis pixels)
 DETECT_SIGMA = 5.0        # detection threshold on the smoothed image
@@ -125,17 +126,21 @@ class FrameMetrics:
     stars: int = 0                    # detected stars
     measured: int = 0                 # stars measured for shape
     fwhm_px: float = None
+    fwhm_err: float = None            # standard error of fwhm_px (from the star-to-star scatter), sensor pixels
     fwhm_arcsec: float = None
     hfr_px: float = None
     eccentricity: float = None        # 0 round .. 1 a line (PixInsight's definition)
+    eccentricity_err: float = None    # its standard error
     alignment: float = None           # 0 random .. 1 every elongated star points the same way
     background: float = None          # median sky, ADU per pixel
     noise: float = None               # background noise, ADU per pixel
     gradient_pct: float = None        # background spread across the frame, % of the median
     star_snr: float = None            # median peak / noise of the measured stars
     star_flux: list = None            # median flux per TRANSPARENCY_BANDS band (None past the last star) - drops under cloud
+    star_flux_err: list = None        # their standard errors
     saturated: int = 0                # saturated stars
     outside_profile: list = None      # share of star light beyond each OUTSIDE_PROFILE_RADII radius (None past the box) - rises with tails and halos
+    outside_profile_err: list = None  # their standard errors
     trails: list = None               # satellite/plane trails, [x0, y0, x1, y1, excess] in sensor pixels; None if not checked
     width: int = 0
     height: int = 0
@@ -153,8 +158,19 @@ class FrameMetrics:
 
 # ---- Loading ----------------------------------------------------------------
 
-def _read_frame(path):
-    """(pixels, header dict) for a FITS or XISF file."""
+def read_file(path):
+    """The whole file, for analyze_file to parse in memory - or None for a
+    format it reads itself (XISF). Lets callers read ahead on threads of their
+    own: on a network share most of a frame's time is waiting for its bytes."""
+    if os.path.splitext(path)[1].lower() in SessionFileScanner.XISF_EXTENSIONS:
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _read_frame(path, raw=None):
+    """(pixels, header dict) for a FITS or XISF file; raw is the FITS file's
+    bytes from read_file, when already read."""
     from ImageLoader import read_astro_array, _read_fits_array
     ext = os.path.splitext(path)[1].lower()
     if ext in SessionFileScanner.XISF_EXTENSIONS:
@@ -164,8 +180,8 @@ def _read_frame(path):
         # One whole-file read, parsed in memory: about twice as fast from a
         # network share as astropy's many small reads plus a separate header read.
         from astropy.io import fits
-        with open(path, "rb") as f:
-            raw = f.read()
+        if raw is None:
+            raw = read_file(path)
         # Each open gets its own buffer - astropy closes the one it was given
         with fits.open(io.BytesIO(raw)) as hdul:
             full_header = hdul[0].header
@@ -448,10 +464,21 @@ def _measure(boxes, shape=True):
     return fwhm, hfr, eccentricity, angle, aperture
 
 
+def _median_error(values):
+    """Standard error of the median of values, from their robust spread - how
+    far a frame's median could be off by which stars it happened to measure."""
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return None
+    spread = np.median(np.abs(values - np.median(values))) * 1.4826
+    return float(1.2533 * spread / math.sqrt(values.size))  # a median's error is ~1.25x a mean's
+
+
 def _outside_profile(boxes, wide, radii):
-    """Median share of each star's light within `wide` pixels that lies beyond
-    each of `radii` pixels (None from `wide` on). The box's corners outside
-    `wide` are the local background."""
+    """(profile, errors): the median share of each star's light within `wide`
+    pixels that lies beyond each of `radii` pixels (None from `wide` on), and
+    each median's standard error. The box's corners outside `wide` are the
+    local background."""
     half = boxes.shape[1] // 2
     offsets = np.arange(-half, half + 1)
     yy, xx = np.meshgrid(offsets, offsets, indexing="ij")
@@ -460,17 +487,26 @@ def _outside_profile(boxes, wide, radii):
     total = light[:, distance <= wide].sum(axis=1)
     good = total > 0
     if not good.any():
-        return None
+        return None, None
     light, total = light[good], total[good]
-    return [float(np.median(1 - light[:, distance <= r].sum(axis=1) / total)) if r < wide else None
-            for r in radii]
+    shares = [1 - light[:, distance <= r].sum(axis=1) / total if r < wide else None for r in radii]
+    return ([float(np.median(s)) if s is not None else None for s in shares],
+            [_median_error(s) if s is not None else None for s in shares])
 
 
 def outside_at(metrics, group_fwhm):
     """A frame's share of star light beyond its core radius (OUTSIDE_CORE_FWHM x
     the larger of its own FWHM and its group's median), from its
     outside_profile - None when it wasn't measured that far out."""
-    profile = metrics.outside_profile
+    return _profile_at(metrics.outside_profile, metrics, group_fwhm)
+
+
+def outside_error_at(metrics, group_fwhm):
+    """The standard error of outside_at - None when not measured."""
+    return _profile_at(metrics.outside_profile_err, metrics, group_fwhm)
+
+
+def _profile_at(profile, metrics, group_fwhm):
     if not profile or metrics.fwhm_px is None or not group_fwhm:
         return None
     radius = OUTSIDE_CORE_FWHM * max(metrics.fwhm_px, group_fwhm)
@@ -499,6 +535,7 @@ def _shape_stats(boxes):
     return {
         "count": int(fwhm.size), "fwhm": float(np.median(fwhm)), "hfr": float(np.median(hfr)),
         "eccentricity": float(np.median(ecc)) if ecc.size else None, "alignment": alignment,
+        "fwhm_err": _median_error(fwhm), "eccentricity_err": _median_error(ecc),
     }
 
 
@@ -509,36 +546,51 @@ def _pool2(img):
     return img[:h, :w].reshape(h // 2, 2, w // 2, 2).mean(axis=(1, 3))
 
 
-def _segment_mean(padded, pad, shape, angle):
+def _segment_mean(padded, pad, angle, out, part):
     """Per pixel, the dimmest of three 4-pixel sub-segment means along a
-    12-pixel segment at angle (noise units): a trail lights all three, a star -
-    a few pixels across - only the middle one, so stars don't read as lines."""
-    h, w = shape
+    12-pixel segment at angle (noise units), into out: a trail lights all three,
+    a star - a few pixels across - only the middle one, so stars don't read as
+    lines. part is scratch space the size of out."""
+    h, w = out.shape
     dy, dx = math.sin(angle), math.cos(angle)
-    dimmest = None
-    for group in ((-6, -5, -4, -3), (-2, -1, 0, 1), (2, 3, 4, 5)):
-        part = np.zeros(shape, np.float32)
-        for k in group:
+    for i, group in enumerate(((-6, -5, -4, -3), (-2, -1, 0, 1), (2, 3, 4, 5))):
+        target = out if i == 0 else part
+        for j, k in enumerate(group):
             oy, ox = int(round(k * dy)), int(round(k * dx))
-            part += padded[pad + oy:pad + oy + h, pad + ox:pad + ox + w]
-        dimmest = part if dimmest is None else np.minimum(dimmest, part)
+            shifted = padded[pad + oy:pad + oy + h, pad + ox:pad + ox + w]
+            if j == 0:
+                np.copyto(target, shifted)
+            else:
+                target += shifted
+        if i:
+            np.minimum(out, part, out=out)
     # Each direction against its own noise, so none (the diagonals' pixel steps) is favored
-    center, spread = _clipped_stats(dimmest[::3, ::3].ravel())
-    return (dimmest - center) / max(spread, 1e-9)
+    center, spread = _clipped_stats(out[::3, ::3].ravel())
+    out -= center
+    out /= max(spread, 1e-9)
+    return out
 
 
 def _line_filter(img):
     """How much brighter each pixel's surroundings are along some direction
-    than across it, in noise units - high on thin lines, low on round stars."""
+    than across it, in noise units - high on thin lines, low on round stars.
+    Works in a few reused buffers: on Windows every fresh image-sized array is
+    new memory to fault in, which cost several times the arithmetic itself and
+    serialized the analysis threads."""
     pad = 7
     padded = np.pad(img, pad, mode="edge")
     half = TRAIL_ORIENTATIONS // 2
+    along, across, part = (np.empty(img.shape, np.float32) for _ in range(3))
     best = None
     for o in range(half):
-        along = _segment_mean(padded, pad, img.shape, math.pi * o / TRAIL_ORIENTATIONS)
-        across = _segment_mean(padded, pad, img.shape, math.pi * (o + half) / TRAIL_ORIENTATIONS)
-        contrast = np.abs(along - across)
-        best = contrast if best is None else np.maximum(best, contrast)
+        _segment_mean(padded, pad, math.pi * o / TRAIL_ORIENTATIONS, along, part)
+        _segment_mean(padded, pad, math.pi * (o + half) / TRAIL_ORIENTATIONS, across, part)
+        np.subtract(along, across, out=along)
+        np.abs(along, out=along)
+        if best is None:
+            best, along = along, np.empty(img.shape, np.float32)
+        else:
+            np.maximum(best, along, out=best)
     return best
 
 
@@ -639,12 +691,13 @@ def _find_trails(sub, noise):
 
 # ---- Analysis ---------------------------------------------------------------
 
-def analyze_file(path):
-    """Measure one light frame. Never raises - failures come back with ok=False."""
+def analyze_file(path, raw=None):
+    """Measure one light frame (raw: its bytes from read_file, if already read).
+    Never raises - failures come back with ok=False."""
     started = time.perf_counter()
     result = FrameMetrics(path=path)
     try:
-        data, header = _read_frame(path)
+        data, header = _read_frame(path, raw)
         full_scale = _full_scale(data)
         img, scale, summed = _luminance(data, header)
         result.height, result.width = data.shape[:2]
@@ -713,8 +766,12 @@ def analyze_file(path):
             result.measured = stats["count"]
             # Box sizes stay on the measured FWHM they were tuned on
             result.fwhm_px = _true_fwhm(stats["fwhm"], green_odd is not None) * pixel
+            if stats["fwhm_err"] is not None:  # through the same correction - it's steeper for small stars
+                result.fwhm_err = (_true_fwhm(stats["fwhm"] + stats["fwhm_err"], green_odd is not None) * pixel
+                                   - result.fwhm_px)
             result.hfr_px = stats["hfr"] * pixel
             result.eccentricity = stats["eccentricity"]
+            result.eccentricity_err = stats["eccentricity_err"]
             result.alignment = stats["alignment"]
             result.star_snr = stats["snr"]
             arcsec_per_px = _arcsec_per_pixel(header)
@@ -723,20 +780,21 @@ def analyze_file(path):
 
             by_brightness = np.argsort(-peaks)
             result.saturated = int((~unsaturated).sum())
-            result.star_flux = []
+            result.star_flux, result.star_flux_err = [], []
             for start, stop in TRANSPARENCY_BANDS:
                 band = by_brightness[start:stop]
                 band = boxable(band[unsaturated[band]])
                 flux = (_measure(_sensor_boxes(source, src_y[band], src_x[band], radius, green_odd), shape=False)[4]
                         if band.size else np.empty(0))
                 result.star_flux.append(float(np.median(flux)) if flux.size else None)
+                result.star_flux_err.append(_median_error(flux) if flux.size else None)
 
             # Wide enough for the tail, and well past the core of bloated stars
             wide = int(math.ceil(max(OUTSIDE_RADIUS / pixel, 4.5 * stats["fwhm"])))
             # Boxes run a little past the circle - that ring is each star's local background
             bright = boxable(candidates, wide + 4)[:OUTSIDE_STARS]
             if bright.size:
-                result.outside_profile = _outside_profile(
+                result.outside_profile, result.outside_profile_err = _outside_profile(
                     _sensor_boxes(source, src_y[bright], src_x[bright], wide + 4, green_odd), wide,
                     [r / pixel for r in OUTSIDE_PROFILE_RADII])
 
@@ -881,6 +939,9 @@ def _arcsec_per_pixel(header):
 GRADE_GOOD, GRADE_MARGINAL, GRADE_REJECT = "Good", "Marginal", "Reject"
 GRADE_UNGRADED, GRADE_ERROR = "Not graded", "Error"
 MIN_GROUP_SIZE = 3  # fewer frames than this can't be compared with each other
+NOISE_FLOOR = 3.0   # no Reject line closer to the median than this many times the frame's own measurement error
+MIN_NIGHT_FRAMES = 10  # a night with fewer frames in a group is graded with the whole group
+MAX_GRADE_ROUNDS = 50  # re-grading against the survivors settles long before this
 
 
 @dataclass
@@ -904,8 +965,11 @@ class FrameGrade:
     flags: list = field(default_factory=list)
     badness: dict = field(default_factory=dict)  # per metric, 1.0 = at its Reject line
     relative: dict = field(default_factory=dict)  # per metric, % of the group median
-    medians: dict = field(default_factory=dict)   # the group medians graded against (shared by the group)
+    medians: dict = field(default_factory=dict)   # the group medians graded against (flux and sky: its gain's)
     outside: float = None              # share of star light beyond the core radius outside_at uses (0-1)
+    night_issue: str = ""              # why its whole night is graded down (see _check_nights), if it is
+    night_grade: str = ""              # the grade its whole night was held to then (Marginal or Reject)
+    score_badness: dict = field(default_factory=dict)  # what the score was computed from
 
 
 # Total badness at which several smaller problems add up to a Marginal/Reject.
@@ -956,10 +1020,17 @@ def _score_total(badness):
     return total
 
 
-def grade_frames(frames, settings=None):
+def grade_frames(frames, settings=None, gains=None, nights=None):
     """Grade frames against their group. frames is an iterable of
-    (group_key, FrameMetrics); returns {path: FrameGrade}."""
+    (group_key, FrameMetrics). gains ({path: gain}, optional) is each frame's
+    camera gain - star flux and the sky are in ADU, which scale with it, so
+    those are only compared between frames with the same gain. nights
+    ({path: night}, optional): each night is graded against its own frames,
+    then as a whole against a typical night (_check_nights) - seeing changes
+    from night to night, and against the whole session a softer night was
+    rejected wholesale. Returns {path: FrameGrade}."""
     settings = settings or GradeSettings()
+    gains, nights = gains or {}, nights or {}
     groups = {}
     for key, metrics in frames:
         groups.setdefault(key, []).append(metrics)
@@ -975,22 +1046,129 @@ def grade_frames(frames, settings=None):
                 grades[m.path] = FrameGrade(GRADE_UNGRADED, 0.0, ["Too few frames in this group to compare"])
             continue
         band = transparency_band(usable)
-        grades.update(_grade_group(usable, settings, band))
+        gain_of = lambda m: gains.get(m.path)
+        by_night = {}
+        for m in usable:
+            by_night.setdefault(nights.get(m.path), []).append(m)
+        own = {night: night_frames for night, night_frames in by_night.items()
+               if len(night_frames) >= MIN_NIGHT_FRAMES}
+        for night_frames in own.values():
+            grades.update(_grade_group(night_frames, settings, band, gain_of))
+        rest = [m for night, night_frames in by_night.items() if night not in own for m in night_frames]
+        if rest:  # too few on their night to judge them by it
+            whole = _grade_group(usable, settings, band, gain_of)
+            grades.update({m.path: whole[m.path] for m in rest})
+        if len(own) > 1:
+            # A typical night from each night graded on its own - not from the
+            # re-grade below, whose looser lines keep more frames: fed back,
+            # that made removing the rejects turn up new ones - then each night
+            # again against the softer of its own median and the typical night's
+            night_medians, typical = _night_medians(own, grades, band, settings)
+            for night_frames in own.values():
+                grades.update(_grade_group(night_frames, settings, band, gain_of, typical))
+            _check_nights(own, grades, settings, night_medians, typical)
     return grades
 
 
-def _grade_group(frames, settings, band):
+_GRADE_RANK = {GRADE_GOOD: 0, GRADE_MARGINAL: 1, GRADE_REJECT: 2}
+
+
+def _night_medians(nights, grades, band, settings):
+    """({night: medians}, typical): each night's median FWHM, eccentricity and
+    signal from its frames that aren't rejected, and a typical night's - the
+    median of those, leaving out nights rejected as a whole against it (as a
+    group's median leaves out rejected frames), so removing a bad night's
+    frames doesn't move it and turn up new rejects on the others.
+    nights: {night: [FrameMetrics]}, graded in grades."""
+    medians = {}
+    for night, frames in nights.items():
+        kept = [m for m in frames if grades[m.path].grade != GRADE_REJECT] or frames
+        medians[night] = {"fwhm": _median_of(m.fwhm_px for m in kept),
+                          "eccentricity": _median_of(m.eccentricity for m in kept),
+                          "signal": _median_of(frame_signal(m, band) for m in kept)}
+    reference = list(medians)
+    for _ in range(len(medians)):
+        typical = {key: _median_of(medians[night][key] for night in reference)
+                   for key in ("fwhm", "eccentricity", "signal")}
+        good = [night for night in medians
+                if max(_night_badness(medians[night], typical, settings).values(), default=0.0) < 1.0]
+        if good == reference or not good:
+            break
+        reference = good
+    return medians, typical
+
+
+def _night_badness(own, typical, settings):
+    """A night's median FWHM and eccentricity against a typical night's, each
+    1.0 at its Reject line."""
+    badness = {}
+    if own["fwhm"] and typical["fwhm"]:
+        badness["fwhm"] = (own["fwhm"] - typical["fwhm"]) / typical["fwhm"] * 100 / settings.fwhm_rise_pct
+    if own["eccentricity"] is not None and typical["eccentricity"] is not None:
+        badness["eccentricity"] = (own["eccentricity"] - typical["eccentricity"]) / settings.eccentricity_rise
+    return badness
+
+
+def _check_nights(nights, grades, settings, medians, typical):
+    """Grade each night as a whole against a typical one (_night_medians) by
+    its median FWHM and eccentricity, with the frames' own lines: past the
+    Reject line every frame of the night is a Reject, past half of it Marginal
+    at best. Each night's offset also goes into its frames' scores, which were
+    only against their own night: Top % keeps the best across the whole session.
+    nights: {night: [FrameMetrics]}, graded in grades."""
+    for night, frames in nights.items():
+        own = medians[night]
+        badness, issues = _night_badness(own, typical, settings), []
+        if badness.get("fwhm", 0.0) >= 0.5:
+            issues.append(f"Soft night (median FWHM {own['fwhm']:.2f} vs {typical['fwhm']:.2f} px on a typical "
+                          f"night) - focus, dew or seeing?")
+        if badness.get("eccentricity", 0.0) >= 0.5:
+            issues.append(f"Elongated night (median eccentricity {own['eccentricity']:.2f} vs "
+                          f"{typical['eccentricity']:.2f} on a typical night) - wind, tracking or tilt?")
+        worst = max(badness.values(), default=0.0)
+        night_grade = GRADE_REJECT if worst >= 1.0 else GRADE_MARGINAL if worst >= 0.5 else GRADE_GOOD
+        if own["signal"] and typical["signal"]:
+            badness["signal"] = (100 - own["signal"] / typical["signal"] * 100) / SIGNAL_DROP_PCT
+        for m in frames:
+            g = grades[m.path]
+            if _GRADE_RANK[night_grade] > _GRADE_RANK[g.grade]:
+                g.grade = night_grade
+            if issues:
+                g.night_issue, g.night_grade = "; ".join(issues), night_grade
+                g.flags = issues + g.flags
+            ranking = dict(g.score_badness)
+            for metric, offset in badness.items():
+                ranking[metric] = ranking.get(metric, 0.0) + offset
+            g.score = _score(_score_total(ranking))
+
+
+def _grade_group(frames, settings, band, gain_of, typical=None):
     """Grade against the median of the frames that aren't rejected. With bad
     frames in the median it sits lower, so removing them would make it rise and
     reject frames that passed before - each removal peeling off another layer.
     Re-grading against the survivors until nothing changes gives that end
-    result at once, so removing the rejects leaves the rest graded the same."""
+    result at once, so removing the rejects leaves the rest graded the same.
+    That only settles because no frame is rejected for a change smaller than
+    its own measurement error (see _grade_one): when chance alone put frames
+    past the lines, each round's survivors set a stricter median and the
+    rounds peeled the group down to a handful. typical (a typical night's
+    medians, _night_medians): FWHM and eccentricity are graded against it where
+    it's softer than this night's own - a frame sharper than most of the
+    session's isn't worth rejecting for missing an unusually sharp night."""
+    everyone = _group_medians(frames, band, gain_of)
     reference = frames
-    for _ in range(10):
-        medians = _group_medians(reference, band)
-        grades = {m.path: _grade_one(m, medians, settings, band) for m in frames}
+    for _ in range(MAX_GRADE_ROUNDS):
+        medians = _group_medians(reference, band, gain_of)
+        grades = {}
+        for m in frames:
+            med = _frame_medians(medians, everyone, gain_of(m))
+            if typical:
+                if med["fwhm_px"] and typical["fwhm"]:
+                    med["fwhm_ref"] = max(med["fwhm_px"], typical["fwhm"])
+                if med["eccentricity"] is not None and typical["eccentricity"] is not None:
+                    med["eccentricity_ref"] = max(med["eccentricity"], typical["eccentricity"])
+            grades[m.path] = _grade_one(m, med, settings, band)
         survivors = [m for m in frames if grades[m.path].grade != GRADE_REJECT]
-        # A better reference mostly just adds rejects, so this settles in a few rounds
         if len(survivors) == len(reference) or len(survivors) < MIN_GROUP_SIZE:
             break
         reference = survivors
@@ -1016,27 +1194,67 @@ def band_flux(metrics, band):
     return metrics.star_flux[band]
 
 
+def band_flux_error(metrics, band):
+    """The standard error of band_flux, or None."""
+    if band is None or not metrics.star_flux_err or band >= len(metrics.star_flux_err):
+        return None
+    return metrics.star_flux_err[band]
+
+
+def _line(threshold, error):
+    """A Reject line no closer than NOISE_FLOOR x the frame's own measurement
+    error (in the threshold's units), so a frame isn't rejected for a change it
+    can't measure. Few stars make a noisy median: a small-aperture rig's short
+    subs may have only a dozen bright enough to measure, and their light outside
+    the cores scatters 50% from one frame to the next against a 35% line."""
+    return max(threshold, NOISE_FLOOR * error) if error else threshold
+
+
+def _pct(error, median):
+    return error / median * 100 if error is not None and median else None
+
+
 def _median_of(values):
     values = [v for v in values if v is not None]
     return float(np.median(values)) if values else None
 
 
-def _group_medians(frames, band):
-    medians = {attr: _median_of(getattr(f, attr) for f in frames)
-               for attr in ("stars", "fwhm_px", "eccentricity", "background")}
-    medians["star_flux"] = _median_of(band_flux(f, band) for f in frames)
+def _group_medians(frames, band, gain_of=lambda m: None):
+    medians = {attr: _median_of(getattr(f, attr) for f in frames) for attr in ("stars", "fwhm_px", "eccentricity")}
     medians["signal"] = _median_of(frame_signal(f, band) for f in frames)
     medians["outside_light"] = _median_of(outside_at(f, medians["fwhm_px"]) for f in frames)
+    # Star flux and the sky are in ADU, which scale with the gain - a gain
+    # change between nights looked like brighter stars and a brighter sky
+    by_gain = {}
+    for f in frames:
+        by_gain.setdefault(gain_of(f), []).append(f)
+    medians["by_gain"] = {gain: {"star_flux": _median_of(band_flux(f, band) for f in members),
+                                 "background": _median_of(f.background for f in members)}
+                          for gain, members in by_gain.items()}
     return medians
 
 
+def _frame_medians(medians, everyone, gain):
+    """The medians to grade one frame against: star flux and the sky from frames
+    with its gain - from the whole group when every one of those is rejected."""
+    own = medians["by_gain"].get(gain) or everyone["by_gain"][gain]
+    result = {key: value for key, value in medians.items() if key != "by_gain"}
+    result.update(own)
+    return result
+
+
 def _grade_one(m, med, s, band):
+    """med: the medians to grade against. Its optional fwhm_ref and
+    eccentricity_ref (see _grade_group) replace the FWHM and eccentricity
+    medians for the grade - the score stays against the medians themselves."""
     badness, flags = {}, []
+    ranking = {}  # the score's own badness where it differs from the grade's
 
     flux = band_flux(m, band)
+    flux_error = band_flux_error(m, band)
     if flux is not None and med["star_flux"]:
         drop = (med["star_flux"] - flux) / med["star_flux"] * 100
-        badness["flux"] = drop / s.flux_drop_pct
+        badness["flux"] = drop / _line(s.flux_drop_pct, _pct(flux_error, med["star_flux"]))
         if badness["flux"] >= 0.5:
             flags.append(f"Dimmer stars (-{drop:.0f}%) - clouds or haze?")
 
@@ -1050,24 +1268,29 @@ def _grade_one(m, med, s, band):
         badness["fwhm"] = 1.0
         flags.append("No measurable stars")
     elif med["fwhm_px"]:
-        rise = (m.fwhm_px - med["fwhm_px"]) / med["fwhm_px"] * 100
-        badness["fwhm"] = rise / s.fwhm_rise_pct
+        ref = med.get("fwhm_ref") or med["fwhm_px"]
+        line = _line(s.fwhm_rise_pct, _pct(m.fwhm_err, ref))
+        badness["fwhm"] = (m.fwhm_px - ref) / ref * 100 / line
+        ranking["fwhm"] = (m.fwhm_px - med["fwhm_px"]) / med["fwhm_px"] * 100 / line
         if badness["fwhm"] >= 0.5:
-            flags.append(f"Soft stars (FWHM {m.fwhm_px:.2f} vs {med['fwhm_px']:.2f} px) - seeing or focus?")
+            flags.append(f"Soft stars (FWHM {m.fwhm_px:.2f} vs {ref:.2f} px) - seeing or focus?")
 
     if m.eccentricity is not None and med["eccentricity"] is not None:
-        badness["eccentricity"] = (m.eccentricity - med["eccentricity"]) / s.eccentricity_rise
+        ref = med.get("eccentricity_ref", med["eccentricity"])
+        line = _line(s.eccentricity_rise, m.eccentricity_err)
+        badness["eccentricity"] = (m.eccentricity - ref) / line
+        ranking["eccentricity"] = (m.eccentricity - med["eccentricity"]) / line
         if badness["eccentricity"] >= 0.5:
             cause = "trailing" if (m.alignment or 0) >= 0.6 else "wind, guiding or tilt"
-            flags.append(f"Elongated stars (eccentricity {m.eccentricity:.2f} vs "
-                         f"{med['eccentricity']:.2f}) - {cause}?")
+            flags.append(f"Elongated stars (eccentricity {m.eccentricity:.2f} vs {ref:.2f}) - {cause}?")
 
     outside = outside_at(m, med["fwhm_px"])
     if outside is not None and med["outside_light"]:
         rise = (outside - med["outside_light"]) / med["outside_light"] * 100
         # Never credit: a fainter halo than the median isn't worth offsetting
         # other problems, and the score's credit is for sharpness and signal
-        badness["outside"] = max(rise / s.outside_rise_pct, 0.0)
+        line = _line(s.outside_rise_pct, _pct(outside_error_at(m, med["fwhm_px"]), med["outside_light"]))
+        badness["outside"] = max(rise / line, 0.0)
         if badness["outside"] >= 0.5:
             flags.append(f"Light spread outside the star cores (+{rise:.0f}%) - guiding jump, trailing or halos?")
 
@@ -1085,7 +1308,9 @@ def _grade_one(m, med, s, band):
     signal = frame_signal(m, band)
     if s.signal_drop_pct and signal is not None and med["signal"]:
         drop = (med["signal"] - signal) / med["signal"] * 100
-        badness["signal"] = max(drop / s.signal_drop_pct, 0.0)
+        # The noise is measured from the whole background - all the error is the stars' flux
+        error = _pct(flux_error * signal / flux, med["signal"]) if flux_error is not None and flux else None
+        badness["signal"] = max(drop / _line(s.signal_drop_pct, error), 0.0)
         if badness["signal"] >= 0.5:
             flags.append(f"Low signal ({100 - drop:.0f}% of the median) - moonlight, dawn, haze or clouds?")
 
@@ -1128,12 +1353,13 @@ def _grade_one(m, med, s, band):
 
     # The score's own measurement - signal doesn't grade (a moonlit frame with
     # good stars stays Good), it only ranks
-    score_badness = dict(badness)
+    score_badness = dict(badness, **ranking)
     if "signal" in relative:
         score_badness["signal"] = (100 - relative["signal"]) / SIGNAL_DROP_PCT
     elif med["signal"]:
         score_badness["signal"] = 1.0  # too few stars to measure where the others could
-    return FrameGrade(grade, _score(_score_total(score_badness)), flags, badness, relative, med, outside)
+    return FrameGrade(grade, _score(_score_total(score_badness)), flags, badness, relative, med, outside,
+                      score_badness=score_badness)
 
 
 # ---- Command line -----------------------------------------------------------
@@ -1150,14 +1376,16 @@ def _collect_paths(args):
     return paths
 
 
-def _group_key(path):
+def _frame_info(path):
+    """(group key, gain) from a frame's header."""
     try:
         ext = os.path.splitext(path)[1].lower()
         header = (SessionFileScanner.extract_xisf_header(path) if ext in SessionFileScanner.XISF_EXTENSIONS
                   else SessionFileScanner.extract_fits_header(path))
     except Exception:
-        return ("?", None, None)
-    return (str(header.get("FILTER") or "No filter"), header.get("EXPTIME"), header.get("XBINNING") or 1)
+        return ("?", None, None), None
+    key = (str(header.get("FILTER") or "No filter"), header.get("EXPTIME"), header.get("XBINNING") or 1)
+    return key, header.get("GAIN")
 
 
 def _fmt(value, spec):
@@ -1180,6 +1408,7 @@ def main(argv):
         with open(args.cache, encoding="utf-8") as f:
             saved = json.load(f)
         keys = [tuple(entry["key"]) for entry in saved]
+        gains = [entry.get("gain") for entry in saved]
         results = [FrameMetrics.from_dict(entry["metrics"]) for entry in saved]
         print(f"Re-grading {len(results)} frame(s) from {args.cache}\n")
     else:
@@ -1190,7 +1419,7 @@ def main(argv):
         print(f"Analyzing {len(paths)} frame(s) with {args.workers} worker(s)...")
         started = time.perf_counter()
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            keys = list(pool.map(_group_key, paths))
+            keys, gains = zip(*pool.map(_frame_info, paths))
             results = []
             for i, metrics in enumerate(pool.map(analyze_file, paths), 1):
                 results.append(metrics)
@@ -1200,9 +1429,10 @@ def main(argv):
         if args.cache:
             import json
             with open(args.cache, "w", encoding="utf-8") as f:
-                json.dump([{"key": list(k), "metrics": m.to_dict()} for k, m in zip(keys, results)], f)
+                json.dump([{"key": list(k), "gain": g, "metrics": m.to_dict()}
+                           for k, g, m in zip(keys, gains, results)], f)
 
-    grades = grade_frames(zip(keys, results))
+    grades = grade_frames(zip(keys, results), gains={m.path: g for m, g in zip(results, gains)})
     rows = sorted(zip(keys, results), key=lambda kr: (str(kr[0]), -grades[kr[1].path].score))
     current = None
     for key, m in rows:

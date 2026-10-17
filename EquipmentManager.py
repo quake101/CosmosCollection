@@ -8,8 +8,13 @@ deleting first shows what uses the item, keeping those records working.
 
 Equipment links to telescopes through telescope_equipment, edited from either
 side: a telescope's "Used with" lists, or an item's "Used with telescopes".
+
+The Matches tab lists the telescope and camera names in the user's files and
+gallery images and the equipment each one is (see EquipmentMapper.py), and
+offers to link images that could be.
 """
 
+import html
 import json
 import logging
 import re
@@ -20,9 +25,13 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit, QPlainTextEdit,
     QComboBox, QCheckBox, QPushButton, QListWidget, QListWidgetItem, QTabWidget, QSplitter,
-    QScrollArea, QGroupBox, QDoubleSpinBox, QSpinBox, QMenu, QMessageBox, QCompleter, QFrame
+    QScrollArea, QGroupBox, QDoubleSpinBox, QSpinBox, QMenu, QMessageBox, QCompleter, QFrame,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QDialogButtonBox
 )
 
+import EquipmentMapper
+import LibraryScanner
+from LibraryScanner import TELESCOPE, CAMERA
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, font_size, themed_style
@@ -168,6 +177,21 @@ def _set(box, value):
 def _fmt(number):
     """12.0 -> '12', 3.76 -> '3.76'."""
     return f"{number:g}" if number is not None else ""
+
+
+def _count(n, word):
+    """'1 session', '3 sessions'."""
+    return f"{n} {word}{'s' if n != 1 else ''}"
+
+
+def _and(parts):
+    """'a', 'a and b', 'a, b and c'."""
+    return parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} and {parts[-1]}"
+
+
+def _images_keep_name(images):
+    return (f"{_count(images, 'gallery image')} taken with it {'keeps' if images == 1 else 'keep'} its name."
+            if images else "")
 
 
 class _CheckList(QListWidget):
@@ -733,19 +757,23 @@ class TelescopesPage(_EquipmentPage):
                                (item_id,)).fetchone()[0]
         linked = conn.execute("SELECT COUNT(*) FROM telescope_equipment WHERE telescope_id = ?",
                               (item_id,)).fetchone()[0]
-        uses = [f"{n} {word}{'s' if n != 1 else ''}" for n, word in ((sessions, "session"), (targets, "target"))
-                if n]
+        images = EquipmentMapper.images_using(conn, TELESCOPE, item_id)
+        uses = [_count(n, word) for n, word in ((sessions, "session"), (targets, "target")) if n]
         if short:
-            return [f"Used by {' and '.join(uses)}."] if uses else []
+            uses += [_count(images, "gallery image")] if images else []
+            return [f"Used by {_and(uses)}."] if uses else []
         lines = []
         if uses:
-            lines.append(f"It's used by {' and '.join(uses)}. They keep everything else, "
+            lines.append(f"It's used by {_and(uses)}. They keep everything else, "
                          "but won't show a telescope any more.")
+        if images:
+            lines.append(_images_keep_name(images))
         if linked:
             lines.append("Its cameras, eyepieces and barlows stay in your equipment.")
         return lines
 
     def remove(self, conn, item_id):
+        EquipmentMapper.keep_names_of(conn, TELESCOPE, item_id)
         conn.execute("UPDATE usersessions SET telescope_id = NULL WHERE telescope_id = ?", (item_id,))
         conn.execute("UPDATE usertargetlist SET telescope_id = NULL WHERE telescope_id = ?", (item_id,))
         conn.execute("UPDATE userequipment SET telescope_id = NULL WHERE telescope_id = ?", (item_id,))
@@ -984,9 +1012,13 @@ class CamerasPage(_EquipmentPage):
         names = self.linked_telescope_names(conn, item_id)
         lines = [f"It's used with {', '.join(names)}."] if names else []
         lines.append("Sessions keep the camera name they were saved with.")
+        images = EquipmentMapper.images_using(conn, CAMERA, item_id)
+        if images:
+            lines.append(_images_keep_name(images))
         return lines
 
     def remove(self, conn, item_id):
+        EquipmentMapper.keep_names_of(conn, CAMERA, item_id)
         self.remove_equipment(conn, item_id)
 
 
@@ -1142,14 +1174,397 @@ class BarlowsPage(_EquipmentPage):
 
 
 # ---------------------------------------------------------------------------
+# Matches: the names in files and images, and the equipment each one is
+# ---------------------------------------------------------------------------
+
+# Combo item data (strings: Qt can't compare Python tuples in findData)
+NOT_MATCHED, ADD_NEW = "none", "new"
+
+
+def _equipment_combo(kind, info, chosen_id, not_matched="Not matched - keep the name", add_new=True):
+    """A picker of the user's telescopes or cameras (enabled ones first),
+    with chosen_id selected - else the 'not matched' item."""
+    combo = QComboBox()
+    if not_matched:
+        combo.addItem(not_matched, NOT_MATCHED)
+    items = info.items(kind)
+    for item_id in sorted(items, key=lambda i: (not items[i]["is_active"], (items[i]["name"] or "").lower())):
+        item = items[item_id]
+        combo.addItem(item["name"] + ("" if item["is_active"] else " (disabled)"), f"id:{item_id}")
+    if add_new:
+        combo.addItem(f"Add as a new {kind}", ADD_NEW)
+    index = combo.findData(f"id:{chosen_id}") if chosen_id is not None else -1
+    combo.setCurrentIndex(index if index >= 0 else 0)
+    return combo
+
+
+def _combo_choice(combo):
+    """An _equipment_combo's choice: an equipment id, None (not matched) or ADD_NEW."""
+    choice = combo.currentData()
+    return int(choice[3:]) if isinstance(choice, str) and choice.startswith("id:") else \
+        (ADD_NEW if choice == ADD_NEW else None)
+
+
+def _add_equipment(conn, kind, name, header=None):
+    """A new telescope or camera named so (the one already named so, if
+    there is one), with what a file's header says about it. Its id."""
+    measured = LibraryScanner.equipment_from_header(kind, header)
+    if kind == TELESCOPE:
+        return LibraryScanner.add_telescope(conn, name, measured["focal_length"], measured["aperture"])
+    width, height = measured["sensor_width"], measured["sensor_height"]
+    if width and height and width < height:  # A portrait frame: the sensor is landscape
+        width, height = height, width
+    return LibraryScanner.add_camera(conn, name, width, height, measured["pixel_size"])
+
+
+def _sized_rows(table):
+    """Even rows, and no taller than they need (the space left goes below)."""
+    row_height = max(QComboBox().sizeHint().height() + 6, 26)
+    table.verticalHeader().setDefaultSectionSize(row_height)
+    for row in range(table.rowCount()):
+        table.setRowHeight(row, row_height)
+    table.setMaximumHeight(table.horizontalHeader().sizeHint().height() + row_height * table.rowCount()
+                           + 2 * table.frameWidth() + 2)
+
+
+def refresh_image_views():
+    """An open gallery and the main window show images' new equipment."""
+    try:
+        from DSOGallery import refresh_open_image_views
+        refresh_open_image_views()
+    except Exception as e:
+        logger.debug(f"Couldn't refresh the image views: {e}")
+
+
+def refresh_equipment_window():
+    """An open Equipment window shows equipment added elsewhere."""
+    try:
+        if _window is not None and _window.isVisible():
+            for page in _window.pages:
+                page.reload()
+    except RuntimeError:
+        pass  # Closed and deleted
+
+
+class MatchesPage(QWidget):
+    """The telescope and camera names in the user's files and gallery images,
+    and which equipment each one is: change a match (the images given that
+    name follow), forget one, or review images that could be linked."""
+
+    changed = Signal()
+
+    def __init__(self, db_manager, parent=None):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self._suggestions = []
+        self._info = LibraryScanner.EquipmentInfo()
+
+        layout = QVBoxLayout(self)
+        intro = QLabel("The telescope and camera names in your files, gallery images and sessions, and which of "
+                       "your equipment each one is. Changing a match updates the images and sessions given that "
+                       "name, and the Import Wizard uses it for files you import later.")
+        intro.setWordWrap(True)
+        themed_style(intro, lambda: f"color: {COLORS['text_secondary']};")
+        layout.addWidget(intro)
+
+        # Images that could be linked to equipment
+        self.fix_bar = QFrame()
+        self.fix_bar.setObjectName("fixBar")
+        themed_style(self.fix_bar, lambda: f"QFrame#fixBar {{ background: {COLORS['background_light']}; "
+                                           f"border: 1px solid {COLORS['warning']}; border-radius: 4px; }}")
+        bar = QHBoxLayout(self.fix_bar)
+        bar.setContentsMargins(8, 4, 8, 4)
+        self.fix_label = QLabel()
+        self.fix_label.setWordWrap(True)
+        bar.addWidget(self.fix_label, 1)
+        fix_button = QPushButton("Review and Fix...")
+        fix_button.setAutoDefault(False)
+        fix_button.setToolTip("See which images could be linked to your equipment, and link them")
+        fix_button.clicked.connect(self._review)
+        bar.addWidget(fix_button)
+        layout.addWidget(self.fix_bar)
+
+        self.tables = {}
+        for kind, heading in ((TELESCOPE, "Telescopes"), (CAMERA, "Cameras")):
+            label = QLabel(heading)
+            themed_style(label, lambda: f"font-weight: bold; font-size: {font_size(11)};")
+            table = QTableWidget(0, 4)
+            table.setHorizontalHeaderLabels(["Name", "Used by", "Is", ""])
+            table.verticalHeader().setVisible(False)
+            table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            table.setSelectionMode(QAbstractItemView.NoSelection)
+            table.setWordWrap(False)
+            header = table.horizontalHeader()
+            header.setSectionResizeMode(0, QHeaderView.Stretch)
+            header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.Interactive)
+            header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+            table.setColumnWidth(2, 320)
+            layout.addWidget(label)
+            layout.addWidget(table, 1)
+            self.tables[kind] = (label, table)
+        self.empty_label = QLabel("No names yet. The names in your files appear here once you've used the "
+                                  "Import Wizard, and names on gallery images and sessions that aren't in "
+                                  "your equipment.")
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        themed_style(self.empty_label, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_size(11)};")
+        layout.addWidget(self.empty_label, 1)
+        layout.addStretch()
+        self.status = QLabel()
+        themed_style(self.status, lambda: f"color: {COLORS['text_secondary']};")
+        layout.addWidget(self.status)
+
+    # The window's calls to every tab
+    def save_now(self):
+        pass
+
+    def refresh_links(self):
+        self.reload()
+
+    def reload(self, select_id=None):
+        try:
+            with self.db_manager.get_connection() as conn:
+                self._info = LibraryScanner.load_equipment_info(conn)
+                rows = EquipmentMapper.matches(conn, self._info)
+                self._suggestions = EquipmentMapper.suggestions(conn, self._info)
+        except Exception as e:
+            logger.error(f"Error loading the equipment matches: {e}", exc_info=True)
+            rows, self._suggestions = [], []
+        for kind, (label, table) in self.tables.items():
+            kind_rows = [r for r in rows if r["kind"] == kind]
+            label.setVisible(bool(kind_rows))
+            table.setVisible(bool(kind_rows))
+            table.setRowCount(len(kind_rows))
+            for row, entry in enumerate(kind_rows):
+                self._fill_row(table, row, entry)
+            _sized_rows(table)
+        self.empty_label.setVisible(not rows)
+        could = {table: len({i for s in self._suggestions for i in s["ids"].get(table, [])})
+                 for table in (EquipmentMapper.IMAGES, EquipmentMapper.SESSIONS)}
+        self.fix_bar.setVisible(any(could.values()))
+        self.fix_label.setText(f"<b>{EquipmentMapper.describe(could)}</b> could be linked to your equipment.")
+
+    def _fill_row(self, table, row, entry):
+        name_item = QTableWidgetItem(entry["name"])
+        name_item.setToolTip("Matched in the Import Wizard or here" if entry["saved"] else
+                             "Given to gallery images or sessions, but not matched to your equipment")
+        table.setItem(row, 0, name_item)
+        table.setItem(row, 1, QTableWidgetItem(EquipmentMapper.describe(entry["used"]) or "-"))
+        combo = _equipment_combo(entry["kind"], self._info, entry["equipment_id"])
+        combo.currentIndexChanged.connect(lambda _i, e=entry, c=combo: self._on_match_changed(e, c))
+        table.setCellWidget(row, 2, combo)
+        forget = QPushButton("Forget")
+        forget.setAutoDefault(False)
+        forget.setEnabled(entry["saved"])
+        forget.setToolTip("Forget this match: the Import Wizard asks about the name again. "
+                          "Images and sessions keep their equipment." if entry["saved"] else "Not a saved match")
+        forget.clicked.connect(lambda _checked=False, e=entry: self._forget(e))
+        table.setCellWidget(row, 3, forget)
+
+    def _on_match_changed(self, entry, combo):
+        kind, name = entry["kind"], entry["name"]
+        choice = _combo_choice(combo)
+        try:
+            with self.db_manager.get_connection() as conn:
+                if choice == ADD_NEW:
+                    choice = _add_equipment(conn, kind, name)
+                    conn.commit()
+                changed = EquipmentMapper.save_matches(conn, {(kind, name): choice})
+                item = LibraryScanner.load_equipment_info(conn).items(kind).get(choice)
+        except Exception as e:
+            logger.error(f"Error saving the match for {name}: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Couldn't save the match: {e}")
+            changed = {}
+        else:
+            text = f"“{name}” is the {item['name']} now" if item else f"“{name}” isn't matched to your equipment now"
+            self.status.setText(text + (f" - {EquipmentMapper.describe(changed)} updated." if any(changed.values())
+                                        else "."))
+        QTimer.singleShot(0, self.reload)  # Not from inside the combo's own signal
+        self.changed.emit()
+        if any(changed.values()):
+            refresh_image_views()
+
+    def _forget(self, entry):
+        try:
+            with self.db_manager.get_connection() as conn:
+                EquipmentMapper.forget_match(conn, entry["kind"], entry["name"])
+        except Exception as e:
+            logger.error(f"Error forgetting the match for {entry['name']}: {e}", exc_info=True)
+            return
+        self.status.setText(f"Forgot the match for “{entry['name']}”.")
+        QTimer.singleShot(0, self.reload)
+
+    def _review(self):
+        dialog = FixImagesDialog(self._suggestions, self._info, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        changed = Counter()
+        try:
+            with self.db_manager.get_connection() as conn:
+                for suggestion, equipment_id in dialog.choices():
+                    changed += EquipmentMapper.apply_suggestion(conn, suggestion, equipment_id)
+        except Exception as e:
+            logger.error(f"Error linking images and sessions to equipment: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Couldn't link them: {e}")
+        self.status.setText(f"Linked {EquipmentMapper.describe(changed)} to your equipment." if changed
+                            else "Nothing was linked.")
+        self.reload()
+        self.changed.emit()
+        if changed:
+            refresh_image_views()
+
+
+class FixImagesDialog(QDialog):
+    """Review EquipmentMapper.suggestions(): tick the ones to link, to the
+    suggested equipment or another."""
+
+    def __init__(self, suggestions, info, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Link to Your Equipment")
+        self.resize(940, 420)
+        self.suggestions = suggestions
+        layout = QVBoxLayout(self)
+        intro = QLabel("These gallery images and sessions could be linked to your equipment. Untick any that "
+                       "aren't right, or pick other equipment. A name is remembered, so files given it later "
+                       "are linked too.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.table = QTableWidget(len(suggestions), 4)
+        self.table.setHorizontalHeaderLabels(["What", "Used by", "Link to", "Why"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.setWordWrap(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.setColumnWidth(2, 220)
+        for row, suggestion in enumerate(suggestions):
+            if suggestion["name"] is None:
+                text = f"{info.telescopes[suggestion['telescope_id']]['name']} images with no camera"
+            else:
+                text = f"{suggestion['kind'].title()} named “{suggestion['name']}”"
+            what = QTableWidgetItem(text)
+            what.setToolTip(text)
+            what.setFlags(what.flags() | Qt.ItemIsUserCheckable)
+            what.setCheckState(Qt.Checked)
+            self.table.setItem(row, 0, what)
+            used = {table: len(ids) for table, ids in suggestion["ids"].items()}
+            self.table.setItem(row, 1, QTableWidgetItem(EquipmentMapper.describe(used)))
+            self.table.setCellWidget(row, 2, _equipment_combo(suggestion["kind"], info, suggestion["equipment_id"],
+                                                              not_matched=None, add_new=False))
+            self.table.setItem(row, 3, QTableWidgetItem(suggestion["reason"]))
+        _sized_rows(self.table)
+        self.table.setMaximumHeight(16777215)
+        layout.addWidget(self.table, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        link = buttons.addButton("Link Ticked", QDialogButtonBox.AcceptRole)
+        link.setDefault(True)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def choices(self):
+        """[(suggestion, equipment id)] for the ticked rows."""
+        chosen = []
+        for row, suggestion in enumerate(self.suggestions):
+            equipment_id = _combo_choice(self.table.cellWidget(row, 2))
+            if self.table.item(row, 0).checkState() == Qt.Checked and isinstance(equipment_id, int):
+                chosen.append((suggestion, equipment_id))
+        return chosen
+
+
+def choose_equipment(parent, telescope, camera, header=None, record="image"):
+    """The telescope and camera to save on a gallery image or session, from
+    the names typed or filled in: linked to the user's Equipment where they
+    name it, or are matched to it. A name that isn't asks first - use the
+    user's equipment it's like (saved as a match), add it to Equipment, or
+    keep it as typed (remembered, so it isn't asked about again).
+    telescope: None when there's none to save (a session's is picked from
+    Equipment). header: the image file's, for a new item's details. record:
+    'image' or 'session', for the question. {"telescope_id",
+    "telescope_name", "camera_id", "camera_name"}, or None when the user cancels."""
+    db_manager = DatabaseManager()
+    try:
+        with db_manager.get_connection() as conn:
+            info = LibraryScanner.load_equipment_info(conn)
+    except Exception as e:
+        logger.error(f"Couldn't load the equipment: {e}", exc_info=True)
+        info = LibraryScanner.EquipmentInfo()
+    chosen, unlisted = {}, []  # unlisted: [(kind, name, the equipment it's like, or None)]
+    for kind, name in ((TELESCOPE, telescope), (CAMERA, camera)):
+        name = (name or "").strip()
+        equipment_id = EquipmentMapper.resolve(kind, name, info)
+        chosen[kind] = (equipment_id, name or None)
+        if name and equipment_id is None and not info.decided(kind, name):
+            unlisted.append((kind, name, EquipmentMapper.suggest(kind, name, info, header)[0]))
+    if unlisted:
+        similar = [(kind, name, like) for kind, name, like in unlisted if like is not None]
+        lines = []
+        for kind, name, like in unlisted:
+            line = f"{kind.title()}: <b>{html.escape(name)}</b>"
+            if like is not None:
+                line += f" - like your <b>{html.escape(info.items(kind)[like]['name'])}</b>"
+            lines.append(line)
+        box = QMessageBox(parent)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Not in Your Equipment")
+        box.setText(f"{'This isn' if len(unlisted) == 1 else 'These aren'}'t in your Equipment yet:"
+                    f"<br><br>{'<br>'.join(lines)}")
+        box.setInformativeText(
+            ("Use your own if it's the same - the name is remembered for next time. " if similar else "")
+            + f"Add to your Equipment to link the {record} to it, and have it offered in the FOV Simulator, "
+            f"sessions and the target list. Or keep the name on the {record} as typed.")
+        use_button = None
+        if similar:
+            kind, _name, like = similar[0]
+            use_button = box.addButton(f"Use {info.items(kind)[like]['name']}" if len(similar) == 1
+                                       else "Use Yours", QMessageBox.AcceptRole)
+        add_button = box.addButton("Add to Equipment", QMessageBox.ActionRole if similar else QMessageBox.AcceptRole)
+        keep_button = box.addButton("Keep as Typed", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(use_button or add_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in (use_button, add_button, keep_button) or clicked is None:
+            return None
+        try:
+            with db_manager.get_connection() as conn:
+                if clicked is add_button:
+                    for kind, name, _like in unlisted:
+                        chosen[kind] = (_add_equipment(conn, kind, name, header), name)
+                    conn.commit()
+                elif clicked is use_button:
+                    # Matched to the user's own (any without one stay as typed) - other
+                    # images and sessions given the name link too
+                    EquipmentMapper.save_matches(conn, {(kind, name): like for kind, name, like in unlisted})
+                    for kind, name, like in similar:
+                        chosen[kind] = (like, name)
+                else:
+                    LibraryScanner.save_equipment_aliases(conn, {(kind, name): None for kind, name, _like in unlisted})
+        except Exception as e:
+            logger.error(f"Couldn't save the equipment: {e}", exc_info=True)
+            QMessageBox.critical(parent, "Error", f"Couldn't save the equipment: {e}")
+            return None
+        if clicked is add_button:
+            refresh_equipment_window()
+    return {"telescope_id": chosen[TELESCOPE][0], "telescope_name": chosen[TELESCOPE][1],
+            "camera_id": chosen[CAMERA][0], "camera_name": chosen[CAMERA][1]}
+
+
+# ---------------------------------------------------------------------------
 # The window
 # ---------------------------------------------------------------------------
 
 class EquipmentDialog(WindowPositionMixin, QDialog):
-    """Telescopes, cameras, eyepieces and barlows/reducers - add, edit, delete."""
+    """Telescopes, cameras, eyepieces and barlows/reducers - add, edit, delete -
+    and the names in files and images matched to them."""
 
     WINDOW_POSITION_KEY = "EquipmentDialog"
-    TELESCOPES_TAB, CAMERAS_TAB, EYEPIECES_TAB, BARLOWS_TAB = range(4)
+    TELESCOPES_TAB, CAMERAS_TAB, EYEPIECES_TAB, BARLOWS_TAB, MATCHES_TAB = range(5)
 
     def __init__(self, parent=None, start_tab=0):
         super().__init__(parent)
@@ -1171,8 +1586,8 @@ class EquipmentDialog(WindowPositionMixin, QDialog):
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
         self.pages = [TelescopesPage(self.db_manager), CamerasPage(self.db_manager),
-                      EyepiecesPage(self.db_manager), BarlowsPage(self.db_manager)]
-        for page, title in zip(self.pages, ("Telescopes", "Cameras", "Eyepieces", "Barlows && Reducers")):
+                      EyepiecesPage(self.db_manager), BarlowsPage(self.db_manager), MatchesPage(self.db_manager)]
+        for page, title in zip(self.pages, ("Telescopes", "Cameras", "Eyepieces", "Barlows && Reducers", "Matches")):
             self.tabs.addTab(page, title)  # "&&" shows as "&"
             page.changed.connect(lambda source=page: self._on_changed(source))
         layout.addWidget(self.tabs, 1)

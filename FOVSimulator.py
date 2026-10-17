@@ -2319,15 +2319,18 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             logger.debug(f"No target list entry for {name}: {e}")
         telescope = self.selected_telescope or {}
         camera = self.camera_combo.currentData() or {}
-        camera_name = self.camera_combo.currentText().split(" (")[0] if camera.get('source') == 'user' else ""
+        # The user's own camera (not a preset, or an eyepiece), linked to their Equipment
+        own_camera = camera.get('source') == 'user' and camera.get('type') == 'camera'
+        camera_name = self.camera_combo.currentText().split(" (")[0] if own_camera else ""
         cursor = conn.execute("""
             INSERT INTO usersessions (target_id, dso_name, ra_deg, dec_deg, status, session_date,
                                       location_lat, location_lon, location_name, location_timezone,
-                                      location_source, telescope_id, camera, modified_date)
-            VALUES (?, ?, ?, ?, 'Planned', ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                                      location_source, telescope_id, camera_id, camera, modified_date)
+            VALUES (?, ?, ?, ?, 'Planned', ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
         """, (target_id, name, ra, dec, datetime.now().strftime("%Y-%m-%d"), location[0], location[1],
               location[2], location[3], None if telescope.get('smart_telescope') else telescope.get('id'),
-              camera_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+              camera.get('id') if own_camera else None, camera_name,
+              datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         return cursor.lastrowid
 
     def _load_observer_location(self):

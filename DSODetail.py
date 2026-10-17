@@ -14,9 +14,10 @@ from PySide6.QtGui import QPixmap, QPainter, QAction
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QLineEdit,
     QComboBox, QTextEdit, QGroupBox, QPushButton, QGridLayout,
-    QToolBar, QMessageBox, QMenu, QFileDialog
+    QToolBar, QMessageBox, QMenu, QFileDialog, QProgressBar
 )
 
+import EquipmentMapper
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager
 from Theme import COLORS, adapt_color, font_size, themed_style, themed_text
@@ -97,43 +98,6 @@ class SimbadQueryThread(QThread):
 # or closed the window). Referenced here until they finish, since destroying a
 # running QThread crashes.
 _orphaned_loader_threads = set()
-
-
-class ImageLoaderThread(QThread):
-    """Background thread for loading large images without blocking the UI"""
-    image_loaded = Signal(object, str)
-    load_failed = Signal(str, str)
-
-    def __init__(self, image_path, is_fits=False):
-        super().__init__()
-        self.image_path = image_path
-        self.is_fits = is_fits
-
-    def run(self):
-        """Load the full-resolution image in a background thread"""
-        try:
-            if not os.path.exists(self.image_path):
-                self.load_failed.emit(self.image_path, "File not found")
-                return
-
-            file_size_mb = os.path.getsize(self.image_path) / (1024 * 1024)
-            logger.info(f"Image loading: {os.path.basename(self.image_path)} - {file_size_mb:.1f}MB")
-
-            # FITS/XISF come back as a QImage detached from numpy memory, so
-            # it's safe to hand across threads; other formats are read whole
-            # first, much quicker from a network drive
-            from ImageLoader import load_image_qimage
-            qimage, error = load_image_qimage(self.image_path)
-            if qimage is not None:
-                self.image_loaded.emit(qimage, self.image_path)
-            elif self.is_fits:
-                self.load_failed.emit(self.image_path, error)
-            else:
-                self.load_failed.emit(self.image_path, f"Failed to load image: {error}")
-
-        except Exception as e:
-            logger.error(f"Error loading image in thread: {str(e)}")
-            self.load_failed.emit(self.image_path, str(e))
 
 
 class ImageCache:
@@ -287,6 +251,7 @@ class DSODetailWindow(QDialog):
 
         self.image_loader_thread = None
         self.simbad_query_thread = None
+        self._shown = False  # The heavy work starts after the first show (showEvent)
 
         self.user_images = []
         self.current_image_index = 0
@@ -297,9 +262,14 @@ class DSODetailWindow(QDialog):
         self._setup_ui()
 
     def showEvent(self, event):
-        """Handle window show event"""
+        """The heavy work starts once, after the first show. Restoring the window
+        from minimized shows it again - that re-ran everything: a second
+        visibility thread replaced one still running (a fatal Qt error), the
+        UI waited on the running SIMBAD query, and the images reloaded."""
         super().showEvent(event)
-        QTimer.singleShot(200, self._defer_heavy_calculations)
+        if not self._shown:
+            self._shown = True
+            QTimer.singleShot(200, self._defer_heavy_calculations)
 
     def _defer_heavy_calculations(self):
         """Perform heavy calculations after window is shown"""
@@ -747,6 +717,13 @@ class DSODetailWindow(QDialog):
             self.image_label.setMouseTracking(True)  # Enable mouse tracking
             image_container_layout.addWidget(self.image_label)
 
+            # Loading an image: how much of the file is read, then busy while it decodes
+            self.image_progress = QProgressBar()
+            self.image_progress.setTextVisible(False)
+            self.image_progress.setFixedHeight(8)
+            self.image_progress.hide()
+            image_container_layout.addWidget(self.image_progress)
+
             # Which collages show this image (links open the Collage Builder on them)
             self.collages_label = QLabel()
             self.collages_label.setTextFormat(Qt.RichText)
@@ -780,13 +757,21 @@ class DSODetailWindow(QDialog):
             info_form_layout.addWidget(date_label, 0, 2)
             info_form_layout.addWidget(self.date_edit, 0, 3)
 
-            # Row 1: Telescope (full width)
-            telescope_label = QLabel("Telescope:")
-            self.telescope_combo = QComboBox()
-            self.telescope_combo.setEditable(True)
-            self.telescope_combo.setPlaceholderText("Select telescope or enter custom equipment")
-            info_form_layout.addWidget(telescope_label, 1, 0)
-            info_form_layout.addWidget(self.telescope_combo, 1, 1, 1, 3)  # Span 3 columns
+            # Row 1: Telescope and Camera (side by side) - your equipment, or any name typed
+            for column, (label, placeholder) in enumerate((("Telescope:", "e.g., 8\" SCT"),
+                                                           ("Camera:", "e.g., ASI294MC Pro"))):
+                combo = QComboBox()
+                combo.setEditable(True)
+                combo.setInsertPolicy(QComboBox.NoInsert)
+                combo.lineEdit().setPlaceholderText(placeholder)
+                combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+                combo.setMinimumContentsLength(12)
+                info_form_layout.addWidget(QLabel(label), 1, column * 2)
+                info_form_layout.addWidget(combo, 1, column * 2 + 1)
+                if column == 0:
+                    self.telescope_combo = combo
+                else:
+                    self.camera_combo = combo
 
             # Row 2: Notes (label and text edit on same row)
             notes_label = QLabel("Notes:")
@@ -811,8 +796,8 @@ class DSODetailWindow(QDialog):
             self.relocate_button.setVisible(False)
             left_layout.addWidget(self.relocate_button)
 
-            # Load telescopes into the dropdown after UI is set up
-            self._load_telescopes()
+            # Load telescopes and cameras into the dropdowns after UI is set up
+            self._load_equipment()
 
             # Add left layout to a container widget
             left_container = QWidget()
@@ -1040,32 +1025,19 @@ class DSODetailWindow(QDialog):
             # Update the display with preserved zoom and adjusted position
             self._update_zoom()
 
-    def _load_telescopes(self):
-        """Load user telescopes into the telescope dropdown"""
+    def _load_equipment(self):
+        """Load the user's telescopes and cameras into their dropdowns"""
         try:
             with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT name FROM usertelescopes ORDER BY name")
-                telescopes = cursor.fetchall()
-
-                # Clear existing items
-                self.telescope_combo.clear()
-
-                # Add telescopes to the dropdown
-                for telescope in telescopes:
-                    self.telescope_combo.addItem(telescope[0])
-
-                logger.debug(f"Loaded {len(telescopes)} telescopes into dropdown")
+                for combo, query in ((self.telescope_combo, "SELECT name FROM usertelescopes ORDER BY name"),
+                                     (self.camera_combo, "SELECT name FROM userequipment "
+                                                         "WHERE equipment_type = 'camera' ORDER BY name")):
+                    combo.clear()
+                    for (name,) in conn.execute(query).fetchall():
+                        combo.addItem(name)
+                    combo.setCurrentIndex(-1)
         except Exception as e:
-            logger.error(f"Error loading telescopes: {e}")
-
-    def _load_image_info(self):
-        """Load image information into the form fields"""
-        self.integration_edit.setText(self.data.get('integration_time', ''))
-        # Set telescope combo box text (works for both existing items and custom text)
-        self.telescope_combo.setCurrentText(self.data.get('equipment', ''))
-        self.date_edit.setText(self.data.get('date_taken', ''))
-        self.notes_edit.setText(self.data.get('notes', ''))
+            logger.error(f"Error loading telescopes and cameras: {e}")
 
     def _set_season_label_from_location(self):
         """
@@ -1136,6 +1108,14 @@ class DSODetailWindow(QDialog):
             current_image = self.user_images[self.current_image_index]
             image_id = current_image['id']
 
+            # The telescope and camera, linked to the user's Equipment - asking
+            # about any that aren't in it
+            from EquipmentManager import choose_equipment
+            equipment = choose_equipment(self, self.telescope_combo.currentText(),
+                                         self.camera_combo.currentText())
+            if equipment is None:
+                return
+
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
 
@@ -1143,26 +1123,39 @@ class DSODetailWindow(QDialog):
                 cursor.execute("""
                     UPDATE userimages
                     SET integration_time = ?,
-                        equipment = ?,
+                        telescope_id = ?,
+                        telescope_name = ?,
+                        camera_id = ?,
+                        camera_name = ?,
+                        equipment = NULL,
                         date_taken = ?,
                         notes = ?
                     WHERE id = ?
                 """, (
                     self.integration_edit.text().strip(),
-                    self.telescope_combo.currentText().strip(),
+                    equipment['telescope_id'],
+                    equipment['telescope_name'],
+                    equipment['camera_id'],
+                    equipment['camera_name'],
                     self.date_edit.text().strip(),
                     self.notes_edit.toPlainText().strip(),
                     image_id
                 ))
                 conn.commit()
+                shown = EquipmentMapper.image_equipment(tuple(conn.execute(
+                    f"SELECT {EquipmentMapper.select_sql('ui')} FROM userimages ui WHERE ui.id = ?",
+                    (image_id,)).fetchone()))
 
                 # Update the current image data in our local list
                 current_image.update({
                     'integration_time': self.integration_edit.text().strip(),
-                    'equipment': self.telescope_combo.currentText().strip(),
+                    'telescope': shown['telescope'],
+                    'camera': shown['camera'],
                     'date_taken': self.date_edit.text().strip(),
                     'notes': self.notes_edit.toPlainText().strip()
                 })
+                self.telescope_combo.setCurrentText(shown['telescope'])
+                self.camera_combo.setCurrentText(shown['camera'])
 
                 logger.debug(f"Successfully updated image information for image {image_id}")
 
@@ -1214,6 +1207,11 @@ class DSODetailWindow(QDialog):
             # Store the current image path
             self.current_image_path = image_path
 
+            # Drop any load still in progress for a previous image - first, so
+            # it can't replace what's shown now (a cached image, or why this
+            # one can't be shown) when it finishes
+            self._abandon_image_loader_thread()
+
             logger.debug(f"Attempting to load image: {image_path}")
 
             # Check if file exists
@@ -1247,18 +1245,17 @@ class DSODetailWindow(QDialog):
                 self._display_loaded_image()
                 return
 
-            # Drop any load still in progress for a previous image
-            self._abandon_image_loader_thread()
-
-            # Determine if FITS/XISF file
-            file_ext = os.path.splitext(image_path)[1].lower()
-            is_fits = file_ext in ['.fits', '.fit', '.fts', '.xisf']
-
-            # Load in a background thread (all formats) so large files don't freeze the UI
+            # Load in a background thread (all formats) so large files don't
+            # freeze the UI - the same loader as the Image Viewer, with progress
+            from ImageViewer import ImageLoadWorker
+            logger.info(f"Image loading: {os.path.basename(image_path)} - {file_size / (1024 * 1024):.1f}MB")
             self.image_label.setText(f"Loading {os.path.basename(image_path)}...")
-            self.image_loader_thread = ImageLoaderThread(image_path, is_fits)
+            self.image_progress.setRange(0, 0)  # Busy until the first progress arrives
+            self.image_progress.show()
+            self.image_loader_thread = ImageLoadWorker(image_path)
             self.image_loader_thread.image_loaded.connect(self._on_image_loaded)
             self.image_loader_thread.load_failed.connect(self._on_image_load_failed)
+            self.image_loader_thread.progress.connect(self._on_image_load_progress)
             self.image_loader_thread.start()
             logger.debug(f"Started background loading for: {image_path}")
 
@@ -1266,8 +1263,27 @@ class DSODetailWindow(QDialog):
             logger.error(f"Error initiating image load: {str(e)}", exc_info=True)
             self.image_label.setText(f"Error loading image:\n{str(e)}")
 
+    def _on_image_load_progress(self, image_path, done, total):
+        """How much of the file is read, under the image and in its place -
+        then decoding, which can't report progress."""
+        if image_path != self.current_image_path:
+            return  # From a load that was dropped (another image was chosen)
+        name = os.path.basename(image_path)
+        if done < total:
+            from ImageViewer import _megabytes
+            self.image_progress.setRange(0, 1000)
+            self.image_progress.setValue(int(done * 1000 / total) if total else 0)
+            percent = int(done * 100 / total) if total else 0
+            self.image_label.setText(f"Loading {name}...\n\n{percent}% ({_megabytes(done)} of {_megabytes(total)})")
+        else:
+            self.image_progress.setRange(0, 0)
+            self.image_label.setText(f"Loading {name}...\n\nDecoding...")
+
     def _on_image_loaded(self, qimage, image_path):
         """Handle image loaded signal from background thread"""
+        if image_path != self.current_image_path:
+            return  # From a load that was dropped (another image was chosen)
+        self.image_progress.hide()
         try:
             logger.info(f"Full image received: {qimage.width()}x{qimage.height()}")
 
@@ -1276,7 +1292,7 @@ class DSODetailWindow(QDialog):
 
             if self.original_pixmap.isNull():
                 logger.error(f"Failed to convert QImage to QPixmap for: {image_path}")
-                self._on_image_load_failed(image_path, "Failed to convert image")
+                self._on_image_load_failed("Failed to convert image", image_path)
                 return
 
             logger.info(f"Full resolution image converted to pixmap: {self.original_pixmap.width()}x{self.original_pixmap.height()}")
@@ -1290,10 +1306,13 @@ class DSODetailWindow(QDialog):
 
         except Exception as e:
             logger.error(f"Error handling loaded image: {str(e)}", exc_info=True)
-            self._on_image_load_failed(image_path, str(e))
+            self._on_image_load_failed(str(e), image_path)
 
-    def _on_image_load_failed(self, image_path, error_message):
+    def _on_image_load_failed(self, error_message, image_path):
         """Handle image load failure from background thread"""
+        if image_path != self.current_image_path:
+            return
+        self.image_progress.hide()
         file_ext = os.path.splitext(image_path)[1].lower()
 
         if file_ext in ['.fits', '.fit', '.fts', '.xisf']:
@@ -1492,23 +1511,27 @@ class DSODetailWindow(QDialog):
                 if result:
                     dsodetailid = result[0]
 
-                    cursor.execute("""
-                        SELECT id, image_path, integration_time, equipment, date_taken, notes, is_favorite
-                        FROM userimages
-                        WHERE dsodetailid = ?
-                        ORDER BY is_favorite DESC, id ASC
+                    cursor.execute(f"""
+                        SELECT ui.id, ui.image_path, ui.integration_time, ui.date_taken, ui.notes, ui.is_favorite,
+                               {EquipmentMapper.select_sql('ui')}
+                        FROM userimages ui
+                        WHERE ui.dsodetailid = ?
+                        ORDER BY ui.is_favorite DESC, ui.id ASC
                     """, (dsodetailid,))
 
                     images = cursor.fetchall()
 
                     self.user_images = []
-                    for img_id, image_path, integration_time, equipment, date_taken, notes, is_favorite in images:
+                    for row in images:
+                        img_id, image_path, integration_time, date_taken, notes, is_favorite = tuple(row)[:6]
+                        shown = EquipmentMapper.image_equipment(tuple(row)[6:])
                         self.user_images.append({
                             'id': img_id,
                             'dsodetailid': dsodetailid,
                             'image_path': image_path,
                             'integration_time': integration_time,
-                            'equipment': equipment,
+                            'telescope': shown['telescope'],
+                            'camera': shown['camera'],
                             'date_taken': date_taken,
                             'notes': notes,
                             'is_favorite': is_favorite
@@ -1595,7 +1618,8 @@ class DSODetailWindow(QDialog):
         if self.user_images and 0 <= self.current_image_index < len(self.user_images):
             current_image = self.user_images[self.current_image_index]
             self.integration_edit.setText(current_image.get('integration_time', ''))
-            self.telescope_combo.setCurrentText(current_image.get('equipment', ''))
+            self.telescope_combo.setCurrentText(current_image.get('telescope', ''))
+            self.camera_combo.setCurrentText(current_image.get('camera', ''))
             self.date_edit.setText(current_image.get('date_taken', ''))
             self.notes_edit.setText(current_image.get('notes', ''))
 
@@ -1809,6 +1833,8 @@ class DSODetailWindow(QDialog):
                     self._load_current_image_info()
                 else:
                     self.current_image_index = 0
+                    self._abandon_image_loader_thread()
+                    self.current_image_path = None
                     self.image_label.setText("No Image Loaded")
                     themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
                     self._clear_image_info()
@@ -1826,6 +1852,7 @@ class DSODetailWindow(QDialog):
         """Clear all image information fields"""
         self.integration_edit.setText("")
         self.telescope_combo.setCurrentText("")
+        self.camera_combo.setCurrentText("")
         self.date_edit.setText("")
         self.notes_edit.setText("")
 
@@ -2005,16 +2032,20 @@ class DSODetailWindow(QDialog):
             QMessageBox.critical(self, "Error", f"Failed to open from target list: {str(e)}")
 
     def _abandon_image_loader_thread(self):
-        """Stop listening to a running image load and keep the thread object alive
-        until it finishes - a load can't be interrupted, waiting on it would freeze
-        the UI, and destroying a running QThread crashes."""
+        """Stop a running image load: its read stops (decoding can't be
+        interrupted), its result is dropped, and the thread object is kept
+        alive until it finishes - destroying a running QThread crashes."""
         thread = self.image_loader_thread
         if thread and thread.isRunning():
+            thread.cancel()
             thread.image_loaded.disconnect()
             thread.load_failed.disconnect()
+            thread.progress.disconnect()
             _orphaned_loader_threads.add(thread)
             thread.finished.connect(lambda: _orphaned_loader_threads.discard(thread))
         self.image_loader_thread = None
+        if hasattr(self, 'image_progress'):
+            self.image_progress.hide()
 
     def closeEvent(self, event):
         """Save window position when closing"""

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
 from PySide6.QtCore import QSettings
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QFontMetricsF
 
+import EquipmentMapper
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, font_px, font_size, themed_style
@@ -39,6 +40,25 @@ SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.fits',
 SOLVE_BADGES = {"unsolved": "Not solved", "queued": "Waiting to solve", "solving": "Solving…",
                 "failed": "Solve failed"}
 
+# The gallery's Show filter: a card per object (its other images behind it), or per image file
+SHOW_BY_OBJECT, SHOW_EVERY_IMAGE = "One per object", "Every image"
+
+
+def _file_key(path):
+    """Paths of the same file compare equal ('/' or '\\', any case on Windows)."""
+    return os.path.normcase(os.path.normpath(path)) if path else ""
+
+
+def _main_name(name):
+    """An object's main designation: "M 31" of "M 31, NGC 224"."""
+    return (name or "").split(", ")[0]
+
+
+def _newest(row):
+    """Sort key for an object's images, newest last: when taken (or saved, for
+    processed files), then when added."""
+    return row.get('date_taken') or '', row.get('created_date') or '', row['imageid']
+
 
 def insert_user_image(db_manager, image_data, others=None):
     """Insert an AddImageDialog.get_image_data() result into userimages and commit:
@@ -51,8 +71,9 @@ def insert_user_image(db_manager, image_data, others=None):
                   [(dsodetailid, True) for dsodetailid in image_data.get('also_dsodetailids', [])]
     else:
         targets = [(dsodetailid, True) for dsodetailid in others]
-    details = (image_data['image_path'], image_data['integration_time'], image_data['equipment'],
-               image_data['date_taken'], image_data['notes'])
+    from DatabaseManager import add_user_image_row
+    details = (image_data['image_path'], image_data['integration_time'],
+               image_data['date_taken'], image_data['notes'], image_data.get('session_id'))
     ids = []
     with db_manager.get_connection() as conn:
         cursor = conn.cursor()
@@ -62,13 +83,7 @@ def insert_user_image(db_manager, image_data, others=None):
                                (dsodetailid, image_data['image_path']))
                 if cursor.fetchone():
                     continue
-            cursor.execute("""
-                INSERT INTO userimages (
-                    dsodetailid, image_path, integration_time,
-                    equipment, date_taken, notes, created_date
-                ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-            """, (dsodetailid, *details))
-            ids.append(cursor.lastrowid)
+            ids.append(add_user_image_row(cursor, dsodetailid, *details, equipment=image_data.get('equipment')))
         conn.commit()
     return ids
 
@@ -554,13 +569,14 @@ class DataLoaderRunnable(QRunnable):
             try:
                 cursor = conn.cursor()
 
-                # One row per image (not per DSO) so every attached image gets its own card
-                query = """
+                # One row per attached image (an image of M 31 and M 32 is two
+                # rows) - the window groups them into cards by object or by file
+                query = f"""
                 SELECT
                     d.id as dsodetailid,
                     ui.id as imageid,
                     ui.image_path,
-                    ui.equipment,
+                    {EquipmentMapper.select_sql('ui')},
                     ui.is_favorite,
                     d.dsotype,
                     d.constellation,
@@ -574,7 +590,8 @@ class DataLoaderRunnable(QRunnable):
                             END, c.designation) as name,
                     ui.created_date,
                     d.ra,
-                    d.dec
+                    d.dec,
+                    ui.date_taken
                 FROM userimages ui
                 INNER JOIN dsodetail d ON d.id = ui.dsodetailid
                 INNER JOIN cataloguenr c ON d.id = c.dsodetailid
@@ -601,17 +618,19 @@ class DataLoaderRunnable(QRunnable):
                         'dsodetailid': row[0],
                         'imageid': row[1],
                         'image_path': row[2],
-                        'equipment': row[3] or '',
-                        'is_favorite': row[4],
-                        'dsotype': row[5] or '',
-                        'constellation': row[6] or '',
-                        'name': row[7] or 'Unknown',
-                        'friendly_type': self._get_friendly_type_name(row[5] or ''),
-                        'created_date': row[8] or '',
-                        'ra_deg': row[9],
-                        'dec_deg': row[10],
+                        'is_favorite': row[9],
+                        'dsotype': row[10] or '',
+                        'constellation': row[11] or '',
+                        'name': row[12] or 'Unknown',
+                        'friendly_type': self._get_friendly_type_name(row[10] or ''),
+                        'created_date': row[13] or '',
+                        'ra_deg': row[14],
+                        'dec_deg': row[15],
+                        'date_taken': row[16] or '',
                         'collages': in_collages.get(row[1], [])
                     }
+                    # telescope, camera, equipment (both as text), equipment_key ...
+                    item.update(EquipmentMapper.image_equipment(tuple(row)[3:9]))
                     items.append(item)
 
                 # Emit success signal with loaded data
@@ -655,9 +674,10 @@ def _format_dec(dec_deg):
     return f"{sign}{degrees:02d}:{minutes:02d}:{seconds:04.1f}"
 
 
-def open_image_viewer(parent, name, image_path, ra_deg=None, dec_deg=None):
+def open_image_viewer(parent, name, image_path, ra_deg=None, dec_deg=None, versions=None):
     """Show an image full size in the Image Viewer (loaded in the background,
-    so large files don't freeze the UI). Returns the viewer, or None."""
+    so large files don't freeze the UI). versions: the object's image paths
+    (image_path among them) to step through there. Returns the viewer, or None."""
     try:
         from ImageViewer import ImageViewerWindow
         if not image_path or not os.path.exists(image_path):
@@ -666,7 +686,7 @@ def open_image_viewer(parent, name, image_path, ra_deg=None, dec_deg=None):
                                 f"The file may have been moved or deleted.")
             return None
         # (pixmap, title, file_path, parent, dso_ra, dso_dec)
-        viewer = ImageViewerWindow(None, name, image_path, parent, dso_ra=ra_deg, dso_dec=dec_deg)
+        viewer = ImageViewerWindow(None, name, image_path, parent, dso_ra=ra_deg, dso_dec=dec_deg, versions=versions)
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
@@ -695,7 +715,7 @@ def open_dso_details(parent, dsodetailid, name=None):
                                WHEN 'IC' THEN 3
                                ELSE 4
                            END, c.designation) as designations,
-                       ui.image_path, ui.integration_time, ui.equipment, ui.date_taken, ui.notes,
+                       ui.image_path, ui.integration_time, ui.date_taken, ui.notes,
                        (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
                 FROM dsodetail d
                 JOIN cataloguenr c ON d.id = c.dsodetailid
@@ -711,7 +731,7 @@ def open_dso_details(parent, dsodetailid, name=None):
 
         (obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max,
          constellation, dso_type, dso_class, designations, image_path, integration_time,
-         equipment, date_taken, notes, image_count) = tuple(result)
+         date_taken, notes, image_count) = tuple(result)
 
         # Primary designation for catalogue and id
         primary_designation = designations.split(',')[0]
@@ -736,7 +756,6 @@ def open_dso_details(parent, dsodetailid, name=None):
             "dsodetailid": obj_id,
             "image_path": image_path,
             "integration_time": integration_time,
-            "equipment": equipment,
             "date_taken": date_taken,
             "notes": notes,
             "image_count": image_count
@@ -788,6 +807,8 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self._camera_auto_filled = False
         self._date_auto_filled = False
         self._integration_auto_filled = False
+        self._equipment_info = None  # LibraryScanner.EquipmentInfo: the user's equipment and file-name matches
+        self._equipment = None       # The telescope/camera to save, linked to Equipment on OK
         self._matching_sessions = []  # Session Manager sessions found for the current DSO
         self._dso_positions = {}  # dsodetailid -> (ra, dec) degrees
         self._dso_indexes = {}    # dsodetailid -> dso_combo index
@@ -797,6 +818,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         self._solves_tried = set()  # (path, hint) solves started, so a failure isn't retried
         self._solves_queued = set()  # Paths this dialog queued - stopped if it's cancelled
         self._can_solve_blind = None  # ASTAP is available (no position needed)
+        self._session_id = None       # The Session Manager session it came from, once one is chosen
         self._objects_timer = QTimer(self)
         self._objects_timer.setSingleShot(True)
         self._objects_timer.timeout.connect(self._update_objects)
@@ -1072,6 +1094,10 @@ class AddImageDialog(WindowPositionMixin, QDialog):
                 for row in cursor.fetchall():
                     self.camera_combo.addItem(row[0])
 
+                # Which equipment the names in files mean (matched in the import wizard)
+                import LibraryScanner
+                self._equipment_info = LibraryScanner.load_equipment_info(conn)
+
             # Clear selection so placeholder text is shown
             self.telescope_combo.setCurrentIndex(-1)
             self.telescope_combo.lineEdit().clear()
@@ -1080,6 +1106,16 @@ class AddImageDialog(WindowPositionMixin, QDialog):
 
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to load equipment list: {str(e)}")
+
+    def _equipment_name(self, kind, value, header=None):
+        """A telescope/camera name from a file or session ('z61', 'ZWO ASI2600MC Pro')
+        as the user's equipment is named: what it's matched to, else what the
+        Import Wizard would suggest - so the gallery doesn't list the same gear
+        under several names. kind: 'telescope' or 'camera'."""
+        value = str(value).strip()
+        if self._equipment_info is None:
+            return value
+        return EquipmentMapper.display_name(kind, value, self._equipment_info, header)
 
     def _browse_file(self):
         """Open file dialog to select an image"""
@@ -1227,7 +1263,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
 
         telescope = header.get('TELESCOP')
         if telescope and (self._telescope_auto_filled or not self.telescope_combo.currentText().strip()):
-            self.telescope_combo.setCurrentText(str(telescope).strip())
+            self.telescope_combo.setCurrentText(self._equipment_name("telescope", telescope, header))
             self._telescope_auto_filled = True
         elif not telescope and self._telescope_auto_filled:
             self.telescope_combo.setCurrentText("")
@@ -1235,7 +1271,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
 
         camera = header.get('INSTRUME')
         if camera and (self._camera_auto_filled or not self.camera_combo.currentText().strip()):
-            self.camera_combo.setCurrentText(str(camera).strip())
+            self.camera_combo.setCurrentText(self._equipment_name("camera", camera, header))
             self._camera_auto_filled = True
         elif not camera and self._camera_auto_filled:
             self.camera_combo.setCurrentText("")
@@ -1278,14 +1314,16 @@ class AddImageDialog(WindowPositionMixin, QDialog):
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
+                # camera: its Equipment's name, else the name it was given
+                cursor.execute(f"""
                     SELECT s.id, s.dso_name, s.session_date, tel.name as telescope_name,
-                           s.camera, s.integration_seconds, s.status
+                           s.camera_id, {EquipmentMapper.session_camera_sql('s')}, s.integration_seconds, s.status
                     FROM usersessions s
                     LEFT JOIN usertelescopes tel ON s.telescope_id = tel.id
                     ORDER BY s.session_date DESC, s.id DESC
                 """)
-                for session_id, dso_name, session_date, telescope_name, camera, integration_seconds, status in cursor.fetchall():
+                for (session_id, dso_name, session_date, telescope_name, camera_id, camera, integration_seconds,
+                     status) in cursor.fetchall():
                     if not dso_name:
                         continue
                     name_norm = re.sub(r'[^A-Z0-9-]', '', dso_name.upper())
@@ -1295,7 +1333,7 @@ class AddImageDialog(WindowPositionMixin, QDialog):
                         continue
                     matches.append({
                         "id": session_id, "dso_name": dso_name, "session_date": session_date,
-                        "telescope_name": telescope_name, "camera": camera,
+                        "telescope_name": telescope_name, "camera_id": camera_id, "camera": camera,
                         "integration_seconds": integration_seconds, "status": status,
                     })
         except Exception as e:
@@ -1366,12 +1404,16 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         """Apply a chosen session's telescope/camera/date/integration time.
         An explicit user click (via the menu above), so unlike the passive
         metadata auto-fill this always overwrites the fields - the user just
-        told us which session's data they want."""
+        told us which session's data they want. The image is linked to it."""
+        self._session_id = session.get("id")
         if session["telescope_name"]:
             self.telescope_combo.setCurrentText(session["telescope_name"])
             self._telescope_auto_filled = True
-        if session["camera"]:
-            self.camera_combo.setCurrentText(session["camera"])
+        if session.get("camera"):
+            # The session's camera in Equipment - else its name, matched like a file's
+            info = self._equipment_info
+            item = info.cameras.get(session.get("camera_id")) if info is not None else None
+            self.camera_combo.setCurrentText(item["name"] if item else self._equipment_name("camera", session["camera"]))
             self._camera_auto_filled = True
         if session["session_date"]:
             self.date_edit.setText(str(session["session_date"])[:10])
@@ -1588,6 +1630,15 @@ class AddImageDialog(WindowPositionMixin, QDialog):
             self.status_label.show()
             return
 
+        # The telescope and camera, linked to the user's Equipment - asking
+        # about any that aren't in it (cancelling stays here)
+        from EquipmentManager import choose_equipment
+        equipment = choose_equipment(self, self.telescope_combo.currentText(),
+                                     self.camera_combo.currentText(), self._capture_header)
+        if equipment is None:
+            return
+        self._equipment = equipment
+
         self.status_label.hide()
         self.accept()
 
@@ -1602,11 +1653,14 @@ class AddImageDialog(WindowPositionMixin, QDialog):
             'dso_names': [self._main_dso_name()] + [name for _dsodetailid, name in others],
             'objects_known': known,
             'image_path': self.selected_file,
-            'equipment': ', '.join(filter(None, [self.telescope_combo.currentText().strip(),
-                                                     self.camera_combo.currentText().strip()])),
+            # {"telescope_id", "telescope_name", "camera_id", "camera_name"} (EquipmentMapper.py)
+            'equipment': self._equipment or {
+                'telescope_name': self.telescope_combo.currentText().strip() or None,
+                'camera_name': self.camera_combo.currentText().strip() or None},
             'integration_time': self.integration_edit.text().strip(),
             'date_taken': self.date_edit.text().strip(),
-            'notes': self.notes_edit.toPlainText().strip()
+            'notes': self.notes_edit.toPlainText().strip(),
+            'session_id': self._session_id,
         }
 
 
@@ -1615,28 +1669,37 @@ class GalleryCard(QFrame):
 
     double_clicked = Signal(dict)  # Emits item_data when double-clicked
     context_menu_requested = Signal(dict, object)  # Emits item_data and position
+    stack_toggled = Signal(dict)  # An object's card: show or hide its other images after it
 
-    def __init__(self, item_data, parent=None, thumbnail_size=150):
+    def __init__(self, item_data, parent=None, thumbnail_size=150, expanded=False):
         """
         Initialize gallery card
 
         Args:
-            item_data (dict): Dictionary describing a single image (one DSO can
-                have multiple images, and therefore multiple cards)
+            item_data (dict): Dictionary describing the image shown
                 - dsodetailid: DSO ID
                 - imageid: userimages.id for this specific image
                 - name: DSO name
                 - dsotype: DSO type code
                 - image_path: Path to this image
                 - equipment: Equipment used for this image
+                - role: 'stack' (an object's card, its images in 'stack', this
+                  one first), 'version' (one of an expanded object's other
+                  images, after its card) or 'image' (an image file - with
+                  'rows' for each object it's attached to)
             thumbnail_size (int): Size of thumbnail in pixels (default 150)
+            expanded: an object's card with its other images showing after it
         """
         super().__init__(parent)
         self.item_data = item_data
         self.thumbnail_size = thumbnail_size
         self._thumb = None                    # The plain thumbnail (shown as is, or annotated)
         self._annotations = (None, {}, None)  # AnnotationData, layers, plate solve state
+        self._grouped = item_data.get('role') == 'version'  # Tinted with the object card it follows
+        self.stack_button = None
         self._init_ui()
+        if self.stack_button is not None:
+            self.set_expanded(expanded)
 
     def _init_ui(self):
         """Create card layout with thumbnail and labels"""
@@ -1660,47 +1723,101 @@ class GalleryCard(QFrame):
         self.thumbnail_label.setText("Loading...")
         layout.addWidget(self.thumbnail_label)
 
-        # DSO name label
+        version = self.item_data.get('role') == 'version'
+        file_name = os.path.basename(self.item_data.get('image_path') or '')
+
+        # DSO name label - a version (after its object's card) is told apart by its file name
         name_label = QLabel(self.item_data.get('name', 'Unknown'))
         themed_style(name_label, lambda: f"font-weight: bold; font-size: {font_px(12)};")
         name_label.setAlignment(Qt.AlignCenter)
-        name_label.setWordWrap(True)
+        if version:
+            name_label.ensurePolished()  # The style sheet's font, for measuring
+            name_label.setText(name_label.fontMetrics().elidedText(file_name, Qt.ElideMiddle, self.thumbnail_size))
+        else:
+            name_label.setWordWrap(True)
         layout.addWidget(name_label)
 
-        # DSO type label
-        type_label = QLabel(self.item_data.get('friendly_type', 'Unknown'))
+        # DSO type label - a version's date instead
+        subtitle = (self.item_data.get('date_taken') if version else None) or self.item_data.get('friendly_type')
+        type_label = QLabel(subtitle or 'Unknown')
         themed_style(type_label, lambda: f"font-size: {font_px(10)}; color: {COLORS['text_secondary']};")
         type_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(type_label)
 
-        # Tooltip with per-image details, since a DSO with multiple images
-        # will have multiple cards that otherwise look identical
+        # Tooltip with per-image details, since an object's images otherwise look alike
         equipment = self.item_data.get('equipment', '').strip()
-        tooltip_lines = [self.item_data.get('name', 'Unknown')]
+        tooltip_lines = [self.item_data.get('name', 'Unknown'), file_name]
         if equipment:
             tooltip_lines.append(f"Equipment: {equipment}")
+        if self.item_data.get('date_taken'):
+            tooltip_lines.append(f"Date: {self.item_data['date_taken']}")
         if self.item_data.get('is_favorite'):
             tooltip_lines.append("Favorite image")
         if self.item_data.get('collages'):
             tooltip_lines.append(f"In collages: {', '.join(self.item_data['collages'])}")
+        stack = self.item_data.get('stack') or []
+        if len(stack) > 1:
+            shown = "the favorite" if self.item_data.get('is_favorite') else "the newest"
+            tooltip_lines.append(f"\n{len(stack)} images of this object - {shown} shows")
         self._tooltip = '\n'.join(tooltip_lines)
         self.setToolTip(self._tooltip)
+
+        # An object with more images: a badge on its thumbnail shows them after its card
+        if len(stack) > 1:
+            self.stack_button = QToolButton(self.thumbnail_label)
+            self.stack_button.setCursor(Qt.PointingHandCursor)
+            # Like the plate solve badge: legible on any image, in any theme
+            self.stack_button.setStyleSheet(f"""
+                QToolButton {{
+                    background-color: rgba(0, 0, 0, 170); color: #ebebeb; border: none;
+                    border-radius: 3px; padding: 1px 5px; font-size: {11 if self.thumbnail_size >= 150 else 10}px;
+                }}
+                QToolButton:hover {{ background-color: rgba(0, 0, 0, 220); color: white; }}
+            """)
+            self.stack_button.clicked.connect(lambda: self.stack_toggled.emit(self.item_data))
 
         # Card styling - card width is thumbnail size + padding (20px for margins and borders)
         card_width = self.thumbnail_size + 20
         self.setFixedWidth(card_width)
-        themed_style(self, lambda: f"""
-            GalleryCard {{
-                background-color: {COLORS['background_lighter']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 5px;
-            }}
-            GalleryCard:hover {{
-                border: 2px solid {COLORS['accent']};
-                background-color: {COLORS['background_hover']};
-            }}
-        """)
+        self._apply_style()
         self.setCursor(Qt.PointingHandCursor)
+
+    def _apply_style(self):
+        """The card's frame - tinted with the accent while it's one of an
+        object's images shown together."""
+        grouped = self._grouped
+
+        def build():
+            if grouped:
+                accent = QColor(COLORS['accent'])
+                background = f"rgba({accent.red()}, {accent.green()}, {accent.blue()}, 45)"
+                border = f"1px solid {COLORS['accent']}"
+            else:
+                background, border = COLORS['background_lighter'], f"1px solid {COLORS['border']}"
+            return f"""
+                GalleryCard {{
+                    background-color: {background};
+                    border: {border};
+                    border-radius: 5px;
+                }}
+                GalleryCard:hover {{
+                    border: 2px solid {COLORS['accent']};
+                    background-color: {COLORS['background_hover']};
+                }}
+            """
+        themed_style(self, build)
+
+    def set_expanded(self, expanded):
+        """An object's card: whether its other images show after it."""
+        count = len(self.item_data.get('stack') or [])
+        self.stack_button.setText(f"{count} ◂" if expanded else f"{count} ▸")
+        self.stack_button.setToolTip(f"Hide the other {count - 1} images of this object" if expanded else
+                                     f"{count} images of this object - show them all here.\n"
+                                     f"Double-click to step through them in the Image Viewer.")
+        self.stack_button.adjustSize()
+        self.stack_button.move(self.thumbnail_size - self.stack_button.width() - 4, 4)
+        self._grouped = expanded
+        self._apply_style()
 
     def set_thumbnail(self, pixmap):
         """Update thumbnail with actual image"""
@@ -1794,15 +1911,20 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         # Initialize data structures
         self.db_manager = DatabaseManager()
-        self.all_items = []
-        self.filtered_items = []
+        self.all_items = []       # One per attached image (database row)
+        self._files = []          # One per image file - its rows (one per object) in 'rows'
+        self._objects = {}        # dsodetailid -> its rows
+        self._expanded = set()    # Objects whose other images show after their card
+        self.filtered_items = []  # The cards shown, in order
         self.data_loaded = False  # Track whether initial data load is complete
         self.current_columns = 1
         self.current_filters = {
             'search': '',
             'catalog': 'All',
             'type': 'All',
-            'equipment': 'All',
+            'telescope': 'All',
+            'camera': 'All',
+            'show': SHOW_BY_OBJECT,
             'sort': 'Name (A-Z)'
         }
 
@@ -1811,7 +1933,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.current_filters['search'] = filter_settings.value("gallery_filter_search", '', type=str)
         self.current_filters['catalog'] = filter_settings.value("gallery_filter_catalog", 'All', type=str)
         self.current_filters['type'] = filter_settings.value("gallery_filter_type", 'All', type=str)
-        self.current_filters['equipment'] = filter_settings.value("gallery_filter_equipment", 'All', type=str)
+        self.current_filters['telescope'] = filter_settings.value("gallery_filter_telescope", 'All', type=str)
+        self.current_filters['camera'] = filter_settings.value("gallery_filter_camera", 'All', type=str)
+        self.current_filters['show'] = filter_settings.value("gallery_filter_show", SHOW_BY_OBJECT, type=str)
         self.current_filters['sort'] = filter_settings.value("gallery_filter_sort", 'Name (A-Z)', type=str)
 
         # Thumbnail size options: Small (100), Medium (150), Large (200), Extra Large (250)
@@ -1871,7 +1995,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self._pending_wait_cursors = 0
 
         # Lazy loading tracking
-        self.thumbnail_loaded_indices = set()  # Track which card indices have been queued
+        self._queued_cards = set()  # Cards whose thumbnails have been queued
         self.scroll_debounce_timer = QTimer()
         self.scroll_debounce_timer.setSingleShot(True)
         self.scroll_debounce_timer.timeout.connect(self._on_scroll_debounced)
@@ -1964,14 +2088,28 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.type_combo.currentTextChanged.connect(self._on_filter_changed)
         filters_layout.addWidget(self.type_combo)
 
-        # Equipment filter
-        filters_layout.addWidget(QLabel("Equipment:"))
-        self.equipment_combo = QComboBox()
-        self.equipment_combo.addItem("All")
-        self.equipment_combo.setMinimumWidth(200)
-        self.equipment_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.equipment_combo.currentTextChanged.connect(self._on_filter_changed)
-        filters_layout.addWidget(self.equipment_combo)
+        # Telescope and camera filters
+        self.telescope_filter = QComboBox()
+        self.camera_filter = QComboBox()
+        for label, combo in (("Telescope:", self.telescope_filter), ("Camera:", self.camera_filter)):
+            filters_layout.addWidget(QLabel(label))
+            combo.addItem("All")
+            combo.setMinimumWidth(140)
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.currentTextChanged.connect(self._on_filter_changed)
+            filters_layout.addWidget(combo)
+
+        # Show filter: one card per object, or every image (with the other filters, e.g. every Seestar image)
+        filters_layout.addWidget(QLabel("Show:"))
+        self.show_combo = QComboBox()
+        self.show_combo.addItems([SHOW_BY_OBJECT, SHOW_EVERY_IMAGE])
+        self.show_combo.setToolTip(f"{SHOW_BY_OBJECT}: each object's favorite image (else its newest), with a badge\n"
+                                   f"to show the rest of its images that match the filters.\n"
+                                   f"{SHOW_EVERY_IMAGE}: a card for each image that matches the filters.")
+        if self.current_filters['show'] in (SHOW_BY_OBJECT, SHOW_EVERY_IMAGE):
+            self.show_combo.setCurrentText(self.current_filters['show'])
+        self.show_combo.currentTextChanged.connect(self._on_filter_changed)
+        filters_layout.addWidget(self.show_combo)
 
         # Clear filters button
         clear_btn = QPushButton("Clear Filters")
@@ -2107,22 +2245,46 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     def _on_data_loaded(self, items):
         """Handle data loaded from background thread"""
         self.all_items = items
+        self._group_images()
         self.data_loaded = True  # Mark data as loaded
 
-        # Populate filter dropdowns (restores saved type/equipment selection if still valid)
+        # Populate filter dropdowns (restores saved type/telescope/camera selection if still valid)
         self._populate_type_filter()
-        self._populate_equipment_filter()
+        self._populate_equipment_filters()
 
         # Apply restored search/filter/sort state now that data and options are available
         self._filter_and_sort_items()
 
         # Update status
-        count = len(self.all_items)
+        count = len(self._files)
         self.status_label.setText(f"Loaded {count} image{'s' if count != 1 else ''}")
 
         # Populate grid if window is already shown
         if not self._initial_load_pending:
             self._populate_grid()
+
+    def _group_images(self):
+        """Each image file once - an image of M 31 and M 32 is one file, named
+        "M 31 & M 32" (as in the Collage Builder) - and each object's rows."""
+        from CollageBuilder import join_names
+        self._files, self._objects, by_file = [], {}, {}
+        for row in self.all_items:
+            key = _file_key(row['image_path']) or f"id:{row['imageid']}"
+            entry = by_file.get(key)
+            if entry is None:
+                entry = by_file[key] = dict(row, rows=[])
+                self._files.append(entry)
+            elif any(other['dsodetailid'] == row['dsodetailid'] for other in entry['rows']):
+                continue  # The same file attached twice (paths spelled differently)
+            entry['rows'].append(row)
+            self._objects.setdefault(row['dsodetailid'], []).append(row)
+        for entry in self._files:
+            rows = entry['rows']
+            if len(rows) > 1:
+                entry['name'] = join_names(_main_name(row['name']) for row in rows)
+                entry['friendly_type'] = join_names(row['friendly_type'] for row in rows)
+                entry['is_favorite'] = any(row['is_favorite'] for row in rows)
+                entry['collages'] = list(dict.fromkeys(name for row in rows for name in row['collages']))
 
     def _on_data_load_error(self, error_message):
         """Handle error loading data from background thread"""
@@ -2155,31 +2317,24 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Ensure dropdown view is wide enough to show full text
         self.type_combo.view().setMinimumWidth(self.type_combo.minimumSizeHint().width())
 
-    def _populate_equipment_filter(self):
-        """Populate equipment filter dropdown with unique equipment from loaded data"""
-        # Get unique equipment (non-empty)
-        equipment_set = set()
-        for item in self.all_items:
-            if item['equipment'].strip():
-                equipment_set.add(item['equipment'].strip())
+    def _populate_equipment_filters(self):
+        """The telescope and camera filters: those the loaded images were taken with"""
+        for combo, key in ((self.telescope_filter, 'telescope'), (self.camera_filter, 'camera')):
+            names = sorted({item[key] for item in self.all_items if item[key]}, key=str.casefold)
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("All")
+            combo.addItems(names)
 
-        # Sort and add to combo box
-        self.equipment_combo.blockSignals(True)
-        self.equipment_combo.clear()
-        self.equipment_combo.addItem("All")
-        for equipment in sorted(equipment_set):
-            self.equipment_combo.addItem(equipment)
+            # Restore saved filter selection if it still exists among the options
+            if self.current_filters.get(key, 'All') in names:
+                combo.setCurrentText(self.current_filters[key])
+            else:
+                self.current_filters[key] = 'All'
+            combo.blockSignals(False)
 
-        # Restore saved filter selection if it still exists among the options
-        saved_equipment = self.current_filters.get('equipment', 'All')
-        if saved_equipment in [self.equipment_combo.itemText(i) for i in range(self.equipment_combo.count())]:
-            self.equipment_combo.setCurrentText(saved_equipment)
-        else:
-            self.current_filters['equipment'] = 'All'
-        self.equipment_combo.blockSignals(False)
-
-        # Ensure dropdown view is wide enough to show full text
-        self.equipment_combo.view().setMinimumWidth(self.equipment_combo.minimumSizeHint().width())
+            # Ensure dropdown view is wide enough to show full text
+            combo.view().setMinimumWidth(combo.minimumSizeHint().width())
 
     def _grid_width(self):
         """Width the cards can use: the scroll area's, less a scrollbar whether
@@ -2222,6 +2377,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
         self._cards_by_path = {}
+        self.cards = []
         self._update_solve_summary()
 
         # Check if there are items to display
@@ -2243,7 +2399,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self.grid_layout.addWidget(loading_label, 0, 0)
 
             if self.all_items:
-                self.status_label.setText(f"Showing 0 of {len(self.all_items)} images")
+                self.status_label.setText(f"Showing 0 of {len(self._files)} images")
 
             # Re-enable updates
             self.grid_container.setUpdatesEnabled(True)
@@ -2253,12 +2409,8 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         cols = self._calculate_grid_columns()
         self.current_columns = cols
 
-        # Store cards for thumbnail loading
-        self.cards = []
-
         # Show wait cursor during loading if many items
         showing = len(self.filtered_items)
-        total = len(self.all_items)
         cursor_pushed = showing > 50
         if cursor_pushed:
             self._push_wait_cursor()
@@ -2300,13 +2452,20 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             QApplication.processEvents()  # Ensure dialog can be displayed
 
         # Update status immediately
-        if showing == total:
-            self.status_label.setText(f"Loading {total} image{'s' if total != 1 else ''}...")
-        else:
-            self.status_label.setText(f"Loading {showing} of {total} images...")
+        self.status_label.setText(f"Loading {showing} card{'s' if showing != 1 else ''}...")
 
         # Create cards in batches to keep UI responsive
         self._create_cards_batch(0, cols, cursor_pushed=cursor_pushed)
+
+    def _make_card(self, item):
+        """A card for an item of filtered_items, at the current thumbnail size."""
+        expanded = item.get('role') == 'stack' and item['dsodetailid'] in self._expanded
+        card = GalleryCard(item, thumbnail_size=self.thumbnail_size, expanded=expanded)
+        card.double_clicked.connect(self._on_card_double_clicked)
+        card.context_menu_requested.connect(self._show_card_context_menu)
+        card.stack_toggled.connect(lambda item: self._toggle_stack(item['dsodetailid']))
+        self._cards_by_path.setdefault(item['image_path'], []).append(card)
+        return card
 
     def _create_cards_batch(self, start_idx, cols, batch_size=15, cursor_pushed=False):
         """Create a batch of gallery cards to keep UI responsive"""
@@ -2315,21 +2474,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         # Create cards for this batch
         cols = self.current_columns  # A resize may have changed it since the first batch
         for idx in range(start_idx, end_idx):
-            item = self.filtered_items[idx]
-            row = idx // cols
-            col = idx % cols
-
-            # Create card with current thumbnail size
-            card = GalleryCard(item, thumbnail_size=self.thumbnail_size)
-            card.double_clicked.connect(self._on_card_double_clicked)
-            card.context_menu_requested.connect(self._show_card_context_menu)
-
-            # Add to grid
-            self.grid_layout.addWidget(card, row, col)
-
-            # Store reference
+            card = self._make_card(self.filtered_items[idx])
+            self.grid_layout.addWidget(card, idx // cols, idx % cols)
             self.cards.append(card)
-            self._cards_by_path.setdefault(item['image_path'], []).append(card)
 
         # Update progress in status bar
         total = len(self.filtered_items)
@@ -2366,7 +2513,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.cancelled_flag = [False]
 
         # Reset tracking for new grid
-        self.thumbnail_loaded_indices.clear()
+        self._queued_cards.clear()
 
         # Connect signals (disconnect first to avoid duplicates). Only attempt
         # disconnect if we know we're connected - PySide6 emits a
@@ -2415,33 +2562,18 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         return visible_indices
 
+    def _queue_thumbnail(self, card):
+        """Load a card's thumbnail in the background, unless it's already queued."""
+        if card in self._queued_cards:
+            return
+        self._queued_cards.add(card)
+        self.thread_pool.start(ThumbnailRunnable(card, card.item_data['image_path'], self.thumbnail_cache,
+                                                 self.thumbnail_signals, self.cancelled_flag, self.thumbnail_size))
+
     def _load_visible_thumbnails(self):
         """Load thumbnails for currently visible cards that haven't been loaded yet"""
-        visible_indices = self._get_visible_card_indices()
-
-        # Find indices that need loading (visible but not yet queued)
-        indices_to_load = visible_indices - self.thumbnail_loaded_indices
-
-        if not indices_to_load:
-            return
-
-        # Mark these indices as queued
-        self.thumbnail_loaded_indices.update(indices_to_load)
-
-        # Queue thumbnail loading for new visible cards
-        for idx in indices_to_load:
-            if idx < len(self.cards):
-                card = self.cards[idx]
-                image_path = card.item_data['image_path']
-                runnable = ThumbnailRunnable(
-                    card,
-                    image_path,
-                    self.thumbnail_cache,
-                    self.thumbnail_signals,
-                    self.cancelled_flag,
-                    self.thumbnail_size
-                )
-                self.thread_pool.start(runnable)
+        for idx in self._get_visible_card_indices():
+            self._queue_thumbnail(self.cards[idx])
 
     def _load_remaining_thumbnails(self, batch_start=0, batch_size=20):
         """Load remaining thumbnails that weren't in the initial visible set"""
@@ -2454,24 +2586,10 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
         total_cards = len(self.cards)
         batch_end = min(batch_start + batch_size, total_cards)
-        loaded_count = 0
 
         # Queue thumbnails for this batch (skip already queued ones)
         for idx in range(batch_start, batch_end):
-            if idx not in self.thumbnail_loaded_indices:
-                self.thumbnail_loaded_indices.add(idx)
-                card = self.cards[idx]
-                image_path = card.item_data['image_path']
-                runnable = ThumbnailRunnable(
-                    card,
-                    image_path,
-                    self.thumbnail_cache,
-                    self.thumbnail_signals,
-                    self.cancelled_flag,
-                    self.thumbnail_size
-                )
-                self.thread_pool.start(runnable)
-                loaded_count += 1
+            self._queue_thumbnail(self.cards[idx])
 
         # Schedule next batch if there are more cards
         if batch_end < total_cards:
@@ -2518,12 +2636,16 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self._update_thumbnail_progress(card)
 
     def _showing_text(self):
-        """Status text for how many of the images are shown"""
-        showing = len(self.filtered_items)
-        total = len(self.all_items)
-        if showing == total:
-            return f"Showing all {total} image{'s' if total != 1 else ''}"
-        return f"Showing {showing} of {total} images"
+        """Status text for how many of the images are shown (counting those
+        behind each object's card)"""
+        files = {_file_key(row['image_path']) for card in self.filtered_items for row in card.get('stack') or [card]}
+        total = len(self._files)
+        images = (f"all {total} image{'s' if total != 1 else ''}" if len(files) == total
+                  else f"{len(files)} of {total} images")
+        if not self._by_object():
+            return f"Showing {images}"
+        objects = sum(card.get('role') == 'stack' for card in self.filtered_items)
+        return f"Showing {objects} object{'s' if objects != 1 else ''} · {images}"
 
     def _set_status(self, text):
         """Show status text - kept for after the resize if one is showing the column count"""
@@ -2583,9 +2705,11 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self._set_status(self._showing_text())
 
     def _on_card_double_clicked(self, item_data):
-        """Handle card double-click - open image viewer"""
+        """Open the image in the Image Viewer - which steps through its object's
+        other images (those the filters show) too"""
+        versions = [row['image_path'] for row in self._object_images(item_data['dsodetailid'])]
         self.image_viewer = open_image_viewer(self, item_data['name'], item_data['image_path'],
-                                              item_data.get('ra_deg'), item_data.get('dec_deg'))
+                                              item_data.get('ra_deg'), item_data.get('dec_deg'), versions)
 
     def _open_dso_details(self, item_data):
         """Open DSO detail window for the selected object"""
@@ -2599,8 +2723,24 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         view_action = context_menu.addAction("View Full Image")
         view_action.triggered.connect(lambda: self._on_card_double_clicked(item_data))
 
-        details_action = context_menu.addAction("View DSO Details")
-        details_action.triggered.connect(lambda: self._open_dso_details(item_data))
+        # An image of several objects: each one's details
+        rows = item_data.get('rows') or [item_data]
+        if len(rows) > 1:
+            details_menu = context_menu.addMenu("View DSO Details")
+            for row in rows:
+                details_menu.addAction(row['name'], lambda checked=False, row=row: self._open_dso_details(row))
+        else:
+            details_action = context_menu.addAction("View DSO Details")
+            details_action.triggered.connect(lambda: self._open_dso_details(item_data))
+
+        # An object's other images, shown after its card
+        key = item_data['dsodetailid']
+        count = len(item_data.get('stack') or [])
+        if item_data.get('role') == 'version':
+            context_menu.addAction("Hide the Object's Other Images", lambda: self._toggle_stack(key))
+        elif count > 1:
+            label = f"Hide the Other {count - 1} Images" if key in self._expanded else f"Show All {count} Images Here"
+            context_menu.addAction(label, lambda: self._toggle_stack(key))
 
         # Annotations need a plate solve
         if plate_solve_queue().state(item_data['image_path']) in ("unsolved", "failed"):
@@ -2788,7 +2928,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             settings.setValue("gallery_thumbnail_size", size_name)
 
             # The memory cache is kept - it's keyed by size, so switching back is instant
-            self.thumbnail_loaded_indices.clear()
+            self._queued_cards.clear()
 
             # Cancel pending thumbnail tasks
             self.cancelled_flag[0] = True
@@ -2802,7 +2942,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.current_filters['search'] = self.search_input.text().strip()
         self.current_filters['catalog'] = self.catalog_combo.currentText()
         self.current_filters['type'] = self.type_combo.currentText()
-        self.current_filters['equipment'] = self.equipment_combo.currentText()
+        self.current_filters['telescope'] = self.telescope_filter.currentText()
+        self.current_filters['camera'] = self.camera_filter.currentText()
+        self.current_filters['show'] = self.show_combo.currentText()
         self.current_filters['sort'] = self.sort_combo.currentText()
 
         # Persist filter/search state so it's remembered next time the gallery opens
@@ -2819,13 +2961,95 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         settings.setValue("gallery_filter_search", self.current_filters['search'])
         settings.setValue("gallery_filter_catalog", self.current_filters['catalog'])
         settings.setValue("gallery_filter_type", self.current_filters['type'])
-        settings.setValue("gallery_filter_equipment", self.current_filters['equipment'])
+        settings.setValue("gallery_filter_telescope", self.current_filters['telescope'])
+        settings.setValue("gallery_filter_camera", self.current_filters['camera'])
+        settings.setValue("gallery_filter_show", self.current_filters['show'])
         settings.setValue("gallery_filter_sort", self.current_filters['sort'])
 
+    def _by_object(self):
+        return self.current_filters['show'] != SHOW_EVERY_IMAGE
+
     def _filter_and_sort_items(self):
-        """Filter and sort all_items into filtered_items based on current_filters"""
-        self.filtered_items = [item for item in self.all_items if self._matches_filters(item)]
+        """The cards to show (filtered_items), sorted: one per object, its images
+        that match the filters behind it - then an expanded object's other
+        images follow its card. Or one per image file that matches."""
+        if self._by_object():
+            self.filtered_items = []
+            for dsodetailid, rows in self._objects.items():
+                images = self._object_images(dsodetailid) if self._object_matches(rows[0]) else []
+                if images:
+                    self.filtered_items.append(dict(images[0], role='stack', stack=images))
+        else:
+            self.filtered_items = [dict(entry, role='image') for entry in self._files if self._image_matches(entry)
+                                   and any(self._object_matches(row) for row in entry['rows'])]
         self._sort_items()
+        if self._by_object() and self._expanded:
+            cards, self.filtered_items = self.filtered_items, []
+            for card in cards:
+                self.filtered_items.append(card)
+                if card['dsodetailid'] in self._expanded:
+                    self.filtered_items.extend(self._version_items(card))
+
+    def _object_images(self, dsodetailid):
+        """An object's images that match the filters, as its rows: its favorite
+        (else its newest) first, then newest first."""
+        rows = sorted((row for row in self._objects.get(dsodetailid, []) if self._image_matches(row)),
+                      key=_newest, reverse=True)
+        rows.sort(key=lambda row: not row['is_favorite'])  # Stable: the rest stay newest first
+        return rows
+
+    @staticmethod
+    def _version_items(card):
+        """Items for the other images of an object's card, shown after it."""
+        return [dict(row, role='version') for row in card['stack'][1:]]
+
+    def _toggle_stack(self, dsodetailid):
+        """Show an object's other images after its card, or hide them again.
+        The cards are added or removed in place - the rest keep their thumbnails."""
+        expanding = dsodetailid not in self._expanded
+        if expanding:
+            self._expanded.add(dsodetailid)
+        else:
+            self._expanded.discard(dsodetailid)
+        head = next((i for i, card in enumerate(getattr(self, 'cards', None) or [])
+                     if card.item_data.get('role') == 'stack' and card.item_data['dsodetailid'] == dsodetailid), None)
+        if head is None or not self._grid_built():  # Not shown, or the grid is still being built
+            self._filter_and_sort_items()
+            self._populate_grid()
+            return
+        head_card = self.cards[head]
+        if expanding:
+            items = self._version_items(head_card.item_data)
+            added = [self._make_card(item) for item in items]
+            self.filtered_items[head + 1:head + 1] = items
+            self.cards[head + 1:head + 1] = added
+            if self.is_loading_thumbnails:
+                self.thumbnails_to_load += len(added)
+            for card in added:
+                self._queue_thumbnail(card)
+        else:
+            end = head + 1
+            while end < len(self.cards) and self.cards[end].item_data.get('role') == 'version' \
+                    and self.cards[end].item_data['dsodetailid'] == dsodetailid:
+                end += 1
+            removed = self.cards[head + 1:end]
+            del self.filtered_items[head + 1:end]
+            del self.cards[head + 1:end]
+            for card in removed:
+                if self.is_loading_thumbnails and card not in self._finished_cards:
+                    self.thumbnails_to_load -= 1
+                self._queued_cards.discard(card)
+                self._cards_by_path[card.item_data['image_path']].remove(card)
+                if not self._cards_by_path[card.item_data['image_path']]:
+                    del self._cards_by_path[card.item_data['image_path']]
+                self.grid_layout.removeWidget(card)
+                card.deleteLater()
+        head_card.set_expanded(expanding)
+        self._arrange_cards(self.current_columns)
+        self._set_status(self._showing_text())
+        self._update_solve_summary()
+        if self.is_loading_thumbnails and self.thumbnails_loaded >= self.thumbnails_to_load:
+            self._finish_thumbnail_loading()
 
     def _on_sort_changed(self):
         """Handle sort dropdown change"""
@@ -2835,53 +3059,56 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         """Sort filtered items based on current sort selection"""
         sort_option = self.current_filters['sort']
 
+        def added(x):  # An object's card: when its newest image was added
+            return max(row.get('created_date') or '' for row in x.get('stack') or [x])
+
         if sort_option == "Name (A-Z)":
             self.filtered_items.sort(key=lambda x: x['name'].lower())
         elif sort_option == "Name (Z-A)":
             self.filtered_items.sort(key=lambda x: x['name'].lower(), reverse=True)
         elif sort_option == "Date Added (Newest)":
-            self.filtered_items.sort(key=lambda x: x.get('created_date', '') or '', reverse=True)
+            self.filtered_items.sort(key=added, reverse=True)
         elif sort_option == "Date Added (Oldest)":
-            self.filtered_items.sort(key=lambda x: x.get('created_date', '') or '')
+            self.filtered_items.sort(key=added)
         elif sort_option == "Type":
             self.filtered_items.sort(key=lambda x: (x['friendly_type'].lower(), x['name'].lower()))
         elif sort_option == "Constellation":
             self.filtered_items.sort(key=lambda x: (x['constellation'].lower(), x['name'].lower()))
 
-    def _matches_filters(self, item):
-        """Check if item matches all current filters"""
+    def _object_matches(self, row):
+        """Whether an image's object (a row's) matches the search, catalog and type filters"""
         # Text search (case-insensitive substring match in name)
         search_text = self.current_filters['search']
-        if search_text and search_text.lower() not in item['name'].lower():
+        if search_text and search_text.lower() not in row['name'].lower():
             return False
 
         # Catalog filter (name starts with catalog prefix)
         catalog = self.current_filters['catalog']
         if catalog != 'All':
             # Check if name starts with the catalog (e.g., "M ", "NGC ")
-            if not item['name'].startswith(catalog + ' '):
+            if not row['name'].startswith(catalog + ' '):
                 return False
 
         # Type filter (friendly type name match)
         type_filter = self.current_filters['type']
         if type_filter != 'All':
-            if item['friendly_type'] != type_filter:
-                return False
-
-        # Equipment filter (substring match)
-        equipment = self.current_filters['equipment']
-        if equipment != 'All':
-            if equipment not in item.get('equipment', ''):
+            if row['friendly_type'] != type_filter:
                 return False
 
         return True
+
+    def _image_matches(self, item):
+        """Whether an image matches the telescope and camera filters"""
+        return all(self.current_filters[key] in ('All', item.get(key, '')) for key in ('telescope', 'camera'))
 
     def _clear_filters(self):
         """Clear all filters"""
         self.search_input.clear()
         self.catalog_combo.setCurrentText("All")
         self.type_combo.setCurrentText("All")
-        self.equipment_combo.setCurrentText("All")
+        self.telescope_filter.setCurrentText("All")
+        self.camera_filter.setCurrentText("All")
+        self.show_combo.setCurrentText(SHOW_BY_OBJECT)
         self._apply_filters()
 
     def _refresh_gallery(self):
@@ -2890,7 +3117,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         self.all_items = []
         self.filtered_items = []
         self.data_loaded = False
-        self.thumbnail_loaded_indices.clear()
+        self._queued_cards.clear()
 
         # Cancel pending thumbnail tasks
         self.cancelled_flag[0] = True
