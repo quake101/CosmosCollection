@@ -8,6 +8,7 @@ equipment, and (via drag-and-drop) the FITS/XISF subs a session produced.
 import os
 import calendar
 import logging
+import threading
 from collections import Counter
 from datetime import datetime, date as date_cls, timedelta
 
@@ -29,6 +30,7 @@ from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from TimeFormatHelper import format_time
 from Theme import COLORS, font_px, font_size, themed_style
+import MountDetection
 import SessionFileScanner
 import SessionObservations
 
@@ -383,6 +385,19 @@ class SessionFormWidget(QWidget):
         camera_row.addWidget(self.camera_combo, 1)
         equipment_layout.addLayout(camera_row)
 
+        mount_row = QHBoxLayout()
+        mount_row.addWidget(QLabel("Mount:"))
+        # Detected from the lights (each night's header, or how far the field turned) - or chosen here
+        self.mount_combo = QComboBox()
+        self.mount_combo.addItem("Detected", None)
+        self.mount_combo.addItem(MountDetection.EQUATORIAL, MountDetection.EQUATORIAL)
+        self.mount_combo.addItem(MountDetection.ALT_AZ, MountDetection.ALT_AZ)
+        self.mount_combo.setToolTip("Equatorial or alt-az: detected from the light frames (a Seestar's header, or "
+                                    "how far the field turned during each night), or choose it yourself.")
+        mount_row.addWidget(self.mount_combo, 1)
+        equipment_layout.addLayout(mount_row)
+        self.set_detected_mount(None, "")
+
         filters_row = QHBoxLayout()
         filters_row.addWidget(QLabel("Filters:"))
         self.filters_edit = QLineEdit()
@@ -407,6 +422,16 @@ class SessionFormWidget(QWidget):
     def _on_time_checkbox_toggled(self, checked):
         self.start_time_edit.setEnabled(checked)
         self.end_time_edit.setEnabled(checked)
+
+    def set_detected_mount(self, mount, how):
+        """What the Mount choice's first item says - MountDetection.summarize() without the override."""
+        if how == "equipment":
+            text = f"Detected (none yet; the telescope's Equipment says {mount})"
+        elif mount:
+            text = f"Detected ({mount})"
+        else:
+            text = "Detected (none yet)"
+        self.mount_combo.setItemText(0, text)
 
     def _populate_telescope_combo(self):
         self.telescope_combo.clear()
@@ -550,6 +575,8 @@ class SessionFormWidget(QWidget):
         filters = summary.get("filters_used") or []
         if filters:
             self.filters_edit.setText(", ".join(filters))
+        if summary.get("mount_detected"):
+            self.set_detected_mount(*MountDetection.summarize(summary["mount_detected"]))
         earliest = summary.get("earliest_sub_date")
         if earliest:
             try:
@@ -600,6 +627,11 @@ class SessionFormWidget(QWidget):
         self.camera_combo.setCurrentText(session_data.get("camera") or "")
         self.filters_edit.setText(session_data.get("filters_used") or "")
         self.notes_edit.setPlainText(session_data.get("notes") or "")
+        if edit_mode:
+            self.set_detected_mount(*MountDetection.summarize(session_data.get("mount_detected"), None,
+                                                              session_data.get("telescope_mount")))
+        index = self.mount_combo.findData(session_data.get("mount_override"))
+        self.mount_combo.setCurrentIndex(max(index, 0))
 
         self.location_widget.set_location(
             session_data.get("location_lat"), session_data.get("location_lon"),
@@ -673,6 +705,7 @@ class SessionFormWidget(QWidget):
             if camera else None,
             "camera": camera,
             "filters_used": self.filters_edit.text().strip(),
+            "mount_override": self.mount_combo.currentData(),
             "sub_count": aggregate.get("sub_count", 0),
             "integration_seconds": aggregate.get("integration_seconds", 0),
             "earliest_sub_date": aggregate.get("earliest_sub_date"),
@@ -697,7 +730,7 @@ class SessionFormWidget(QWidget):
                     target_id=?, dso_name=?, ra_deg=?, dec_deg=?, status=?, session_date=?,
                     start_time=?, end_time=?, location_lat=?, location_lon=?, location_name=?,
                     location_timezone=?, location_source=?, telescope_id=?, camera_id=?, camera=?, filters_used=?,
-                    sub_count=?, integration_seconds=?, earliest_sub_date=?, latest_sub_date=?,
+                    mount_override=?, sub_count=?, integration_seconds=?, earliest_sub_date=?, latest_sub_date=?,
                     notes=?, modified_date=?
                 WHERE id=?
             """, (
@@ -705,7 +738,7 @@ class SessionFormWidget(QWidget):
                 data["session_date"], data["start_time"], data["end_time"], data["location_lat"],
                 data["location_lon"], data["location_name"], data["location_timezone"],
                 data["location_source"], data["telescope_id"], data["camera_id"], data["camera"], data["filters_used"],
-                data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
+                data["mount_override"], data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
                 data["latest_sub_date"], data["notes"], data["modified_date"], self.session_id,
             ))
         else:
@@ -713,15 +746,15 @@ class SessionFormWidget(QWidget):
                 INSERT INTO usersessions (
                     target_id, dso_name, ra_deg, dec_deg, status, session_date, start_time, end_time,
                     location_lat, location_lon, location_name, location_timezone, location_source,
-                    telescope_id, camera_id, camera, filters_used, sub_count, integration_seconds,
+                    telescope_id, camera_id, camera, filters_used, mount_override, sub_count, integration_seconds,
                     earliest_sub_date, latest_sub_date, notes, modified_date
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 data["target_id"], data["dso_name"], data["ra_deg"], data["dec_deg"], data["status"],
                 data["session_date"], data["start_time"], data["end_time"], data["location_lat"],
                 data["location_lon"], data["location_name"], data["location_timezone"],
                 data["location_source"], data["telescope_id"], data["camera_id"], data["camera"], data["filters_used"],
-                data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
+                data["mount_override"], data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
                 data["latest_sub_date"], data["notes"], data["modified_date"],
             ))
             self.session_id = cursor.lastrowid
@@ -794,10 +827,12 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
 
     WINDOW_POSITION_KEY = "SessionDropMatchDialog"
 
-    def __init__(self, summary, db_manager, parent=None):
+    def __init__(self, summary, db_manager, mounts=None, parent=None):
         super().__init__(parent)
         self.summary = summary
         self.db_manager = db_manager
+        self.mounts = mounts or []      # Each night's MountDetection.NightMount
+        self.summary["mount_detected"] = [m.mount for m in self.mounts]
         self.result_session_id = None
         self.setWindowTitle("Attach Scanned Files")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
@@ -828,6 +863,11 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
         form.addRow("Integration Time:", QLabel(self._format_integration()))
         form.addRow("Camera:", QLabel(self.summary.get("camera") or "(unknown)"))
         form.addRow("Telescope:", QLabel(self.summary.get("telescope") or "(unknown)"))
+        if self.mounts:
+            mount_label = QLabel(MountDetection.count_text([m.mount for m in self.mounts]))
+            mount_label.setToolTip("\n".join(f"{m.night:%b} {m.night.day}: {m.mount or 'Unknown'} - {m.evidence}"
+                                             for m in sorted(self.mounts, key=lambda m: m.night)))
+            form.addRow("Mount:", mount_label)
         form.addRow("Filters:", QLabel(", ".join(self.summary.get("filters_used", [])) or "(none)"))
         if self._already_attached_total:
             already_label = QLabel(
@@ -1001,6 +1041,7 @@ class DropMatchDialog(WindowPositionMixin, QDialog):
                 report = SessionObservations.attach_files(conn, session_id, self.summary.get("files", []))
                 SessionObservations.assign_files_to_observations(conn, session_id)
                 SessionObservations.recompute_session_aggregates(conn, session_id)
+                MountDetection.save(conn, session_id, self.mounts)
                 conn.commit()
         except Exception as e:
             _rollback(self.db_manager)
@@ -1491,6 +1532,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         self._files = []
         self._session_meta = {}
         self._framing = None          # The framing saved from the FOV Simulator, if any
+        self._obs_mounts = {}         # observation id -> (mount, source, evidence) (MountDetection)
         self._fov_window = None
         self._obs_dirty = False
         self._added_any = False
@@ -1547,7 +1589,8 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         summary_form = QFormLayout()
         self.summary_labels = {}
         for key, label in (("subs", "Light Subs:"), ("integration", "Integration:"), ("nights", "Nights:"),
-                           ("filters", "Filters:"), ("range", "Date Range:"), ("files", "Attached Files:"),
+                           ("filters", "Filters:"), ("mount", "Mount:"), ("range", "Date Range:"),
+                           ("files", "Attached Files:"),
                            ("target", "Linked Target:"), ("created", "Created:"), ("modified", "Modified:")):
             value_label = QLabel()
             value_label.setWordWrap(True)
@@ -1555,6 +1598,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
             summary_form.addRow(label, value_label)
             self.summary_labels[key] = value_label
         summary_group.setLayout(summary_form)
+        self.form.mount_combo.currentIndexChanged.connect(lambda _index: self._refresh_summary())
 
         summary_column = QVBoxLayout()
         summary_column.addWidget(summary_group)
@@ -1593,7 +1637,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         layout.addLayout(buttons)
 
         splitter = QSplitter(Qt.Vertical)
-        self.obs_table = _make_table(["Night", "Filters", "Subs", "Integration", "Source", "Notes"])
+        self.obs_table = _make_table(["Night", "Filters", "Subs", "Integration", "Source", "Mount", "Notes"])
         self.obs_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.obs_table.itemSelectionChanged.connect(self._on_observation_selected)
         self.obs_table.itemDoubleClicked.connect(lambda _item: self._edit_observation())
@@ -1853,14 +1897,17 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
             with self.db_manager.get_connection() as conn:
                 self._observations = SessionObservations.load_observations(conn, self.session_id)
                 self._files = SessionObservations.load_session_files(conn, self.session_id)
+                self._obs_mounts = MountDetection.observation_mounts(conn, self.session_id)
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT s.created_date, s.modified_date, t.name
+                    SELECT s.created_date, s.modified_date, t.name, tel.mount_type
                     FROM usersessions s LEFT JOIN usertargetlist t ON t.id = s.target_id
+                    LEFT JOIN usertelescopes tel ON tel.id = s.telescope_id
                     WHERE s.id = ?
                 """, (self.session_id,))
                 row = cursor.fetchone()
-                self._session_meta = {"created": row[0], "modified": row[1], "target": row[2]} if row else {}
+                self._session_meta = {"created": row[0], "modified": row[1], "target": row[2],
+                                      "telescope_mount": row[3]} if row else {}
         except Exception as e:
             logger.error(f"Error loading session details: {e}")
             QMessageBox.critical(self, "Error", f"Failed to load session details: {e}")
@@ -1951,7 +1998,10 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
             self.obs_table.setItem(row, 2, _table_item(str(subs), Qt.AlignCenter))
             self.obs_table.setItem(row, 3, _table_item(format_duration(seconds), Qt.AlignCenter))
             self.obs_table.setItem(row, 4, _table_item(source, Qt.AlignCenter))
-            self.obs_table.setItem(row, 5, _table_item(notes, tooltip=obs["notes"] or None))
+            mount, _source, evidence = self._obs_mounts.get(obs["id"], (None, None, ""))
+            self.obs_table.setItem(row, 5, _table_item(mount or ("Unknown" if evidence else ""), Qt.AlignCenter,
+                                                       tooltip=evidence or None))
+            self.obs_table.setItem(row, 6, _table_item(notes, tooltip=obs["notes"] or None))
             if obs is select_obs:
                 select_row = row
         if select_row < 0 and self._observations:
@@ -2057,11 +2107,24 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         labels["integration"].setText(f"{format_duration(seconds)}  ({seconds / 3600.0:.2f} h)")
         labels["nights"].setText(str(len(self._observations)))
         labels["filters"].setText(", ".join(t[0] for t in totals) or "(none)")
+        labels["mount"].setText(self._mount_text())
         labels["range"].setText(date_range)
         labels["files"].setText(str(len(self._visible_files())))
         labels["target"].setText(self._session_meta.get("target") or "(not linked)")
         labels["created"].setText(self._session_meta.get("created") or "")
         labels["modified"].setText(self._session_meta.get("modified") or "")
+
+    def _mount_text(self):
+        """The session's mount and what its nights showed; also updates the form's Detected choice."""
+        nights = [self._obs_mounts[o["id"]][0] for o in self._observations if o["id"] in self._obs_mounts]
+        telescope_mount = self._session_meta.get("telescope_mount")
+        self.form.set_detected_mount(*MountDetection.summarize(nights, None, telescope_mount))
+        mount, how = MountDetection.summarize(nights, self.form.mount_combo.currentData(), telescope_mount)
+        text = MountDetection.describe(mount, how)
+        detail = MountDetection.count_text(nights) if nights else ""
+        if detail and detail != mount:
+            text += f"\nDetected: {detail}"
+        return text
 
     # ---- Observation edits (held in memory until Save) -------------------
 
@@ -2228,7 +2291,10 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
                 widget.installEventFilter(self)
 
     def _scan_running(self):
-        return self._scan_thread is not None and self._scan_thread.isRunning()
+        try:
+            return self._scan_thread is not None and self._scan_thread.isRunning()
+        except RuntimeError:
+            return False  # Finished and deleted
 
     def _accept_file_drag(self, event):
         if not self._scan_running() and dropped_sub_paths(event.mimeData()):
@@ -2279,11 +2345,15 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         self._progress_dialog.setMinimumDuration(0)
         self._progress_dialog.show()
 
-        self._scan_thread = SessionScanThread(paths)
+        # Where subs without a site in their headers were taken: the session's location
+        lat, lon = self.session_data.get("location_lat"), self.session_data.get("location_lon")
+        site = (lat, lon) if lat is not None and lon is not None else _active_site(self.db_manager)
+        self._scan_thread = SessionScanThread(paths, site, parent=self)
         self._scan_thread.progress.connect(self._on_scan_progress)
+        self._scan_thread.status.connect(self._progress_dialog.setLabelText)
         self._scan_thread.scan_finished.connect(self._on_scan_finished)
         self._scan_thread.scan_error.connect(self._on_scan_error)
-        self._progress_dialog.canceled.connect(self._scan_thread.terminate)
+        self._progress_dialog.canceled.connect(self._scan_thread.stop)
         self._scan_thread.start()
 
     def _on_scan_progress(self, current, total):
@@ -2295,7 +2365,14 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         self._progress_dialog.close()
         QMessageBox.critical(self, "Scan Error", f"Failed to scan files: {message}")
 
-    def _on_scan_finished(self, files):
+    def done(self, result):
+        # A stopped scan finishes its current file or night first
+        if self._scan_running():
+            self._scan_thread.stop()
+            self._scan_thread.wait(30000)
+        super().done(result)
+
+    def _on_scan_finished(self, files, mounts):
         self._progress_dialog.close()
         if not files:
             QMessageBox.information(self, "No Files Found", "No supported FITS/XISF files were found.")
@@ -2305,6 +2382,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
                 report = SessionObservations.attach_files(conn, self.session_id, files)
                 SessionObservations.assign_files_to_observations(conn, self.session_id)
                 SessionObservations.recompute_session_aggregates(conn, self.session_id)
+                MountDetection.save(conn, self.session_id, mounts)
                 conn.commit()
         except Exception as e:
             _rollback(self.db_manager)
@@ -2374,32 +2452,86 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         self._after_immediate_write()
 
 
+class _ScanStopped(Exception):
+    pass
+
+
+def _active_site(db_manager):
+    """(lat, lon) of the active saved location, or None."""
+    try:
+        with db_manager.get_connection() as conn:
+            row = conn.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 "
+                               "AND location_lat IS NOT NULL AND location_lon IS NOT NULL").fetchone()
+        return (row[0], row[1]) if row else None
+    except Exception as e:
+        logger.debug(f"No active location: {e}")
+        return None
+
+
 class SessionScanThread(QThread):
-    """Background scan of dropped files/folders so large folders don't block the UI."""
+    """Background scan of dropped files/folders so large folders don't block the
+    UI, then each night's mount (MountDetection). stop() ends it at the next
+    file or night - stopping a thread part way through a database write isn't safe."""
     progress = Signal(int, int)
-    scan_finished = Signal(list)
+    status = Signal(str)
+    scan_finished = Signal(list, list)  # file dicts, [MountDetection.NightMount]
     scan_error = Signal(str)
 
-    def __init__(self, paths):
-        super().__init__()
+    def __init__(self, paths, site=None, parent=None):
+        super().__init__(parent)
         self.paths = paths
+        self.site = site
+        self.cancel = threading.Event()
+        self.finished.connect(self.deleteLater)
+
+    def stop(self):
+        self.cancel.set()
+
+    def _progress(self, current, total):
+        if self.cancel.is_set():
+            raise _ScanStopped()
+        self.progress.emit(current, total)
 
     def run(self):
         try:
             all_files = []
             for path in self.paths:
+                if self.cancel.is_set():
+                    return
                 if os.path.isdir(path):
-                    all_files.extend(SessionFileScanner.scan_folder(
-                        path, progress_callback=lambda i, total: self.progress.emit(i, total)
-                    ))
+                    all_files.extend(SessionFileScanner.scan_folder(path, progress_callback=self._progress))
                 elif os.path.splitext(path)[1].lower() in SessionFileScanner.SUPPORTED_EXTENSIONS:
                     data = SessionFileScanner.scan_file(path)
                     if data is not None:
                         all_files.append(data)
-            self.scan_finished.emit(all_files)
+            mounts = self._detect_mounts(all_files)
+            if not self.cancel.is_set():
+                self.scan_finished.emit(all_files, mounts)
+        except _ScanStopped:
+            return
         except Exception as e:
             logger.error(f"Error scanning dropped files: {e}")
             self.scan_error.emit(str(e))
+
+    def _detect_mounts(self, files):
+        nights = MountDetection.nights_from_file_dicts(files, self.site[1] if self.site else None)
+        if not nights:
+            return []
+        self.status.emit("Checking how the mount tracked each night...")
+        cache = None
+        try:
+            cache = MountDetection.MountCache()
+        except Exception as e:
+            logger.warning(f"Could not open the mount cache: {e}")
+        try:
+            return MountDetection.detect(nights, self.site, cache, cancel=self.cancel,
+                                         progress=lambda done, total: self.progress.emit(done, total))
+        except Exception as e:
+            logger.warning(f"Mount detection failed: {e}", exc_info=True)
+            return []
+        finally:
+            if cache:
+                cache.close()
 
 
 class VisibilityCalcThread(QThread):
@@ -3234,6 +3366,8 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                 conn.commit()
                 # Observation tables, then place any not-yet-grouped files on their nights.
                 SessionObservations.migrate(conn)
+                MountDetection.ensure_schema(conn)
+                conn.commit()
         except Exception as e:
             _rollback(self.db_manager)
             logger.error(f"Error initializing session manager database: {e}")
@@ -3273,6 +3407,16 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             combo.currentTextChanged.connect(self._filter_sessions)
             search_row.addWidget(combo)
+        # Equatorial or alt-az: detected from the lights, set by hand, else the telescope's Equipment
+        search_row.addSpacing(12)
+        search_row.addWidget(QLabel("Mount:"))
+        self.mount_filter = QComboBox()
+        self.mount_filter.addItems(["All", MountDetection.EQUATORIAL, MountDetection.ALT_AZ, MountDetection.MIXED,
+                                    "Unknown"])
+        self.mount_filter.setToolTip("Sessions by how the mount tracked: detected from their light frames, "
+                                     "chosen in the session, or else the telescope's Mount in Equipment")
+        self.mount_filter.currentTextChanged.connect(self._filter_sessions)
+        search_row.addWidget(self.mount_filter)
         search_row.addStretch()
         control_layout.addLayout(search_row)
 
@@ -3319,9 +3463,10 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
 
         self.sessions_table = QTableWidget()
+        # New columns go at the end: hidden columns and widths are saved by position
         self._column_labels = [
             "DSO Name", "Status", "Date", "Time", "Location", "Telescope",
-            "Filters", "Subs", "Integration", "Linked Target"
+            "Filters", "Subs", "Integration", "Linked Target", "Mount"
         ]
         self.sessions_table.setColumnCount(len(self._column_labels))
         self.sessions_table.setHorizontalHeaderLabels(self._column_labels)
@@ -3437,6 +3582,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                 "camera_id", "camera", "filters_used", "sub_count", "integration_seconds",
                 "earliest_sub_date", "latest_sub_date", "notes",
                 "created_date", "modified_date",
+                "mount_override", "mount_detected", "telescope_mount",
             ]
             import EquipmentMapper
             with self.db_manager.get_connection() as conn:
@@ -3450,12 +3596,16 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                            s.camera_id, {EquipmentMapper.session_camera_sql('s')},
                            s.filters_used, s.sub_count, s.integration_seconds,
                            s.earliest_sub_date, s.latest_sub_date, s.notes,
-                           s.created_date, s.modified_date
+                           s.created_date, s.modified_date,
+                           s.mount_override, {MountDetection.detected_sql('s')}, tel.mount_type
                     FROM usersessions s
                     LEFT JOIN usertelescopes tel ON s.telescope_id = tel.id
                     ORDER BY s.session_date DESC, s.id DESC
                 """)
                 self.sessions_data = [dict(zip(columns, row)) for row in cursor.fetchall()]
+            for session in self.sessions_data:
+                session["mount"], session["mount_how"] = MountDetection.summarize(
+                    session["mount_detected"], session["mount_override"], session["telescope_mount"])
 
             self._populate_table()
             self._populate_equipment_filters()
@@ -3517,6 +3667,11 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             self.sessions_table.setItem(row, 9, cell("Yes" if session.get("target_id") else "",
                                                      align=Qt.AlignCenter))
 
+            mount_item = cell(session.get("mount") or "", align=Qt.AlignCenter)
+            if session.get("mount"):
+                mount_item.setToolTip(MountDetection.describe(session["mount"], session["mount_how"]))
+            self.sessions_table.setItem(row, 10, mount_item)
+
         if fit_name_column:
             # No remembered widths yet: size the names column to its contents once
             self._fit_name_column_on_load = False
@@ -3545,6 +3700,9 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         equipment = [(key, combo.currentText()) for key, combo in (("telescope_name", self.telescope_filter),
                                                                    ("camera", self.camera_filter))
                      if combo.currentText() != "All"]
+        mount_filter = self.mount_filter.currentText()
+        if mount_filter != "All":
+            equipment.append(("mount", None if mount_filter == "Unknown" else mount_filter))
 
         for row in range(self.sessions_table.rowCount()):
             show_row = True
@@ -3642,6 +3800,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         equipment_lines = [
             f"Telescope: {session.get('telescope_name') or 'Any'}",
             f"Camera: {session.get('camera') or '(unknown)'}",
+            f"Mount: {MountDetection.describe(session.get('mount'), session.get('mount_how'))}",
             f"Filters: {session.get('filters_used') or '(none)'}",
             f"Subs: {session.get('sub_count') or 0}",
             f"Integration: {(session.get('integration_seconds') or 0) / 3600.0:.2f} h",
@@ -4157,11 +4316,12 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         self._progress_dialog.setMinimumDuration(0)
         self._progress_dialog.show()
 
-        self._scan_thread = SessionScanThread(paths)
+        self._scan_thread = SessionScanThread(paths, _active_site(self.db_manager), parent=self)
         self._scan_thread.progress.connect(self._on_scan_progress)
+        self._scan_thread.status.connect(self._progress_dialog.setLabelText)
         self._scan_thread.scan_finished.connect(self._on_scan_finished)
         self._scan_thread.scan_error.connect(self._on_scan_error)
-        self._progress_dialog.canceled.connect(self._scan_thread.terminate)
+        self._progress_dialog.canceled.connect(self._scan_thread.stop)
         self._scan_thread.start()
 
     def _on_scan_progress(self, current, total):
@@ -4169,13 +4329,13 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             self._progress_dialog.setMaximum(total)
             self._progress_dialog.setValue(current)
 
-    def _on_scan_finished(self, files):
+    def _on_scan_finished(self, files, mounts):
         self._progress_dialog.close()
         if not files:
             QMessageBox.information(self, "No Files Found", "No supported FITS/XISF files were found.")
             return
         summary = SessionFileScanner.summarize_files(files)
-        dialog = DropMatchDialog(summary, self.db_manager, parent=self)
+        dialog = DropMatchDialog(summary, self.db_manager, mounts=mounts, parent=self)
         if dialog.exec() == QDialog.Accepted and dialog.result_session_id:
             self._load_sessions()
             self._select_session_by_id(dialog.result_session_id)

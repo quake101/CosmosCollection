@@ -316,6 +316,10 @@ class DatabaseManager:
                 # Observations (one per observing night) + usersessionfiles.observation_id/sub_key
                 import SessionObservations
                 SessionObservations.ensure_schema(conn)
+                # Each night's detected mount (usersessionmounts, usersessionfiles.mount_id) and
+                # the user's own choice (usersessions.mount_override)
+                import MountDetection
+                MountDetection.ensure_schema(conn)
 
                 conn.commit()
 

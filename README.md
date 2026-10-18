@@ -22,7 +22,7 @@ A personal astrophotography catalog and session planning tools for organizing an
 - **Locations & Equipment**: Save several observing locations (pick them on a map) with custom horizons imported from NINA or Stellarium, and your telescopes, cameras, eyepieces and barlows/reducers.
 
 **Imaging**
-- **Session Manager**: Drop a night's files to create or update sessions, plan them on a calendar with weather and visibility, save mosaic panels and track their progress, and hand them to Siril or PixInsight for stacking.
+- **Session Manager**: Drop a night's files to create or update sessions, plan them on a calendar with weather and visibility, save mosaic panels and track their progress, see whether each night was shot on an equatorial or alt-az mount, and hand them to Siril or PixInsight for stacking.
 - **Light Quality Review**: Grade a session's light frames with graphs, grouped by night.
 - **NINA Integration**: A live dashboard, plus sending targets, panels and slews to NINA.
 
@@ -121,3 +121,5 @@ If Cosmos Collection is useful to you, you can help keep it going by [sponsoring
 MIT. See [LICENSE](LICENSE).
 
 The built-in plate solver's star-pattern matching follows [twirl](https://github.com/lgrcia/twirl) by Lionel Garcia (MIT), with reference stars from [Gaia DR3](https://www.cosmos.esa.int/gaia) and [Tycho-2](https://cdsarc.cds.unistra.fr/viz-bin/cat/I/259) through [VizieR](https://vizier.cds.unistra.fr/).
+
+Detecting equatorial from alt-az nights by the frames' field rotation was inspired by a mount detection script from [wileecyte](https://github.com/wileecyte).

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 import LibraryScanner
+import MountDetection
 from LibraryScanner import ScanRules, scan_and_build, ScanIndex
 from Theme import COLORS, font_size, themed_style
 from WindowPositionManager import WindowPositionMixin
@@ -158,7 +159,21 @@ class ScanWorker(QThread):
             logger.error(f"Library scan failed: {e}", exc_info=True)
             self.failed.emit(str(e))
             return
+        self._save_known_mounts(library)
         self.scanned.emit(scan, library)
+
+    def _save_known_mounts(self, library):
+        """Sessions already in the Session Manager get the mounts just detected."""
+        import sqlite3
+        from ResourceManager import ResourceManager
+        try:
+            conn = sqlite3.connect(str(ResourceManager.get_database_path()), timeout=30)
+            try:
+                LibraryScanner.save_known_mounts(conn, library)
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning(f"Couldn't save the detected mounts: {e}", exc_info=True)
 
 
 class ImportWorker(QThread):
@@ -1687,6 +1702,7 @@ class DetailsPane(QWidget):
         ResourceManager.open_file_manager(folder)
 
     def _set_table(self, headers, rows, numeric=()):
+        """rows of values - a (text, tooltip) pair for a cell with a tooltip."""
         self.table.setVisible(bool(rows))
         self.table.clear()
         self.table.setColumnCount(len(headers))
@@ -1694,7 +1710,10 @@ class DetailsPane(QWidget):
         self.table.setRowCount(len(rows))
         for r, row in enumerate(rows):
             for c, value in enumerate(row):
+                value, tooltip = value if isinstance(value, tuple) else (value, None)
                 cell = QTableWidgetItem(str(value))
+                if tooltip:
+                    cell.setToolTip(tooltip)
                 if c in numeric:
                     cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.table.setItem(r, c, cell)
@@ -1730,6 +1749,12 @@ class DetailsPane(QWidget):
                  f"{format_duration(session.integration_seconds)}",
                  f"Camera: {_html(session.camera or 'Unknown')}",
                  f"Telescope: {_html(session.telescope or 'Unknown')}"]
+        mounts = session.night_mounts
+        if mounts:
+            lines.append(f"Mount: {MountDetection.count_text([m.mount for m in mounts.values()])}")
+            if len(mounts) == 1:
+                lines.append(f"<span style='color:{COLORS['text_secondary']}'>"
+                             f"{_html(next(iter(mounts.values())).evidence)}</span>")
         calibration = defaultdict(int)
         for record in session.calibration:
             calibration[record.frame_type] += 1
@@ -1747,9 +1772,13 @@ class DetailsPane(QWidget):
                    LibraryScanner.exposure_of(record.header) or 0)
             per_night[key][0] += 1
             per_night[key][1] += key[2]
-        rows = [(f"{night:%b} {night.day}, {night.year}", filt, f"{count:,} × {exposure:g}s", format_duration(total))
-                for (night, filt, exposure), (count, total) in sorted(per_night.items())]
-        self._set_table(["Night", "Filter", "Subs", "Integration"], rows, numeric=(2, 3))
+        rows = []
+        for (night, filt, exposure), (count, total) in sorted(per_night.items()):
+            mount = mounts.get(night)
+            rows.append((f"{night:%b} {night.day}, {night.year}", filt, f"{count:,} × {exposure:g}s",
+                         format_duration(total),
+                         ((mount.mount or "Unknown"), mount.evidence) if mount else "Not checked"))
+        self._set_table(["Night", "Filter", "Subs", "Integration", "Mount"], rows, numeric=(2, 3))
         folders = session.folders + sorted({r.folder for r in session.calibration})
         self._set_folders(folders, rel)
 
@@ -2102,6 +2131,7 @@ class ImportWizardWindow(WindowPositionMixin, QDialog):
         self.worker = None
         self.scan, self.library = scan, library
         self.folders_page.refresh_scan_dates()
+        _refresh_session_manager()  # Sessions it already had may have been given their mounts
         # Names in the files nobody has matched to equipment yet: ask first
         equipment = library.equipment or LibraryScanner.EquipmentInfo()
         if any(not equipment.decided(row["kind"], row["value"]) for row in LibraryScanner.equipment_in_files(library)):

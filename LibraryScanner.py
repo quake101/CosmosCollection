@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import MountDetection
 import SessionFileScanner
 import SessionObservations
 from SessionObservations import make_sub_key, parse_obs_datetime, night_date_for
@@ -177,6 +178,7 @@ class FileRecord:
     variants: list = field(default_factory=list)
     is_new: bool = False    # Not in the scan index before this scan
     imported: bool = False  # A light already in a Session Manager session
+    mount: Optional[object] = None  # Lights: their night's MountDetection.NightMount
 
     def __post_init__(self):
         self.folder, self.name = os.path.split(self.path)
@@ -952,6 +954,25 @@ class Session:
     def new_lights(self):
         """Lights found since the previous scan."""
         return sum(1 for r in self.lights if r.is_new)
+
+    @property
+    def night_mounts(self):
+        """{night: the strongest MountDetection.NightMount of its lights that
+        night} - empty before detect_mounts()."""
+        best = {}
+        for record in self.lights:
+            mount = record.mount
+            if mount is not None:
+                current = best.get(mount.night)
+                if current is None or (mount.mount is not None, mount.strength) > \
+                        (current.mount is not None, current.strength):
+                    best[mount.night] = mount
+        return dict(sorted(best.items()))
+
+    @property
+    def mounts(self):
+        """Every NightMount its lights point to (to save with the session)."""
+        return list({id(r.mount): r.mount for r in self.lights if r.mount is not None}.values())
 
     @property
     def status(self):
@@ -1808,10 +1829,64 @@ def regroup_sessions(library, equipment):
             final.session = _pair_session(final, group.sessions)
 
 
-def scan_and_build(roots, rules=None, progress=None, cancel=None, reread=False, scan_index=None, status=None):
+def detect_mounts(library, site=None, cache=None, status=None, cancel=None):
+    """Tell each session's nights' mount, equatorial or alt-az (MountDetection):
+    every light's record.mount is its night's NightMount. site: (lat, lon) for
+    subs that don't say where they were taken. Nights not checked when cancel
+    is set keep None."""
+    status = status or (lambda text: None)
+    nights, records_of = [], {}
+    for group in library.groups.values():
+        for session in group.sessions:
+            by_night = defaultdict(list)
+            for record in session.lights:
+                record.mount = None
+                by_night[(_night(record), MountDetection.rig_of(record.header))].append(record)
+            for (night, rig), records in sorted(by_night.items(), key=lambda item: item[0]):
+                subs = []
+                for record in records:
+                    coords = SessionFileScanner._file_coordinates(record.header or {})
+                    sub = MountDetection.Sub(record.path, _obs_time(record), *(coords or (None, None)),
+                                             record.size, record.mtime_ns, _sub_key(record),
+                                             *MountDetection.site_of(record.header))
+                    records_of[id(sub)] = record
+                    subs.append(sub)
+                nights.append((night, rig, subs))
+    if not nights:
+        return
+    status(f"Checking how the mount tracked each night: 0 of {len(nights):,}")
+    mounts = MountDetection.detect(
+        nights, site, cache, cancel=cancel,
+        progress=lambda done, total: status(f"Checking how the mount tracked each night: {done:,} of {total:,}"))
+    for mount in mounts:
+        for sub in mount.subs:
+            records_of[id(sub)].mount = mount
+
+
+def save_known_mounts(conn, library):
+    """Save the detected mounts of lights already in Session Manager sessions -
+    a rescan fills in sessions imported before. Commits."""
+    MountDetection.ensure_schema(conn)
+    by_path, by_key = _owners(conn)
+    for group in library.groups.values():
+        for session in group.sessions:
+            mounts = session.mounts
+            if not mounts or not session.imported:
+                continue
+            owners = {by_path.get(os.path.normcase(os.path.normpath(r.path))) or by_key.get(_sub_key(r))
+                      for r in session.lights} - {None}
+            for session_id in owners:
+                MountDetection.save(conn, session_id, mounts, tidy=False)
+    MountDetection.tidy_saved(conn)
+    conn.commit()
+
+
+def scan_and_build(roots, rules=None, progress=None, cancel=None, reread=False, scan_index=None, status=None,
+                   mounts=True):
     """The whole scan, for a worker thread: load the index, scan (reading only
-    new or changed headers, or every one with reread), save the index, classify
-    and group. scan_index=None skips the index. status(text) is told each step.
+    new or changed headers, or every one with reread), save the index, classify,
+    group and (with mounts) tell each night's mount. scan_index=None skips the
+    index and the mount cache kept beside it. status(text) is told each step.
     Returns (ScanResult, Library); a cancelled scan's Library covers what was
     found before cancelling."""
     rules = rules or ScanRules()
@@ -1836,9 +1911,23 @@ def scan_and_build(roots, rules=None, progress=None, cancel=None, reread=False, 
         known = load_known(conn)
         assignments = load_assignments(conn)
         equipment = load_equipment_info(conn)
+        locations = _saved_locations(conn)
     finally:
         conn.close()
-    return scan, build_library(scan, catalog, known, rules, assignments, equipment)
+    library = build_library(scan, catalog, known, rules, assignments, equipment)
+    if mounts and not (cancel and cancel.is_set()):
+        active = next((loc for loc in locations if loc[4]), locations[0] if locations else None)
+        cache = None
+        try:
+            cache = MountDetection.MountCache(scan_index.path) if scan_index else None
+        except sqlite3.Error as e:
+            logger.warning(f"Could not open the mount cache: {e}")   # Only costs measuring again
+        try:
+            detect_mounts(library, (active[0], active[1]) if active else None, cache, status, cancel)
+        finally:
+            if cache:
+                cache.close()
+    return scan, library
 
 
 # ---------------------------------------------------------------------------
@@ -2008,6 +2097,8 @@ def import_library(conn, library, progress=None, cancelled=None, today=None):
     by_path, by_key = _owners(conn)
     locations = _saved_locations(conn)
     targets = list(conn.execute("SELECT id, name FROM usertargetlist"))
+    MountDetection.ensure_schema(conn)
+    conn.commit()
     catalog = library.catalog
 
     for done, session in enumerate(sessions):
@@ -2045,6 +2136,12 @@ def import_library(conn, library, progress=None, cancelled=None, today=None):
             conn.rollback()
             logger.error(f"Linking gallery images failed: {e}", exc_info=True)
             report.errors.append(f"Linking images: {e}")
+    try:
+        MountDetection.tidy_saved(conn)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.warning(f"Tidying the detected mounts failed: {e}", exc_info=True)
     progress(total, total, "Done")
     return report
 
@@ -2081,6 +2178,7 @@ def _import_session(conn, session, group, all_finals, library, catalog, by_path,
     calibration = SessionObservations.attach_files(conn, session_id, [_file_dict(r) for r in session.calibration])
     SessionObservations.assign_files_to_observations(conn, session_id)
     SessionObservations.recompute_session_aggregates(conn, session_id, promote=False)
+    MountDetection.save(conn, session_id, session.mounts, tidy=False)
     report.subs_added += lights["inserted"]
     report.calibration_added += calibration["inserted"]
     report.subs_skipped += sum(lights["dup_other_sessions"].values())
@@ -2198,6 +2296,9 @@ def print_library(library, scan, out, new_only=False):
             out.write(f"   [{'x' if s.checked else ' '}] Session {n}: {nights[0]} -> {nights[-1]}, "
                       f"{len(s.nights)} nights, {len(s.lights)} lights, {_format_duration(s.integration_seconds)}, "
                       f"{s.camera or '?'} / {s.telescope or '?'}, {filters} [{s.status}]{new}\n")
+            for night, mount in s.night_mounts.items():
+                out.write(f"         {night} mount: {mount.mount or 'Unknown'} ({mount.source or '-'}) - "
+                          f"{mount.evidence}\n")
             cal = Counter(r.frame_type for r in s.calibration)
             if cal:
                 out.write(f"         + calibration: {', '.join(f'{v} {k}' for k, v in cal.items())}\n")
@@ -2231,6 +2332,7 @@ def main(argv=None):
     parser.add_argument("--full", action="store_true", help="Read every header again, ignoring the scan index")
     parser.add_argument("--no-index", action="store_true", help="Don't use or update the scan index")
     parser.add_argument("--new-only", action="store_true", help="Only list what's new since the last scan")
+    parser.add_argument("--no-mounts", action="store_true", help="Don't tell each night's mount (no image reads)")
     parser.add_argument("--out", help="Write the report here instead of the console")
     args = parser.parse_args(argv)
 
@@ -2246,7 +2348,8 @@ def main(argv=None):
         sys.stderr.flush()
 
     started = time.perf_counter()
-    scan, library = scan_and_build(args.roots, rules, progress=progress, reread=args.full, scan_index=scan_index)
+    scan, library = scan_and_build(args.roots, rules, progress=progress, reread=args.full, scan_index=scan_index,
+                                   status=lambda text: sys.stderr.write(f"\r{text}   "), mounts=not args.no_mounts)
     sys.stderr.write(f"\nDone in {time.perf_counter() - started:.1f}s\n")
     if args.out:
         with open(args.out, "w", encoding="utf-8") as out:

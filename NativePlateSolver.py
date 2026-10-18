@@ -267,6 +267,31 @@ def _quads(z):
     return codes, combos[rows[:, None], order]
 
 
+def close_pairs(codes_a, codes_b, tolerance, order_b=None):
+    """(i, j, distance) of every pair of quad codes nearer than tolerance -
+    codes_a[i] and codes_b[j]. Only codes whose first value is within
+    tolerance can be that near, so codes_b is searched sorted by it (order_b:
+    its stable argsort, to reuse) rather than every pair compared - the same
+    pairs, a small fraction of the work."""
+    if order_b is None:
+        order_b = np.argsort(codes_b[:, 0], kind="stable")
+    first = codes_b[order_b, 0]
+    lo = np.searchsorted(first, codes_a[:, 0] - tolerance, side="left")
+    counts = np.searchsorted(first, codes_a[:, 0] + tolerance, side="right") - lo
+    total = int(counts.sum())
+    if not total:
+        return np.empty(0, np.intp), np.empty(0, np.intp), np.empty(0)
+    # Row r's candidates are order_b[lo[r]:lo[r] + counts[r]], all rows end to end
+    i = np.repeat(np.arange(len(codes_a)), counts)
+    j = order_b[np.arange(total) + np.repeat(lo - (np.cumsum(counts) - counts), counts)]
+    # The second value too, before the full distance of the few left
+    near = np.abs(codes_a[i, 1] - codes_b[j, 1]) < tolerance
+    i, j = i[near], j[near]
+    distance = np.sqrt(((codes_a[i] - codes_b[j]) ** 2).sum(axis=1))
+    near = distance < tolerance
+    return i[near], j[near], distance[near]
+
+
 def _similarity(src, dst):
     """Least-squares dst = a * src + b for each row of the (k, n) complex arrays."""
     ms, md = src.mean(axis=1, keepdims=True), dst.mean(axis=1, keepdims=True)
@@ -317,18 +342,16 @@ def _try_field(stars_xy, diag_px, field, ra0, dec0, progress=None):
 
     verify = image[:VERIFY_STARS]
     best = None
+    # Mirroring flips the codes' second and fourth values, so one sort serves both
+    order = np.argsort(sky_codes[:, 0], kind="stable")
     for mirrored in (False, True):
         codes = sky_codes * np.array([1, -1, 1, -1]) if mirrored else sky_codes
         # The closest pairs of shapes
-        pairs = []
-        for start in range(0, len(image_codes), 256):
-            distance = np.sqrt(((image_codes[start:start + 256, None, :] - codes[None, :, :]) ** 2).sum(axis=2))
-            i, j = np.nonzero(distance < CODE_TOLERANCE)
-            pairs.append(np.column_stack([i + start, j, distance[i, j]]))
-        pairs = np.concatenate(pairs) if pairs else np.empty((0, 3))
-        if not len(pairs):
+        i, j, distance = close_pairs(image_codes, codes, CODE_TOLERANCE, order)
+        if not i.size:
             continue
-        pairs = pairs[np.argsort(pairs[:, 2])[:MAX_CANDIDATES]]
+        pairs = np.column_stack([i, j, distance])
+        pairs = pairs[np.argsort(pairs[:, 2], kind="stable")[:MAX_CANDIDATES]]
         src = top_image[image_quads[pairs[:, 0].astype(int)]]
         if mirrored:
             src = np.conj(src)
@@ -380,23 +403,33 @@ def _refine(stars_xy, sky, scale_guess, points):
     return xy, matched
 
 
-def solve(path, ra, dec, scale=None, progress=None, cancelled=None):
+def load_stars(path):
+    """What solve() needs from an image: (the analysis image's shape, its
+    original pixels per analysis pixel, original (width, height), header,
+    find_stars()'s rankings) - small, no pixels kept. Pass it to solve() as
+    loaded to solve an image already read for something else."""
+    img, factor, size, header = _load_luminance(path)
+    return img.shape, factor, size, header, find_stars(img)
+
+
+def solve(path, ra, dec, scale=None, progress=None, cancelled=None, loaded=None):
     """Plate solve an image near ra, dec (degrees) - scale: its arcsec/pixel
-    if known (else from the FITS header, or tried over a range).
+    if known (else from the FITS header, or tried over a range). loaded:
+    load_stars(path), when already read.
 
     Returns (WCS keywords in the same convention as ASTAP's .wcs files, info
     dict) - raises SolveFailed with the reason otherwise."""
     started = time.perf_counter()
     say = progress or (lambda message: None)
     say("Finding stars...")
-    img, factor, (width, height), header = _load_luminance(path)
-    rankings = [stars for stars in find_stars(img) if len(stars) >= MIN_MATCHED]
+    shape, factor, (width, height), header, all_rankings = loaded or load_stars(path)
+    rankings = [stars for stars in all_rankings if len(stars) >= MIN_MATCHED]
     if not rankings:
         raise SolveFailed("Too few stars found in the image")
 
     # Fields to try, the likeliest first: the given scale, the FITS header's,
     # other images taken with the same equipment, then a sweep out from those
-    diag_px = math.hypot(*img.shape)
+    diag_px = math.hypot(*shape)
     scales = [scale] if scale else []
     if header.get("FOCALLEN") and header.get("XPIXSZ"):
         binning = header.get("XBINNING") or 1
@@ -450,7 +483,7 @@ def solve(path, ra, dec, scale=None, progress=None, cancelled=None):
                     xy, matched, sky, catalog = deep_xy, deep_matched, deep_sky, deep
 
         # TAN solution about the image center, from the matched stars
-        center = np.array([(img.shape[1] - 1) / 2, (img.shape[0] - 1) / 2])
+        center = np.array([(shape[1] - 1) / 2, (shape[0] - 1) / 2])
         sky_xy = np.column_stack([sky.real, sky.imag])
         matrix, offset = _affine(xy, sky_xy[matched])
         ra_c, dec_c = _deproject(*(matrix @ center + offset), ra, dec)
