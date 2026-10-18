@@ -941,6 +941,7 @@ GRADE_UNGRADED, GRADE_ERROR = "Not graded", "Error"
 MIN_GROUP_SIZE = 3  # fewer frames than this can't be compared with each other
 NOISE_FLOOR = 3.0   # no Reject line closer to the median than this many times the frame's own measurement error
 MIN_NIGHT_FRAMES = 10  # a night with fewer frames in a group is graded with the whole group
+TYPICAL_NIGHT_SHARE = 0.25  # a night with fewer than this share of its group's biggest night's frames doesn't set the typical night
 MAX_GRADE_ROUNDS = 50  # re-grading against the survivors settles long before this
 
 
@@ -967,8 +968,8 @@ class FrameGrade:
     relative: dict = field(default_factory=dict)  # per metric, % of the group median
     medians: dict = field(default_factory=dict)   # the group medians graded against (flux and sky: its gain's)
     outside: float = None              # share of star light beyond the core radius outside_at uses (0-1)
-    night_issue: str = ""              # why its whole night is graded down (see _check_nights), if it is
-    night_grade: str = ""              # the grade its whole night was held to then (Marginal or Reject)
+    night_issue: str = ""              # why its whole night is behind a typical one (see _check_nights), if it is
+    night_grade: str = ""              # how far behind, as a grade for the night (Marginal or Reject)
     score_badness: dict = field(default_factory=dict)  # what the score was computed from
 
 
@@ -1062,11 +1063,18 @@ def grade_frames(frames, settings=None, gains=None, nights=None):
             # A typical night from each night graded on its own - not from the
             # re-grade below, whose looser lines keep more frames: fed back,
             # that made removing the rejects turn up new ones - then each night
-            # again against the softer of its own median and the typical night's
+            # again against the softer of its own median and the typical night's -
+            # and a night behind the typical one also against the typical night's
+            # alone on what it's behind on, for the frames that hold up anyway
             night_medians, typical = _night_medians(own, grades, band, settings)
-            for night_frames in own.values():
-                grades.update(_grade_group(night_frames, settings, band, gain_of, typical))
-            _check_nights(own, grades, settings, night_medians, typical)
+            alone = {}
+            for night, night_frames in own.items():
+                night_grades = _grade_group(night_frames, settings, band, gain_of, typical)
+                grades.update(night_grades)
+                behind = _behind(_night_badness(night_medians[night], typical, settings))
+                if behind:
+                    alone.update(_grade_alone(night_frames, night_grades, settings, band, typical, behind))
+            _check_nights(own, grades, alone, settings, night_medians, typical)
     return grades
 
 
@@ -1078,19 +1086,24 @@ def _night_medians(nights, grades, band, settings):
     signal from its frames that aren't rejected, and a typical night's - the
     median of those, leaving out nights rejected as a whole against it (as a
     group's median leaves out rejected frames), so removing a bad night's
-    frames doesn't move it and turn up new rejects on the others.
-    nights: {night: [FrameMetrics]}, graded in grades."""
+    frames doesn't move it and turn up new rejects on the others. Nights with
+    only a few frames (TYPICAL_NIGHT_SHARE) are left out too: what's left of a
+    rejected night once its Rejects are removed is its sharpest stretch,
+    which would move it the same way. nights: {night: [FrameMetrics]}, graded
+    in grades."""
     medians = {}
     for night, frames in nights.items():
         kept = [m for m in frames if grades[m.path].grade != GRADE_REJECT] or frames
         medians[night] = {"fwhm": _median_of(m.fwhm_px for m in kept),
                           "eccentricity": _median_of(m.eccentricity for m in kept),
                           "signal": _median_of(frame_signal(m, band) for m in kept)}
-    reference = list(medians)
+    largest = max(len(frames) for frames in nights.values())
+    sized = [night for night in medians if len(nights[night]) >= TYPICAL_NIGHT_SHARE * largest]
+    reference = sized
     for _ in range(len(medians)):
         typical = {key: _median_of(medians[night][key] for night in reference)
                    for key in ("fwhm", "eccentricity", "signal")}
-        good = [night for night in medians
+        good = [night for night in sized
                 if max(_night_badness(medians[night], typical, settings).values(), default=0.0) < 1.0]
         if good == reference or not good:
             break
@@ -1109,20 +1122,48 @@ def _night_badness(own, typical, settings):
     return badness
 
 
-def _check_nights(nights, grades, settings, medians, typical):
+def _behind(badness):
+    """The measurements a night is behind a typical night on (_night_badness):
+    past half their Reject line."""
+    return {metric for metric in ("fwhm", "eccentricity") if badness.get(metric, 0.0) >= 0.5}
+
+
+def _grade_alone(frames, grades, settings, band, typical, behind):
+    """{path: FrameGrade} against the same medians as grades (the night's own),
+    but against the typical night's alone on what the night is behind on
+    (behind, _behind) - its own soft median would pass soft frames. Not
+    re-graded against its own survivors: they're the night's sharpest stretch,
+    and its stars' signal against theirs isn't the night's."""
+    alone = {}
+    for m in frames:
+        med = dict(grades[m.path].medians)
+        for metric in behind:
+            med[f"{metric}_ref"] = typical[metric]
+        alone[m.path] = _grade_one(m, med, settings, band)
+    return alone
+
+
+def _check_nights(nights, grades, alone, settings, medians, typical):
     """Grade each night as a whole against a typical one (_night_medians) by
     its median FWHM and eccentricity, with the frames' own lines: past the
     Reject line every frame of the night is a Reject, past half of it Marginal
-    at best. Each night's offset also goes into its frames' scores, which were
-    only against their own night: Top % keeps the best across the whole session.
-    nights: {night: [FrameMetrics]}, graded in grades."""
+    at best - unless a frame holds up against the typical night on its own
+    (alone: {path: FrameGrade} against the typical night's alone on what the
+    night is behind on, see _grade_alone), as a night whose focus drifts as it
+    cools starts out as sharp as the others. A Marginal night's Rejects are
+    still only those past its own median's line, so removing them leaves the
+    night as it was. Each night's offset also goes into its frames' scores,
+    which were only against their own night: Top % keeps the best across the
+    whole session - on what the night is behind on, the frame against the
+    typical night instead. nights: {night: [FrameMetrics]}, graded in grades."""
     for night, frames in nights.items():
         own = medians[night]
         badness, issues = _night_badness(own, typical, settings), []
-        if badness.get("fwhm", 0.0) >= 0.5:
+        behind = _behind(badness)
+        if "fwhm" in behind:
             issues.append(f"Soft night (median FWHM {own['fwhm']:.2f} vs {typical['fwhm']:.2f} px on a typical "
                           f"night) - focus, dew or seeing?")
-        if badness.get("eccentricity", 0.0) >= 0.5:
+        if "eccentricity" in behind:
             issues.append(f"Elongated night (median eccentricity {own['eccentricity']:.2f} vs "
                           f"{typical['eccentricity']:.2f} on a typical night) - wind, tracking or tilt?")
         worst = max(badness.values(), default=0.0)
@@ -1131,14 +1172,22 @@ def _check_nights(nights, grades, settings, medians, typical):
             badness["signal"] = (100 - own["signal"] / typical["signal"] * 100) / SIGNAL_DROP_PCT
         for m in frames:
             g = grades[m.path]
-            if _GRADE_RANK[night_grade] > _GRADE_RANK[g.grade]:
-                g.grade = night_grade
             if issues:
+                held = night_grade if _GRADE_RANK[night_grade] > _GRADE_RANK[g.grade] else g.grade
+                lone = alone[m.path]
+                lone.grade = min(lone.grade, held, key=_GRADE_RANK.get)
+                if night_grade == GRADE_MARGINAL:  # its Rejects start at its own median's line (the graph's)
+                    lone.medians = dict(lone.medians, **{f"{metric}_reject_ref": g.medians[f"{metric}_ref"]
+                                                         for metric in behind if f"{metric}_ref" in g.medians})
+                grades[m.path] = g = lone
                 g.night_issue, g.night_grade = "; ".join(issues), night_grade
                 g.flags = issues + g.flags
             ranking = dict(g.score_badness)
             for metric, offset in badness.items():
-                ranking[metric] = ranking.get(metric, 0.0) + offset
+                if metric not in behind:
+                    ranking[metric] = ranking.get(metric, 0.0) + offset
+                elif metric in g.badness:  # graded against the typical night already
+                    ranking[metric] = g.badness[metric]
             g.score = _score(_score_total(ranking))
 
 

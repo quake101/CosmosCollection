@@ -3261,6 +3261,18 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         self.search_box.textChanged.connect(self._filter_sessions)
         search_row.addWidget(QLabel("Search:"))
         search_row.addWidget(self.search_box)
+
+        # Telescope and camera filters: the equipment the sessions use
+        self.telescope_filter = QComboBox()
+        self.camera_filter = QComboBox()
+        for label, combo in (("Telescope:", self.telescope_filter), ("Camera:", self.camera_filter)):
+            search_row.addSpacing(12)
+            search_row.addWidget(QLabel(label))
+            combo.addItem("All")
+            combo.setMinimumWidth(140)
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.currentTextChanged.connect(self._filter_sessions)
+            search_row.addWidget(combo)
         search_row.addStretch()
         control_layout.addLayout(search_row)
 
@@ -3446,6 +3458,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                 self.sessions_data = [dict(zip(columns, row)) for row in cursor.fetchall()]
 
             self._populate_table()
+            self._populate_equipment_filters()
             self._filter_sessions()
             self.status_label.setText(f"Loaded {len(self.sessions_data)} sessions")
             self.calendar_widget.refresh_session_markers()
@@ -3511,9 +3524,27 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
 
         self.sessions_table.setSortingEnabled(True)
 
+    def _populate_equipment_filters(self):
+        """The telescope and camera filters: the equipment the loaded sessions
+        use - a session with no telescope ("Any") only shows under All."""
+        for combo, key in ((self.telescope_filter, "telescope_name"), (self.camera_filter, "camera")):
+            current = combo.currentText()
+            names = sorted({s[key] for s in self.sessions_data if s.get(key)}, key=str.casefold)
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("All")
+            combo.addItems(names)
+            combo.setCurrentText(current if current in names else "All")
+            combo.blockSignals(False)
+            # Wide enough a dropdown to show the full names
+            combo.view().setMinimumWidth(combo.minimumSizeHint().width())
+
     def _filter_sessions(self):
         search_text = self.search_box.text().strip().lower()
         status_filter = self.status_filter.currentText()
+        equipment = [(key, combo.currentText()) for key, combo in (("telescope_name", self.telescope_filter),
+                                                                   ("camera", self.camera_filter))
+                     if combo.currentText() != "All"]
 
         for row in range(self.sessions_table.rowCount()):
             show_row = True
@@ -3524,6 +3555,11 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             if search_text and show_row:
                 name_item = self.sessions_table.item(row, 0)
                 if not name_item or search_text not in name_item.text().lower():
+                    show_row = False
+            if equipment and show_row:
+                name_item = self.sessions_table.item(row, 0)
+                session = name_item.data(Qt.UserRole) if name_item else None
+                if not session or any(session.get(key) != name for key, name in equipment):
                     show_row = False
             self.sessions_table.setRowHidden(row, not show_row)
 

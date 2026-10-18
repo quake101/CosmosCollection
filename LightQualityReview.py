@@ -1173,34 +1173,47 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
                 f" #nightNotice QLabel {{ color: {COLORS['text']}; background: transparent; }}")
 
     def _bad_nights(self):
-        """{night date: (grade, issue, frames)} for the nights graded down as a
-        whole (FrameQuality._check_nights) - Reject when any filter's was."""
+        """{night date: (grade, issue, frames, Counter of their grades)} for the
+        nights graded down as a whole (FrameQuality._check_nights) - Reject when
+        any filter's was. Frames that hold up against a typical night on their
+        own keep their grade."""
         nights = {}
         for path, g in self._grades.items():
             if g.night_grade:
                 night = self._lights[path]["night_date"] or ""
-                grade, issue, count = nights.get(night, (g.night_grade, g.night_issue, 0))
+                grade, issue, count, grades = nights.get(night, (g.night_grade, g.night_issue, 0, Counter()))
                 if g.night_grade == FrameQuality.GRADE_REJECT:
                     grade = FrameQuality.GRADE_REJECT
-                nights[night] = (grade, issue, count + 1)
+                grades[g.grade] += 1
+                nights[night] = (grade, issue, count + 1, grades)
         return nights
 
     def _refresh_night_notice(self):
         if self._analyzing:
             self.night_notice.hide()  # the nights are judged once every frame is in
             return
-        rejected, held = [], []
-        for night, (grade, issue, count) in sorted(self._bad_nights().items()):
+        rejected, held, kept_any = [], [], False
+        for night, (grade, issue, count, grades) in sorted(self._bad_nights().items()):
             label, why = self._night_label(night), issue.replace("?; ", "? ")
             if grade == FrameQuality.GRADE_REJECT:
-                rejected.append(f"<b>{label} doesn't match your other nights.</b> {why} "
-                                f"All {count:,} of its frames are Rejects.")
+                kept = count - grades[FrameQuality.GRADE_REJECT]
+                kept_any = kept_any or bool(kept)
+                rejected.append(f"<b>{label} doesn't match your other nights.</b> {why} " + (
+                    f"All {count:,} of its frames are Rejects." if not kept else
+                    f"{count - kept:,} of its {count:,} frames are Rejects - the {kept:,} that "
+                    f"{'holds' if kept == 1 else 'hold'} up against your other nights on their own "
+                    f"{'is' if kept == 1 else 'are'} kept."))
             else:
-                held.append(f"<b>{label} is a little behind your other nights.</b> {why} "
-                            f"Its {count:,} frames are Marginal at best - still worth stacking with Good + Marginal.")
+                good = grades[FrameQuality.GRADE_GOOD]
+                held.append(f"<b>{label} is a little behind your other nights.</b> {why} " + (
+                    f"Its {count:,} frames are Marginal at best" if not good else
+                    f"Its frames are Marginal at best, except the {good:,} that {'holds' if good == 1 else 'hold'} "
+                    f"up against your other nights on their own") + " - still worth stacking with Good + Marginal.")
         parts = [self._removal_note] if self._removal_note else []
         parts += rejected
-        if rejected:
+        if rejected and kept_any:
+            parts.append("Removing these Rejects is expected - they would blur the stack.")
+        elif rejected:
             parts.append("Removing a night like this is expected - it would blur the stack. The other nights "
                          "are already graded without it, so removing it won't change their grades.")
         parts += held
@@ -1224,6 +1237,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)  # a name with a space wrapped there, cut off after its first word
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         # Not ResizeToContents: that re-measures a column on every cell set, which
@@ -1413,7 +1427,8 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         grid = QGridLayout(box)
         note = QLabel("Each night is graded against its own frames (for FWHM and eccentricity, against a "
                       "typical night instead when that's softer), then as a whole against a typical night by "
-                      "its median FWHM and eccentricity - past a line, so is every frame of that night. "
+                      "its median FWHM and eccentricity - past a line, so is every frame of that night, "
+                      "except frames that hold up against the typical night on their own. "
                       "Half of each is Marginal. A brighter sky alone is Marginal at most, though the signal "
                       "it costs can reject a frame. Fewer stars and less signal only count on their own - "
                       "moonlight causes both. The median leaves out "
@@ -1741,15 +1756,17 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
     def _metric_lines(key, med, s):
         """(y, label, kind) median and limits of an absolute measurement. FWHM and
         eccentricity limits start from a typical night's median where that's
-        softer than this night's (FrameQuality._grade_group)."""
+        softer than this night's (FrameQuality._grade_group) - and on a night
+        a little behind a typical one, its Reject line from its own median
+        (FrameQuality._check_nights)."""
         if key == "fwhm" and med.get("fwhm_px"):
             m, ref, rise = med["fwhm_px"], med.get("fwhm_ref") or med["fwhm_px"], s.fwhm_rise_pct / 100
             return [(m, "Median", "median"), (ref * (1 + rise / 2), "Marginal", "marginal"),
-                    (ref * (1 + rise), "Reject", "reject")]
+                    ((med.get("fwhm_reject_ref") or ref) * (1 + rise), "Reject", "reject")]
         if key == "eccentricity" and med.get("eccentricity") is not None:
             m, ref, rise = med["eccentricity"], med.get("eccentricity_ref", med["eccentricity"]), s.eccentricity_rise
             return [(m, "Median", "median"), (ref + rise / 2, "Marginal", "marginal"),
-                    (ref + rise, "Reject", "reject")]
+                    (med.get("eccentricity_reject_ref", ref) + rise, "Reject", "reject")]
         if key == "outside" and med.get("outside_light"):
             m, rise = med["outside_light"] * 100, s.outside_rise_pct / 100
             return [(m, "Median", "median"), (m * (1 + rise / 2), "Marginal", "marginal"),
@@ -2149,7 +2166,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             return False
 
         self.files_changed = True
-        bad_nights = {night: count for night, (grade, _issue, count) in self._bad_nights().items()
+        bad_nights = {night: count for night, (grade, _issue, count, _grades) in self._bad_nights().items()
                       if grade == FrameQuality.GRADE_REJECT}
         gone = Counter(self._lights[p]["night_date"] or "" for p in changed
                        if (self._lights[p]["night_date"] or "") in bad_nights)
