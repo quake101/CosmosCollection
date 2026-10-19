@@ -2,7 +2,7 @@
 Window Position Manager
 Manages saving and restoring window positions using QSettings
 """
-from PySide6.QtCore import QSettings, QPoint
+from PySide6.QtCore import QSettings, QPoint, QRect
 from PySide6.QtWidgets import QApplication
 
 
@@ -44,34 +44,57 @@ class WindowPositionManager:
 
         # Try to restore saved geometry first
         geometry = settings.value(f"{window_key}/geometry")
-        if geometry and window.restoreGeometry(geometry):
-            return True
+        restored = bool(geometry) and window.restoreGeometry(geometry)
 
         # Fallback: Try to restore position and size separately
-        pos = settings.value(f"{window_key}/pos")
-        size = settings.value(f"{window_key}/size")
+        if not restored:
+            pos = settings.value(f"{window_key}/pos")
+            size = settings.value(f"{window_key}/size")
+            if pos is not None and size is not None:
+                window.move(pos)
+                window.resize(size)
+                restored = True
 
-        if pos is not None and size is not None:
-            window.move(pos)
-            window.resize(size)
-            return True
+        if not restored:
+            # First time opening - center the window
+            WindowPositionManager.center_window(window)
+            return False
 
-        # First time opening - center the window
-        WindowPositionManager.center_window(window)
+        # Saved on a monitor that's since been unplugged or turned off: a modal
+        # dialog there would block the app with nothing to see or close
+        if not WindowPositionManager._on_a_screen(window):
+            WindowPositionManager.center_window(window)
+        return True
+
+    @staticmethod
+    def _on_a_screen(window, min_width=100, min_height=50):
+        """Whether enough of the window shows on a connected screen to see and drag it."""
+        geometry = window.geometry()
+        for screen in QApplication.screens():
+            visible = screen.availableGeometry().intersected(geometry)
+            if visible.width() >= min(min_width, geometry.width()) and visible.height() >= min(min_height, geometry.height()):
+                return True
         return False
 
     @staticmethod
     def center_window(window):
         """
-        Center window on screen
+        Center window on its parent's screen (the primary screen without one),
+        shrunk to fit if it's bigger than that screen
 
         Args:
             window: QMainWindow or QDialog instance
         """
-        screen_geometry = QApplication.primaryScreen().geometry()
-        window_geometry = window.frameGeometry()
-        center_point = screen_geometry.center()
-        window_geometry.moveCenter(center_point)
+        parent = window.parentWidget()
+        screen = (parent.window().screen() if parent is not None else None) or QApplication.primaryScreen()
+        available = screen.availableGeometry()
+        frame = window.frameGeometry()
+        # Room for the title bar and borders, which a not-yet-shown window doesn't have yet
+        border_w, border_h = max(frame.width() - window.width(), 16), max(frame.height() - window.height(), 40)
+        window.resize(min(window.width(), available.width() - border_w),
+                      min(window.height(), available.height() - border_h))
+        window_geometry = QRect(0, 0, window.width() + border_w, window.height() + border_h)
+        window_geometry.moveCenter(available.center())
         window.move(window_geometry.topLeft())
 
 

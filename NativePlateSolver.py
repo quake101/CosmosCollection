@@ -11,7 +11,8 @@ be known: a few likely fields of view are tried in turn, nearest the FITS
 header's (or a hint's) first.
 
 Reference stars come from Gaia DR3, or Tycho-2 for wide fields, through
-VizieR (online), cached on disk.
+VizieR (online), kept on disk in sky tiles (StarTiles.py) so a part of the
+sky fetched once solves offline afterwards.
 
 Command line - solve images and compare with their saved (e.g. ASTAP) solutions:
     python NativePlateSolver.py image [image ...] [--ra DEG --dec DEG]
@@ -19,10 +20,8 @@ Command line - solve images and compare with their saved (e.g. ASTAP) solutions:
 
 import os
 import sys
-import json
 import math
 import time
-import hashlib
 import logging
 import itertools
 
@@ -30,10 +29,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-VIZIER_URL = "https://vizier.cds.unistra.fr/viz-bin/asu-tsv"
 TYCHO_RADIUS = 0.45       # Catalog cones this wide (degrees) try Tycho-2 first
 TYCHO_ENOUGH = 100        # ...and use it if it has at least this many stars there
-TYCHO = ("I/259/tyc2", ("RAmdeg", "DEmdeg", "VTmag"))
 DEEP_DEPTH = 1500         # Catalog stars for the final fit (Tycho-2 fields)
 ANALYSIS_SIDE = 2000      # Stars are found in a copy of the image at most this many pixels across
 IMAGE_STARS = 15          # Brightest image stars quads are made from
@@ -82,66 +79,30 @@ def _deproject(xi, eta, ra0, dec0):
 
 # ---- Reference stars ---------------------------------------------------------
 
-def _cache_dir():
-    from ResourceManager import ResourceManager
-    return ResourceManager.get_cache_dir("star_catalog")
-
-
-def _vizier_stars(source, columns, ra, dec, radius, count):
-    """The `count` brightest stars of a VizieR catalog within radius (degrees)
-    of ra, dec, brightest first: an (n, 3) array of ra, dec, magnitude. columns:
-    its ra, dec and magnitude columns. Cached on disk. Raises SolveFailed if
-    the catalog can't be reached."""
-    key = f"{source}|{ra:.3f}|{dec:.3f}|{radius:.3f}|{count}"
-    cache = _cache_dir() / f"{hashlib.sha1(key.encode()).hexdigest()}.json"
-    if cache.exists():
-        try:
-            return np.array(json.loads(cache.read_text()), dtype=np.float64).reshape(-1, 3)
-        except (ValueError, OSError):
-            pass
-    import requests
-    from OnlineLimits import online_request
-    params = {"-source": source, "-c": f"{ra:.5f} {dec:+.5f}", "-c.rd": f"{radius:.4f}",
-              "-out": ",".join(columns), "-sort": columns[2], "-out.max": str(count)}
-    for attempt in range(2):
-        try:
-            with online_request("vizier"):
-                response = requests.get(VIZIER_URL, params=params, timeout=45)
-            response.raise_for_status()
-            break
-        except requests.RequestException as e:
-            if attempt:
-                raise SolveFailed(f"Couldn't reach the star catalog (online): {e}")
-            logger.info(f"Star catalog query failed, trying again: {e}")
-    rows = []
-    for line in response.text.splitlines():
-        parts = line.split("\t")
-        if len(parts) != 3 or line.startswith("#"):
-            continue
-        try:
-            rows.append([float(parts[0]), float(parts[1]), float(parts[2])])
-        except ValueError:
-            continue  # Header and unit lines, and stars without a position
-    stars = np.array(rows, dtype=np.float64).reshape(-1, 3)
+def catalog_stars(catalog, ra, dec, radius, count):
+    """The `count` brightest stars of catalog ("tycho2" or "gaia") within
+    radius (degrees) of ra, dec, brightest first: an (n, 3) array of ra, dec,
+    magnitude. From the sky tiles on disk, fetching what's missing from
+    VizieR. Raises SolveFailed if the catalog is needed but can't be reached."""
+    from StarTiles import cone_stars, CatalogUnavailable
     try:
-        cache.write_text(json.dumps(stars.round(7).tolist()))
-    except OSError:
-        pass
-    return stars
+        return cone_stars(catalog, ra, dec, radius, count)
+    except CatalogUnavailable as e:
+        raise SolveFailed(f"Couldn't reach the star catalog (online): {e}")
 
 
 def gaia_stars(ra, dec, radius, count=CATALOG_DEPTH):
-    """The brightest Gaia DR3 stars around ra, dec (see _vizier_stars)."""
-    return _vizier_stars("I/355/gaiadr3", ("RA_ICRS", "DE_ICRS", "Gmag"), ra, dec, radius, count)
+    """The brightest Gaia DR3 stars around ra, dec (see catalog_stars)."""
+    return catalog_stars("gaia", ra, dec, radius, count)
 
 
 def reference_stars(ra, dec, radius, count=CATALOG_DEPTH):
-    """The brightest stars around ra, dec (see _vizier_stars). A wide field's
+    """The brightest stars around ra, dec (see catalog_stars). A wide field's
     brightest stars are all in Tycho-2, which answers in about a second where
     Gaia can take a minute (it holds millions of stars in a wide cone along
     the Milky Way); narrower fields need Gaia's fainter stars."""
     if radius >= TYCHO_RADIUS:
-        stars = _vizier_stars(*TYCHO, ra, dec, radius, count)
+        stars = catalog_stars("tycho2", ra, dec, radius, count)
         if len(stars) >= TYCHO_ENOUGH:
             return stars
     return gaia_stars(ra, dec, radius, count)
@@ -470,7 +431,7 @@ def solve(path, ra, dec, scale=None, progress=None, cancelled=None, loaded=None)
         # or saturated, and the fainter ones' centers are more exact
         if field * 0.6 >= TYCHO_RADIUS:
             try:
-                deep = _vizier_stars(*TYCHO, ra, dec, field * 0.6, DEEP_DEPTH)
+                deep = catalog_stars("tycho2", ra, dec, field * 0.6, DEEP_DEPTH)
             except SolveFailed:
                 deep = np.empty((0, 3))
             if len(deep) > len(catalog):
