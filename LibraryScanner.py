@@ -1039,6 +1039,7 @@ class Library:
     catalog: Optional[object] = None                         # The Catalog it was named with
     equipment: Optional[object] = None                       # The EquipmentInfo sessions were grouped with
     session_gap_days: int = DEFAULT_SESSION_GAP_DAYS
+    relinked: int = 0       # Attached subs found in a renamed or moved folder, now pointing there
 
 
 def _clean(value):
@@ -1907,7 +1908,17 @@ def scan_and_build(roots, rules=None, progress=None, cancel=None, reread=False, 
     from ResourceManager import ResourceManager
     catalog = load_catalog()
     conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+    relinked = 0
     try:
+        # Session subs whose folder was renamed or moved: point them at where this
+        # scan found them, before deciding what's already imported
+        try:
+            relinked = len(SessionObservations.relink_moved(
+                conn, [(r.path, _sub_key(r)) for r in scan.records if r.kind == "sub"]))
+            conn.commit()
+        except sqlite3.Error as e:
+            conn.rollback()
+            logger.warning(f"Relinking moved session files failed: {e}")
         known = load_known(conn)
         assignments = load_assignments(conn)
         equipment = load_equipment_info(conn)
@@ -1915,6 +1926,7 @@ def scan_and_build(roots, rules=None, progress=None, cancel=None, reread=False, 
     finally:
         conn.close()
     library = build_library(scan, catalog, known, rules, assignments, equipment)
+    library.relinked = relinked
     if mounts and not (cancel and cancel.is_set()):
         active = next((loc for loc in locations if loc[4]), locations[0] if locations else None)
         cache = None

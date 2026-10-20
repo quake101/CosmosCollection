@@ -1537,6 +1537,8 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         self._obs_dirty = False
         self._added_any = False
         self._scan_thread = None
+        self._file_check = None       # SessionFileCheck.FileCheckWorker of the last load
+        self._file_check_result = None  # its CheckResult, None until it's done
 
         self.setWindowTitle(f"{session_data.get('dso_name', '')} — {session_data.get('session_date', '')}")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.WindowMaximizeButtonHint)
@@ -1675,7 +1677,37 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         review_btn.setToolTip("Grade the light frames (stars, focus, trailing, clouds) to stack only the best.")
         review_btn.clicked.connect(self._review_light_quality)
         top.addWidget(review_btn)
+        check_btn = QPushButton("Check Files...")
+        check_btn.setToolTip("Find files that are missing on disk or on no night - relink moved ones, "
+                             "remove the rest from the session.")
+        check_btn.clicked.connect(self._open_file_check)
+        top.addWidget(check_btn)
         layout.addLayout(top)
+
+        # Filled in by the background disk check (SessionFileCheck) after each load
+        self.files_problem_label = QLabel()
+        self.files_problem_label.setWordWrap(True)
+        self.files_problem_label.setTextFormat(Qt.RichText)
+        self.files_problem_label.linkActivated.connect(lambda _link: self._open_file_check())
+        self.files_problem_label.hide()
+        layout.addWidget(self.files_problem_label)
+
+        filters = QHBoxLayout()
+        self.files_filters = {}
+        for key, label, tip in (("night", "Night:", None), ("frame", "Frame:", None), ("filter", "Filter:", None),
+                                ("status", "Show:", "Missing on disk: not found where the session points. "
+                                                    "Not on a night: no observing night holds them.")):
+            filters.addWidget(QLabel(label))
+            combo = QComboBox()
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+            if tip:
+                combo.setToolTip(tip)
+            combo.currentIndexChanged.connect(lambda _index: self._refresh_files_table())
+            filters.addWidget(combo)
+            self.files_filters[key] = combo
+        filters.addStretch()
+        layout.addLayout(filters)
+
         self.files_table = _make_table(["File", "Night", "Frame", "Filter", "Exposure", "Gain", "Temp", "Binning"])
         self.files_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.files_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1916,7 +1948,28 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         self._deleted_ids = []
         self._obs_dirty = False
         self._added_any = False
+        self._file_check_result = None
         self._refresh_all()
+        self._start_file_check()
+
+    def _start_file_check(self):
+        """Which attached files are missing on disk - off the UI thread, as hundreds
+        of subs on a network drive can take a while."""
+        from SessionFileCheck import FileCheckWorker
+        if self._file_check is not None:
+            self._file_check.stop()
+            _retire_thread(self._file_check)
+        if not self._files:
+            return
+        # No parent: a check still running when the dialog closes is retired, not destroyed
+        self._file_check = FileCheckWorker(self._files)
+        self._file_check.checked.connect(self._on_file_check)
+        self._file_check.start()
+
+    def _on_file_check(self, result):
+        self._file_check_result = result
+        self._refresh_files_table()
+        self._refresh_summary()
 
     def _visible_files(self):
         """Files not belonging to an observation that's pending deletion."""
@@ -2065,12 +2118,86 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
                 str(len(self._observations)),
             ])
 
+    FILES_ALL, FILES_MISSING, FILES_NO_NIGHT = "all", "missing", "no_night"
+
+    def _missing_file_ids(self):
+        return self._file_check_result.missing if self._file_check_result else set()
+
+    def _fill_files_filters(self, every):
+        """The Files tab's filter choices from the files there, keeping each one's selection."""
+        nights = sorted({f["night_date"] for f in every if f["night_date"]})
+        frames = sorted({f["frame_type"] or "Unknown" for f in every})
+        filter_names = sorted({f["filter_name"] or "" for f in every}, key=lambda n: (n == "", n.lower()))
+        checking = self._file_check_result is None and bool(every)
+        choices = {
+            "night": [("All nights", None)] + [(n, n) for n in nights],
+            "frame": [("All frames", None)] + [(t, t) for t in frames],
+            "filter": [("All filters", None)] + [(n or "(no filter)", n) for n in filter_names],
+            "status": [("All files", self.FILES_ALL),
+                       ("Missing on disk (checking...)" if checking else "Missing on disk", self.FILES_MISSING),
+                       ("Not on a night", self.FILES_NO_NIGHT)],
+        }
+        for key, items in choices.items():
+            combo = self.files_filters[key]
+            wanted = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            for text, data in items:
+                combo.addItem(text, data)
+            index = combo.findData(wanted)
+            combo.setCurrentIndex(max(index, 0))
+            combo.blockSignals(False)
+
+    def _filtered_files(self, every):
+        night = self.files_filters["night"].currentData()
+        frame = self.files_filters["frame"].currentData()
+        filter_name = self.files_filters["filter"].currentData()
+        status = self.files_filters["status"].currentData()
+        missing = self._missing_file_ids()
+        return [f for f in every
+                if (night is None or f["night_date"] == night)
+                and (frame is None or (f["frame_type"] or "Unknown") == frame)
+                and (filter_name is None or (f["filter_name"] or "") == filter_name)
+                and (status in (None, self.FILES_ALL)
+                     or (status == self.FILES_MISSING and f["id"] in missing)
+                     or (status == self.FILES_NO_NIGHT and f["observation_id"] is None))]
+
+    def _refresh_files_problem(self, every):
+        from SessionFileCheck import problem_summary
+        if self._file_check_result is None:
+            self.files_problem_label.hide()
+            return
+        text, warning = problem_summary(every, self._file_check_result)
+        if not text:
+            self.files_problem_label.hide()
+            return
+        self.files_problem_label.setText(f"{'⚠ ' if warning else ''}{text}  <a href='clean'>Clean Up...</a>")
+        color = COLORS["warning"] if warning else COLORS["text_secondary"]
+        self.files_problem_label.setStyleSheet(f"color: {color};")
+        self.files_problem_label.show()
+
     def _refresh_files_table(self):
-        files = self._visible_files()
+        every = self._visible_files()
+        self._fill_files_filters(every)
+        self._refresh_files_problem(every)
+        files = self._filtered_files(every)
+        missing = self._missing_file_ids()
+        unreachable = self._file_check_result.unreachable if self._file_check_result else set()
+        # Columns sized to their contents re-measure every row after each setItem
+        # once the table is on screen - a minute for a few hundred files. Fill with
+        # that off, then size the columns once.
+        header = self.files_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        self.files_table.setUpdatesEnabled(False)
         self.files_table.setRowCount(len(files))
         for row, f in enumerate(files):
             path = f["file_path"] or ""
-            self.files_table.setItem(row, 0, _table_item(os.path.basename(path), user_data=f["id"], tooltip=path))
+            name_item = _table_item(os.path.basename(path), user_data=f["id"], tooltip=path)
+            if f["id"] in missing:
+                name_item.setForeground(QColor(COLORS["warning"]))
+                name_item.setToolTip(f"{path}\n\n" + ("Its drive or network share isn't available."
+                                                      if f["id"] in unreachable else "Not found on disk."))
+            self.files_table.setItem(row, 0, name_item)
             night = f["night_date"] or ("—" if f["date_obs"] else "(no date)")
             self.files_table.setItem(row, 1, _table_item(night, Qt.AlignCenter))
             self.files_table.setItem(row, 2, _table_item(f["frame_type"] or "", Qt.AlignCenter))
@@ -2083,11 +2210,15 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
             self.files_table.setItem(row, 6, _table_item(temp, Qt.AlignCenter))
             binning = f"{f['xbinning']}x{f['ybinning'] or f['xbinning']}" if f["xbinning"] else ""
             self.files_table.setItem(row, 7, _table_item(binning, Qt.AlignCenter))
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.files_table.setUpdatesEnabled(True)
 
         frame_counts = Counter(f["frame_type"] or "Unknown" for f in files)
         breakdown = ", ".join(f"{count} {frame}" for frame, count in frame_counts.most_common())
+        shown = f"{len(files)} attached file(s)" if len(files) == len(every) else \
+            f"Showing {len(files)} of {len(every)} attached files"
         self.files_count_label.setText(
-            f"{len(files)} attached file(s)" + (f" — {breakdown}" if breakdown else "")
+            shown + (f" — {breakdown}" if breakdown else "")
             + ("   (right-click to open a folder or remove files)" if files else ""))
 
     def _refresh_summary(self):
@@ -2109,7 +2240,8 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         labels["filters"].setText(", ".join(t[0] for t in totals) or "(none)")
         labels["mount"].setText(self._mount_text())
         labels["range"].setText(date_range)
-        labels["files"].setText(str(len(self._visible_files())))
+        missing = len(self._missing_file_ids() & {f["id"] for f in self._visible_files()})
+        labels["files"].setText(str(len(self._visible_files())) + (f"  ({missing} missing on disk)" if missing else ""))
         labels["target"].setText(self._session_meta.get("target") or "(not linked)")
         labels["created"].setText(self._session_meta.get("created") or "")
         labels["modified"].setText(self._session_meta.get("modified") or "")
@@ -2370,6 +2502,9 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         if self._scan_running():
             self._scan_thread.stop()
             self._scan_thread.wait(30000)
+        if self._file_check is not None:
+            self._file_check.stop()
+            _retire_thread(self._file_check)
         super().done(result)
 
     def _on_scan_finished(self, files, mounts):
@@ -2429,6 +2564,15 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         if dialog.files_changed:
             self._after_immediate_write()
 
+    def _open_file_check(self):
+        if not self._save_pending_before("Cleaning up files"):
+            return
+        from SessionFileCheck import SessionFileCheckDialog
+        dialog = SessionFileCheckDialog(self.session_data, parent=self)
+        dialog.exec()
+        if dialog.changed:
+            self._after_immediate_write()
+
     def _remove_selected_files(self):
         file_ids = self._selected_file_ids()
         if not file_ids:
@@ -2440,6 +2584,8 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
             return
         if not self._save_pending_before("Removing files"):
             return
+        from SessionFileCheck import ask_stranded
+        file_ids += ask_stranded(self, self.db_manager, self.session_id, file_ids)
         try:
             with self.db_manager.get_connection() as conn:
                 SessionObservations.remove_files(conn, self.session_id, file_ids)
@@ -4123,7 +4269,11 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         """Hand the session to Siril/PixInsight from the right-click menu - the
         same handoff as on completion, without the completion choices."""
         from SessionCompletion import SessionCompletionDialog
-        SessionCompletionDialog(session, parent=self, app=app).exec()
+        dialog = SessionCompletionDialog(session, parent=self, app=app)
+        dialog.exec()
+        if dialog.files_changed:  # Cleaned up there - sub counts may have changed
+            self._load_sessions()
+            self._select_session_by_id(session["id"])
 
     def _catalog_data(self, session):
         """Catalogue data for the session's object (for DSO Details / FOV

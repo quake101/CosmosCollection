@@ -787,9 +787,16 @@ class ReviewPage(QWidget):
         self.scan, self.library = scan, library
         self._layout_edited = False
         stopped = scan.cancelled
-        self.banner.setVisible(stopped)
-        self.banner.setText("The scan was stopped before it finished, so this is only part of your library. "
-                            "Scan Again carries on where it stopped." if stopped else "")
+        notes = []
+        if stopped:
+            notes.append("The scan was stopped before it finished, so this is only part of your library. "
+                         "Scan Again carries on where it stopped.")
+        if library.relinked:
+            notes.append(f"{_count(library.relinked, 'session sub')} had moved to a renamed or moved folder - "
+                         f"the Session Manager now points to {'its' if library.relinked == 1 else 'their'} "
+                         f"new location.")
+        self.banner.setVisible(bool(notes))
+        self.banner.setText("\n".join(notes))
         self._rebuild()
 
     def _rel(self, path):

@@ -112,18 +112,23 @@ def load_cached(conn, paths):
             f"WHERE file_path IN ({','.join('?' * len(chunk))})", chunk).fetchall()
         for path, size, mtime_ns, version, metrics_json in rows:
             try:
-                cached[path] = (size, mtime_ns, version, FrameQuality.FrameMetrics.from_dict(json.loads(metrics_json)))
+                # The path is the row's only: older saves also kept one in the JSON,
+                # stale once a folder was renamed or moved (relinked)
+                metrics = FrameQuality.FrameMetrics.from_dict({**json.loads(metrics_json), "path": path})
             except (TypeError, ValueError):
                 continue
+            cached[path] = (size, mtime_ns, version, metrics)
     return cached
 
 
 def save_cached(conn, entries):
-    """entries: [(FrameMetrics, size, mtime_ns)]. Does not commit."""
+    """entries: [(FrameMetrics, size, mtime_ns)]. The path is stored only as the
+    row's key, so moving a file is one update. Does not commit."""
     conn.executemany(
         "INSERT OR REPLACE INTO framequality (file_path, file_size, file_mtime_ns, version, metrics_json) "
         "VALUES (?, ?, ?, ?, ?)",
-        [(m.path, size, mtime_ns, m.version, json.dumps(m.to_dict())) for m, size, mtime_ns in entries])
+        [(m.path, size, mtime_ns, m.version, json.dumps({k: v for k, v in m.to_dict().items() if k != "path"}))
+         for m, size, mtime_ns in entries])
 
 
 # ---- Grading a session from saved measurements -------------------------------------
@@ -2041,7 +2046,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
                 "The files stay where they are on disk - only the session forgets them.",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
-        if self._record_removed({p: p for p in paths}, mode=None):
+        if self._record_removed({p: p for p in paths}, mode=None, extra_ids=self._ask_stranded(paths)):
             self.status_label.setText(f"Removed {len(paths)} frame(s) from the session.")
 
     def _move_checked(self):
@@ -2118,7 +2123,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
     def _on_file_operation_done(self, mode, finished, failed):
         self._file_op_running = False
         self._op_progress.close()
-        recorded = bool(finished) and self._record_removed(finished, mode)
+        recorded = bool(finished) and self._record_removed(finished, mode, extra_ids=self._ask_stranded(finished))
         if recorded:
             if mode == FileOperationWorker.MOVE:
                 where = (f"'{SessionFileScanner.REJECTED_FOLDER}' folders" if self._file_op.destination is None
@@ -2134,16 +2139,24 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
                                 f"and are still in the session:\n\n{lines}{more}")
         self._update_action_buttons()
 
-    def _record_removed(self, changed, mode):
+    def _ask_stranded(self, paths):
+        """Ids of the flats/darks/bias to remove with these lights, when they empty
+        a night and the user says so (SessionFileCheck.ask_stranded)."""
+        from SessionFileCheck import ask_stranded
+        return ask_stranded(self, self.db_manager, self.session["id"], [self._lights[p]["id"] for p in paths])
+
+    def _record_removed(self, changed, mode, extra_ids=()):
         """Detach frames from the session - changed maps each path to its new
         path when moved, or None when deleted - and update other sessions and
-        the saved measurements to match. Returns False if the database update failed."""
+        the saved measurements to match. extra_ids: other session files to detach
+        too (a night's calibration frames). Returns False if the database update failed."""
         session_id = self.session["id"]
         # Looked up before the transaction, so it only holds the writes
         others =self._other_sessions(changed) if mode == FileOperationWorker.DELETE else {}
         try:
             with self.db_manager.get_connection() as conn:
-                SessionObservations.remove_files(conn, session_id, [self._lights[p]["id"] for p in changed])
+                SessionObservations.remove_files(conn, session_id,
+                                                 [self._lights[p]["id"] for p in changed] + list(extra_ids))
                 if mode == FileOperationWorker.MOVE:
                     for old, new in changed.items():
                         conn.execute("UPDATE usersessionfiles SET file_path = ? WHERE file_path = ? AND session_id != ?",
@@ -2293,7 +2306,10 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         # Worked out now, so it matches the current percent and checks
         paths = self._stack_paths(choice) if choice == LIGHTS_PICKED else None
         self.accept()
-        SessionCompletionDialog(session, parent=parent, app=app, light_choice=choice, light_paths=paths).exec()
+        completion = SessionCompletionDialog(session, parent=parent, app=app, light_choice=choice, light_paths=paths)
+        completion.exec()
+        if completion.files_changed:
+            self.files_changed = True  # So Session Details reloads its files
 
     # ---- Selection, preview and menu ------------------------------------
 

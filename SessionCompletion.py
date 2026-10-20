@@ -10,6 +10,7 @@ target Completed too. The handoff logic lives in ProcessingHandoff.py.
 import os
 import time
 import logging
+from collections import Counter
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QThread, Signal, QProcess, QProcessEnvironment, QUrl, QTimer, QSettings
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, 
 
 import ProcessingHandoff as handoff
 import LightQualityReview
+import SessionObservations
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, font_size, themed_style
@@ -141,6 +143,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self._exposures = {}       # path -> exposure seconds
         self._picked_lights = set(light_paths or ())
         self._requested_light_choice = light_choice
+        self.files_changed = False  # The session's files were relinked or removed here (Clean Up)
 
         self.setWindowTitle(f"Process in {handoff.APP_LABELS[app]}" if app else "Session Completed")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
@@ -201,6 +204,8 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self.missing_label = QLabel()
         themed_style(self.missing_label, lambda: f"color: {COLORS['warning']};")
         self.missing_label.setWordWrap(True)
+        self.missing_label.setTextFormat(Qt.RichText)
+        self.missing_label.linkActivated.connect(lambda _link: self._open_file_check())
         self.missing_label.hide()
         layout.addWidget(self.missing_label)
 
@@ -293,9 +298,11 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
             return  # staging already started - it skips missing files itself
         if missing:
             self._missing |= set(missing)
+            kinds = self._missing_kinds(missing)  # before remove_frames empties the groups
             handoff.remove_frames(self.frames, missing)
-            self.missing_label.setText(f"{len(missing)} attached file(s) no longer exist on disk and will be "
-                                       "left out of any handoff.")
+            self.missing_label.setText(f"{kinds} attached to the session no longer "
+                                       f"{'exists' if len(missing) == 1 else 'exist'} on disk and will be "
+                                       "left out of any handoff. <a href='clean'>Clean Up...</a>")
             self.missing_label.show()
             self._fill_lights_combo()  # its counts leave the missing files out
             self._apply_light_choice()
@@ -306,6 +313,51 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self.osc_checkbox.setText(self.OSC_LABEL)
         if not self._osc_touched:
             self.osc_checkbox.setChecked(osc)
+
+    def _missing_kinds(self, missing):
+        """'3 lights and 20 flats' - which frame types the missing files are, so
+        missing calibration frames don't read as lights the quality review missed."""
+        kind = {}
+        for paths, frame_type in ([(p, "Light") for p in self._all_lights.values()]
+                                  + [(p, "Flat") for p in self.frames.flats.values()]
+                                  + [(self.frames.darks, "Dark"), (self.frames.biases, "Bias")]):
+            for path in paths:
+                kind.setdefault(path, frame_type)
+        return SessionObservations.describe_frame_counts(Counter(kind.get(p) for p in missing))
+
+    def _open_file_check(self):
+        """Relink moved files or remove missing ones (SessionFileCheck), then load the frames again."""
+        if self._stage_worker is not None:
+            return
+        from SessionFileCheck import SessionFileCheckDialog
+        dialog = SessionFileCheckDialog(self.session, parent=self)
+        dialog.exec()
+        if dialog.changed:
+            self.files_changed = True
+            self._reload_frames()
+
+    def _reload_frames(self):
+        """The session's frames from the database again, keeping calibration
+        frames added from folders in this dialog (those aren't in the session)."""
+        old = self.frames
+        if self._frame_check is not None:
+            _retire_thread(self._frame_check)
+            self._frame_check = None
+        self._missing = set()
+        self.missing_label.hide()
+        self._load()
+        attached = set(self.frames.all_paths())
+        for key, paths in old.flats.items():
+            extra = [p for p in paths if p not in attached]
+            if extra:
+                self.frames.flats.setdefault(key, []).extend(extra)
+        self.frames.darks.extend(p for p in old.darks if p not in attached)
+        self.frames.biases.extend(p for p in old.biases if p not in attached)
+        self.frames.added_counts, self.frames.retype = old.added_counts, old.retype
+        self._fill_lights_combo()
+        self._apply_light_choice()
+        self._refresh_calibration_labels()
+        self._start_frame_check()
 
     def done(self, result):
         # Never let the frame-check thread be garbage-collected mid-run with the dialog.

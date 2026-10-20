@@ -455,14 +455,14 @@ def load_session_files(conn, session_id):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT f.id, f.observation_id, f.file_path, f.frame_type, f.filter_name, f.exptime_seconds, f.gain,
-               f.ccd_temp, f.xbinning, f.ybinning, f.date_obs, o.night_date
+               f.ccd_temp, f.xbinning, f.ybinning, f.date_obs, o.night_date, f.sub_key
         FROM usersessionfiles f
         LEFT JOIN usersessionobservations o ON o.id = f.observation_id
         WHERE f.session_id = ?
         ORDER BY f.date_obs, f.file_path
     """, (session_id,))
     columns = ["id", "observation_id", "file_path", "frame_type", "filter_name", "exptime_seconds", "gain",
-               "ccd_temp", "xbinning", "ybinning", "date_obs", "night_date"]
+               "ccd_temp", "xbinning", "ybinning", "date_obs", "night_date", "sub_key"]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
@@ -477,6 +477,94 @@ def remove_files(conn, session_id, file_ids):
                        f"({','.join('?' * len(chunk))})", [session_id] + chunk)
     assign_files_to_observations(conn, session_id)
     recompute_session_aggregates(conn, session_id, promote=False)
+
+
+def calibration_left_without_night(conn, session_id, file_ids):
+    """The calibration frames removing file_ids would strand: for each night whose
+    lights are all being removed (and that would then be dropped - not one the user
+    made, logged subs on or wrote notes for), its other files.
+    {night_date: [(file id, frame type)]}, oldest night first."""
+    removing = set(file_ids)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT f.id, f.observation_id, f.frame_type, o.night_date, o.is_manual
+        FROM usersessionfiles f JOIN usersessionobservations o ON o.id = f.observation_id
+        WHERE f.session_id = ?
+    """, (session_id,))
+    nights = {}  # observation id -> {"night", "manual", "lights_left", "others"}
+    for file_id, obs_id, frame_type, night_date, is_manual in cursor.fetchall():
+        night = nights.setdefault(obs_id, {"night": night_date, "manual": bool(is_manual),
+                                           "touched": False, "lights_left": False, "others": []})
+        if file_id in removing:
+            night["touched"] = True
+        elif frame_type == "Light":
+            night["lights_left"] = True
+        else:
+            night["others"].append((file_id, frame_type))
+    stranded = {}
+    for obs_id, night in nights.items():
+        if (night["touched"] and not night["lights_left"] and night["others"] and not night["manual"]
+                and not _has_user_content(cursor, obs_id)):
+            stranded[night["night"]] = night["others"]
+    return dict(sorted(stranded.items()))
+
+
+FRAME_NOUNS = {"Light": ("light", "lights"), "Flat": ("flat", "flats"), "Dark": ("dark", "darks"),
+               "Bias": ("bias", "biases")}
+
+
+def describe_frame_counts(counts):
+    """'3 lights and 20 flats' from {frame type: count}."""
+    order = list(FRAME_NOUNS)
+    parts = []
+    for frame_type, n in sorted(counts.items(), key=lambda item: order.index(item[0]) if item[0] in order
+                                else len(order)):
+        one, many = FRAME_NOUNS.get(frame_type, ("file", "files"))
+        parts.append(f"{n} {one if n == 1 else many}")
+    return " and ".join([", ".join(parts[:-1]), parts[-1]] if len(parts) > 1 else parts)
+
+
+def stranded_calibration_text(stranded):
+    """'the night of 2026-10-04 (20 flats)' for calibration_left_without_night()'s result."""
+    nights = [f"{night} ({describe_frame_counts(Counter(t for _id, t in files))})"
+              for night, files in stranded.items()]
+    return ("the night of " if len(nights) == 1 else "the nights of ") + ", ".join(nights)
+
+
+def relink_files(conn, moves):
+    """Point attached files at where they are now - moves: [(file id, old path,
+    new path)] - and carry their saved quality measurements along. Does not commit."""
+    cursor = conn.cursor()
+    for file_id, old, new in moves:
+        # OR IGNORE: a row for the new path already in that session keeps its own
+        cursor.execute("UPDATE OR IGNORE usersessionfiles SET file_path = ? WHERE id = ?", (new, file_id))
+    try:
+        for _file_id, old, new in moves:
+            cursor.execute("UPDATE OR REPLACE framequality SET file_path = ? WHERE file_path = ?", (new, old))
+    except Exception as e:
+        logger.debug(f"No quality measurements to move: {e}")  # The review has never run
+
+
+def relink_moved(conn, found):
+    """found: [(path, sub_key)] of subs on disk now. Attached files with the same
+    fingerprint whose own path is gone are pointed at the found path - a renamed
+    or moved folder. Returns the moves made [(file id, old, new)]. Does not commit."""
+    by_key = {}
+    for path, key in found:
+        if key and path:
+            by_key.setdefault(key, path)
+    cursor = conn.cursor()
+    moves = []
+    for chunk in _chunks(sorted(by_key)):
+        cursor.execute(f"SELECT id, file_path, sub_key FROM usersessionfiles "
+                       f"WHERE sub_key IN ({','.join('?' * len(chunk))})", chunk)
+        for file_id, old, key in cursor.fetchall():
+            new = by_key[key]
+            # Only checked when the paths differ, so re-attaching a folder stays cheap
+            if _normalized_path(old) != _normalized_path(new) and not os.path.isfile(old):
+                moves.append((file_id, old, new))
+    relink_files(conn, moves)
+    return moves
 
 
 def recompute_session_aggregates(conn, session_id, promote=True):
@@ -615,16 +703,22 @@ def count_already_attached(conn, file_dicts):
 
 
 def attach_files(conn, session_id, file_dicts):
-    """Insert scanned files into a session, skipping every kind of duplicate.
-    Does not commit. Returns a report dict:
-      {"inserted": n, "dup_in_session": n, "dup_other_sessions": Counter({label: n})}"""
-    report = {"inserted": 0, "dup_in_session": 0, "dup_other_sessions": Counter()}
+    """Insert scanned files into a session, skipping every kind of duplicate. An
+    attached sub whose file is gone but turns up here (a renamed or moved folder)
+    is pointed at its new path instead. Does not commit. Returns a report dict:
+      {"inserted": n, "relinked": n, "dup_in_session": n, "dup_other_sessions": Counter({label: n})}"""
+    report = {"inserted": 0, "relinked": 0, "dup_in_session": 0, "dup_other_sessions": Counter()}
     rows = _rows_from_file_dicts(file_dicts)
     if not rows:
         return report
 
+    moves = relink_moved(conn, [(r["file_path"], r["sub_key"]) for r in rows])
+    report["relinked"] = len(moves)
+    relinked = {_normalized_path(new) for _id, _old, new in moves}
     cursor = conn.cursor()
     for row, owner in zip(rows, _find_owners(conn, session_id, rows)):
+        if _normalized_path(row["file_path"]) in relinked:
+            continue
         if owner:
             report["dup_other_sessions"][owner] += 1
             continue
@@ -650,9 +744,13 @@ def attach_files(conn, session_id, file_dicts):
 def format_attach_report(report):
     """Human-readable summary of an attach_files() report, or '' if every file was new."""
     other_total = sum(report["dup_other_sessions"].values())
-    if not report["dup_in_session"] and not other_total:
+    relinked = report.get("relinked", 0)
+    if not report["dup_in_session"] and not other_total and not relinked:
         return ""
     lines = [f"{report['inserted']} new file(s) attached."]
+    if relinked:
+        lines.append(f"{relinked} attached file(s) had moved (a renamed or moved folder) and now point to "
+                     f"their new location.")
     if report["dup_in_session"]:
         lines.append(f"{report['dup_in_session']} file(s) were already in this session and were skipped.")
     if other_total:
