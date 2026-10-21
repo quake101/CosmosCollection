@@ -45,6 +45,7 @@ import SessionFileScanner
 import SessionObservations
 from SessionObservations import make_sub_key, parse_obs_datetime, night_date_for
 from DatabaseManager import add_user_image_row
+from DSONames import CATALOG_RANK, pick_common_name, with_common_name
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +126,6 @@ POSITION_MATCH_RADIUS = 0.25
 POSITION_MISMATCH_DEG = 3.0
 
 NOT_DSO_TYPES = {"1STAR", "2STAR", "3STAR", "4STAR", "NONEX"}
-CATALOG_RANK = {"M": 0, "NGC": 1, "IC": 2, "Sh2": 3, "Barnard": 3, "LDN": 3, "vdB": 3, "LBN": 4,
-                "Caldwell": 5, "Abell": 5, "Arp": 5, "Collinder": 5, "Melotte": 5, "Ced": 5}
 
 # Catalog prefixes as people write them -> the catalog's own name
 CATALOG_ALIASES = {
@@ -682,11 +681,6 @@ class Resolution:
     mismatch_deg: Optional[float] = None         # name-matched DSO far from the pointing
 
 
-# Words that say what a common name is of - preferred for labels
-COMMON_NAME_TYPE = re.compile(r"\b(nebula|galaxy|cluster|cloud|loop|remnant|pillars|group|triplet|quintet)\b",
-                              re.IGNORECASE)
-
-
 def natural_sort_key(text):
     """'M 2' before 'M 13'."""
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text or "")]
@@ -750,21 +744,11 @@ class Catalog:
         return math.degrees(float(self.ra[n])), math.degrees(float(self.dec[n]))
 
     def label_of(self, dsodetailid):
-        """'IC 443 - Jellyfish Nebula': its best designation and its best-known
-        common name - preferably the shortest that says what it is ('Orion
-        Nebula', not 'Ori Nebula' or radio-source codes like 'Gem A')."""
+        """'IC 443 - Jellyfish Nebula': its best designation and its common name
+        (the same one the rest of the app shows, see DSONames)."""
         name = self.name_of(dsodetailid)
-        common = self.common_names.get(dsodetailid)
-        if not common:
-            return name
-
-        def plain_words(n):  # No digits or abbreviations ('Ori', 'NEB')
-            words = re.findall(r"[A-Za-z]+", n)
-            return not re.search(r"\d", n) and words and all(
-                len(w) >= 4 or w.lower() in ("of", "in", "the", "a") for w in words) and not n.isupper()
-        described = [n for n in common if plain_words(n) and COMMON_NAME_TYPE.search(n)]
-        nicknames = [n for n in common if plain_words(n)]
-        return f"{name} - {min(described or nicknames or common, key=len)}"
+        common = pick_common_name(self.common_names.get(dsodetailid, []))
+        return f"{name} - {common}" if common else name
 
     def search(self, text, limit=200):
         """[dsodetailid] matching what someone typed - a designation ('m31',
@@ -2094,10 +2078,11 @@ def _format_integration(seconds):
     return f"{hours}h" if hours else f"{minutes}m"
 
 
-def import_library(conn, library, progress=None, cancelled=None, today=None):
+def import_library(conn, library, progress=None, cancelled=None, today=None, common_names=False):
     """Import the checked sessions and images; returns an ImportReport. Each
     session (and the images at the end) is its own transaction, so stopping part
-    way keeps what was done. progress(done, total, text); cancelled() -> bool."""
+    way keeps what was done. progress(done, total, text); cancelled() -> bool;
+    common_names: name new sessions "M 31 (Andromeda Galaxy)" rather than "M 31"."""
     progress = progress or (lambda done, total, text: None)
     cancelled = cancelled or (lambda: False)
     today = today or datetime.now().date()
@@ -2122,7 +2107,8 @@ def import_library(conn, library, progress=None, cancelled=None, today=None):
                               f"{len(session.lights):,} subs")
         try:
             report.session_ids[id(session)] = _import_session(conn, session, group, all_finals, library, catalog,
-                                                               by_path, by_key, locations, targets, today, report)
+                                                               by_path, by_key, locations, targets, today, report,
+                                                               common_names)
             conn.commit()
         except Exception as e:
             conn.rollback()
@@ -2159,13 +2145,16 @@ def import_library(conn, library, progress=None, cancelled=None, today=None):
 
 
 def _import_session(conn, session, group, all_finals, library, catalog, by_path, by_key, locations, targets,
-                    today, report):
+                    today, report, common_names=False):
     session_id = _existing_session(session, by_path, by_key)
     if session_id is not None:
-        report.sessions_extended += 1
+        report.sessions_extended += 1  # Keeps the name it has
     else:
         status = _status(session, all_finals, library.session_gap_days, today)
         ra, dec = catalog.position(group.dsodetailid) if catalog else (None, None)
+        name = group.name
+        if common_names and catalog and group.dsodetailid:
+            name = with_common_name(name, pick_common_name(catalog.common_names.get(group.dsodetailid, [])))
         lat, lon, location_name, tz, source = _session_location(session, locations)
         nights = session.nights
         folder = os.path.commonpath(session.folders) if len(session.folders) > 1 else session.folders[0]
@@ -2175,7 +2164,7 @@ def _import_session(conn, session, group, all_finals, library, catalog, by_path,
                 location_lat, location_lon, location_name, location_timezone, location_source,
                 telescope_id, camera_id, camera, notes, modified_date
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (_target_id(group.name, targets), group.name, ra, dec, status,
+        """, (_target_id(group.name, targets), name, ra, dec, status,
               nights[0].isoformat() if nights else today.isoformat(),
               lat, lon, location_name, tz, source, session.telescope_id, session.camera_id, session.camera or None,
               f"Imported from {folder}", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))

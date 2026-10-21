@@ -19,6 +19,7 @@ from astropy import units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 from DatabaseManager import DatabaseManager
+from DSONames import display_name
 from HorizonProfile import load_active_horizon
 from ResourceManager import ResourceManager
 from WindowPositionManager import WindowPositionMixin
@@ -1033,7 +1034,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         """framing: a session's saved framing to show (see load_session_framing);
         session_id: the session it was opened from - Save to Session offers it first."""
         super().__init__(parent)
-        self.setWindowTitle(f"{data['name']} - FOV Simulator - Cosmos Collection")
+        self.setWindowTitle(f"{display_name(data['name'], data.get('dsodetailid'), data.get('designations'))}"
+                            " - FOV Simulator - Cosmos Collection")
         self.resize(1200, 800)
         self.setup_window_position()
 
@@ -2306,7 +2308,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
     def _create_planned_session(self, conn):
         """A new planned session for tonight at the active location. Returns its id."""
-        name = self.data.get('name') or "Target"
+        name = display_name(self.data.get('name') or "Target", self.data.get('dsodetailid'),
+                            self.data.get('designations'), conn=conn)
         ra, dec = self._target_position()
         location = conn.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings "
                                 "WHERE is_active = 1 LIMIT 1").fetchone() or (None, None, None, None)
@@ -3126,7 +3129,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         """Frame a new object here: a fresh single frame on it (the equipment stays)."""
         self.data = data
         name = data.get('name') or "Target"
-        self.setWindowTitle(f"{name} - FOV Simulator - Cosmos Collection")
+        self.setWindowTitle(f"{display_name(name, data.get('dsodetailid'), data.get('designations'))}"
+                            " - FOV Simulator - Cosmos Collection")
         self.default_fov = default_view_fov(data)
         self.session_id = None
         self.framing_note = None

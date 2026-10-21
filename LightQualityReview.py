@@ -973,7 +973,9 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._load_preview)
 
-        self.setWindowTitle(f"Light Quality - {self.session.get('dso_name', '')} {self.session.get('session_date', '')}")
+        from DSONames import display_name
+        self.setWindowTitle(f"Light Quality - {display_name(self.session.get('dso_name', ''))} "
+                            f"{self.session.get('session_date', '')}")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.WindowMaximizeButtonHint)
         self.setModal(True)
         self.resize(1400, 820)  # default size the first time this dialog is ever opened

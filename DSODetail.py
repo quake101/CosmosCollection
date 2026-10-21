@@ -230,7 +230,9 @@ class DSODetailWindow(QDialog):
     def __init__(self, data: dict, parent=None):
         super().__init__(None)
         logger.debug(f"Creating DSODetailWindow for {data['name']}")
-        self.setWindowTitle(f"{data['name']} - DSO Detail - Cosmos Collection")
+        from DSONames import display_name
+        self.setWindowTitle(f"{display_name(data['name'], data.get('dsodetailid'), data.get('designations'))}"
+                            " - DSO Detail - Cosmos Collection")
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.setWindowModality(Qt.NonModal)
@@ -956,19 +958,21 @@ class DSODetailWindow(QDialog):
             return
 
         try:
-            # Import here to avoid circular imports
-            from main import CustomDSOVisibilityWindow
+            from DSOVisibilityCalculator import DSOVisibilityApp
 
-            # Create a formatted object name for the visibility calculator
             object_name = self.data['name']
-
-            # Get coordinates from the data
             ra_deg = self.data.get('ra_deg')
             dec_deg = self.data.get('dec_deg')
 
-            # Create new visibility window with coordinates
-            self.visibility_window = CustomDSOVisibilityWindow(object_name, self, ra_deg, dec_deg)
+            # The calculator's own window (like everywhere else that opens it), so
+            # its close stops its threads and tooltips
+            self.visibility_window = DSOVisibilityApp()
+            self.visibility_window.dso_input.setText(object_name)
+            self.visibility_window.set_dso_coordinates(ra_deg, dec_deg)
             self.visibility_window.show()
+            self.visibility_window.raise_()
+            self.visibility_window.activateWindow()
+            QTimer.singleShot(500, self.visibility_window.calculate_visibility)
 
             logger.debug(f"Opened visibility calculator for {object_name} with coordinates RA={ra_deg}, Dec={dec_deg}")
 
@@ -1480,11 +1484,13 @@ class DSODetailWindow(QDialog):
         if self.original_pixmap is not None:
             try:
                 from ImageViewer import ImageViewerWindow
+                from DSONames import display_name
 
                 ra_deg = self.data.get("ra_deg")
                 dec_deg = self.data.get("dec_deg")
+                title = display_name(self.data["name"], self.data.get("dsodetailid"), self.data.get("designations"))
                 viewer = ImageViewerWindow(
-                    self.original_pixmap, self.data["name"], self.current_image_path, self,
+                    self.original_pixmap, title, self.current_image_path, self,
                     dso_ra=ra_deg, dso_dec=dec_deg
                 )
                 viewer.setModal(False)

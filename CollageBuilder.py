@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QForm
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, contrast_text, font_px, themed_style, theme_manager
 from DatabaseManager import DatabaseManager
+from DSONames import CONSTELLATIONS, load_common_names
 from PlateSolver import describe_solving
 from SessionObservations import parse_obs_datetime
 from AnnotationOverlay import (ANNOTATION_LAYERS, DEFAULT_ANNOTATION_LAYERS, annotation_store,
@@ -284,18 +285,6 @@ def load_library(conn):
     for row in rows:
         row["common_name"] = common.get(str(row["dsodetailid"]))
     return rows
-
-
-def load_common_names(conn, dsodetailids):
-    """{dsodetailid: readable common name} ("Bode's Galaxy") from the NAME catalog."""
-    ids = sorted({str(i) for i in dsodetailids if i})
-    aliases = {}
-    for start in range(0, len(ids), 500):
-        chunk = ids[start:start + 500]
-        for dso, name in conn.execute(f"SELECT dsodetailid, designation FROM cataloguenr WHERE catalogue = 'NAME' "
-                                      f"AND dsodetailid IN ({','.join('?' * len(chunk))})", chunk).fetchall():
-            aliases.setdefault(str(dso), []).append(str(name))
-    return {dso: name for dso, names in aliases.items() if (name := pick_common_name(names))}
 
 
 def convert_grid_layout(collage, grid_width, grid_height, cell_size, spacing, images):
@@ -899,27 +888,6 @@ def rotate_cursor():
 
 MIN_SUGGESTION = 4  # A suggestion needs at least this many images
 
-CONSTELLATIONS = {
-    "AND": "Andromeda", "ANT": "Antlia", "APS": "Apus", "AQR": "Aquarius", "AQL": "Aquila", "ARA": "Ara",
-    "ARI": "Aries", "AUR": "Auriga", "BOO": "Boötes", "CAE": "Caelum", "CAM": "Camelopardalis",
-    "CNC": "Cancer", "CVN": "Canes Venatici", "CMA": "Canis Major", "CMI": "Canis Minor",
-    "CAP": "Capricornus", "CAR": "Carina", "CAS": "Cassiopeia", "CEN": "Centaurus", "CEP": "Cepheus",
-    "CET": "Cetus", "CHA": "Chamaeleon", "CIR": "Circinus", "COL": "Columba", "COM": "Coma Berenices",
-    "CRA": "Corona Australis", "CRB": "Corona Borealis", "CRV": "Corvus", "CRT": "Crater", "CRU": "Crux",
-    "CYG": "Cygnus", "DEL": "Delphinus", "DOR": "Dorado", "DRA": "Draco", "EQU": "Equuleus",
-    "ERI": "Eridanus", "FOR": "Fornax", "GEM": "Gemini", "GRU": "Grus", "HER": "Hercules",
-    "HOR": "Horologium", "HYA": "Hydra", "HYI": "Hydrus", "IND": "Indus", "LAC": "Lacerta", "LEO": "Leo",
-    "LMI": "Leo Minor", "LEP": "Lepus", "LIB": "Libra", "LUP": "Lupus", "LYN": "Lynx", "LYR": "Lyra",
-    "MEN": "Mensa", "MIC": "Microscopium", "MON": "Monoceros", "MUS": "Musca", "NOR": "Norma",
-    "OCT": "Octans", "OPH": "Ophiuchus", "ORI": "Orion", "PAV": "Pavo", "PEG": "Pegasus", "PER": "Perseus",
-    "PHE": "Phoenix", "PIC": "Pictor", "PSC": "Pisces", "PSA": "Piscis Austrinus", "PUP": "Puppis",
-    "PYX": "Pyxis", "RET": "Reticulum", "SGE": "Sagitta", "SGR": "Sagittarius", "SCO": "Scorpius",
-    "SCL": "Sculptor", "SCT": "Scutum", "SER": "Serpens", "SEX": "Sextans", "TAU": "Taurus",
-    "TEL": "Telescopium", "TRI": "Triangulum", "TRA": "Triangulum Australe", "TUC": "Tucana",
-    "UMA": "Ursa Major", "UMI": "Ursa Minor", "VEL": "Vela", "VIR": "Virgo", "VOL": "Volans",
-    "VUL": "Vulpecula",
-}
-
 # Object types by dsodetail.dsotype - broad groups first
 TYPE_GROUPS = (
     ("galaxies", "Galaxies", {"GALXY", "GALCL", "GX+DN"}),
@@ -938,34 +906,11 @@ PLACEHOLDER_CATALOGS = {"M": ("Messier", 110), "Caldwell": ("Caldwell", 109), "S
 CATALOG_TITLES = {"M": "Messier", "Sh2": "Sharpless", "LBN": "Lynds Bright Nebulae",
                   "LDN": "Lynds Dark Nebulae", "Barnard": "Barnard", "Caldwell": "Caldwell"}
 CATALOG_PREFIXES = {"Sh2": "Sh2-"}  # "Sh2-155", not "Sh2 155"
-COMMON_NAME_WORDS = {"nebula", "galaxy", "cluster", "remnant", "loop", "veil", "cloud", "pillars", "pinwheel",
-                     "whirlpool", "sombrero", "pleiades", "beehive", "rosette", "lagoon", "trifid", "eagle"}
 
 
 def slot_label(catalogue, designation):
     return f"{CATALOG_PREFIXES[catalogue]}{designation}" if catalogue in CATALOG_PREFIXES \
         else f"{catalogue} {designation}"
-
-
-def pick_common_name(aliases):
-    """The most readable of an object's NAME aliases: "Orion Nebula", not
-    "Ori Nebula" or "CRAB NEB"."""
-    def score(name):
-        words = name.split()
-        abbreviation = any(word.upper() in CONSTELLATIONS and len(word) == 3 for word in words)
-        descriptive = words[-1].lower() in COMMON_NAME_WORDS
-        return (abbreviation, not descriptive, len(words) == 1, len(name))
-    readable = [name for name in aliases if name and not name.isupper() and len(name) > 3
-                and not CATALOG_NUMBER_NAME.search(name)]
-    return min(readable, key=score) if readable else None
-
-
-# "New General Catalogue 6913", "Messier Object 106", "NGC 2244 Satellite
-# Cluster": a catalog number in words, not a name
-CATALOG_NUMBER_NAME = re.compile(
-    r"(?i)(?=.*\d)(?=.*\b(?:catalog|catalogue|messier|object|ngc|ic|index|melotte|collinder|caldwell|"
-    r"sharpless|sh2|lbn|ldn|barnard|ugc|pgc|abell|cr|mel)\b)"
-    r"|\b(?:M|NGC|IC|Sh2|C)[\s-]?\d+\b")  # ...or the designation itself ("Spiral Galaxy M106")
 
 
 def read_capture_date(path):
@@ -1039,14 +984,8 @@ def load_catalog_members(conn, catalogue):
         designation = str(designation).strip()
         if designation.isdigit() and 1 <= int(designation) <= limit and int(designation) not in members:
             members[int(designation)] = str(dso)
-    names = {}
-    ids = list(members.values())
-    for start in range(0, len(ids), 500):
-        chunk = ids[start:start + 500]
-        for dso, name in conn.execute(f"SELECT dsodetailid, designation FROM cataloguenr WHERE catalogue = 'NAME' "
-                                      f"AND dsodetailid IN ({','.join('?' * len(chunk))})", chunk).fetchall():
-            names.setdefault(str(dso), []).append(str(name))
-    return [(number, slot_label(catalogue, number), dso, pick_common_name(names.get(dso, [])))
+    names = load_common_names(conn, members.values())
+    return [(number, slot_label(catalogue, number), dso, names.get(dso))
             for number, dso in sorted(members.items())]
 
 

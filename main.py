@@ -833,51 +833,6 @@ class SimbadLoadingDialog(QDialog):
 
 
 # --- Custom Visibility Window Class ---
-class CustomDSOVisibilityWindow(QDialog):
-    """Custom wrapper for the DSO Visibility Calculator"""
-
-    def __init__(self, dso_name: str, parent=None, ra_deg=None, dec_deg=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"{dso_name} - DSO Visibility Calculator - Cosmos Collection")
-        self.setWindowFlags(
-            Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
-        self.resize(1200, 800)
-        WindowPositionManager.restore_window_position(self, "CustomDSOVisibility")
-
-        # Create layout
-        layout = QVBoxLayout()
-
-        # Create the visibility app widget (lazy-loaded)
-        from DSOVisibilityCalculator import DSOVisibilityApp
-        self.visibility_app = DSOVisibilityApp()
-
-        # Pre-populate with the DSO name
-        self.visibility_app.dso_input.setText(dso_name)
-
-        # If coordinates are provided, set them for direct calculation
-        if ra_deg is not None and dec_deg is not None:
-            self.visibility_app.set_dso_coordinates(ra_deg, dec_deg)
-
-        # Remove the window frame from the visibility app and add its central widget
-        central_widget = self.visibility_app.centralWidget()
-        layout.addWidget(central_widget)
-
-        # Add close button
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.close)
-        layout.addWidget(close_button)
-
-        self.setLayout(layout)
-
-        # Calculate visibility immediately
-        QTimer.singleShot(100, self.visibility_app.calculate_visibility)
-
-    def closeEvent(self, event):
-        """Save window position when closing"""
-        WindowPositionManager.save_window_position(self, "CustomDSOVisibility")
-        event.accept()
-
-
 # User tables included in backups, in restore order (parents before children)
 BACKUP_TABLES = [
     "usersettings", "usertelescopes", "userequipment", "telescope_equipment",
@@ -3825,9 +3780,14 @@ class BulkAddToTargetDialog(QDialog):
         self.setModal(True)
         self.resize(700, 500)
 
-        self.dso_list = sorted(dso_list, key=lambda e: e.get('name', ''))
+        from DSONames import display_name
+        # Each entry under the name it'll be added as, "M 31 (Andromeda Galaxy)"
+        self.dso_list = sorted(
+            ({**e, 'name': display_name(e.get('name', ''), designations=e.get('designations'))}
+             for e in dso_list),
+            key=lambda e: e.get('name', ''))
         # Build a lookup by name for retrieval during save
-        self._dso_by_name = {e['name']: e for e in dso_list}
+        self._dso_by_name = {e['name']: e for e in self.dso_list}
         self.db_manager = DatabaseManager()
 
         self._setup_ui()

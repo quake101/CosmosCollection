@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QStyledItemDelegate)
 
 from DatabaseManager import DatabaseManager
+from DSONames import SESSION_COMMON_NAMES_SETTING, display_name, suggestion_names
 from WindowPositionManager import WindowPositionMixin
 from TimeFormatHelper import format_time
 from Theme import COLORS, font_px, font_size, themed_style
@@ -328,6 +329,14 @@ class SessionFormWidget(QWidget):
         self._completer.activated.connect(self._on_dso_selected)
         self.name_edit.textChanged.connect(self._on_name_text_changed)
         name_row.addWidget(self.name_edit)
+        # For a session made from scanned files: "M 31" or "M 31 (Andromeda Galaxy)"
+        self.common_name_check = QCheckBox("Add common name")
+        self.common_name_check.setToolTip('Name the session like "M 31 (Andromeda Galaxy)" rather than "M 31". '
+                                          'Remembered for the next scan and the import wizard.')
+        self.common_name_check.setVisible(False)
+        self.common_name_check.toggled.connect(self._on_common_name_toggled)
+        self._scanned_names = None  # (plain, with common name) for the check box
+        name_row.addWidget(self.common_name_check)
         schedule_layout.addLayout(name_row)
 
         status_row = QHBoxLayout()
@@ -507,7 +516,7 @@ class SessionFormWidget(QWidget):
 
                 if catalogue and designation_part is not None:
                     cursor.execute("""
-                        SELECT c.catalogue || ' ' || c.designation as name, d.ra, d.dec
+                        SELECT c.dsodetailid, c.catalogue, c.designation, d.ra, d.dec
                         FROM cataloguenr c
                         JOIN dsodetail d ON d.id = c.dsodetailid
                         WHERE c.catalogue = ? AND c.designation LIKE ?
@@ -516,7 +525,7 @@ class SessionFormWidget(QWidget):
                     """, (catalogue, designation_part + "%"))
                 else:
                     cursor.execute("""
-                        SELECT c.catalogue || ' ' || c.designation as name, d.ra, d.dec
+                        SELECT c.dsodetailid, c.catalogue, c.designation, d.ra, d.dec
                         FROM cataloguenr c
                         JOIN dsodetail d ON d.id = c.dsodetailid
                         WHERE c.catalogue || ' ' || c.designation LIKE ?
@@ -526,9 +535,13 @@ class SessionFormWidget(QWidget):
 
                 self._dso_cache.clear()
                 names = []
-                for name, ra, dec in cursor.fetchall():
+                # One suggestion per object, with its common name; a common
+                # name typed in ("Andromeda") finds the object too
+                results = [tuple(row) for row in cursor.fetchall()]
+                position = {str(row[0]): row[3:5] for row in results}
+                for name, dso in suggestion_names(conn, [row[:3] for row in results], text):
                     names.append(name)
-                    self._dso_cache[name] = {"ra": ra, "dec": dec}
+                    self._dso_cache[name] = {"ra": position[dso][0], "dec": position[dso][1]}
                 self._completer_model.setStringList(names)
         except Exception as e:
             logger.error(f"Error searching DSO catalog: {e}")
@@ -543,17 +556,36 @@ class SessionFormWidget(QWidget):
             self._dec_deg = round(data["dec"], 6)
 
     def _populate_from_target_data(self, target_data):
-        self.name_edit.setText(target_data.get("name", "") or "")
+        # A new session is named with its common name, "M 31 (Andromeda Galaxy)"
+        self.name_edit.setText(display_name(target_data.get("name", "") or "", target_data.get("dsodetailid"),
+                                            target_data.get("designations")))
         self._ra_deg = target_data.get("ra_deg")
         self._dec_deg = target_data.get("dec_deg")
         self._target_id = target_data.get("id")
         from EquipmentManager import select_telescope
         select_telescope(self.telescope_combo, self.db_manager, target_data.get("telescope_id"))
 
+    def _on_common_name_toggled(self, checked):
+        """Switch the scanned name to/from its common-name form (unless it's been
+        retyped) and remember the choice"""
+        QSettings("CosmosCollection", "CosmosCollection").setValue(SESSION_COMMON_NAMES_SETTING, checked)
+        if self._scanned_names and self.name_edit.text().strip() in self._scanned_names:
+            self.name_edit.setText(self._scanned_names[1] if checked else self._scanned_names[0])
+
     def _populate_from_parsed_metadata(self, summary):
         self._scanned_aggregate = summary
         dso_name = summary.get("dso_name")
         if dso_name:
+            named = display_name(dso_name)
+            if named != dso_name:
+                # Offer the common name, as last chosen
+                self._scanned_names = (dso_name, named)
+                self.common_name_check.blockSignals(True)
+                self.common_name_check.setChecked(QSettings("CosmosCollection", "CosmosCollection").value(
+                    SESSION_COMMON_NAMES_SETTING, True, type=bool))
+                self.common_name_check.blockSignals(False)
+                self.common_name_check.setVisible(True)
+                dso_name = named if self.common_name_check.isChecked() else dso_name
             self.name_edit.setText(dso_name)
         # Where the subs were pointed (their headers' mean RA/Dec), so later drops
         # of this target can be matched to the session by position too
@@ -1540,7 +1572,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         self._file_check = None       # SessionFileCheck.FileCheckWorker of the last load
         self._file_check_result = None  # its CheckResult, None until it's done
 
-        self.setWindowTitle(f"{session_data.get('dso_name', '')} — {session_data.get('session_date', '')}")
+        self.setWindowTitle(f"{display_name(session_data.get('dso_name', ''))} — {session_data.get('session_date', '')}")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.WindowMaximizeButtonHint)
         self.setModal(True)
         self.resize(1000, 720)  # default size the first time this dialog is ever opened
@@ -4332,7 +4364,8 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to open FOV Simulator: {e}")
 
     def _open_visibility_calculator(self, session):
-        """DSO Visibility Calculator for the session's object, opened on the session's night."""
+        """DSO Visibility Calculator for the session's object, opened on tonight (for
+        planning the next night); the session's own nights are a calendar click away."""
         if not session:
             return
         ra_deg, dec_deg = self._session_coordinates(session)
@@ -4346,9 +4379,6 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             window = DSOVisibilityApp()
             window.dso_input.setText(session.get("dso_name") or "")
             window.set_dso_coordinates(ra_deg, dec_deg)
-            session_date = QDate.fromString(str(session.get("session_date") or "")[:10], "yyyy-MM-dd")
-            if session_date.isValid():
-                window.date_input.setDate(session_date)
             self._visibility_window = window  # keep a reference so it isn't garbage collected
             window.show()
             window.raise_()

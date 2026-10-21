@@ -848,7 +848,8 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
         self._last_output_at = None
 
         self.setAttribute(Qt.WA_DeleteOnClose)
-        self.setWindowTitle(f"Siril — {self.session.get('dso_name', '')}")
+        from DSONames import display_name
+        self.setWindowTitle(f"Siril — {display_name(self.session.get('dso_name', ''))}")
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
         self.resize(720, 560)  # default size the first time this dialog is ever opened
 

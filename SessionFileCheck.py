@@ -270,7 +270,8 @@ class SessionFileCheckDialog(WindowPositionMixin, QDialog):
         self._searching_root = None
         self._groups = []
 
-        self.setWindowTitle(f"Check Files — {session.get('dso_name', '')}")
+        from DSONames import display_name
+        self.setWindowTitle(f"Check Files — {display_name(session.get('dso_name', ''))}")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.WindowMaximizeButtonHint)
         self.setModal(True)
         self.resize(900, 460)

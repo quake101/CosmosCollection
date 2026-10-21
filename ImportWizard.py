@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 import LibraryScanner
 import MountDetection
 from LibraryScanner import ScanRules, scan_and_build, ScanIndex
+from DSONames import SESSION_COMMON_NAMES_SETTING
 from Theme import COLORS, font_size, themed_style
 from WindowPositionManager import WindowPositionMixin
 
@@ -182,9 +183,10 @@ class ImportWorker(QThread):
     imported = Signal(object)       # ImportReport
     failed = Signal(str)
 
-    def __init__(self, library):
+    def __init__(self, library, common_names=False):
         super().__init__()
         self.library = library
+        self.common_names = common_names  # Name new sessions "M 31 (Andromeda Galaxy)"
         self.cancel = threading.Event()
 
     def stop(self):
@@ -198,7 +200,7 @@ class ImportWorker(QThread):
             conn.row_factory = sqlite3.Row
             try:
                 report = LibraryScanner.import_library(conn, self.library, progress=self.progress.emit,
-                                                       cancelled=self.cancel.is_set)
+                                                       cancelled=self.cancel.is_set, common_names=self.common_names)
             finally:
                 conn.close()
         except Exception as e:
@@ -769,6 +771,13 @@ class ReviewPage(QWidget):
         equipment.clicked.connect(self._request_equipment)
         bottom.addWidget(equipment)
         bottom.addStretch()
+        self.common_names_check = QCheckBox("Add common names to session names")
+        self.common_names_check.setToolTip('New sessions are named like "M 31 (Andromeda Galaxy)" rather than '
+                                           '"M 31". Sessions already in the Session Manager keep their names.')
+        self.common_names_check.setChecked(_settings().value(SESSION_COMMON_NAMES_SETTING, True, type=bool))
+        self.common_names_check.toggled.connect(
+            lambda checked: _settings().setValue(SESSION_COMMON_NAMES_SETTING, checked))
+        bottom.addWidget(self.common_names_check)
         self.selection_label = QLabel("")
         bottom.addWidget(self.selection_label)
         self.import_button = QPushButton("Import Selected")
@@ -2227,7 +2236,7 @@ class ImportWizardWindow(WindowPositionMixin, QDialog):
         self._import_progress.setMinimumDuration(0)
         self._import_progress.setAutoClose(False)
         self._import_progress.setAutoReset(False)
-        self.import_worker = ImportWorker(self.library)
+        self.import_worker = ImportWorker(self.library, self.review_page.common_names_check.isChecked())
         self._import_progress.canceled.connect(self._stop_import)
         self.import_worker.progress.connect(self._on_import_progress)
         self.import_worker.imported.connect(self._on_imported)

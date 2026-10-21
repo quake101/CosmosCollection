@@ -16,7 +16,7 @@ from PySide6.QtCore import Qt, QDate, QThread, Signal, QTimer, QSettings, QEvent
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLineEdit, QLabel, QTextEdit,
                                QDateEdit, QSpinBox, QGroupBox, QMessageBox, QCalendarWidget, QSizePolicy,
-                               QComboBox, QTableView)
+                               QComboBox, QTableView, QSplitter)
 from PySide6.QtGui import QTextCharFormat, QColor
 
 matplotlib.use('Qt5Agg')
@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib import ticker
 import matplotlib.pyplot as plt
 
 from astropy import units as u
@@ -153,7 +154,8 @@ class DSOVisibilityCalculator:
         """
         Get coordinates for a DSO by name with enhanced name resolution.
 
-        Tries multiple name variations and also attempts database lookup for coordinates.
+        Looks in the app's own catalog first, then online by name and several
+        variations of it.
 
         Args:
             dso_name (str): Name of the DSO (e.g., 'M31', 'NGC 7000', 'sh2 142')
@@ -161,7 +163,21 @@ class DSOVisibilityCalculator:
         Returns:
             tuple: (SkyCoord object, error_message) - error_message is None if successful
         """
-        # First try the original name
+        # The app's own catalog: offline, and knows designations written any way
+        # ("Sh2 129 (Squid Nebula)", "sh2-129") and common names
+        try:
+            from DSONames import catalog_ids
+            db_manager = DatabaseManager()
+            with db_manager.get_connection() as conn:
+                ids = catalog_ids(conn, dso_name)
+                if len(ids) == 1:
+                    row = conn.execute("SELECT ra, dec FROM dsodetail WHERE id = ?", (next(iter(ids)),)).fetchone()
+                    if row and row[0] is not None and row[1] is not None:
+                        return SkyCoord(ra=row[0] * u.deg, dec=row[1] * u.deg), None
+        except Exception as e:
+            logger.debug(f"Catalog lookup failed for {dso_name!r}: {e}")
+
+        # Then online, as written
         coord, error = self.get_dso_coordinates(dso_name)
         if coord is not None:
             return coord, None
@@ -217,42 +233,6 @@ class DSOVisibilityCalculator:
                 coord, _ = self.get_dso_coordinates(variation)
                 if coord is not None:
                     return coord, None
-
-        # If name resolution fails, try database lookup
-        try:
-            db_manager = DatabaseManager()
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-
-                # Try exact name match first
-                cursor.execute("""
-                    SELECT ra_deg, dec_deg FROM dso
-                    WHERE UPPER(TRIM(name)) = ?
-                    OR UPPER(TRIM(alternate_names)) LIKE ?
-                    LIMIT 1
-                """, (original_name, f"%{original_name}%"))
-
-                row = cursor.fetchone()
-                if row and row[0] is not None and row[1] is not None:
-                    coord = SkyCoord(ra=row[0] * u.deg, dec=row[1] * u.deg)
-                    return coord, None
-
-                # Try partial matches with variations
-                for variation in name_variations:
-                    cursor.execute("""
-                        SELECT ra_deg, dec_deg FROM dso
-                        WHERE UPPER(TRIM(name)) LIKE ?
-                        OR UPPER(TRIM(alternate_names)) LIKE ?
-                        LIMIT 1
-                    """, (f"%{variation}%", f"%{variation}%"))
-
-                    row = cursor.fetchone()
-                    if row and row[0] is not None and row[1] is not None:
-                        coord = SkyCoord(ra=row[0] * u.deg, dec=row[1] * u.deg)
-                        return coord, None
-
-        except Exception:
-            pass  # Database lookup failed, continue with original error
 
         # If all attempts fail, return the original error with helpful message
         error_msg = f"Could not resolve coordinates for '{dso_name}'. Tried variations: {', '.join(name_variations[:5])}"
@@ -344,7 +324,30 @@ class DSOVisibilityCalculator:
         dark_sky = sun_altaz.alt.deg < max_sun_altitude
         return dso_visible & dark_sky
 
-    def calculate_visibility_for_date(self, dso_name, date, duration_hours=24, min_altitude=30, horizon=None):
+    def find_meridian_crossings(self, time_range, dso_coord):
+        """Times the object crosses the meridian heading west (hour angle 0, where a
+        German equatorial mount flips), interpolated between the time steps.
+
+        Returns:
+            list: astropy Times, empty if it never crosses in the range
+        """
+        from astropy.coordinates import TETE
+        try:
+            # Apparent RA against apparent sidereal time, so precession since J2000
+            # doesn't shift the crossing by a minute or two
+            ra = dso_coord.transform_to(TETE(obstime=time_range[len(time_range) // 2])).ra.deg
+            lst = time_range.sidereal_time('apparent', longitude=self.location.lon).deg
+            hour_angle = (lst - ra + 180) % 360 - 180  # -180..180, 0 on the meridian
+            # Negative to positive is the crossing; the +180 -> -180 wrap goes the other way
+            steps = np.where((hour_angle[:-1] < 0) & (hour_angle[1:] >= 0))[0]
+            return [time_range[i] + (time_range[i + 1] - time_range[i]) *
+                    (-hour_angle[i] / (hour_angle[i + 1] - hour_angle[i])) for i in steps]
+        except Exception as e:
+            logger.debug(f"Could not find meridian crossings: {e}")
+            return []
+
+    def calculate_visibility_for_date(self, dso_name, date, duration_hours=24, min_altitude=30, horizon=None,
+                                      time_resolution=4):
         """
         Calculate complete visibility information for a DSO on a specific date.
 
@@ -354,6 +357,7 @@ class DSOVisibilityCalculator:
             duration_hours (float): Duration to calculate (default: 24 hours)
             min_altitude (float): Minimum altitude threshold (default: 30 degrees)
             horizon (HorizonProfile): Optional custom horizon (see find_optimal_viewing_times)
+            time_resolution (int): Time points per hour (default: 4, every 15 minutes)
 
         Returns:
             dict: Complete visibility results or None if error
@@ -364,10 +368,10 @@ class DSOVisibilityCalculator:
             return {"error": f"Could not find coordinates for {dso_name}: {error}"}
 
         return self.calculate_visibility_for_coordinates(dso_coord, date, duration_hours, min_altitude, dso_name,
-                                                         horizon=horizon)
+                                                         horizon=horizon, time_resolution=time_resolution)
 
     def calculate_visibility_for_coordinates(self, dso_coord, date, duration_hours=24, min_altitude=30, dso_name=None,
-                                             horizon=None):
+                                             horizon=None, time_resolution=4):
         """
         Calculate complete visibility information for DSO coordinates on a specific date.
 
@@ -378,6 +382,7 @@ class DSOVisibilityCalculator:
             min_altitude (float): Minimum altitude threshold (default: 30 degrees)
             dso_name (str, optional): Name of the DSO for display purposes
             horizon (HorizonProfile): Optional custom horizon (see find_optimal_viewing_times)
+            time_resolution (int): Time points per hour (default: 4, every 15 minutes)
 
         Returns:
             dict: Complete visibility results or None if error
@@ -385,7 +390,7 @@ class DSOVisibilityCalculator:
         try:
             # Calculate altitude/azimuth over time
             time_range, dso_altaz, sun_altaz = self.calculate_altaz_over_time(
-                dso_coord, date, duration_hours)
+                dso_coord, date, duration_hours, time_resolution)
 
             # Find optimal viewing times
             optimal_times = self.find_optimal_viewing_times(dso_altaz, sun_altaz, min_altitude, horizon=horizon)
@@ -1070,6 +1075,25 @@ class MultiMonthVisibilityCalendar(QWidget):
         if self.on_date_clicked:
             self.on_date_clicked(qdate)
 
+    def show_date(self, qdate):
+        """Box qdate as the selected day (the one the graph shows), turning the
+        pages to it if it's not in the months shown"""
+        if not qdate.isValid():
+            return
+        start, end = self._display_range()
+        if not start <= qdate.toPython() <= end:
+            self._set_anchor(qdate.year(), qdate.month())
+        # Every month gets the date; only the one it falls in draws the box.
+        # Selecting turns a calendar's page to the date, so turn it back.
+        year, month = self.anchor_year, self.anchor_month
+        for cal in self.calendars:
+            cal.blockSignals(True)
+            cal.setSelectedDate(qdate)
+            cal.setCurrentPage(year, month)
+            cal.blockSignals(False)
+            cal.update()
+            year, month = self._next_month(year, month)
+
     def _trigger_recalculation(self):
         self._refresh_weather_layer()
         self._refresh_visibility_layer()
@@ -1189,6 +1213,9 @@ class MultiMonthVisibilityCalendar(QWidget):
             cal.tooltip_label.destroy()
 
 
+GRAPH_POINTS_PER_HOUR = 12  # The calculator's graph: a point every 5 minutes
+
+
 class CalculationThread(QThread):
     """Thread for performing visibility calculations using centralized calculator"""
     finished = Signal(object)
@@ -1223,12 +1250,12 @@ class CalculationThread(QThread):
                 dso_coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
                 results = self.calculator.calculate_visibility_for_coordinates(
                     dso_coord, self.date, self.hours, self.min_altitude, self.dso_name,
-                    horizon=self.calculator.horizon)
+                    horizon=self.calculator.horizon, time_resolution=GRAPH_POINTS_PER_HOUR)
             else:
                 # Use name-based calculation (original behavior)
                 results = self.calculator.calculate_visibility_for_date(
                     self.dso_name, self.date, self.hours, self.min_altitude,
-                    horizon=self.calculator.horizon)
+                    horizon=self.calculator.horizon, time_resolution=GRAPH_POINTS_PER_HOUR)
 
             if "error" in results:
                 self.error.emit(results["error"])
@@ -1238,6 +1265,9 @@ class CalculationThread(QThread):
             results['local_tz'] = self.local_tz
             # Active location's custom horizon (or None), drawn on the altitude chart
             results['horizon'] = self.calculator.horizon
+            results['min_altitude'] = self.min_altitude
+            results['meridian_times'] = self.calculator.find_meridian_crossings(
+                results['time_range'], results['dso_coord'])
 
             self.finished.emit(results)
 
@@ -1245,8 +1275,45 @@ class CalculationThread(QThread):
             self.error.emit(f"Calculation error: {str(e)}")
 
 
+SUNSET_ALT = -0.833         # The sun's top at the horizon, with refraction
+NIGHT_PADDING_HOURS = 0.5   # Night view: this much daylight either side of sunset/sunrise
+MIN_ZOOM_HOURS = 1.0        # Narrowest the time axis zooms to
+ZOOM_STEP = 0.8             # Each wheel notch shows this fraction of the span
+MERIDIAN_COLOR = '#4fc3f7'  # Matches the FOV Simulator's meridian line
+NOW_COLOR = '#00ff00'
+GRAPH_VIEW_SETTING = "DSOVisibilityApp/graph_view"          # 'night' or 'full'
+GRAPH_SPLITTER_SETTING = "DSOVisibilityApp/graph_splitter"  # calendar / graph divider
+
+
+class ClockTimeLocator(ticker.Locator):
+    """Time axis ticks on round local clock times (every 15 minutes up to every 12
+    hours, whichever fits the axis width), however far it's zoomed or panned.
+    The axis is in hours from start_local."""
+
+    STEPS = (0.25, 0.5, 1, 2, 3, 4, 6, 12)
+    PIXELS_PER_TICK = 70
+
+    def __init__(self, start_local):
+        self.start_hour = start_local.hour + start_local.minute / 60 + start_local.second / 3600
+
+    def __call__(self):
+        vmin, vmax = self.axis.get_view_interval()
+        return self.tick_values(vmin, vmax)
+
+    def tick_values(self, vmin, vmax):
+        vmin, vmax = min(vmin, vmax), max(vmin, vmax)
+        max_ticks = max(3, int(self.axis.axes.bbox.width / self.PIXELS_PER_TICK))
+        step = next((s for s in self.STEPS if (vmax - vmin) / s <= max_ticks), self.STEPS[-1])
+        first = np.ceil((vmin + self.start_hour) / step) * step - self.start_hour
+        return np.arange(first, vmax + 1e-9, step)
+
+
 class VisibilityPlot(FigureCanvas):
-    """Custom matplotlib canvas for PySide6"""
+    """Custom matplotlib canvas for PySide6.
+
+    The three charts share one time axis: the wheel zooms it around the mouse,
+    dragging pans it, and double-click goes back to the view mode's default
+    (the night, or the full calculated range)."""
 
     def __init__(self, parent=None):
         self.figure = Figure(figsize=(12, 8))
@@ -1254,12 +1321,20 @@ class VisibilityPlot(FigureCanvas):
         self.setParent(parent)
         self._last_results = None  # redrawn with new colors when the theme changes
 
-        # Initialize hover data storage
+        # Time axis view: 'night' (sunset to sunrise) or 'full' (the whole range)
+        self.view_mode = 'night'
+        self._data_xlim = None     # the whole calculated range, hours from start
+        self._night_xlim = None    # sunset to sunrise (padded), None without a night
+        self._view_xlim = None     # what's shown now, kept across theme redraws
+        self._pan = None           # (mouse x in pixels, xlim) while dragging
+
+        # Hover: a cursor line and a dot on each curve, drawn ("blitted") over a
+        # saved copy of the charts so following the mouse doesn't redraw them all
         self.hover_data = None
-        self.annotation = None
-        self.cursor_lines = []
-        self.last_idx = None  # Cache last index for performance
-        self.last_tooltip_text = None  # Cache last tooltip content
+        self._cursor_artists = []  # [(line, dot)] per chart, animated
+        self._background = None    # the charts without the cursor, saved after each full draw
+        self._hover_x = None       # hours from start under the mouse, None when not hovering
+        self._tooltip_text = None
 
         # Initialize current time line storage
         self.current_time_lines = []
@@ -1283,6 +1358,11 @@ class VisibilityPlot(FigureCanvas):
         self.mpl_connect('motion_notify_event', self.on_mouse_move)
         # Connect mouse leave event
         self.mpl_connect('axes_leave_event', self.on_mouse_leave)
+        # Zoom and pan the time axis
+        self.mpl_connect('scroll_event', self.on_scroll)
+        self.mpl_connect('button_press_event', self.on_button_press)
+        self.mpl_connect('button_release_event', self.on_button_release)
+        self.mpl_connect('draw_event', self._on_draw)
 
     def _apply_widget_theme(self):
         """Theme colors for the canvas and its Qt tooltip (rebuilt on theme changes)"""
@@ -1303,7 +1383,7 @@ class VisibilityPlot(FigureCanvas):
         """Redraw the chart with the new theme colors (the widget styles
         follow the theme on their own)"""
         if self._last_results is not None:
-            self.plot_visibility(self._last_results)
+            self.plot_visibility(self._last_results, keep_view=True)
 
     def _add_darkness_shading(self, ax, hours_from_start, sun_altitudes):
         """Add background shading to show darkness levels based on sun altitude.
@@ -1343,9 +1423,142 @@ class VisibilityPlot(FigureCanvas):
                 x_end = hours_from_start[min(end_idx, len(hours_from_start) - 1)]
                 ax.axvspan(x_start, x_end, facecolor=color, alpha=alpha, zorder=0)
 
-    def plot_visibility(self, results):
-        """Create visibility plot with altitude and azimuth"""
+    @staticmethod
+    def _find_night(hours_from_start, sun_altitudes, now_hours):
+        """(start, end) hours of sunset to sunrise, padded a little and kept inside
+        the range: tonight (or the night in progress) when now is in the range,
+        otherwise the night the range is centered on. None when the sun never
+        sets or never rises in the range."""
+        hours = np.asarray(hours_from_start)
+        down = sun_altitudes < SUNSET_ALT
+        if not down.any() or down.all():
+            return None
+        diff = np.diff(np.concatenate(([False], down, [False])).astype(int))
+        starts, ends = np.where(diff == 1)[0], np.where(diff == -1)[0] - 1
+        upcoming = [i for i, e in enumerate(ends) if hours[e] >= now_hours]
+        if hours[0] <= now_hours <= hours[-1] and upcoming:
+            best = upcoming[0]
+        else:
+            # The calculation is centered on the night's midnight; take the
+            # dark stretch nearest to it
+            middle = hours[-1] / 2
+            distance = [0 if hours[s] <= middle <= hours[e] else min(abs(hours[s] - middle), abs(hours[e] - middle))
+                        for s, e in zip(starts, ends)]
+            best = int(np.argmin(distance))
+        return (max(hours[0], hours[starts[best]] - NIGHT_PADDING_HOURS),
+                min(hours[-1], hours[ends[best]] + NIGHT_PADDING_HOURS))
+
+    def resizeEvent(self, event):
+        """Re-fit the margins to the new size so the legends beside the charts
+        don't get cut off"""
+        super().resizeEvent(event)
+        if self.hover_data and self.width() > 200 and self.height() > 200:
+            try:
+                self.figure.tight_layout()
+            except Exception:
+                pass  # Too small to fit; the next resize tries again
+
+    @staticmethod
+    def _legend(ax):
+        """Legend just right of the chart, so it never covers the curves however
+        the time axis is zoomed"""
+        ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), borderaxespad=0, fontsize='small')
+
+    def _default_xlim(self):
+        """The view mode's time range"""
+        if self.view_mode == 'night' and self._night_xlim is not None:
+            return self._night_xlim
+        return self._data_xlim
+
+    def _set_xlim(self, lo, hi):
+        """Show lo..hi hours on all three charts, kept inside the calculated range
+        and no narrower than MIN_ZOOM_HOURS"""
+        data_lo, data_hi = self._data_xlim
+        span = min(max(hi - lo, MIN_ZOOM_HOURS), data_hi - data_lo)
+        if span > hi - lo:  # Widened: keep it centered where it was
+            lo -= (span - (hi - lo)) / 2
+        lo = min(max(lo, data_lo), data_hi - span)
+        self._view_xlim = (lo, lo + span)
+        self.hover_data['axes'][0].set_xlim(*self._view_xlim)  # The others share it
+        self._background = None  # Saved for the old range; the next draw saves it again
+        self._update_title()
+
+    def _update_title(self):
+        """Title with the dates on screen ("Wed Sep 24 – Thu Sep 25, 2026"), so
+        it's always clear which night the graph shows"""
+        start_utc = self.hover_data['start_local'].astimezone(pytz.UTC)
+        local_tz = self.hover_data['local_tz']
+        first, last = ((start_utc + timedelta(hours=x)).astimezone(local_tz) for x in self._view_xlim)
+
+        def day(moment, year=False):
+            return f"{moment:%a %b} {moment.day}" + (f", {moment.year}" if year else "")
+        if first.date() == last.date():
+            dates = day(first, year=True)
+        else:
+            dates = f"{day(first, year=first.year != last.year)} – {day(last, year=True)}"
+        self.hover_data['axes'][0].set_title(f"{self._title_name} · {dates} ({first:%Z})",
+                                             fontsize=chart_font_size(14))
+
+    def set_view_mode(self, mode):
+        """'night' or 'full' - shows that range now"""
+        self.view_mode = mode
+        self.reset_view()
+
+    def reset_view(self):
+        """Back to the view mode's time range"""
+        if not self.hover_data or self._data_xlim is None:
+            return
+        self._set_xlim(*self._default_xlim())
+        self._hide_cursor()
+        self.draw_idle()
+
+    def on_scroll(self, event):
+        """Wheel: zoom the time axis around the mouse"""
+        if not self.hover_data or self._data_xlim is None or event.inaxes is None or event.xdata is None:
+            return
+        factor = ZOOM_STEP if event.button == 'up' else 1 / ZOOM_STEP
+        lo, hi = event.inaxes.get_xlim()
+        x = event.xdata
+        self._set_xlim(x - (x - lo) * factor, x + (hi - x) * factor)
+        # The full redraw puts the cursor back where the mouse is
+        self._hover_x = self._clamp_hours(x)
+        self._update_tooltip(event, self._hover_x)
+        self.draw_idle()
+
+    def on_button_press(self, event):
+        """Double-click resets the view; a left-button press starts a pan"""
+        if not self.hover_data or self._data_xlim is None or event.inaxes is None:
+            return
+        if event.dblclick:
+            self._pan = None
+            self.reset_view()
+        elif event.button == 1:
+            self._pan = (event.x, event.inaxes.get_xlim())
+            self._hide_cursor()
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def on_button_release(self, event):
+        """End a pan"""
+        if self._pan is not None:
+            self._pan = None
+            self.unsetCursor()
+            self.on_mouse_move(event)  # The cursor and tooltip back where the mouse is
+
+    def _drag_pan(self, event):
+        """Move the time axis with the mouse while the left button is held"""
+        start_x, (lo, hi) = self._pan
+        width = self.hover_data['axes'][0].bbox.width
+        shift = (event.x - start_x) / width * (hi - lo) if width else 0
+        self._set_xlim(lo - shift, hi - shift)
+        self.draw_idle()
+
+    def plot_visibility(self, results, keep_view=False):
+        """Create visibility plot with altitude and azimuth.
+
+        keep_view: keep the zoomed/panned time range (a theme redraw) instead of
+        going back to the view mode's default (a new calculation)."""
         self._last_results = results
+        previous_view = self._view_xlim if keep_view else None
         self.figure.clear()
         self.figure.set_facecolor(chart_background())
         # Reset subplot parameters to defaults so tight_layout() doesn't
@@ -1393,7 +1606,9 @@ class VisibilityPlot(FigureCanvas):
         self._add_darkness_shading(ax1, hours_from_start, sun_altitudes)
 
         ax1.plot(hours_from_start, dso_altaz.alt.deg, color=chart_color('#00aaff'), linewidth=2, label=f'{dso_name} Altitude')
-        ax1.axhline(y=30, color=chart_color('#00ff88'), linestyle='--', alpha=0.8, label='Min Altitude (30°)')
+        min_altitude = results.get('min_altitude', 30)
+        ax1.axhline(y=min_altitude, color=chart_color('#00ff88'), linestyle='--', alpha=0.8,
+                    label=f'Min Altitude ({min_altitude:g}°)')
         ax1.axhline(y=0, color=chart_color('#888888'), linestyle='-', alpha=0.6, label='Horizon')
 
         # Custom horizon along the object's path: the obstruction height at the
@@ -1412,53 +1627,66 @@ class VisibilityPlot(FigureCanvas):
         optimal_alt = np.where(optimal_times, dso_altaz.alt.deg, np.nan)
         ax1.plot(hours_from_start, optimal_alt, color=chart_color('#ff4444'), linewidth=4, alpha=0.8, label='Optimal Viewing')
 
+        # Meridian crossings while the object is up - where a German equatorial
+        # mount flips. Drawn on all three charts once they exist.
+        meridian_hours = []
+        for crossing in results.get('meridian_times', []):
+            local = crossing.datetime.replace(tzinfo=pytz.UTC).astimezone(local_tz)
+            x = (local - start_local).total_seconds() / 3600
+            if np.interp(x, hours_from_start, dso_altaz.alt.deg) > 0:
+                meridian_hours.append((x, local))
+        for i, (x, _local) in enumerate(meridian_hours):
+            ax1.axvline(x=x, color=chart_color(MERIDIAN_COLOR), linestyle='-.', linewidth=1.8, alpha=0.9,
+                        zorder=90, label='Meridian Flip' if i == 0 else '_nolegend_')
+
         ax1.set_ylabel('Altitude (°)')
         # Get timezone abbreviation for display
         sample_time = local_times[0] if local_times else None
         tz_abbrev = sample_time.strftime('%Z') if sample_time else 'Local Time'
+        self._title_name = f'{dso_name} Visibility'  # _update_title adds the dates shown
         ax1.set_title(f'{dso_name} Visibility ({tz_abbrev})', fontsize=chart_font_size(14))
-        ax1.legend(loc='upper right')
+        self._legend(ax1)
         ax1.grid(True, alpha=0.3)
         ax1.set_ylim(-20, 90)
 
-        # Add time labels at key points
-        time_ticks = []
-        time_labels = []
-        for i in range(0, len(hours_from_start), max(1, len(hours_from_start) // 6)):
-            time_ticks.append(hours_from_start[i])
-            time_labels.append(format_time(local_times[i]))
-        ax1.set_xticks(time_ticks)
-        ax1.set_xticklabels(time_labels)
+        # Time labels on round clock times, re-spaced as the axis zooms. The
+        # three charts share the axis, so this covers them all.
+        def time_label(x, _pos):
+            moment = (start_local.astimezone(pytz.UTC) + timedelta(hours=x)).astimezone(local_tz)
+            return format_time(moment)
+        ax1.xaxis.set_major_locator(ClockTimeLocator(start_local))
+        ax1.xaxis.set_major_formatter(ticker.FuncFormatter(time_label))
 
         # DSO azimuth subplot
-        ax2 = self.figure.add_subplot(3, 1, 2)
+        ax2 = self.figure.add_subplot(3, 1, 2, sharex=ax1)
 
         # Add darkness shading
         self._add_darkness_shading(ax2, hours_from_start, sun_altitudes)
 
         ax2.plot(hours_from_start, dso_altaz.az.deg, color=chart_color('#ff8800'), linewidth=2, label=f'{dso_name} Azimuth')
 
-        # Add cardinal direction lines
-        ax2.axhline(y=0, color=chart_color('#ff4444'), linestyle=':', alpha=0.7, label='N')
-        ax2.axhline(y=90, color=chart_color('#44ff44'), linestyle=':', alpha=0.7, label='E')
-        ax2.axhline(y=180, color=chart_color('#ffff44'), linestyle=':', alpha=0.7, label='S')
-        ax2.axhline(y=270, color=chart_color('#4444ff'), linestyle=':', alpha=0.7, label='W')
+        # Add cardinal direction lines (the axis labels name them, so they stay
+        # out of the legend)
+        ax2.axhline(y=0, color=chart_color('#ff4444'), linestyle=':', alpha=0.7)
+        ax2.axhline(y=90, color=chart_color('#44ff44'), linestyle=':', alpha=0.7)
+        ax2.axhline(y=180, color=chart_color('#ffff44'), linestyle=':', alpha=0.7)
+        ax2.axhline(y=270, color=chart_color('#4444ff'), linestyle=':', alpha=0.7)
 
         # Highlight optimal viewing times for azimuth too
         optimal_az = np.where(optimal_times, dso_altaz.az.deg, np.nan)
         ax2.plot(hours_from_start, optimal_az, color=chart_color('#ff4444'), linewidth=4, alpha=0.8, label='Optimal Viewing')
 
         ax2.set_ylabel('Azimuth (°)')
-        ax2.legend(loc='upper right')
+        self._legend(ax2)
         ax2.grid(True, alpha=0.3)
         ax2.set_ylim(0, 360)
         ax2.set_yticks([0, 90, 180, 270, 360])
         ax2.set_yticklabels(['N (0°)', 'E (90°)', 'S (180°)', 'W (270°)', 'N (360°)'])
-        ax2.set_xticks(time_ticks)
-        ax2.set_xticklabels(time_labels)
+        # Sharing the axis hides the upper charts' time labels; keep them
+        ax2.tick_params(axis='x', labelbottom=True)
 
         # Sun altitude subplot
-        ax3 = self.figure.add_subplot(3, 1, 3)
+        ax3 = self.figure.add_subplot(3, 1, 3, sharex=ax1)
 
         # Add darkness shading
         self._add_darkness_shading(ax3, hours_from_start, sun_altitudes)
@@ -1473,13 +1701,14 @@ class VisibilityPlot(FigureCanvas):
         tz_abbrev = sample_time.strftime('%Z') if sample_time else 'Local Time'
         ax3.set_xlabel(f'Time ({tz_abbrev})')
         ax3.set_ylabel('Sun Alt. (°)')
-        ax3.legend(loc='upper right')
+        self._legend(ax3)
         ax3.grid(True, alpha=0.3)
         ax3.set_ylim(-25, 50)
-        ax3.set_xticks(time_ticks)
-        ax3.set_xticklabels(time_labels)
 
-        self.figure.tight_layout()
+        for ax in (ax2, ax3):
+            for x, _local in meridian_hours:
+                ax.axvline(x=x, color=chart_color(MERIDIAN_COLOR), linestyle='-.', linewidth=1.8, alpha=0.9,
+                           zorder=90)
 
         # Store additional data needed for hover and current time updates
         self.hover_data['horizon_alt'] = horizon_alt
@@ -1487,11 +1716,33 @@ class VisibilityPlot(FigureCanvas):
         self.hover_data['hours_from_start'] = hours_from_start
         self.hover_data['axes'] = [ax1, ax2, ax3]
         self.hover_data['start_local'] = start_local
+        self.hover_data['meridian'] = [local for _x, local in meridian_hours]
+        # As arrays for interpolating between the points under the mouse
+        self.hover_data['hours'] = np.asarray(hours_from_start)
+        self.hover_data['dso_alt'] = np.asarray(dso_altaz.alt.deg)
+        self.hover_data['dso_az'] = np.unwrap(np.asarray(dso_altaz.az.deg), period=360)  # No jump at north
+        self.hover_data['sun_alt'] = np.asarray(sun_altitudes)
 
-        # Reset cursor lines and cached index
-        self.cursor_lines = []
-        self.last_idx = None
-        self.last_tooltip_text = None
+        # The hover cursor: animated, so full draws leave it out and it's drawn
+        # on its own over the saved background
+        cursor_color = chart_color('#ffcc00')
+        self._cursor_artists = []
+        for ax in (ax1, ax2, ax3):
+            line = ax.axvline(x=hours_from_start[0], color=cursor_color, alpha=0.8, linewidth=1.5,
+                              animated=True, label='_nolegend_')
+            dot, = ax.plot([], [], 'o', color=cursor_color, markersize=7, markeredgecolor=chart_background(),
+                           markeredgewidth=1.2, animated=True, zorder=102, label='_nolegend_')
+            self._cursor_artists.append((line, dot))
+        self._background = None
+
+        # Time range: the night (or everything), or where it was zoomed to
+        # before a theme redraw
+        self._data_xlim = (hours_from_start[0], hours_from_start[-1])
+        now_hours = (datetime.now(pytz.UTC) - start_local).total_seconds() / 3600
+        self._night_xlim = self._find_night(hours_from_start, sun_altitudes, now_hours)
+        self._set_xlim(*(previous_view or self._default_xlim()))
+
+        self.figure.tight_layout()
 
         # Clear old current time lines
         for line in self.current_time_lines:
@@ -1548,13 +1799,26 @@ class VisibilityPlot(FigureCanvas):
             axes = self.hover_data.get('axes', [])
             # Draw vertical line on all three subplots
             for ax in axes:
-                line = ax.axvline(x=current_hours_from_start, color=chart_color('#00ff00'), linestyle='--',
+                line = ax.axvline(x=current_hours_from_start, color=chart_color(NOW_COLOR), linestyle='--',
                           linewidth=2.5, alpha=0.9, label='Current Time', zorder=100)
                 self.current_time_lines.append(line)
 
+            # A dot where each curve is right now
+            if axes and 0 <= current_hours_from_start <= hours_from_start[-1]:
+                x = current_hours_from_start
+                azimuths = np.unwrap(self.hover_data['dso_altaz'].az.deg, period=360)
+                now_values = (np.interp(x, hours_from_start, self.hover_data['dso_altaz'].alt.deg),
+                              np.interp(x, hours_from_start, azimuths) % 360,
+                              np.interp(x, hours_from_start, self.hover_data['sun_altaz'].alt.deg))
+                for ax, y in zip(axes, now_values):
+                    dot, = ax.plot([x], [y], 'o', color=chart_color(NOW_COLOR), markersize=9,
+                                   markeredgecolor=chart_background(), markeredgewidth=1.5,
+                                   zorder=101, label='_nolegend_')
+                    self.current_time_lines.append(dot)
+
             # Update legend on first subplot to include current time (only if lines were drawn)
             if axes and self.current_time_lines:
-                axes[0].legend(loc='upper right')
+                self._legend(axes[0])
 
             # Redraw the canvas
             self.draw_idle()
@@ -1567,164 +1831,136 @@ class VisibilityPlot(FigureCanvas):
         """Get twilight condition using centralized method"""
         return DSOVisibilityCalculator.get_twilight_condition(sun_alt)
 
-    def find_nearest_data_point(self, x_pos):
-        """Find the nearest data point to the mouse position"""
-        if not self.hover_data or 'hours_from_start' not in self.hover_data:
-            return None
+    def _clamp_hours(self, x):
+        """x (hours from start) kept inside the calculated range"""
+        hours = self.hover_data['hours']
+        return min(max(x, hours[0]), hours[-1])
 
-        hours_from_start = self.hover_data['hours_from_start']
-        idx = np.argmin(np.abs(np.array(hours_from_start) - x_pos))
-        return idx
-
-    def clear_cursor_elements(self):
-        """Clear existing cursor lines and annotation"""
-        # Remove cursor lines
-        for line in self.cursor_lines:
-            try:
-                line.remove()
-            except (ValueError, NotImplementedError):
-                pass  # Already removed or cannot be removed
-        self.cursor_lines = []
-
-        # Remove annotation - set visibility to False instead of removing
-        if self.annotation:
-            try:
-                self.annotation.set_visible(False)
-            except (ValueError, AttributeError):
-                pass  # Already removed or invalid
-            self.annotation = None
-
-        # Hide Qt tooltip and reset cache
-        if hasattr(self, 'qt_tooltip'):
-            self.qt_tooltip.hide()
-        self.last_tooltip_text = None
-
-    def on_mouse_move(self, event):
-        """Handle mouse movement for hover tooltips with vertical cursor line"""
-        if not self.hover_data or event.inaxes is None or event.xdata is None:
-            self.clear_cursor_elements()
-            self.last_idx = None
-            self.last_tooltip_text = None
-            self.draw_idle()
+    def _on_draw(self, _event):
+        """After every full draw: save the charts (without the cursor) and put the
+        cursor back on them"""
+        if not self._cursor_artists or not self.hover_data:
             return
+        self._background = self.copy_from_bbox(self.figure.bbox)
+        if self._hover_x is not None:
+            self._draw_cursor()
 
-        # Find nearest data point
-        idx = self.find_nearest_data_point(event.xdata)
-        if idx is None:
+    def _draw_cursor(self):
+        """Draw the cursor line and the dots at self._hover_x"""
+        x = self._hover_x
+        hours = self.hover_data['hours']
+        values = (np.interp(x, hours, self.hover_data['dso_alt']),
+                  np.interp(x, hours, self.hover_data['dso_az']) % 360,
+                  np.interp(x, hours, self.hover_data['sun_alt']))
+        for ax, (line, dot), y in zip(self.hover_data['axes'], self._cursor_artists, values):
+            line.set_xdata([x, x])
+            dot.set_data([x], [y])
+            ax.draw_artist(line)
+            ax.draw_artist(dot)
+
+    def _show_cursor(self, x):
+        """Move the cursor to x: the saved charts, the cursor over them, and only
+        that copied to the screen"""
+        self._hover_x = x
+        if self._background is None:
+            self.draw_idle()  # Saves the background and draws the cursor
             return
+        self.restore_region(self._background)
+        self._draw_cursor()
+        self.blit(self.figure.bbox)
 
-        # Performance optimization: skip if same data point as last time
-        if idx == self.last_idx:
+    def _hide_cursor(self):
+        """Take the cursor and tooltip away"""
+        self.qt_tooltip.hide()
+        self._tooltip_text = None
+        if self._hover_x is None:
             return
-        self.last_idx = idx
+        self._hover_x = None
+        if self._background is not None:
+            self.restore_region(self._background)
+            self.blit(self.figure.bbox)
 
-        # Clear previous cursor lines only (keep tooltip visible)
-        for line in self.cursor_lines:
-            try:
-                line.remove()
-            except (ValueError, NotImplementedError):
-                pass
-        self.cursor_lines = []
+    def _hover_text(self, x):
+        """Tooltip text for x hours from start, the values interpolated to the minute"""
+        data = self.hover_data
+        hours = data['hours']
+        start_utc = data['start_local'].astimezone(pytz.UTC)
+        moment = (start_utc + timedelta(hours=x)).astimezone(data['local_tz'])
+        dso_alt = float(np.interp(x, hours, data['dso_alt']))
+        dso_az = float(np.interp(x, hours, data['dso_az'])) % 360
+        sun_alt = float(np.interp(x, hours, data['sun_alt']))
+        nearest = int(np.argmin(np.abs(hours - x)))
+        optimal = data['optimal_times'][nearest]
+        dso_name = data['dso_name']
 
-        # Get the x-position from our data (for precise alignment)
-        hours_from_start = self.hover_data['hours_from_start']
-        x_pos = hours_from_start[idx]
-
-        # Add vertical cursor line to all subplots
-        axes = self.hover_data.get('axes', [])
-        for ax in axes:
-            line = ax.axvline(x=x_pos, color=chart_color('#ffcc00'), linestyle='-', alpha=0.7, linewidth=1.5)
-            self.cursor_lines.append(line)
-
-        # Get data for this point
-        local_time = self.hover_data['local_times'][idx]
-        dso_alt = self.hover_data['dso_altaz'].alt.deg[idx]
-        dso_az = self.hover_data['dso_altaz'].az.deg[idx]
-        sun_alt = self.hover_data['sun_altaz'].alt.deg[idx]
-        optimal = self.hover_data['optimal_times'][idx]
-        dso_name = self.hover_data['dso_name']
-
-        # Pre-calculate values (avoiding repeated function calls)
-        direction = self.azimuth_to_direction(dso_az)
-        twilight = self.get_twilight_condition(sun_alt)
-        tz_name = local_time.strftime('%Z')
-
-        # Create hover text
         horizon_line = ""
-        horizon_alt = self.hover_data.get('horizon_alt')
+        horizon_alt = data.get('horizon_alt')
         if horizon_alt is not None:
-            blocked = " - blocked" if dso_alt <= horizon_alt[idx] else ""
-            horizon_line = f"Custom Horizon: {horizon_alt[idx]:.1f}°{blocked}\n"
-        hover_text = (
-            f"Time: {format_time(local_time, seconds=True)} {tz_name}\n"
+            obstruction = float(np.interp(x, hours, horizon_alt))
+            blocked = " - blocked" if dso_alt <= obstruction else ""
+            horizon_line = f"Custom Horizon: {obstruction:.1f}°{blocked}\n"
+        meridian_line = ""
+        meridian = data.get('meridian')
+        if meridian:
+            # The nearest crossing, and how far it is from the hovered time
+            crossing = min(meridian, key=lambda m: abs((m - moment).total_seconds()))
+            minutes = round((crossing - moment).total_seconds() / 60)
+            gap = f"{abs(minutes) // 60}h {abs(minutes) % 60:02d}m" if abs(minutes) >= 60 else f"{abs(minutes)}m"
+            when = "now" if minutes == 0 else (f"in {gap}" if minutes > 0 else f"{gap} ago")
+            meridian_line = f"Meridian Flip: {format_time(crossing)} ({when})\n"
+        return (
+            f"Time: {format_time(moment)} {moment.strftime('%Z')}\n"
             f"{dso_name} Alt: {dso_alt:.1f}°\n"
-            f"{dso_name} Az: {dso_az:.0f}° ({direction})\n"
+            f"{dso_name} Az: {dso_az:.0f}° ({self.azimuth_to_direction(dso_az)})\n"
             f"{horizon_line}"
-            f"Sun Alt: {sun_alt:.1f}° ({twilight})\n"
+            f"{meridian_line}"
+            f"Sun Alt: {sun_alt:.1f}° ({self.get_twilight_condition(sun_alt)})\n"
             f"Optimal: {'Yes' if optimal else 'No'}"
         )
 
-        # Only update tooltip if content changed (reduces flicker)
-        if hover_text != self.last_tooltip_text:
-            self.last_tooltip_text = hover_text
-
-            # Batch updates to reduce flicker
-            self.qt_tooltip.setUpdatesEnabled(False)
-
-            # Use Qt tooltip instead of matplotlib annotation (ensures it appears on top of calendar)
-            self.qt_tooltip.setText(hover_text)
+    def _update_tooltip(self, event, x):
+        """The tooltip's text for x (rebuilt only when the minute changes) beside
+        the mouse - left of it near the right edge, below it near the top"""
+        from PySide6.QtCore import QPoint
+        text = self._hover_text(x)
+        if text != self._tooltip_text:
+            self._tooltip_text = text
+            self.qt_tooltip.setText(text)
             self.qt_tooltip.adjustSize()
+        x_min, x_max = event.inaxes.get_xlim()
+        y_min, y_max = event.inaxes.get_ylim()
+        x_offset = -self.qt_tooltip.width() - 15 if x > x_min + 0.75 * (x_max - x_min) else 15
+        y_offset = 15 if event.ydata > y_min + 0.6 * (y_max - y_min) else -self.qt_tooltip.height() - 15
+        # Matplotlib counts pixels from the bottom in physical pixels; Qt from the top in logical ones
+        ratio = self.devicePixelRatioF() or 1
+        cursor_pos = self.mapToGlobal(QPoint(int(event.x / ratio), int(self.height() - event.y / ratio)))
+        self.qt_tooltip.move(cursor_pos + QPoint(x_offset, y_offset))
+        if not self.qt_tooltip.isVisible():
+            self.qt_tooltip.show()
+            self.qt_tooltip.raise_()
 
-            # Get mouse position in global screen coordinates
-            from PySide6.QtCore import QPoint
-            cursor_pos = self.mapToGlobal(QPoint(int(event.x), int(self.height() - event.y)))
-
-            # Smart positioning: offset tooltip to avoid covering data and calendar
-            # Get the axis limits to determine position
-            x_min, x_max = event.inaxes.get_xlim()
-            y_min, y_max = event.inaxes.get_ylim()
-            x_range = x_max - x_min
-            y_range = y_max - y_min
-
-            # Horizontal positioning: left when near right edge, right otherwise
-            if x_pos > (x_min + 0.75 * x_range):
-                x_offset = -self.qt_tooltip.width() - 15  # Place to the left of cursor
-            else:
-                x_offset = 15  # Place to the right of cursor
-
-            # Vertical positioning: below when near top (to avoid calendar), above otherwise
-            if event.ydata > (y_min + 0.6 * y_range):
-                y_offset = 15  # Place below cursor
-            else:
-                y_offset = -self.qt_tooltip.height() - 15  # Place above cursor
-
-            # Position and show the Qt tooltip
-            tooltip_pos = cursor_pos + QPoint(x_offset, y_offset)
-            self.qt_tooltip.move(tooltip_pos)
-
-            # Only call show and raise if not already visible
-            if not self.qt_tooltip.isVisible():
-                self.qt_tooltip.show()
-                self.qt_tooltip.raise_()
-
-            # Re-enable updates after all changes are made
-            self.qt_tooltip.setUpdatesEnabled(True)
-
-        # Use draw_idle for better performance (for cursor lines)
-        self.draw_idle()
+    def on_mouse_move(self, event):
+        """Hover: the cursor follows the mouse along the time axis, with the
+        values under it in the tooltip"""
+        if self._pan is not None and self.hover_data:
+            self._drag_pan(event)
+            return
+        if not self.hover_data or event.inaxes is None or event.xdata is None:
+            self._hide_cursor()
+            return
+        x = self._clamp_hours(event.xdata)
+        if x != self._hover_x:
+            self._show_cursor(x)
+        self._update_tooltip(event, x)
 
     def on_mouse_leave(self, event):
-        """Handle mouse leaving the plot area"""
-        self.clear_cursor_elements()
-        self.draw_idle()
+        """Handle mouse leaving a chart"""
+        self._hide_cursor()
 
     def leaveEvent(self, event):
-        """Hide tooltip when mouse leaves the canvas widget entirely"""
+        """Hide the cursor and tooltip when the mouse leaves the canvas entirely"""
         super().leaveEvent(event)
-        if hasattr(self, 'qt_tooltip'):
-            self.qt_tooltip.hide()
-        self.last_tooltip_text = None
-        self.last_idx = None
+        self._hide_cursor()
 
     def __del__(self):
         """Destructor - clean up the tooltip widget"""
@@ -1841,15 +2077,57 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         self.calendar_widget.on_date_clicked = self.on_calendar_date_selected
         calendar_layout.addWidget(self.calendar_widget)
 
-        right_layout.addWidget(calendar_group)
+        # Graph, with its time range picker above it
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        graph_panel = QWidget()
+        graph_layout = QVBoxLayout(graph_panel)
+        graph_layout.setContentsMargins(0, 0, 0, 0)
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel("Show:"))
+        self.view_combo = QComboBox()
+        self.view_combo.addItem("Night", 'night')
+        self.view_combo.addItem("Full range", 'full')
+        self.view_combo.setToolTip("Night: sunset to sunrise of the selected date.\n"
+                                   "Full range: all the hours calculated.")
+        view_row.addWidget(self.view_combo)
+        view_row.addStretch()
+        zoom_hint = QLabel("Scroll to zoom · Drag to pan · Double-click to reset")
+        themed_style(zoom_hint, lambda: f"color: {COLORS['text_secondary']};")
+        view_row.addWidget(zoom_hint)
+        graph_layout.addLayout(view_row)
 
-        # Plot widget
         self.plot_widget = VisibilityPlot()
-        right_layout.addWidget(self.plot_widget, stretch=1)
+        graph_layout.addWidget(self.plot_widget, stretch=1)
+
+        view_mode = settings.value(GRAPH_VIEW_SETTING, 'night', type=str)
+        self.view_combo.setCurrentIndex(max(0, self.view_combo.findData(view_mode)))
+        self.plot_widget.view_mode = self.view_combo.currentData()
+        self.view_combo.currentIndexChanged.connect(self._on_view_mode_changed)
+
+        # Drag the divider to trade calendar room for graph room
+        self.graph_splitter = QSplitter(Qt.Vertical)
+        self.graph_splitter.addWidget(calendar_group)
+        self.graph_splitter.addWidget(graph_panel)
+        self.graph_splitter.setCollapsible(1, False)
+        self.graph_splitter.setStretchFactor(1, 1)
+        if not self.graph_splitter.restoreState(settings.value(GRAPH_SPLITTER_SETTING, b"")):
+            self.graph_splitter.setSizes([320, 600])
+        # Saved as it moves: the main window's wrapper borrows this layout
+        # without ever calling this window's closeEvent
+        self.graph_splitter.splitterMoved.connect(
+            lambda *_: QSettings("CosmosCollection", "CosmosCollection").setValue(
+                GRAPH_SPLITTER_SETTING, self.graph_splitter.saveState()))
+        right_layout.addWidget(self.graph_splitter, stretch=1)
 
         # Add panels to main layout
         main_layout.addWidget(left_panel)
         main_layout.addWidget(right_panel, stretch=1)
+
+    def _on_view_mode_changed(self):
+        """Night / Full range picked: show it and remember it"""
+        mode = self.view_combo.currentData()
+        QSettings("CosmosCollection", "CosmosCollection").setValue(GRAPH_VIEW_SETTING, mode)
+        self.plot_widget.set_view_mode(mode)
 
     def _load_location_from_database(self):
         """Load observer location from the database"""
@@ -1928,46 +2206,9 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
             self.dso_ra_deg, self.dso_dec_deg, self.min_alt_input.value())
 
     def _update_window_title_with_dso(self, dso_name):
-        """Update window title to show DSO name and common name if available"""
-        try:
-            from DatabaseManager import DatabaseManager
-
-            # Try to get common name from database
-            common_name = None
-
-            # Parse the catalog and designation from the DSO name
-            import re
-            match = re.match(r'^([A-Z]+)\s*(\d+)', dso_name.upper())
-            if match:
-                catalog = match.group(1)
-                designation = match.group(2)
-
-                # Query database for common name
-                db_manager = DatabaseManager()
-                with db_manager.get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT d.commonnames
-                        FROM dsodetail d
-                        JOIN cataloguenr c ON d.id = c.dsodetailid
-                        WHERE c.catalogue = ? AND c.designation = ?
-                    """, (catalog, designation))
-
-                    result = cursor.fetchone()
-                    if result and result[0]:
-                        common_name = result[0]
-
-            # Build window title
-            if common_name:
-                title = f"DSO Visibility Calculator - {dso_name} ({common_name}) - Cosmos Collection"
-            else:
-                title = f"DSO Visibility Calculator - {dso_name} - Cosmos Collection"
-
-            self.setWindowTitle(title)
-
-        except Exception as e:
-            # Fallback to simple title if any error
-            self.setWindowTitle(f"DSO Visibility Calculator - {dso_name} - Cosmos Collection")
+        """Window title with the object's name and common name ("M 31 (Andromeda Galaxy)")"""
+        from DSONames import display_name
+        self.setWindowTitle(f"DSO Visibility Calculator - {display_name(dso_name)} - Cosmos Collection")
 
     def on_calculation_error(self, error_msg):
         """Handle calculation error"""
@@ -2004,7 +2245,16 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         tz_name = max_alt_time_local.strftime('%Z')
 
         text += f"Maximum altitude: {max_altitude:.1f}° at {format_time(max_alt_time_local)} {tz_name}\n"
-        text += f"Direction at max altitude: {max_direction} ({max_azimuth:.0f}°)\n\n"
+        text += f"Direction at max altitude: {max_direction} ({max_azimuth:.0f}°)\n"
+        # Meridian crossings while it's up - when a German equatorial mount flips
+        crossings = results.get('meridian_times', [])
+        for crossing in crossings:
+            crossing_local = crossing.datetime.replace(tzinfo=pytz.UTC).astimezone(local_tz)
+            index = int(np.argmin(np.abs((time_range - crossing).to_value('hour'))))
+            if dso_altaz.alt.deg[index] > 0:
+                day = crossing_local.strftime('%b %d ') if len(crossings) > 1 else ""
+                text += f"Meridian flip: {day}{format_time(crossing_local)} {crossing_local.strftime('%Z')}\n"
+        text += "\n"
 
         horizon = results.get('horizon')
         if horizon is not None:
@@ -2074,6 +2324,7 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         # Get parameters
         dso_name = self.dso_input.text().strip() or "M100"
         date = self.date_input.date().toString("yyyy-MM-dd")
+        self.calendar_widget.show_date(self.date_input.date())
         hours = self.hours_input.value()
         min_altitude = self.min_alt_input.value()
 
@@ -2104,6 +2355,10 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
             ra_deg (float): Right Ascension in degrees
             dec_deg (float): Declination in degrees
         """
+        # 0/0 is how the app stores "no position" (a target added without
+        # coordinates): look the object up by name instead of plotting that spot
+        if not ra_deg and not dec_deg:
+            ra_deg = dec_deg = None
         self.dso_ra_deg = ra_deg
         self.dso_dec_deg = dec_deg
 

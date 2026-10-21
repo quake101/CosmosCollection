@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
 from PySide6.QtGui import QFont, QColor
 
 from DatabaseManager import DatabaseManager
+from DSONames import designation_candidates, display_name, suggestion_names
 from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, font_px, theme_manager, themed_style, themed_text
 from NINAIntegration import NINAIntegration
@@ -246,7 +247,10 @@ class AddTargetDialog(QDialog):
         if not self.dso_data:
             return
 
-        self.name_edit.setText(self.dso_data.get("name", ""))
+        # A new entry is named with its common name, "M 31 (Andromeda Galaxy)"
+        # (editing puts the saved name back afterwards)
+        self.name_edit.setText(display_name(self.dso_data.get("name", ""), self.dso_data.get("dsodetailid"),
+                                            self.dso_data.get("designations")))
         self.type_edit.setText(self.dso_data.get("dso_type", ""))
         self.constellation_edit.setText(self.dso_data.get("constellation", ""))
 
@@ -316,7 +320,8 @@ class AddTargetDialog(QDialog):
                                d.ra, d.dec, d.magnitude,
                                d.sizemin / 60.0 as sizemin,
                                d.sizemax / 60.0 as sizemax,
-                               d.constellation, d.dsotype
+                               d.constellation, d.dsotype,
+                               c.dsodetailid, c.catalogue, c.designation
                         FROM cataloguenr c
                         JOIN dsodetail d ON d.id = c.dsodetailid
                         WHERE c.catalogue = ? AND c.designation LIKE ?
@@ -330,7 +335,8 @@ class AddTargetDialog(QDialog):
                                d.ra, d.dec, d.magnitude,
                                d.sizemin / 60.0 as sizemin,
                                d.sizemax / 60.0 as sizemax,
-                               d.constellation, d.dsotype
+                               d.constellation, d.dsotype,
+                               c.dsodetailid, c.catalogue, c.designation
                         FROM cataloguenr c
                         JOIN dsodetail d ON d.id = c.dsodetailid
                         WHERE c.catalogue || ' ' || c.designation LIKE ?
@@ -341,8 +347,11 @@ class AddTargetDialog(QDialog):
                 results = cursor.fetchall()
                 self._dso_cache.clear()
                 names = []
-                for row in results:
-                    name = row[0]
+                # One suggestion per object, with its common name; a common
+                # name typed in ("Andromeda") finds the object too
+                row_of = {str(row[8]): row for row in results}
+                for name, dso in suggestion_names(conn, [tuple(row)[8:11] for row in results], text):
+                    row = row_of[dso]
                     names.append(name)
                     self._dso_cache[name] = {
                         "ra": row[1],
@@ -689,28 +698,11 @@ def name_key(name):
     return SessionFileScanner.normalize_object_name(name)
 
 
-def _designation_candidates(name):
-    """(catalogue, designation) pairs a target name could be ('Sh2-129' ->
-    ('Sh2', '129'); 'vdB 152 (Wolf's Cave Nebula)' -> ('vdB', '152'))."""
-    base = re.sub(r'\([^)]*\)|\[[^\]]*\]', '', name or '').strip()
-    if not base or '&' in base or ',' in base:
-        return []  # Pairs/groups ('NGC 4038 & NGC 4039') aren't one catalog object
-    candidates = []
-    parts = base.split()
-    if len(parts) >= 2:
-        candidates.append((parts[0], " ".join(parts[1:])))
-    for pattern in (r'([A-Za-z]+)[-_ ]?(\d[\w.+\-]*)', r'([A-Za-z]+\d)[-_ ]+(\d[\w.+\-]*)'):
-        match = re.fullmatch(pattern, base)
-        if match:
-            candidates.append((match.group(1), match.group(2)))
-    return list(dict.fromkeys(candidates))
-
-
 def catalog_object_ids(cursor, name):
     """The catalog objects (dsodetail ids) a target name designates; empty if
     the name isn't a known designation."""
     ids = set()
-    for catalogue, designation in _designation_candidates(name):
+    for catalogue, designation in designation_candidates(name):
         try:
             cursor.execute("""
                 SELECT dsodetailid FROM cataloguenr
@@ -724,7 +716,7 @@ def catalog_object_ids(cursor, name):
 
 def _standard_name(cursor, name):
     """The catalog's own spelling of a target's designation ('M17' -> 'M 17'), or None."""
-    for catalogue, designation in _designation_candidates(name):
+    for catalogue, designation in designation_candidates(name):
         cursor.execute("""
             SELECT catalogue || ' ' || designation FROM cataloguenr
             WHERE catalogue = ? COLLATE NOCASE AND designation = ? COLLATE NOCASE LIMIT 1
@@ -880,7 +872,7 @@ def preferred_duplicate_name(cursor, names, fallback):
         return with_common[0]
 
     def catalog_rank(name):
-        candidates = _designation_candidates(name)
+        candidates = designation_candidates(name)
         catalogue = candidates[0][0].upper() if candidates else ""
         return PREFERRED_CATALOGS.index(catalogue) if catalogue in PREFERRED_CATALOGS else len(PREFERRED_CATALOGS)
 

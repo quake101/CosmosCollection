@@ -685,8 +685,10 @@ def open_image_viewer(parent, name, image_path, ra_deg=None, dec_deg=None, versi
                                 f"Image file not found:\n{image_path}\n\n"
                                 f"The file may have been moved or deleted.")
             return None
+        from DSONames import display_name
         # (pixmap, title, file_path, parent, dso_ra, dso_dec)
-        viewer = ImageViewerWindow(None, name, image_path, parent, dso_ra=ra_deg, dso_dec=dec_deg, versions=versions)
+        viewer = ImageViewerWindow(None, display_name(name), image_path, parent, dso_ra=ra_deg, dso_dec=dec_deg,
+                                   versions=versions)
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
