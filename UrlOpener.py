@@ -61,8 +61,7 @@ def clean_subprocess_env():
     app sets for its own use:
     - QTWEBENGINE_CHROMIUM_FLAGS (main.py) is read by every QtWebEngine app,
       e.g. PixInsight - its --enable-logging makes each of their Chromium
-      helper processes flash a console window on Windows (and --log-file
-      would send their logs into this app's chromium_debug.log).
+      helper processes flash a console window on Windows.
     - SSL/CA bundle variables and XDG_CACHE_HOME point at this app's own
       certificates and cache folder.
     On Linux a PyInstaller-frozen build also exports its bundled

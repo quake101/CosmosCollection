@@ -34,10 +34,11 @@ if getattr(sys, 'frozen', False):
 # update once overwrote these and brought the crashes back.
 #   --no-sandbox: Chromium's sandbox failed to start here (renderer exit code 18), so the
 #     FOV Simulator's sky and the map picker never drew. Applies to every web view.
-#   --enable-logging --log-file --log-level=1: Chromium writes its fatal-error message to
-#     chromium_debug.log just before it aborts - the only clue when the app crashes inside
-#     app.exec() while a sky view is drawing. Level 1 keeps warnings and errors, not the
-#     info lines (every web page console message).
+#   --enable-logging --log-level=1: Chromium writes its fatal-error message to stderr just
+#     before it aborts - the only clue when the app crashes inside app.exec() while a sky
+#     view is drawing. Level 1 keeps warnings and errors, not the info lines (every web page
+#     console message). QtWebEngine ignores --log-file, so stderr is pointed at
+#     chromium_debug.log below.
 #   Linux only - --disable-gpu-compositing --disable-gpu-rasterization --disable-zero-copy:
 #     some Mesa builds (e.g. CachyOS, especially under Wayland) draw web views as garbled or
 #     solid black. These keep drawing on the CPU (WebGL is unaffected). Elsewhere they'd only
@@ -48,8 +49,24 @@ _gpu_workarounds = ('--disable-gpu-compositing --disable-gpu-rasterization --dis
                     if sys.platform.startswith('linux') else '')
 os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
     f'--no-sandbox {_gpu_workarounds}'
-    f'--enable-logging --log-level=1 --log-file={_chromium_log_path}'
+    f'--enable-logging --log-level=1'
 )
+
+# The packaged app (and pythonw) has no console, so Chromium's stderr went nowhere. Point the
+# process's stderr at chromium_debug.log; Chromium's GPU and renderer processes inherit it.
+# Appended, not overwritten, so the messages from a crash survive the next start. From a
+# terminal they already show there.
+if sys.stderr is None:
+    try:
+        os.makedirs(os.path.dirname(_chromium_log_path), exist_ok=True)
+        if os.path.exists(_chromium_log_path) and os.path.getsize(_chromium_log_path) > 2 * 1024 * 1024:
+            os.replace(_chromium_log_path, _chromium_log_path + '.old')
+        _chromium_log_file = open(_chromium_log_path, 'a', encoding='utf-8', buffering=1)
+        import datetime as _datetime
+        _chromium_log_file.write(f"\n--- session started {_datetime.datetime.now().isoformat()} ---\n")
+        os.dup2(_chromium_log_file.fileno(), 2)
+    except OSError:
+        pass
 
 # Core PySide6 imports (always needed)
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QUrl, Signal, QObject, QTimer, QEvent, QThread, QSettings, Slot, QCoreApplication, QPointF, QRectF, QSize
@@ -6284,6 +6301,24 @@ if __name__ == "__main__":
         logger.debug(f"Crash log: {_crash_log_path}")
     except Exception as e:
         logger.warning(f"Could not enable crash log: {e}")
+
+    # With no console, Qt sends its warnings - and the qFatal message it prints just before
+    # aborting ("Fatal Python error: Aborted" in crash.log) - to the Windows debugger only.
+    # Send them to stderr, which is chromium_debug.log then (see the top of this file).
+    if sys.stderr is None:
+        from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+        import datetime
+
+        def _qt_message_to_stderr(msg_type, context, message):
+            if msg_type == QtMsgType.QtDebugMsg or msg_type == QtMsgType.QtInfoMsg:
+                return
+            try:
+                line = f"{datetime.datetime.now().isoformat()} Qt {msg_type.name}: {message}\n"
+                os.write(2, line.encode('utf-8', 'replace'))
+            except OSError:
+                pass
+
+        qInstallMessageHandler(_qt_message_to_stderr)
 
     # Configure file logging if enabled (must be after QApplication for QSettings to work on Windows)
     try:
