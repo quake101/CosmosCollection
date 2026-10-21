@@ -94,6 +94,10 @@ class DownloadWorker(QThread):
         self._cancelled = True
 
     def run(self):
+        from OnlineLimits import OFFLINE_NOTE, is_offline
+        if is_offline():
+            self.error_occurred.emit(f"Downloading the update needs the internet. {OFFLINE_NOTE}")
+            return
         try:
             self.dest_dir.mkdir(parents=True, exist_ok=True)
             zip_path = self.dest_dir / self.zip_asset['name']

@@ -698,20 +698,41 @@ def name_key(name):
     return SessionFileScanner.normalize_object_name(name)
 
 
+_ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
 def catalog_object_ids(cursor, name):
     """The catalog objects (dsodetail ids) a target name designates; empty if
     the name isn't a known designation."""
-    ids = set()
-    for catalogue, designation in designation_candidates(name):
-        try:
-            cursor.execute("""
-                SELECT dsodetailid FROM cataloguenr
-                WHERE catalogue = ? COLLATE NOCASE AND designation = ? COLLATE NOCASE
-            """, (catalogue, designation))
-            ids.update(row[0] for row in cursor.fetchall())
-        except Exception as e:
-            logger.debug(f"Catalog lookup failed for {name!r}: {e}")
-    return frozenset(ids)
+    return catalog_object_ids_many(cursor, [name])[name]
+
+
+def catalog_object_ids_many(cursor, names):
+    """{name: catalog_object_ids(name)} for many names in one pass over the
+    catalog - cataloguenr is a view over the update catalogs that no index
+    serves case-insensitively, so each lookup scans it all."""
+    def fold(text):  # Case folded as COLLATE NOCASE does it (ASCII letters only)
+        return (text or "").translate(_ASCII_UPPER)
+
+    wanted = {}  # (CATALOGUE, DESIGNATION) -> the names that could be it
+    for name in names:
+        for catalogue, designation in designation_candidates(name):
+            wanted.setdefault((fold(catalogue), fold(designation)), set()).add(name)
+    ids = {name: set() for name in names}
+    designations = list({designation for _, designation in wanted})
+    try:
+        for start in range(0, len(designations), 500):
+            chunk = designations[start:start + 500]
+            cursor.execute(f"""
+                SELECT dsodetailid, catalogue, designation FROM cataloguenr
+                WHERE designation COLLATE NOCASE IN ({",".join("?" * len(chunk))})
+            """, chunk)
+            for obj, catalogue, designation in cursor.fetchall():
+                for name in wanted.get((fold(catalogue), fold(designation)), ()):
+                    ids[name].add(obj)
+    except Exception as e:
+        logger.debug(f"Catalog lookup failed for {len(names)} names: {e}")
+    return {name: frozenset(found) for name, found in ids.items()}
 
 
 def _standard_name(cursor, name):
@@ -792,7 +813,8 @@ def find_duplicate_groups(conn, targets=None, dismissed=None):
             else:
                 keys[key] = t["id"]
 
-    objects = {t["id"]: catalog_object_ids(cursor, t["name"]) for t in targets}
+    target_objects = catalog_object_ids_many(cursor, [t["name"] for t in targets])
+    objects = {t["id"]: target_objects[t["name"]] for t in targets}
     seen_objects = {}
     for t in targets:
         for obj in objects[t["id"]]:
@@ -993,10 +1015,11 @@ class TargetListIndex:
                         for row in self._cursor.fetchall() if row[0] != exclude_id and row[1]]
         self._exact, self._keys = {}, {}
         objects = {}
+        entry_objects = catalog_object_ids_many(self._cursor, [entry["name"] for entry in self.entries])
         for entry in self.entries:
             self._exact.setdefault(entry["name"].strip().upper(), entry)
             self._keys.setdefault(name_key(entry["name"]), entry)
-            for obj in catalog_object_ids(self._cursor, entry["name"]):
+            for obj in entry_objects[entry["name"]]:
                 objects.setdefault(obj, entry)
         # Every catalog designation of the listed objects ("NGC 6618" for M 17), so
         # checking a name is a lookup rather than a catalog query per name

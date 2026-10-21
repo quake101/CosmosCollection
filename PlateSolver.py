@@ -33,6 +33,9 @@ def test_astrometry_key(api_key: str, timeout: int = 30) -> Tuple[bool, str]:
     api_key = (api_key or "").strip()
     if not api_key:
         return False, "Please enter an API key first."
+    from OnlineLimits import OFFLINE_NOTE, is_offline
+    if is_offline():
+        return False, OFFLINE_NOTE
 
     try:
         login_url = PlateSolver.ASTROMETRY_NET_API_URL + "login"
@@ -128,9 +131,15 @@ SOLVER_ORDERS = (("builtin,astap,astrometry", "Built-in, then ASTAP, then astrom
 
 def describe_solving():
     """How images will be plate solved, in a sentence - for confirmations."""
-    notes = {"builtin": "the built-in solver (online star catalog, seconds each)",
-             "astap": "ASTAP (if installed, seconds each)",
-             "astrometry": "astrometry.net (online, with an API key - can take minutes each)"}
+    from OnlineLimits import is_offline
+    if is_offline():
+        notes = {"builtin": "the built-in solver (star catalog areas already downloaded only - offline mode)",
+                 "astap": "ASTAP (if installed, seconds each)",
+                 "astrometry": "astrometry.net (off - offline mode)"}
+    else:
+        notes = {"builtin": "the built-in solver (online star catalog, seconds each)",
+                 "astap": "ASTAP (if installed, seconds each)",
+                 "astrometry": "astrometry.net (online, with an API key - can take minutes each)"}
     steps = [notes[name] for name in solver_order()]
     return f"This runs in the background with {', then '.join(steps)}."
 
@@ -581,6 +590,10 @@ class PlateSolver:
         key_problem = self.astrometry_key_problem()
         if key_problem:
             result.error_message = key_problem
+            return result
+        from OnlineLimits import OFFLINE_NOTE, is_offline
+        if is_offline():
+            result.error_message = f"Astrometry.net needs the internet. {OFFLINE_NOTE}"
             return result
 
         temp_dir = None

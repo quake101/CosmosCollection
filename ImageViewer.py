@@ -7,10 +7,7 @@ Provides the ImageViewerWindow class for displaying images with zoom, pan, and a
 import json
 import logging
 import math
-import platform
-import ctypes
 import re
-import subprocess
 import os
 from collections import namedtuple
 from html import escape
@@ -18,12 +15,13 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QSettings, QThread, QRectF, QObject, QRunnable, QThreadPool
-from PySide6.QtGui import QPixmap, QPainter, QImage, QKeySequence, QShortcut
+from PySide6.QtGui import QPixmap, QPainter, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
-    QGroupBox, QScrollArea, QFileDialog, QMessageBox, QCheckBox, QProgressBar, QToolButton, QMenu
+    QGroupBox, QScrollArea, QMessageBox, QProgressBar, QMenu
 )
 
+import ImageDetails
 from Theme import COLORS, adapt_color, font_size, theme_manager, themed_style
 from WindowPositionManager import WindowPositionManager
 from ResourceManager import ResourceManager
@@ -116,55 +114,6 @@ class ImageLoadWorker(QThread):
                 return
             logger.error(f"Failed to load image {self.file_path}: {e}", exc_info=True)
             self.load_failed.emit(str(e), self.file_path)
-
-
-class ImageSaveWorker(QThread):
-    """Encodes and writes a QImage to disk off the GUI thread (PNG compression
-    of a large image takes seconds)"""
-    image_saved = Signal(bool, str)  # success, save path
-
-    def __init__(self, image, save_path, image_format, quality=-1):
-        super().__init__()
-        self.image = image
-        self.save_path = save_path
-        self.image_format = image_format
-        self.quality = quality
-
-    def run(self):
-        try:
-            from ImageLoader import write_image_file
-            ok = write_image_file(self.image, self.save_path, self.image_format, self.quality)
-        except Exception as e:
-            logger.error(f"Failed to save image to {self.save_path}: {e}", exc_info=True)
-            ok = False
-        self.image_saved.emit(ok, self.save_path)
-
-
-class BackgroundSetterWorker(QThread):
-    """Converts a FITS/XISF render to PNG (if needed) and sets it as the desktop
-    background off the GUI thread"""
-    background_set = Signal(str, str)  # level ('success'/'warning'/'error'), message
-
-    def __init__(self, file_path, image=None):
-        super().__init__()
-        self.file_path = file_path
-        self.image = image  # QImage to convert to PNG first, or None to use file_path directly
-
-    def run(self):
-        try:
-            if self.image is not None:
-                abs_path = ImageViewerWindow._export_background_png(self.image, self.file_path)
-                if not abs_path:
-                    self.background_set.emit("error", "Failed to convert image to PNG for desktop background")
-                    return
-            else:
-                abs_path = str(Path(self.file_path).resolve())
-
-            level, message = ImageViewerWindow._apply_desktop_background(abs_path)
-            self.background_set.emit(level, message)
-        except Exception as e:
-            logger.error(f"Failed to set desktop background: {e}", exc_info=True)
-            self.background_set.emit("error", f"Failed to set desktop background: {str(e)}")
 
 
 # ------------------------------------------------------------------------------
@@ -864,22 +813,21 @@ class ImageViewerWindow(QDialog):
             open_location_button.clicked.connect(self._open_file_location)
             toolbar.addWidget(open_location_button)
 
-            self.set_bg_button = QPushButton("Set as Background")
-            self.set_bg_button.setFixedHeight(30)
-            self.set_bg_button.setToolTip("Set this image as your desktop background")
-            self.set_bg_button.clicked.connect(self._set_as_background)
-            toolbar.addWidget(self.set_bg_button)
-
-            # Annotations, as in the gallery: on/off, which layers, plate solving
+            # What's drawn over the image, in one menu: the annotations (as in the
+            # gallery: on/off, which layers, plate solving) and the capture details
+            # (ImageDetails.py: on/off, and which and how)
             toolbar.addSpacing(6)
-            self.annotations_check = QCheckBox("Show Annotations")
-            self.annotations_check.setToolTip("Mark the objects in the image (it needs a plate solve)")
-            toolbar.addWidget(self.annotations_check)
-            self.layers_button = QToolButton()
-            self.layers_button.setText("Layers")
-            self.layers_button.setToolTip("What the annotations show")
-            self.layers_button.setPopupMode(QToolButton.InstantPopup)
-            layers_menu = QMenu(self.layers_button)
+            self.overlays_button = QPushButton("Overlays")
+            self.overlays_button.setFixedHeight(30)
+            overlays_menu = QMenu(self.overlays_button)
+            overlays_menu.setToolTipsVisible(True)
+            self.annotations_action = overlays_menu.addAction("Show Annotations")
+            self.annotations_action.setCheckable(True)
+            self.annotations_action.setToolTip("Mark the objects in the image (it needs a plate solve)")
+            layers_menu = overlays_menu.addMenu("Annotation Layers")
+            layers_menu.setToolTipsVisible(True)
+            self.layers_action = layers_menu.menuAction()
+            self.layers_action.setToolTip("What the annotations show")
             layers = self._annotation_layers()
             self.layer_actions = {}
             for key, label in ANNOTATION_LAYERS:
@@ -891,18 +839,26 @@ class ImageViewerWindow(QDialog):
             # Dark nebulae are among the DSOs
             self.layer_actions["dark"].setEnabled(layers["dsos"])
             self.layer_actions["dsos"].toggled.connect(self.layer_actions["dark"].setEnabled)
-            self.layers_button.setMenu(layers_menu)
-            toolbar.addWidget(self.layers_button)
-            self.solve_button = QPushButton("Plate Solve")
-            self.solve_button.setFixedHeight(30)
-            self.solve_button.clicked.connect(self._start_plate_solve)
-            toolbar.addWidget(self.solve_button)
+            self.solve_action = overlays_menu.addAction("Plate Solve")
+            self.solve_action.triggered.connect(self._start_plate_solve)
+            overlays_menu.addSeparator()
+            self.details_action = overlays_menu.addAction("Show Details")
+            self.details_action.setCheckable(True)
+            self.details_action.setToolTip("Show the capture details on the image - object, integration, "
+                                           "equipment and more")
+            details_dialog_action = overlays_menu.addAction("Details...")
+            details_dialog_action.setToolTip("Choose the details shown and how they look")
+            details_dialog_action.triggered.connect(self._open_details_dialog)
+            self.overlays_button.setMenu(overlays_menu)
+            toolbar.addWidget(self.overlays_button)
 
-            self.save_annotated_button = QPushButton("Save with Annotations")
-            self.save_annotated_button.setFixedHeight(30)
-            self.save_annotated_button.setToolTip("Save image with annotations overlaid")
-            self.save_annotated_button.clicked.connect(self._save_with_annotations)
-            toolbar.addWidget(self.save_annotated_button)
+            # Every way the image leaves the app, in one dialog (ImageExport.py)
+            toolbar.addSpacing(6)
+            self.export_button = QPushButton("Export...")
+            self.export_button.setFixedHeight(30)
+            self.export_button.setToolTip("Save, copy, set as background or share this image")
+            self.export_button.clicked.connect(self._open_export_dialog)
+            toolbar.addWidget(self.export_button)
 
         toolbar.addStretch()
 
@@ -923,8 +879,8 @@ class ImageViewerWindow(QDialog):
         self.annotations_enabled = settings.value("annotation_enabled", False, type=bool)
         if self.file_path:
             annotation_store().ready.connect(self._on_annotations_ready)
-            self.annotations_check.setChecked(self.annotations_enabled)
-            self.annotations_check.toggled.connect(self._toggle_annotations)
+            self.annotations_action.setChecked(self.annotations_enabled)
+            self.annotations_action.toggled.connect(self._toggle_annotations)
         self.plate_solve_result = None
         self.plate_solve_worker = None
         self._solve_message = None       # Plate solving's progress or result, for the status bar
@@ -932,8 +888,25 @@ class ImageViewerWindow(QDialog):
         self._solve_message_timer = QTimer(self)  # Clears a result a moment after it shows
         self._solve_message_timer.setSingleShot(True)
         self._solve_message_timer.timeout.connect(self._clear_solve_message)
-        self.background_worker = None
-        self.save_worker = None
+        self.export_dialog = None
+
+        # The details, gathered in the background (ImageDetails.DetailsTask) for each image shown
+        self.details_style = ImageDetails.load_style()
+        self._details = None          # (file path, {"auto", "edits", "info"})
+        self._details_reading = None  # The file path being gathered
+        self._details_signals = ImageDetails.DetailsSignals(self)
+        self._details_signals.ready.connect(self._on_details_ready)
+        self._banner_cache = None     # (what it was measured for, banner height)
+        self.details_dialog = None
+        self._closing = False
+        # Edits are saved a moment after typing stops
+        self._pending_edits = None    # (file path, edits)
+        self._edits_timer = QTimer(self)
+        self._edits_timer.setSingleShot(True)
+        self._edits_timer.timeout.connect(self._save_details_edits)
+        if self.file_path:
+            self.details_action.setChecked(self.details_style["enabled"])
+            self.details_action.toggled.connect(self._toggle_details)
 
         main_layout.addLayout(toolbar)
 
@@ -1104,6 +1077,14 @@ class ImageViewerWindow(QDialog):
         self._update_version_controls()
         self._update_status()
 
+        if self.file_path:
+            if self.original_pixmap is not None:
+                self._load_details()  # Given the image - otherwise once it loads
+            # Reopen the details dialog if it was open last time
+            if self.details_style["enabled"] and QSettings("CosmosCollection", "CosmosCollection").value(
+                    ImageDetails.DIALOG_SETTING, False, type=bool):
+                QTimer.singleShot(0, self._open_details_dialog)
+
     def _update_version_controls(self):
         """Which of the object's images shows (n of N, its file in the title).
         Stepping waits while a plate solve of this one runs."""
@@ -1126,6 +1107,7 @@ class ImageViewerWindow(QDialog):
         if index == self.version_index:
             return
         self._drop_image_load()
+        self._save_details_edits()  # The edits of the one being left
         if self.original_pixmap is not None:
             self._previous_size = self.original_pixmap.size()
         self.version_index = index
@@ -1141,7 +1123,10 @@ class ImageViewerWindow(QDialog):
         self._start_image_load()
         if self.file_info_panel.isVisible():
             self._load_file_information()  # Read alongside the image, not after it
+        if self.details_dialog is not None:
+            self.details_dialog.set_details(self.file_path, None, None)  # Gathered once it loads
         self._update_status()
+        self._refresh_export()
 
     def _drop_image_load(self):
         """Stop an image that's still loading: its read stops (decoding can't be
@@ -1160,7 +1145,7 @@ class ImageViewerWindow(QDialog):
     def _image_buttons(self):
         """Toolbar buttons that need the image to be loaded"""
         return [getattr(self, name) for name in
-                ('set_bg_button', 'save_annotated_button')
+                ('export_button',)
                 if hasattr(self, name)]
 
     def _start_image_load(self):
@@ -1217,6 +1202,8 @@ class ImageViewerWindow(QDialog):
         # A panel opened before the image arrived is missing the image's size
         if self.file_info_panel.isVisible():
             self._load_file_information()
+        self._load_details()
+        self._refresh_export()
 
         # Another of the object's images: fitted afresh unless it's the same size
         if self._previous_size is not None and self._previous_size != pixmap.size():
@@ -1317,9 +1304,16 @@ class ImageViewerWindow(QDialog):
         # Create a painter to draw the scaled image at the correct position
         painter = QPainter(final_pixmap)
 
-        # Calculate the position to draw the image
+        # Calculate the position to draw the image - centered with the details
+        # banner, when there's one above or below it
+        banner = self._banner_height()
         x = (label_size.width() - new_width) // 2 + self.image_position[0]
-        y = (label_size.height() - new_height) // 2 + self.image_position[1]
+        y = (label_size.height() - int((img_h + banner) * self.zoom_factor)) // 2 + self.image_position[1]
+        if banner and self.details_style["layout"] == "banner_above":
+            banner_y = y
+            y += int(banner * self.zoom_factor)
+        else:
+            banner_y = y + new_height
 
         # Draw only the part of the image that's visible in the label, rather
         # than scaling the whole image on every pan/zoom (at high zoom on a large
@@ -1363,6 +1357,19 @@ class ImageViewerWindow(QDialog):
             paint_annotations(painter, data, self._annotation_layers(), img_w, QRectF(0, 0, img_w, img_h),
                               whole, font_px=screen_name_px(whole))
 
+        # The details, painted in image pixels and scaled down - just as they're saved
+        lines = self._details_lines()
+        if lines and new_width >= 1 and new_height >= 1:
+            painter.save()
+            painter.translate(x, banner_y if banner else y)
+            painter.scale(self.zoom_factor, self.zoom_factor)
+            if banner:
+                ImageDetails.paint_banner(painter, lines, QRectF(0, 0, img_w, banner), (img_w, img_h),
+                                          self.details_style)
+            else:
+                ImageDetails.paint_overlay(painter, lines, QRectF(0, 0, img_w, img_h), self.details_style)
+            painter.restore()
+
         painter.end()
 
         # Update the display
@@ -1380,9 +1387,9 @@ class ImageViewerWindow(QDialog):
         # Get available size
         available_size = self.image_container.size()
 
-        # Calculate zoom factor to fit
+        # Calculate zoom factor to fit (with the details banner, if there's one)
         width_ratio = available_size.width() / self.original_pixmap.width()
-        height_ratio = available_size.height() / self.original_pixmap.height()
+        height_ratio = available_size.height() / (self.original_pixmap.height() + self._banner_height())
         self.zoom_factor = min(width_ratio, height_ratio)
 
         # Reset position
@@ -1468,274 +1475,51 @@ class ImageViewerWindow(QDialog):
             if not success:
                 QMessageBox.critical(self, "Error", "Failed to open file location")
 
-    def _set_as_background(self):
-        """Set the current image as the desktop background. The PNG conversion and
-        OS call run in a worker thread so the window doesn't hang on large images."""
+    # Export (ImageExport.py)
+
+    def _open_export_dialog(self):
+        """The export dialog beside the viewer - including what the viewer shows."""
         if not self.file_path:
-            QMessageBox.warning(self, "Warning", "No file path available")
             return
+        if self.export_dialog is None:
+            import ImageExport
+            dialog = ImageExport.ExportDialog(self)
+            dialog.finished.connect(self._on_export_dialog_closed)
+            self.export_dialog = dialog
+            self._load_details()  # For the details and descriptions
+            dialog.refresh()
+        self.export_dialog.show()
+        self.export_dialog.raise_()
+        self.export_dialog.activateWindow()
 
-        if self.background_worker and self.background_worker.isRunning():
-            return
+    def _on_export_dialog_closed(self, _result=None):
+        self.export_dialog = None
 
-        # FITS/XISF can't be used as a wallpaper directly - convert the stretched
-        # render already shown in the viewer to PNG. QPixmap isn't safe to use off
-        # the GUI thread, so hand the worker a QImage copy.
-        image = None
-        if Path(self.file_path).suffix.lower() in ['.fits', '.fit', '.fts', '.xisf']:
-            if self.original_pixmap is None or self.original_pixmap.isNull():
-                QMessageBox.critical(self, "Error", "No image available to convert for desktop background")
-                return
-            image = self.original_pixmap.toImage()
+    def _refresh_export(self):
+        """What the export dialog shows changed (loaded, edited, another image)."""
+        if self.export_dialog is not None:
+            self.export_dialog.refresh()
 
-        self.set_bg_button.setEnabled(False)
-        self.setCursor(Qt.BusyCursor)
-        self._update_status("Converting image to PNG..." if image is not None
-                            else "Setting desktop background...")
-
-        self.background_worker = BackgroundSetterWorker(self.file_path, image)
-        self.background_worker.background_set.connect(self._on_background_set)
-        self.background_worker.start()
-
-    def _on_background_set(self, level, message):
-        """Show the result of the background worker"""
-        self.set_bg_button.setEnabled(True)
-        self.unsetCursor()
-        self._update_status()
-
-        if level == "success":
-            QMessageBox.information(self, "Success", message)
-        elif level == "warning":
-            QMessageBox.warning(self, "Warning", message)
-        else:
-            QMessageBox.critical(self, "Error", message)
-
-    @staticmethod
-    def _apply_desktop_background(abs_path):
-        """Set abs_path as the desktop wallpaper. Safe to call from a worker thread.
-        Returns (level, message) where level is 'success', 'warning' or 'error'."""
-        success = ("success", "Desktop background updated successfully!")
-
-        if platform.system() == "Windows":
-            # Windows implementation using ctypes
-            SPI_SETDESKWALLPAPER = 20
-            SPIF_UPDATEINIFILE = 0x01
-            SPIF_SENDCHANGE = 0x02
-
-            # Call SystemParametersInfoW to set the wallpaper
-            result = ctypes.windll.user32.SystemParametersInfoW(
-                SPI_SETDESKWALLPAPER,
-                0,
-                abs_path,
-                SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
-            )
-            return success if result else ("error", "Failed to set desktop background")
-
-        if platform.system() == "Darwin":
-            # macOS implementation
-            script = f'''
-            tell application "Finder"
-                set desktop picture to POSIX file "{abs_path}"
-            end tell
-            '''
-            subprocess.run(["osascript", "-e", script], check=True)
-            return success
-
-        if platform.system() == "Linux":
-            desktop = ImageViewerWindow._linux_desktop_name()
-            if ImageViewerWindow._set_linux_background(abs_path, desktop):
-                return success
-            return ("warning",
-                    f"Could not set background on this desktop environment "
-                    f"({desktop or 'unknown'}).\n"
-                    f"Supported: KDE Plasma, GNOME, Cinnamon, MATE, XFCE.")
-
-        return ("warning", f"Setting desktop background is not supported on {platform.system()}")
-
-    @staticmethod
-    def _linux_desktop_name():
-        """Return the current desktop environment in lowercase, e.g. 'kde:plasma'
-        or 'ubuntu:gnome' (XDG_CURRENT_DESKTOP can hold several names separated by ':')"""
-        return (os.environ.get('XDG_CURRENT_DESKTOP')
-                or os.environ.get('DESKTOP_SESSION')
-                or '').lower()
-
-    @staticmethod
-    def _set_linux_background(abs_path, desktop):
-        """Set the wallpaper using the right tool for the Linux desktop environment.
-        Returns True on success, False if the desktop isn't supported or the command failed."""
-        uri = Path(abs_path).as_uri()
-
-        def run(*args):
-            subprocess.run(list(args), check=True, capture_output=True, timeout=15)
-
-        try:
-            if 'kde' in desktop or 'plasma' in desktop:
-                # Plasma 5.24+ ships a CLI tool for this
-                try:
-                    run("plasma-apply-wallpaperimage", abs_path)
-                    return True
-                except (subprocess.CalledProcessError, FileNotFoundError):
-                    pass
-
-                # Older Plasma - set it through a plasmashell script over D-Bus
-                script = (
-                    "var allDesktops = desktops();"
-                    "for (var i = 0; i < allDesktops.length; i++) {"
-                    "  var d = allDesktops[i];"
-                    "  d.wallpaperPlugin = 'org.kde.image';"
-                    "  d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General'];"
-                    f"  d.writeConfig('Image', {json.dumps(uri)});"
-                    "}"
-                )
-                for qdbus in ("qdbus6", "qdbus", "qdbus-qt5"):
-                    try:
-                        run(qdbus, "org.kde.plasmashell", "/PlasmaShell",
-                            "org.kde.PlasmaShell.evaluateScript", script)
-                        return True
-                    except (subprocess.CalledProcessError, FileNotFoundError):
-                        continue
-                return False
-
-            if 'xfce' in desktop:
-                # Every monitor/workspace has its own last-image property
-                result = subprocess.run(["xfconf-query", "-c", "xfce4-desktop", "-l"],
-                                        check=True, capture_output=True, text=True, timeout=15)
-                props = [p for p in result.stdout.split() if p.endswith('/last-image')]
-                if not props:
-                    return False
-                for prop in props:
-                    run("xfconf-query", "-c", "xfce4-desktop", "-p", prop, "-s", abs_path)
-                return True
-
-            if 'cinnamon' in desktop:
-                run("gsettings", "set", "org.cinnamon.desktop.background", "picture-uri", uri)
-                return True
-
-            if 'mate' in desktop:
-                run("gsettings", "set", "org.mate.background", "picture-filename", abs_path)
-                return True
-
-            if any(name in desktop for name in ('gnome', 'unity', 'budgie', 'pantheon')):
-                run("gsettings", "set", "org.gnome.desktop.background", "picture-uri", uri)
-                # GNOME 42+ uses a separate key in dark mode; older versions lack it
-                try:
-                    run("gsettings", "set", "org.gnome.desktop.background", "picture-uri-dark", uri)
-                except subprocess.CalledProcessError:
-                    pass
-                return True
-
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-            logger.warning(f"Failed to set background on desktop '{desktop}': {e}")
-            return False
-
-        logger.warning(f"Setting background not supported on desktop '{desktop}'")
-        return False
-
-    @staticmethod
-    def _export_background_png(image, file_path):
-        """Save image (a QImage) as a PNG next to the original file for use as a
-        desktop background. The file has to persist since macOS/GNOME reference it
-        directly. Safe to call from a worker thread. Returns the absolute path, or
-        None on failure."""
-        # "_background" suffix so an existing PNG of the same name isn't overwritten
-        source = Path(file_path).resolve()
-        png_path = source.with_name(f"{source.stem}_background.png")
-        from ImageLoader import write_image_file
-        if not write_image_file(image, str(png_path), "PNG"):
-            logger.error(f"Failed to save background PNG to {png_path}")
-            return None
-
-        logger.info(f"Converted {file_path} to {png_path} for desktop background")
-        return str(png_path)
-
-    def _save_with_annotations(self):
-        """Save the current image with annotations overlaid"""
-        if not self.file_path or not self.original_pixmap:
-            QMessageBox.warning(self, "Warning", "No image available to save")
-            return
-
+    def export_annotations(self):
+        """For the export dialog: (state, AnnotationData) - "ready", "loading"
+        (the solution or its star names) or "unsolved"."""
         data = self._annotations()
         if data is None:
-            if annotation_store().known(self.file_path) or self._unsaved_annotations is not None:
-                message = ("This image isn't plate solved yet, so there's nothing to annotate.\n\n"
-                           "Use 'Show Annotations' to plate solve it first.")
-            else:
-                message = "The annotations are still loading - try again in a moment."
-            QMessageBox.information(self, "No Annotations", message)
-            return
+            return ("unsolved" if annotation_store().known(self.file_path) else "loading"), None
+        if self._annotation_layers()["stars"] and data is not self._unsaved_annotations and data.stars is None:
+            return "loading", data
+        return "ready", data
 
-        if self.save_worker and self.save_worker.isRunning():
-            return
+    def export_layers(self):
+        return self._annotation_layers()
 
-        try:
-            # Draw onto a QImage copy rather than a QPixmap - the encoding and
-            # writing happen in a worker thread, where QPixmap isn't safe to use.
-            annotated_image = self.original_pixmap.toImage().convertToFormat(QImage.Format_RGB32)
-
-            # Full resolution, with names sized relative to the image (as in a collage)
-            painter = QPainter(annotated_image)
-            whole = QRectF(annotated_image.rect())
-            paint_annotations(painter, data, self._annotation_layers(), annotated_image.width(), whole, whole)
-            painter.end()
-
-            # Generate default filename - keep JPEG as JPEG, everything else
-            # (including FITS/XISF, which can only be saved as PNG/JPEG here) as PNG
-            original_path = Path(self.file_path)
-            default_ext = '.jpg' if original_path.suffix.lower() in ('.jpg', '.jpeg') else '.png'
-            default_name = f"{original_path.stem}_annotated{default_ext}"
-            default_path = str(original_path.parent / default_name)
-
-            # Open save dialog
-            png_filter = "PNG Image (*.png)"
-            jpeg_filter = "JPEG Image (*.jpg *.jpeg)"
-            save_path, selected_filter = QFileDialog.getSaveFileName(
-                self,
-                "Save Annotated Image",
-                default_path,
-                f"{png_filter};;{jpeg_filter}",
-                jpeg_filter if default_ext == '.jpg' else png_filter
-            )
-
-            if save_path:
-                # Only PNG and JPEG can be written - if the name has any other
-                # extension (e.g. .xisf), use the chosen filter's extension so the
-                # file's name matches its contents
-                save_ext = Path(save_path).suffix.lower()
-                if save_ext not in ('.png', '.jpg', '.jpeg'):
-                    save_ext = '.jpg' if selected_filter == jpeg_filter else '.png'
-                    save_path = str(Path(save_path).with_suffix(save_ext))
-                    if Path(save_path).exists() and QMessageBox.question(
-                            self, "Overwrite File",
-                            f"{Path(save_path).name} already exists.\nDo you want to replace it?"
-                    ) != QMessageBox.Yes:
-                        return
-
-                if save_ext in ('.jpg', '.jpeg'):
-                    self.save_worker = ImageSaveWorker(annotated_image, save_path, "JPEG", 95)
-                else:
-                    self.save_worker = ImageSaveWorker(annotated_image, save_path, "PNG")
-
-                self.save_annotated_button.setEnabled(False)
-                self.setCursor(Qt.BusyCursor)
-                self._update_status(f"Saving {Path(save_path).name}...")
-                self.save_worker.image_saved.connect(self._on_annotated_image_saved)
-                self.save_worker.start()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save annotated image: {str(e)}")
-
-    def _on_annotated_image_saved(self, success, save_path):
-        """Show the result of the save worker"""
-        self.save_annotated_button.setEnabled(True)
-        self.unsetCursor()
-        self._update_status()
-
-        if success:
-            QMessageBox.information(self, "Success",
-                                  f"Annotated image saved successfully!\n{save_path}")
-        else:
-            QMessageBox.critical(self, "Error", f"Failed to save annotated image:\n{save_path}")
+    def export_details(self):
+        """For the export dialog: the image's {"auto", "edits"}, or None while
+        they're gathered."""
+        if not self._details_loaded():
+            self._load_details()
+            return None
+        return self._details[1]
 
     INFO_PANEL_SETTING = "image_viewer/file_info_visible"
 
@@ -1897,18 +1681,25 @@ class ImageViewerWindow(QDialog):
             self._load_file_information()
 
     def _update_annotation_controls(self):
-        """As in the gallery: Layers and the solve button show while the
-        annotations do, and the button reads Re-Plate Solve once solved."""
-        if not hasattr(self, 'annotations_check'):
+        """The Overlays menu: Layers works while the annotations show, and
+        plate solving reads Re-Plate Solve once solved (as in the gallery)."""
+        if not hasattr(self, 'annotations_action'):
             return
-        on = self.annotations_enabled
         solved = self._unsaved_annotations is not None or bool(annotation_store().is_solved(self.file_path))
-        self.layers_button.setVisible(on)
-        self.solve_button.setVisible(on)
-        self.solve_button.setEnabled(not self._solving)
-        self.solve_button.setText("Re-Plate Solve" if solved else "Plate Solve")
-        self.solve_button.setToolTip("Solve the image again, replacing its saved solution" if solved
+        self.layers_action.setEnabled(self.annotations_enabled)
+        self.solve_action.setEnabled(not self._solving)
+        self.solve_action.setText("Re-Plate Solve" if solved else "Plate Solve")
+        self.solve_action.setToolTip("Solve the image again, replacing its saved solution" if solved
                                      else "Find where the image is in the sky, so its objects can be marked")
+        self._update_overlays_button()
+
+    def _update_overlays_button(self):
+        """The Overlays button says what's on the image."""
+        shown = [name for name, on in (("annotations", self.annotations_enabled),
+                                       ("details", self.details_style["enabled"])) if on]
+        self.overlays_button.setToolTip("Showing the " + " and ".join(shown) if shown
+                                        else "Annotations and capture details over the image - none showing")
+        self.overlays_button.setText(f"Overlays ({len(shown)})" if shown else "Overlays")
 
     def _start_plate_solve(self):
         """Plate solve the image in the background - progress in the status bar."""
@@ -1987,6 +1778,7 @@ class ImageViewerWindow(QDialog):
             self._update_status()
             if self.annotations_enabled:
                 self._update_zoom()
+            self._refresh_export()
 
     def _annotation_status(self):
         """Status bar text about the annotations, or None when they're off."""
@@ -2018,7 +1810,12 @@ class ImageViewerWindow(QDialog):
                     fits_rows=Path(self.file_path).suffix.lower() in FITS_EXTENSIONS)
             except Exception as e:
                 logger.warning(f"Could not use the plate solve for annotations: {e}")
+        # The details' image scale, now measured
+        if self._details is not None and self._details[0] == self.file_path:
+            self._details = None
+            self._load_details()
         self._update_zoom()
+        self._refresh_export()
 
     def _update_annotation_settings(self):
         """Save the layer choices and redraw"""
@@ -2026,6 +1823,7 @@ class ImageViewerWindow(QDialog):
         for key, setting in ANNOTATION_LAYER_SETTINGS.items():
             settings.setValue(setting, self.layer_actions[key].isChecked())
         self._update_zoom()
+        self._refresh_export()
 
     def _toggle_annotations(self, enabled):
         """Turn the annotations overlay on or off"""
@@ -2033,9 +1831,166 @@ class ImageViewerWindow(QDialog):
         QSettings("CosmosCollection", "CosmosCollection").setValue("annotation_enabled", enabled)
         self._update_annotation_controls()
         self._update_zoom()
+        if self.export_dialog is not None:
+            self.export_dialog.follow_viewer()
+
+    # Details (ImageDetails.py)
+
+    def _details_on(self):
+        return bool(self.file_path) and self.details_style["enabled"]
+
+    def _details_loaded(self):
+        return self._details is not None and self._details[0] == self.file_path
+
+    def _details_wanted(self):
+        """Shown, or the details or export dialog is open."""
+        return self._details_on() or self.details_dialog is not None or self.export_dialog is not None
+
+    def _load_details(self):
+        """Gather this image's details in the background, when they're
+        wanted (shown, or a dialog that uses them is open) and not gathered yet."""
+        if not self.file_path or self.original_pixmap is None:
+            return
+        if not self._details_wanted() or self._details_loaded():
+            return
+        if self._details_reading == self.file_path:
+            return
+        self._details_reading = self.file_path
+        info = self._file_info[1] if (self._file_info and self._file_info[0] == self.file_path
+                                      and isinstance(self._file_info[1], dict)) else None
+        solved = self.plate_solve_result
+        wcs = solved.wcs_header if solved and solved.success and solved.wcs_header else None
+        QThreadPool.globalInstance().start(ImageDetails.DetailsTask(
+            self.file_path, self._details_signals, (self.original_pixmap.width(), self.original_pixmap.height()),
+            info, wcs, self.title))
+
+    def _on_details_ready(self, path, result):
+        """An image's details arrived: show them, if it's still this image."""
+        if self._details_reading == path:
+            self._details_reading = None
+        if path != self.file_path:
+            if self._details_wanted():
+                self._load_details()  # Another image is showing now
+            return
+        if isinstance(result, Exception):
+            result = {"auto": {}, "edits": {}, "info": None}
+        self._details = (path, result)
+        # The file was read for them - the File Information panel needn't read it again
+        if isinstance(result.get("info"), dict) and not (self._file_info and self._file_info[0] == path):
+            self._file_info = (path, result["info"])
+            if self.file_info_panel.isVisible():
+                self._load_file_information()
+        if self.details_dialog is not None:
+            self.details_dialog.set_details(path, result["auto"], result["edits"])
+        self._details_layout_changed()
+
+    def _details_lines(self):
+        """[(key, text)] of the details shown on this image - none while they're off or loading."""
+        if not self._details_on() or not self._details_loaded():
+            return []
+        details = self._details[1]
+        return ImageDetails.detail_lines(details["auto"], details["edits"], self.details_style)
+
+    def _banner_height(self):
+        """The details banner's height in image pixels (0 when there isn't one)."""
+        if self.original_pixmap is None or not ImageDetails.is_banner(self.details_style):
+            return 0
+        lines = self._details_lines()
+        size = (self.original_pixmap.width(), self.original_pixmap.height())
+        key = (tuple(lines), size, json.dumps(self.details_style, sort_keys=True))
+        if self._banner_cache is None or self._banner_cache[0] != key:
+            self._banner_cache = (key, ImageDetails.banner_height(lines, size, self.details_style))
+        return self._banner_cache[1]
+
+    def _details_layout_changed(self):
+        """Redraw after the details changed - fitted to the window again if it
+        was fitted, as a banner changes the size of what's shown."""
+        if self.initial_fit_done and abs(self.zoom_factor - self.initial_zoom_factor) < 0.001:
+            self._fit_to_window()
+            self.initial_zoom_factor = self.zoom_factor
+        else:
+            self._update_zoom()
+        self._refresh_export()
+
+    def _toggle_details(self, enabled):
+        """Turn the details on or off"""
+        self.details_style["enabled"] = enabled
+        ImageDetails.save_style(self.details_style)
+        if self.details_dialog is not None:
+            self.details_dialog.style["enabled"] = enabled
+        self._load_details()
+        self._details_layout_changed()
+        self._update_overlays_button()
+        if self.export_dialog is not None:
+            self.export_dialog.follow_viewer()
+
+    def _open_details_dialog(self):
+        """The details dialog beside the viewer - opening it shows the details."""
+        if not self.file_path:
+            return
+        if self.details_dialog is None:
+            dialog = ImageDetails.ImageDetailsDialog(self.details_style, self)
+            dialog.setAttribute(Qt.WA_DeleteOnClose)
+            dialog.style_changed.connect(self._on_details_style_changed)
+            dialog.edits_changed.connect(self._on_details_edited)
+            dialog.save_requested.connect(self._open_export_dialog)
+            dialog.finished.connect(self._on_details_dialog_closed)
+            self.details_dialog = dialog
+            if self._details_loaded():
+                dialog.set_details(self.file_path, self._details[1]["auto"], self._details[1]["edits"])
+            else:
+                dialog.set_details(self.file_path, None, None)
+        if not self.details_action.isChecked():
+            self.details_action.setChecked(True)
+        self._load_details()
+        self.details_dialog.show()
+        self.details_dialog.raise_()
+        self.details_dialog.activateWindow()
+
+    def _on_details_dialog_closed(self, _result=None):
+        if not self._closing:
+            QSettings("CosmosCollection", "CosmosCollection").setValue(ImageDetails.DIALOG_SETTING, False)
+        self.details_dialog = None
+
+    def _on_details_style_changed(self, style):
+        style["enabled"] = self.details_action.isChecked()
+        self.details_style = style
+        ImageDetails.save_style(style)
+        self._details_layout_changed()
+
+    def _on_details_edited(self, path, edits):
+        """A line typed in the dialog: shown now, saved a moment after typing stops."""
+        if self._details is not None and self._details[0] == path:
+            self._details[1]["edits"] = dict(edits)
+        if self._pending_edits is not None and self._pending_edits[0] != path:
+            self._save_details_edits()
+        self._pending_edits = (path, dict(edits))
+        self._edits_timer.start(600)
+        self._details_layout_changed()
+
+    def _save_details_edits(self):
+        self._edits_timer.stop()
+        if self._pending_edits is None:
+            return
+        path, edits = self._pending_edits
+        self._pending_edits = None
+        try:
+            from DatabaseManager import DatabaseManager
+            with DatabaseManager().get_connection() as conn:
+                ImageDetails.save_edits(conn, path, edits)
+        except Exception as e:
+            logger.error(f"Couldn't save the image's details: {e}", exc_info=True)
 
     def closeEvent(self, event):
         """Save window position when closing"""
+        # The details: their edits saved, the dialog closed (and remembered as open)
+        self._save_details_edits()
+        if self.details_dialog is not None:
+            self._closing = True
+            QSettings("CosmosCollection", "CosmosCollection").setValue(ImageDetails.DIALOG_SETTING, True)
+            self.details_dialog.close()
+
+        # Cancel any running plate solve
         # Cancel any running plate solve
         if self.plate_solve_worker and self.plate_solve_worker.isRunning():
             self.plate_solve_worker.cancel()
@@ -2044,18 +1999,10 @@ class ImageViewerWindow(QDialog):
         # Don't block the close on a slow load
         self._drop_image_load()
 
-        # Let a save carry on in the background after the window closes, so the
-        # file still gets written
-        if self.save_worker and self.save_worker.isRunning():
-            worker = self.save_worker
-            worker.image_saved.disconnect()
-            _orphaned_workers.add(worker)
-            worker.finished.connect(lambda: _orphaned_workers.discard(worker))
-
-        # Let a background change finish - destroying a running QThread crashes
-        if self.background_worker and self.background_worker.isRunning():
-            self.background_worker.background_set.disconnect()
-            self.background_worker.wait()
+        # The export dialog: a save or background change it started carries on
+        # in the background, so the file still gets written
+        if self.export_dialog is not None:
+            self.export_dialog.close()
 
         WindowPositionManager.save_window_position(self, "ImageViewer")
         event.accept()

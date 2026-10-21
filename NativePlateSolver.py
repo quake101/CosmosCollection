@@ -88,6 +88,9 @@ def catalog_stars(catalog, ra, dec, radius, count):
     try:
         return cone_stars(catalog, ra, dec, radius, count)
     except CatalogUnavailable as e:
+        from OnlineLimits import OFFLINE_NOTE, is_offline
+        if is_offline():
+            raise SolveFailed(f"The star catalog for this part of the sky isn't downloaded yet. {OFFLINE_NOTE}")
         raise SolveFailed(f"Couldn't reach the star catalog (online): {e}")
 
 

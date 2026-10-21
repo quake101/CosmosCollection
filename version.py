@@ -171,6 +171,11 @@ class VersionManager:
                 datetime.now() - self._cache_timestamp < self.cache_duration):
                 return self._cached_release_info
 
+            from OnlineLimits import is_offline
+            if is_offline():
+                logger.debug("Not checking GitHub for a release - offline mode")
+                return None
+
             # Fetch from GitHub API
             url = f"https://api.github.com/repos/{self.github_repo}/releases/latest"
             headers = {
@@ -310,7 +315,8 @@ class VersionManager:
             if version_info['github_published_date']:
                 details.append(f"Release Date: {version_info['github_published_date']}")
         else:
-            details.append("GitHub status: Offline")
+            from OnlineLimits import is_offline
+            details.append("GitHub status: Not checked (offline mode)" if is_offline() else "GitHub status: Offline")
 
         return "\n".join(details)
 

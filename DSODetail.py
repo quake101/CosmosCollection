@@ -383,6 +383,12 @@ class DSODetailWindow(QDialog):
                 themed_style(self.emission_label, lambda: f"color: {COLORS['text_disabled']};")
                 return
 
+            from OnlineLimits import is_offline
+            if is_offline():
+                self.emission_label.setText("Not looked up - offline mode is on")
+                themed_style(self.emission_label, lambda: f"color: {COLORS['text_disabled']};")
+                return
+
             object_name = self.data.get('name', '')
             ra_deg = self.data.get('ra_deg')
             dec_deg = self.data.get('dec_deg')

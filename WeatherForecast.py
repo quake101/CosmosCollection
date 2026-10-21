@@ -41,6 +41,7 @@ from WindowPositionManager import WindowPositionMixin
 from Theme import COLORS, chart_background, chart_font_size, font_size, sky_shade, theme_manager, themed_style
 from TimeFormatHelper import format_time, format_datetime, get_time_format_24h
 from UrlOpener import open_url
+from OnlineLimits import OFFLINE_NOTE, is_offline
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -92,6 +93,8 @@ def test_openweather_key(api_key: str, timeout: int = 10) -> Tuple[bool, str]:
     api_key = (api_key or "").strip()
     if not api_key:
         return False, "Please enter an API key first."
+    if is_offline():
+        return False, OFFLINE_NOTE
 
     try:
         # Any fixed coordinates work here - we only care whether the key is accepted.
@@ -127,6 +130,8 @@ def test_visualcrossing_key(api_key: str, timeout: int = 10) -> Tuple[bool, str]
     api_key = (api_key or "").strip()
     if not api_key:
         return False, "Please enter an API key first."
+    if is_offline():
+        return False, OFFLINE_NOTE
 
     try:
         # Any fixed coordinates work here - we only care whether the key is accepted.
@@ -174,6 +179,8 @@ def test_weatherapi_key(api_key: str, timeout: int = 10) -> Tuple[bool, str]:
     api_key = (api_key or "").strip()
     if not api_key:
         return False, "Please enter an API key first."
+    if is_offline():
+        return False, OFFLINE_NOTE
 
     try:
         # Any fixed coordinates work here - we only care whether the key is accepted.
@@ -406,6 +413,9 @@ class WeatherWorker(QThread):
         enabled source(s) are reachable if Open-Meteo itself fails - one source
         failing (bad DNS, network outage, etc.) should never blank out the whole
         forecast when another enabled source could still serve it."""
+        if is_offline():
+            self.error_occurred.emit(f"The weather forecast needs the internet. {OFFLINE_NOTE}")
+            return
         data = self._fetch_openmeteo_data()
 
         try:
@@ -2450,6 +2460,11 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
             if cached_data is not None:
                 self._on_weather_loaded(cached_data, from_cache=True)
                 return
+
+        if is_offline():
+            self.status_label.setText(f"The weather forecast needs the internet. {OFFLINE_NOTE}")
+            self._set_status_color('warning')
+            return
 
         # Show progress
         self.progress_bar.setVisible(True)

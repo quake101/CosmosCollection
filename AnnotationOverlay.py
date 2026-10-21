@@ -233,6 +233,10 @@ NON_STAR_OTYPES = {'Cl*', 'As*', 'St*', 'MGr', '**?'}
 def query_bright_stars(ra: float, dec: float, radius: float, magnitude_limit: float = 8.0) -> List[CelestialObject]:
     """Named stars brighter than magnitude_limit within radius (degrees) of
     ra, dec from SIMBAD (online) - the brightest 100. None if it can't be reached."""
+    from OnlineLimits import is_offline
+    if is_offline():
+        logger.debug("Not querying SIMBAD for stars - offline mode")
+        return None
     stars = []
     try:
         from astroquery.simbad import Simbad

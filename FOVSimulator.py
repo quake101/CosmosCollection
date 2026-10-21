@@ -417,6 +417,69 @@ def angular_distance(ra1, dec1, ra2, dec2):
     return math.degrees(2 * math.asin(min(1.0, math.sqrt(h))))
 
 
+# A session made from dropped subs stores where they were pointed, which can be
+# off the catalog center by the framing - this far still counts as the object
+POINTED_NEAR_DEG = 5 / 60
+
+
+def sessions_for_object(conn, name, ra=None, dec=None, dsodetailid=None):
+    """An object's Session Manager sessions, newest first: [(id, name, date, status,
+    has framing)]. A session is the object's when it's linked to the object's Target
+    List entry or named as it (any designation: "M 42 (Orion Nebula)", "NGC 1976"),
+    is at its exact position, or was pointed within POINTED_NEAR_DEG of it with no
+    other catalog object closer (so M 43's sessions aren't M 42's)."""
+    from DSOTargetList import SAME_POSITION_DEG, catalog_object_ids, has_position, name_key
+    cursor = conn.cursor()
+    name = (name or "").strip()
+    position = (float(ra), float(dec)) if has_position({"ra_deg": ra, "dec_deg": dec}) else None
+
+    # The catalog objects the name designates, and every designation of them
+    objects = set(catalog_object_ids(cursor, name)) if name else set()
+    if dsodetailid:
+        objects.add(dsodetailid)
+    keys = {name_key(name)} if name else set()
+    if objects:
+        cursor.execute(f"SELECT catalogue || ' ' || designation FROM cataloguenr WHERE dsodetailid IN "
+                       f"({','.join('?' * len(objects))})", list(objects))
+        keys.update(name_key(row[0]) for row in cursor.fetchall())
+    keys.discard("")
+
+    def exact_position(s_ra, s_dec):
+        return (position is not None and has_position({"ra_deg": s_ra, "dec_deg": s_dec})
+                and abs(s_ra - position[0]) < SAME_POSITION_DEG and abs(s_dec - position[1]) < SAME_POSITION_DEG)
+
+    # Its Target List entries (by any designation or the same position, as find_existing_target
+    # matches them - without its whole-list catalog lookup)
+    entries = {target_id for target_id, target_name, t_ra, t_dec in cursor.execute(
+        "SELECT id, name, ra_deg, dec_deg FROM usertargetlist").fetchall()
+        if name_key(target_name or "") in keys or exact_position(t_ra, t_dec)}
+
+    found = []
+    for session_id, session_name, date, status, s_ra, s_dec, target_id, framing in conn.execute(
+            "SELECT id, dso_name, session_date, status, ra_deg, dec_deg, target_id, framing FROM usersessions "
+            "ORDER BY session_date DESC, id DESC").fetchall():
+        same = target_id in entries or name_key(session_name or "") in keys
+        if not same and position and has_position({"ra_deg": s_ra, "dec_deg": s_dec}):
+            distance = angular_distance(position[0], position[1], s_ra, s_dec)
+            same = exact_position(s_ra, s_dec) or (
+                distance < POINTED_NEAR_DEG and not _other_object_closer(cursor, s_ra, s_dec, distance, objects))
+        if same:
+            found.append((session_id, session_name, date, status, bool(framing)))
+    return found
+
+
+def _other_object_closer(cursor, ra, dec, distance, objects):
+    """Whether a catalog object other than objects is within distance of (ra, dec)."""
+    from AnnotationOverlay import NOT_DSO_TYPES  # Already loaded with the main window
+    cursor.execute(f"""
+        SELECT id, ra, dec FROM dsodetail
+        WHERE dec BETWEEN ? AND ? AND COALESCE(dsotype, '') NOT IN ({','.join('?' * len(NOT_DSO_TYPES))})
+    """, (dec - distance, dec + distance, *NOT_DSO_TYPES))
+    return any(obj not in objects and o_ra is not None and o_dec is not None
+               and angular_distance(ra, dec, float(o_ra), float(o_dec)) < distance
+               for obj, o_ra, o_dec in cursor.fetchall())
+
+
 # --- A framing saved to a session ---
 # One per session, in usersessions.framing as JSON: {"version": 1, "ra", "dec"
 # (the frame or mosaic center), "rotation", "columns", "rows", "overlap" (0-1),
@@ -1398,6 +1461,14 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
     def _create_web_view_safely(self):
         """Safely create the web view with error handling"""
+        from OnlineLimits import OFFLINE_NOTE, is_offline
+        if is_offline():
+            # The sky view loads its images from the internet - leave the
+            # placeholder in its place
+            if self.web_placeholder:
+                self.web_placeholder.setText(f"The sky view needs the internet.\n{OFFLINE_NOTE}")
+                themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['text_disabled']}; font-size: {font_px(12)}; }}")
+            return
         try:
             logger.debug("Creating web view safely...")
 
@@ -2253,22 +2324,9 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                              f"{'are' if len(missing) > 1 else 'is'}n't in your equipment now" if missing else None)
 
     def _sessions_for_object(self, conn):
-        """This object's sessions, newest first: [(id, name, date, status, has framing)] - by
-        position when both have one, else by name."""
-        name = (self.data.get('name') or "").strip().lower()
+        """This object's sessions, newest first: [(id, name, date, status, has framing)]."""
         ra, dec = self._target_position()
-        found = []
-        for session_id, session_name, date, status, s_ra, s_dec, framing in conn.execute(
-                "SELECT id, dso_name, session_date, status, ra_deg, dec_deg, framing FROM usersessions "
-                "ORDER BY session_date DESC, id DESC"):
-            if ra is not None and s_ra is not None and s_dec is not None:
-                same = angular_distance(ra, dec, s_ra, s_dec) < 0.5
-            else:
-                plain = (session_name or "").strip().lower()
-                same = bool(name) and (plain == name or plain.startswith(name + " ("))
-            if same:
-                found.append((session_id, session_name, date, status, bool(framing)))
-        return found
+        return sessions_for_object(conn, self.data.get('name'), ra, dec, self.data.get('dsodetailid'))
 
     def _save_to_session(self):
         """Keep the frame or mosaic with one of this object's sessions (or a new planned one)."""
@@ -2867,6 +2925,10 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
     def _test_connectivity_async(self):
         """Test connectivity to Aladin Lite server asynchronously"""
+        from OnlineLimits import is_offline
+        if is_offline():
+            return
+
         def test_connection():
             try:
                 # Use a plain TCP connection instead of urllib/ssl to avoid an
@@ -3071,6 +3133,12 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             data = coordinates_target(text)
         if data is not None:
             self._set_target(data)
+            return
+        from OnlineLimits import OFFLINE_NOTE, is_offline
+        if is_offline():
+            QMessageBox.information(self, "Not Found",
+                                    f"{text} isn't in the catalogs.\n\nLooking it up on SIMBAD needs the internet. "
+                                    f"{OFFLINE_NOTE}")
             return
         settings = QSettings("CosmosCollection", "CosmosCollection")
         if not settings.value("simbad_lookup_on_search_failure", True, type=bool):

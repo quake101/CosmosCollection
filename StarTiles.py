@@ -230,7 +230,9 @@ def _vizier(catalog, ra, dec, radius, count, brighter_than=None):
     last it sends, even bright ones - stars brighter than a magnitude are all
     there only when it doesn't stop."""
     import requests
-    from OnlineLimits import online_request
+    from OnlineLimits import OFFLINE_NOTE, is_offline, online_request
+    if is_offline():
+        raise CatalogUnavailable(OFFLINE_NOTE)
     source, columns = CATALOGS[catalog]
     params = {"-source": source, "-c": f"{ra:.5f} {dec:+.5f}", "-c.rd": f"{radius:.4f}",
               "-out": ",".join(columns), "-sort": columns[2], "-out.max": str(count)}

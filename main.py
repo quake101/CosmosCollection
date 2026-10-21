@@ -1099,6 +1099,31 @@ class SettingsDialog(QDialog):
         app_settings_layout = QVBoxLayout(app_settings_tab)
         app_settings_scroll.setWidget(app_settings_tab)
 
+        # Network group - offline mode (OnlineLimits.py)
+        network_group = QGroupBox("Network")
+        network_layout = QVBoxLayout(network_group)
+
+        self.offline_mode_checkbox = QCheckBox("Offline mode")
+        self.offline_mode_checkbox.setToolTip(
+            "When enabled, nothing in the app goes online: no update checks, weather,\n"
+            "SIMBAD lookups, star catalog downloads, astrometry.net, FOV Simulator sky view\n"
+            "or map picker. Links that open your web browser and NINA still work."
+        )
+        self.offline_mode_checkbox.toggled.connect(self._on_offline_mode_toggled)
+        network_layout.addWidget(self.offline_mode_checkbox)
+
+        offline_help = QLabel(
+            "Turns off update checks, the weather forecast, SIMBAD lookups, astrometry.net, the FOV Simulator's "
+            "sky view and the map picker. The built-in plate solver uses only the star catalog areas already "
+            "downloaded. ASTAP, NINA and links that open your web browser still work."
+        )
+        offline_help.setWordWrap(True)
+        offline_help.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        themed_style(offline_help, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; margin-left: 20px; }}")
+        network_layout.addWidget(offline_help)
+
+        app_settings_layout.addWidget(network_group)
+
         # UI Preferences group
         ui_prefs_group = QGroupBox("User Interface Preferences")
         ui_prefs_layout = QVBoxLayout(ui_prefs_group)
@@ -1808,6 +1833,11 @@ class SettingsDialog(QDialog):
         reset_update_reminders()
         self._update_reminder_status()
 
+    def _on_offline_mode_toggled(self, offline):
+        """Gray out the settings that only matter online (their values are kept)."""
+        for checkbox in (self.check_updates_checkbox, self.simbad_lookup_checkbox):
+            checkbox.setEnabled(not offline)
+
     def _load_current_settings(self):
         """Load current settings from database and QSettings"""
         # Populate location list
@@ -1816,6 +1846,11 @@ class SettingsDialog(QDialog):
         # Load UI preferences from QSettings
         try:
             settings = QSettings("CosmosCollection", "CosmosCollection")
+            from OnlineLimits import OFFLINE_SETTING
+            offline_mode = settings.value(OFFLINE_SETTING, False, type=bool)
+            self.offline_mode_checkbox.setChecked(offline_mode)
+            self._on_offline_mode_toggled(offline_mode)
+
             show_observer_location = settings.value("show_observer_location", True, type=bool)
             self.show_observer_location_checkbox.setChecked(show_observer_location)
 
@@ -2247,6 +2282,8 @@ class SettingsDialog(QDialog):
         """Save application settings (QSettings only - locations are saved separately)"""
         try:
             settings = QSettings("CosmosCollection", "CosmosCollection")
+            from OnlineLimits import OFFLINE_SETTING
+            settings.setValue(OFFLINE_SETTING, self.offline_mode_checkbox.isChecked())
             settings.setValue("show_observer_location", self.show_observer_location_checkbox.isChecked())
             settings.setValue("check_updates_on_startup", self.check_updates_checkbox.isChecked())
             settings.setValue("minimize_to_tray", self.minimize_to_tray_checkbox.isChecked())
@@ -2303,6 +2340,10 @@ class SettingsDialog(QDialog):
 
     def _open_map_picker(self):
         """Open map dialog to select location coordinates"""
+        from OnlineLimits import is_offline, notify_offline
+        if is_offline():
+            notify_offline(self, "The map")
+            return
         try:
             # Get current coordinates as starting point (or default to NYC)
             current_lat = 40.7128
@@ -3701,7 +3742,10 @@ class MapLocationPickerDialog(QDialog):
         import urllib.request
         import urllib.parse
         import json
+        from OnlineLimits import is_offline
 
+        if is_offline():
+            return json.dumps([])
         try:
             # URL encode the query
             encoded_query = urllib.parse.quote(query)
@@ -3727,7 +3771,10 @@ class MapLocationPickerDialog(QDialog):
         """Reverse geocode using Python's urllib to avoid CORS issues"""
         import urllib.request
         import json
+        from OnlineLimits import is_offline
 
+        if is_offline():
+            return json.dumps({})
         try:
             url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}"
 
@@ -3948,7 +3995,11 @@ def offer_update_and_apply(parent, version_info):
     page" behavior.
     """
     from AppUpdater import update_manager
+    from OnlineLimits import is_offline, notify_offline
 
+    if is_offline():
+        notify_offline(parent, "Updating")
+        return
     if not update_manager.is_supported():
         UpdateAvailableDialog(parent, version_info, "page").exec()
         return
@@ -4212,6 +4263,10 @@ class AboutDialog(QDialog):
 
     def _check_updates(self):
         """Ask GitHub again (in the background) and show the result"""
+        from OnlineLimits import is_offline, notify_offline
+        if is_offline():
+            notify_offline(self, "Checking for updates")
+            return
         self.update_button.setEnabled(False)
         self.update_button.setText("Checking…")
         run_update_check(self, self._on_update_check, refresh=True)
@@ -4537,6 +4592,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         settings_dialog.exec()
         # Update NINA Dashboard action visibility based on current settings
         self.nina_dashboard_action.setVisible(NINAIntegration.is_enabled())
+        self._update_status()  # Shows whether offline mode is on
 
     def _check_location_on_startup(self):
         """Check if user has configured their location and prompt if not"""
@@ -4854,10 +4910,12 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         # 1. Search text is not empty and looks like an object designation
         # 2. No results found in local database
         # 3. No other filters are active (catalog/type filters should be "All")
-        # 4. SIMBAD lookup on search failure is enabled in settings
+        # 4. SIMBAD lookup on search failure is enabled in settings (and not offline)
+        from OnlineLimits import is_offline
         if (text and
             QSettings("CosmosCollection", "CosmosCollection").value(
                 "simbad_lookup_on_search_failure", True, type=bool) and
+            not is_offline() and
             len(self.model.filtered_data) == 0 and
             self.catalog_combo.currentText() == "All Catalogs" and
             self._get_selected_type() is None and
@@ -4951,6 +5009,9 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self.status_label.setText(f"Showing all {total} objects")
         else:
             self.status_label.setText(f"Showing {filtered} of {total} objects")
+        from OnlineLimits import is_offline
+        if is_offline():
+            self.status_label.setText(self.status_label.text() + " · Offline mode")
 
     def _cleanup_stale_updates(self):
         """Kick off background cleanup of leftover updates\\staged-* dirs
@@ -4981,6 +5042,10 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
             if not check_updates:
                 logger.debug("Update check on startup is disabled")
+                return
+            from OnlineLimits import is_offline
+            if is_offline():
+                logger.debug("Update check on startup skipped - offline mode")
                 return
 
             logger.debug("Checking for updates on startup")
@@ -5355,11 +5420,88 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
         context_menu.addSeparator()
 
-        target_action = context_menu.addAction("Add to Target List")
-        target_action.triggered.connect(lambda: self._context_add_to_target_list(row))
+        # Is it already on the Target List / in the Session Manager?
+        target_entry, sessions = self._context_list_status(row)
+
+        if sessions:
+            sessions_menu = context_menu.addMenu(f"Sessions ({len(sessions)})")
+            for session_id, session_name, date, status, _ in sessions:
+                session_action = sessions_menu.addAction(f"{date or 'No date'} – {session_name} ({status})")
+                session_action.triggered.connect(lambda checked=False, sid=session_id: self._context_open_session(sid))
+            sessions_menu.addSeparator()
+            plan_action = sessions_menu.addAction("Plan a New Session")
+        else:
+            plan_action = context_menu.addAction("Plan a Session")
+        plan_action.triggered.connect(lambda: self._context_plan_session(row, target_entry))
+
+        if target_entry:
+            target_action = context_menu.addAction("Open in Target List")
+            target_action.triggered.connect(lambda: self._context_open_in_target_list(target_entry))
+        else:
+            target_action = context_menu.addAction("Add to Target List")
+            target_action.triggered.connect(lambda: self._context_add_to_target_list(row))
 
         # Show the menu at the clicked position
         context_menu.exec(self.table_view.mapToGlobal(position))
+
+    def _context_list_status(self, row):
+        """The row's Target List entry (or None) and its Session Manager sessions -
+        matched by name, other designations or position, like everywhere else."""
+        entry = self.model.filtered_data[row]
+        name = entry.get('name', '')
+        ra_deg, dec_deg = entry.get('ra_deg'), entry.get('dec_deg')
+        try:
+            from DSOTargetList import find_existing_target
+            from FOVSimulator import sessions_for_object
+            with self.db_manager.get_connection() as conn:
+                return (find_existing_target(conn, name, ra_deg, dec_deg),
+                        sessions_for_object(conn, name, ra_deg, dec_deg, entry.get('dsodetailid')))
+        except Exception as e:
+            logger.error(f"Error checking Target List / sessions for {name}: {e}", exc_info=True)
+            return None, []
+
+    def _context_open_in_target_list(self, target_entry):
+        """Open the Target List with this object's entry selected"""
+        try:
+            from DSOTargetList import DSOTargetListWindow
+            if not hasattr(self, 'target_list_window') or not self.target_list_window.isVisible():
+                self.target_list_window = DSOTargetListWindow()
+            if not self.target_list_window.open_and_select_target(target_entry['name']):
+                QMessageBox.warning(self, "Not Found", f"Could not find '{target_entry['name']}' in your target list.")
+        except Exception as e:
+            logger.error(f"Error opening Target List: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Target List: {str(e)}")
+
+    def _context_open_session(self, session_id):
+        """Open the Session Manager with this session selected"""
+        try:
+            from SessionManager import SessionManagerWindow
+            if not hasattr(self, 'session_manager_window') or not self.session_manager_window.isVisible():
+                self.session_manager_window = SessionManagerWindow()
+            self.session_manager_window.open_and_select_session(session_id)
+        except Exception as e:
+            logger.error(f"Error opening Session Manager: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Session Manager: {str(e)}")
+
+    def _context_plan_session(self, row, target_entry=None):
+        """Open Session Manager pre-filled with this DSO (linked to its Target List entry)"""
+        try:
+            entry = self.model.filtered_data[row]
+            dso_data = {
+                'id': target_entry['id'] if target_entry else None,
+                'name': entry.get('name', ''),
+                'dsodetailid': entry.get('dsodetailid'),
+                'ra_deg': entry.get('ra_deg'),
+                'dec_deg': entry.get('dec_deg'),
+                'designations': entry.get('designations', '')
+            }
+            from SessionManager import SessionManagerWindow
+            if not hasattr(self, 'session_manager_window') or not self.session_manager_window.isVisible():
+                self.session_manager_window = SessionManagerWindow()
+            self.session_manager_window.create_session_from_dso(dso_data)
+        except Exception as e:
+            logger.error(f"Error opening Session Manager: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Session Manager: {str(e)}")
 
     def _context_view_details(self, row):
         """View DSO details from context menu"""
@@ -5725,6 +5867,10 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _check_updates_for_tray(self):
         """Check for updates in the background; a tray notification follows if one is available"""
+        from OnlineLimits import is_offline
+        if is_offline():
+            logger.debug("Tray update check skipped - offline mode")
+            return
         try:
             self._run_update_check(self._on_tray_update_check)
         except Exception as e:
@@ -5762,6 +5908,10 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _fetch_weather_for_tray(self):
         """Fetch weather data in background for tray tooltip"""
+        from OnlineLimits import is_offline
+        if is_offline():
+            logger.debug("Tray weather refresh skipped - offline mode")
+            return
         try:
             from WeatherForecast import WeatherCache, WeatherWorker
 
