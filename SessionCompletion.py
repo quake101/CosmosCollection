@@ -59,13 +59,15 @@ class StageWorker(QThread):
     staged = Signal(object, int, int, object)  # layout, linked, copied, unfixed paths
     failed = Signal(str)
 
-    def __init__(self, frames, frames_dir, copy_files, fix_frame_types, siril_sequences):
+    def __init__(self, frames, frames_dir, copy_files, fix_frame_types, siril_sequences, night_folders, filter_names):
         super().__init__()
         self.frames = frames
         self.frames_dir = frames_dir
         self.copy_files = copy_files
         self.fix_frame_types = fix_frame_types
         self.siril_sequences = siril_sequences
+        self.night_folders = night_folders
+        self.filter_names = filter_names
         self.cancelled = False
 
     def cancel(self):
@@ -76,7 +78,8 @@ class StageWorker(QThread):
             layout, linked, copied, unfixed = handoff.stage_workspace(
                 self.frames, self.frames_dir, self.copy_files,
                 progress_callback=self.progress.emit, is_cancelled=lambda: self.cancelled,
-                fix_frame_types=self.fix_frame_types, siril_sequences=self.siril_sequences)
+                fix_frame_types=self.fix_frame_types, siril_sequences=self.siril_sequences,
+                night_folders=self.night_folders, filter_names=self.filter_names)
             if not self.cancelled:
                 self.staged.emit(layout, linked, copied, unfixed)
         except Exception as e:
@@ -462,7 +465,12 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
             text = f"{attached} attached" + (f" + {added} added" if added else "")
             if not counts[kind]:
                 text += " (step skipped)"
+            unmatched = handoff.lights_without_flats(self.frames) if kind == "Flat" else []
+            if unmatched:
+                text += f" - none for {', '.join(unmatched)} lights"
             label.setText(text)
+            label.setToolTip("Flats pair with lights of the same filter. Set a manual filter's subs in "
+                             "Session Details → Observations → Set Filters." if unmatched else "")
 
     # ---- Which lights (from the light quality review) -------------------------
 
@@ -531,6 +539,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         lights = {key: [p for p in paths if p in keep] for key, paths in self._all_lights.items()}
         self.frames.lights = {key: paths for key, paths in lights.items() if paths}
         self.summary_label.setText(self._summary_text())
+        self._refresh_calibration_labels()  # which light filters have no flats
         self._update_fast_integration_text()
         self._update_continue()
 
@@ -711,12 +720,18 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         self._progress.setMinimumDuration(300)
 
         # WBPP sorts frames by IMAGETYP, so frames added as another type get it
-        # corrected. For Siril, FITS frames are staged as ready-made sequences so
-        # its convert step (which copies every sub without Developer Mode) is skipped.
+        # corrected, a multi-night session is split into NIGHT_<n> folders so
+        # each night gets its own flats, and filters the user set reach it through
+        # the staged names. For Siril, FITS frames are staged as ready-made
+        # sequences so its convert step (which copies every sub without
+        # Developer Mode) is skipped.
+        wbpp = app == handoff.PIXINSIGHT
         self._stage_worker = StageWorker(self.frames, frames_dir, self.copy_checkbox.isChecked(),
-                                         fix_frame_types=(app == handoff.PIXINSIGHT),
-                                         siril_sequences=(app == handoff.SIRIL))
-        self._stage_worker.progress.connect(lambda done, _total: self._progress.setValue(done))
+                                         fix_frame_types=wbpp, siril_sequences=(app == handoff.SIRIL),
+                                         night_folders=wbpp, filter_names=wbpp)
+        # The total can grow past the file count: flats a night borrows are staged twice.
+        self._stage_worker.progress.connect(
+            lambda done, total: (self._progress.setMaximum(total), self._progress.setValue(done)))
         self._progress.canceled.connect(self._stage_worker.cancel)
         self._stage_worker.staged.connect(
             lambda layout, linked, copied, unfixed:
@@ -773,18 +788,46 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
             run_dialog.show()
             run_dialog.start()
         else:
-            self._launch_wbpp(workdir, frames_dir)
+            self._launch_wbpp(workdir, frames_dir, layout["nights"], layout["smart_naming"])
         self.accept()
 
-    def _launch_wbpp(self, workdir, frames_dir):
+    @staticmethod
+    def _nights_note(nights):
+        """What the NIGHT grouping did, for the Opening PixInsight message."""
+        if not nights:
+            return ""
+        count = len(nights["numbers"])
+        note = (f"\n\nThe lights are from {count} nights, staged in folders NIGHT_1 to NIGHT_{count} "
+                "(WBPP grouping keyword NIGHT), so each night is calibrated with its own flats. "
+                "All nights are still integrated together.")
+        for night, source, key, _paths in nights["borrowed"]:
+            note += f"\nNight {night} has no {key} flats of its own, so night {source}'s are used for it."
+        return note
+
+    def _filters_note(self, smart_naming):
+        """What happened to the filters the user set, for the Opening PixInsight message."""
+        if not smart_naming:
+            return ""
+        staged = set(self.frames.all_paths())
+        corrected = {p: name for p, name in self.frames.corrected_filters.items() if p in staged}
+        note = (f"\n\n{len(corrected)} sub(s) use filters you set in the session. WBPP reads them from the "
+                "workspace file names (its Smart naming override is on for this run).")
+        renamed = sorted({(name, handoff.wbpp_filter_name(name)) for name in corrected.values()
+                          if handoff.wbpp_filter_name(name) != name})
+        for name, read_as in renamed:
+            note += f"\nWBPP reads the filter {name} as {read_as}."
+        return note
+
+    def _launch_wbpp(self, workdir, frames_dir, nights, smart_naming):
         exe = handoff.resolve_executable(handoff.PIXINSIGHT)
         output_dir = os.path.join(workdir, handoff.WBPP_OUTPUT_DIR)
         os.makedirs(output_dir, exist_ok=True)
         args = handoff.pixinsight_wbpp_args(exe, frames_dir, output_dir, self.run_now_checkbox.isChecked(),
-                                            fast_integration=self.fast_integration_checkbox.isChecked())
+                                            fast_integration=self.fast_integration_checkbox.isChecked(),
+                                            night_keyword=bool(nights), smart_naming=smart_naming)
         if handoff.launch_detached(args, cwd=workdir):
             fixed = len(self.frames.retype) - len(self._unfixed_frames)
-            notes = ""
+            notes = self._nights_note(nights) + self._filters_note(smart_naming)
             if fixed:
                 notes += (f"\n\n{fixed} added calibration frame(s) had a FITS IMAGETYP header that didn't match "
                           "the type you added them as (e.g. darks saved as LIGHT). Their workspace copies were "
@@ -804,7 +847,11 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
                 self.parentWidget(), "Couldn't Start PixInsight",
                 "PixInsight couldn't be started. The frames are ready in:\n"
                 f"{frames_dir}\n\n(path copied to the clipboard) - open WBPP yourself and use "
-                "'Add Directory' with that folder.")
+                "'Add Directory' with that folder."
+                + ("\n\nAdd NIGHT as a grouping keyword (Pre) first so each night gets its own flats."
+                   if nights else "")
+                + ("\n\nTurn on Smart naming override first so WBPP uses the filters you set."
+                   if smart_naming else ""))
 
 
 class SirilRunDialog(WindowPositionMixin, QDialog):

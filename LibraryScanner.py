@@ -43,7 +43,7 @@ from typing import Optional
 import MountDetection
 import SessionFileScanner
 import SessionObservations
-from SessionObservations import make_sub_key, parse_obs_datetime, night_date_for
+from SessionObservations import make_sub_key, parse_obs_datetime, night_date_for, FILE_FILTER_SQL
 from DatabaseManager import add_user_image_row
 from DSONames import CATALOG_RANK, pick_common_name, with_common_name
 
@@ -1186,9 +1186,11 @@ def load_known(conn):
     for (path,) in conn.execute("SELECT image_path FROM userimages WHERE image_path IS NOT NULL"):
         known.image_paths.add(_norm_path(path))
     # Fingerprints made here, not read from sub_key, so they match _sub_key()
-    # even in a database the app hasn't migrated yet
+    # even in a database the app hasn't migrated yet. From the header's filter,
+    # not a user's correction - _sub_key() reads the header too.
     for path, date_obs, exptime, filter_name, frame_type, camera in conn.execute(
-            "SELECT file_path, date_obs, exptime_seconds, filter_name, frame_type, camera FROM usersessionfiles"):
+            f"SELECT file_path, date_obs, exptime_seconds, {FILE_FILTER_SQL}, frame_type, camera "
+            "FROM usersessionfiles"):
         known.session_paths.add(_norm_path(path))
         sub_key = make_sub_key(date_obs, exptime, filter_name, frame_type, camera)
         if sub_key:
@@ -1986,7 +1988,7 @@ def _owners(conn):
     in Session Manager sessions."""
     by_path, by_key = {}, {}
     for session_id, path, date_obs, exptime, filter_name, frame_type, camera in conn.execute(
-            "SELECT session_id, file_path, date_obs, exptime_seconds, filter_name, frame_type, camera "
+            f"SELECT session_id, file_path, date_obs, exptime_seconds, {FILE_FILTER_SQL}, frame_type, camera "
             "FROM usersessionfiles"):
         by_path[os.path.normcase(os.path.normpath(path or ""))] = session_id
         key = SessionObservations.make_sub_key(date_obs, exptime, filter_name, frame_type, camera)

@@ -32,6 +32,11 @@ MAX_OBSERVATION_SPAN = timedelta(hours=24)
 
 DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
+# A usersessionfiles row's filter as its file's header records it - filter_name
+# holds the user's correction instead when there is one. Fingerprints (sub_key)
+# are always made from the header's filter, so they keep matching the file.
+FILE_FILTER_SQL = "(CASE WHEN filter_corrected = 1 THEN filter_from_file ELSE filter_name END)"
+
 # Keys are already lowercased with spaces/hyphens/underscores stripped.
 FILTER_ALIASES = {
     "halpha": "ha", "hydrogenalpha": "ha",
@@ -80,7 +85,11 @@ def ensure_schema(conn):
                    "ON usersessionobservationfilters(observation_id)")
 
     for column_sql in ("ALTER TABLE usersessionfiles ADD COLUMN observation_id INTEGER",
-                       "ALTER TABLE usersessionfiles ADD COLUMN sub_key TEXT"):
+                       "ALTER TABLE usersessionfiles ADD COLUMN sub_key TEXT",
+                       # A filter the user set (see set_file_filters) - filter_name holds it,
+                       # filter_from_file what the file's header said
+                       "ALTER TABLE usersessionfiles ADD COLUMN filter_corrected INTEGER DEFAULT 0",
+                       "ALTER TABLE usersessionfiles ADD COLUMN filter_from_file TEXT"):
         try:
             cursor.execute(column_sql)
         except Exception:
@@ -101,8 +110,8 @@ def _backfill_sub_keys(conn):
     same sub within one session was double-counted before - its row is removed
     (the file on disk is never touched). Returns the ids of sessions that lost rows."""
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, session_id, date_obs, exptime_seconds, filter_name, frame_type, camera
+    cursor.execute(f"""
+        SELECT id, session_id, date_obs, exptime_seconds, {FILE_FILTER_SQL}, frame_type, camera
         FROM usersessionfiles WHERE sub_key IS NULL AND date_obs IS NOT NULL
     """)
     pending = [tuple(row) for row in cursor.fetchall()]  # sqlite3.Row isn't orderable
@@ -137,8 +146,8 @@ def _rekey_whole_second_sub_keys(conn):
     collide where the old ones didn't, so the unique index stays satisfied.
     Only old keys match, so after the first run this finds nothing."""
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, date_obs, exptime_seconds, filter_name, frame_type, camera FROM usersessionfiles
+    cursor.execute(f"""
+        SELECT id, date_obs, exptime_seconds, {FILE_FILTER_SQL}, frame_type, camera FROM usersessionfiles
         WHERE sub_key IS NOT NULL AND sub_key NOT LIKE '____-__-__T__:__:__.___|%'
     """)
     rows = cursor.fetchall()
@@ -455,15 +464,52 @@ def load_session_files(conn, session_id):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT f.id, f.observation_id, f.file_path, f.frame_type, f.filter_name, f.exptime_seconds, f.gain,
-               f.ccd_temp, f.xbinning, f.ybinning, f.date_obs, o.night_date, f.sub_key
+               f.ccd_temp, f.xbinning, f.ybinning, f.date_obs, o.night_date, f.sub_key,
+               COALESCE(f.filter_corrected, 0), f.filter_from_file
         FROM usersessionfiles f
         LEFT JOIN usersessionobservations o ON o.id = f.observation_id
         WHERE f.session_id = ?
         ORDER BY f.date_obs, f.file_path
     """, (session_id,))
     columns = ["id", "observation_id", "file_path", "frame_type", "filter_name", "exptime_seconds", "gain",
-               "ccd_temp", "xbinning", "ybinning", "date_obs", "night_date", "sub_key"]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+               "ccd_temp", "xbinning", "ybinning", "date_obs", "night_date", "sub_key",
+               "filter_corrected", "filter_from_file"]
+    files = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    for f in files:
+        f["filter_corrected"] = bool(f["filter_corrected"])
+        if not f["filter_corrected"]:
+            f["filter_from_file"] = f["filter_name"]
+    return files
+
+
+def set_file_filters(conn, session_id, changes):
+    """Save the user's filter corrections - for subs whose headers don't record
+    the filter (a manual filter) or record the wrong one. changes: {file id:
+    filter name, or None to go back to the file's own filter}. filter_name
+    takes the correction, so every total, the quality review and the stacking
+    handoffs use it; filter_from_file keeps the header's value for clearing.
+    A correction equal to the file's own filter is cleared instead. Recomputes
+    the session's totals. Does not commit."""
+    cursor = conn.cursor()
+    for file_id, name in changes.items():
+        name = (name or "").strip() or None
+        cursor.execute(f"SELECT {FILE_FILTER_SQL} FROM usersessionfiles WHERE id = ? AND session_id = ?",
+                       (file_id, session_id))
+        row = cursor.fetchone()
+        if row is None:
+            continue
+        from_file = row[0]
+        if name is None or name == (from_file or None):
+            cursor.execute("""
+                UPDATE usersessionfiles SET filter_name = ?, filter_corrected = 0, filter_from_file = NULL
+                WHERE id = ?
+            """, (from_file, file_id))
+        else:
+            cursor.execute("""
+                UPDATE usersessionfiles SET filter_name = ?, filter_corrected = 1, filter_from_file = ?
+                WHERE id = ?
+            """, (name, from_file, file_id))
+    recompute_session_aggregates(conn, session_id, promote=False)
 
 
 def remove_files(conn, session_id, file_ids):

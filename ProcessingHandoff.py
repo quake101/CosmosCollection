@@ -18,6 +18,7 @@ import shutil
 import logging
 import subprocess
 from dataclasses import dataclass, field
+from datetime import date
 
 from PySide6.QtCore import QSettings
 
@@ -41,6 +42,21 @@ SIRIL_XISF_VERSION = (1, 4, 0)
 # recursive scan of it (WBPP's dir= parameter) never picks up the outputs.
 FRAMES_DIR = "frames"
 WBPP_OUTPUT_DIR = "WBPP"
+
+# WBPP grouping keyword for multi-night sessions. WBPP reads a custom keyword's
+# value from the file path (NIGHT_1/...) before the FITS header, so the staged
+# folder is enough - the subs themselves aren't touched.
+NIGHT_KEYWORD = "NIGHT"
+
+# Characters WBPP keeps in a keyword value read from a path (BPP-Global.js
+# KEYWORD_VALUE_CHARSET); it turns any other into '-'.
+_WBPP_VALUE_INVALID_RE = re.compile(r"[^-():. a-zA-Z0-9]")
+
+
+def wbpp_filter_name(name):
+    """The filter name WBPP sees for a user-corrected filter, which reaches it
+    through the staged file name (smart naming) rather than the header."""
+    return _WBPP_VALUE_INVALID_RE.sub("-", str(name or "").strip()) or "NoFilter"
 
 
 def _settings():
@@ -187,7 +203,8 @@ def launch_detached(args, cwd=None):
 WBPP_FAST_INTEGRATION_FRAMES = 150
 
 
-def pixinsight_wbpp_args(pixinsight_path, frames_dir, output_dir, run_immediately=False, fast_integration=True):
+def pixinsight_wbpp_args(pixinsight_path, frames_dir, output_dir, run_immediately=False, fast_integration=True,
+                         night_keyword=False, smart_naming=False):
     """PixInsight command line that opens WBPP with every sub under frames_dir
     loaded (WBPP groups them by IMAGETYP/FILTER itself). -n starts a new
     instance so this works even while PixInsight is already open; loadOnly
@@ -196,10 +213,19 @@ def pixinsight_wbpp_args(pixinsight_path, frames_dir, output_dir, run_immediatel
     for groups of WBPP_FAST_INTEGRATION_FRAMES+ lights). It's always passed:
     WBPP saves its settings when its dialog closes, so leaving it out would
     inherit whatever an earlier handoff left behind.
+    night_keyword adds the NIGHT grouping keyword (pre-processing only, so
+    each night is calibrated with its own flats but all nights still integrate
+    together) for frames staged into NIGHT_<n> folders (see plan_nights).
+    smart_naming turns on WBPP's smart naming override, which reads the
+    FILTER_<name> that stage_workspace puts in corrected subs' names in place
+    of their headers' filter. Always passed, like autoIntegrationMode.
     See BPP-automation.js in the PixInsight install for the parameters."""
     wbpp = find_wbpp_script(pixinsight_path)
     params = [wbpp, "automationMode=true", f"dir={frames_dir}", f"outputDirectory={output_dir}",
-              f"autoIntegrationMode={'true' if fast_integration else 'false'}"]
+              f"autoIntegrationMode={'true' if fast_integration else 'false'}",
+              f"smartNamingOverride={'true' if smart_naming else 'false'}"]
+    if night_keyword:
+        params += [f"keywords={NIGHT_KEYWORD}", "groupingKeywordsEnabled=true"]
     if not run_immediately:
         params.append("loadOnly")
     return [pixinsight_path, "-n", "--automation-mode", "-r=" + ",".join(params)]
@@ -239,6 +265,10 @@ class FrameSet:
     # one they were added as (e.g. darks NINA saved as LIGHT), path -> kind.
     # WBPP sorts frames by that header, so their staged copies get it corrected.
     retype: dict = field(default_factory=dict)
+    nights: dict = field(default_factory=dict)  # attached light/flat path -> its night date (YYYY-MM-DD)
+    # Attached lights/flats whose filter the user corrected (FilterCorrections),
+    # path -> filter. Their headers say otherwise, so WBPP gets it from the staged name.
+    corrected_filters: dict = field(default_factory=dict)
 
     @property
     def light_count(self):
@@ -284,7 +314,18 @@ def collect_session_frames(conn, session_id, check_exists=True):
             frames.missing.append(path)
             continue
         _add_frame(frames, frame_type, path, f["filter_name"])
+        if frame_type in ("Light", "Flat"):
+            if f["night_date"]:
+                frames.nights[path] = str(f["night_date"])
+            if f["filter_corrected"]:
+                frames.corrected_filters[path] = f["filter_name"]
     return frames
+
+
+def lights_without_flats(frames):
+    """Filter keys of lights with no flats of the same filter at all - after
+    the user's filter corrections, which flats need to match."""
+    return sorted(set(frames.lights) - set(frames.flats)) if frames.flats else []
 
 
 def find_missing_frames(frames):
@@ -421,6 +462,61 @@ def plan_layout(frames):
     }
 
 
+def night_folder(number):
+    return f"{NIGHT_KEYWORD}_{number}"
+
+
+def _night_distance(a, b):
+    try:
+        return abs((date.fromisoformat(a) - date.fromisoformat(b)).days)
+    except ValueError:
+        return 0
+
+
+def plan_nights(frames):
+    """For WBPP: stage a multi-night session's lights and flats in NIGHT_<n>
+    folders (numbered in date order) so WBPP, given keywords=NIGHT, calibrates
+    each night's lights with that night's flats. WBPP's matching is strict - a
+    flat group tagged with another night is never used - so:
+      - flats with no night (added from a folder, or from a night none of the
+        lights are from) stay untagged, which WBPP matches to every night;
+      - a night with no flats of its own for a filter, when there are no
+        untagged ones either, gets the nearest night's flats linked in again.
+    Darks and biases stay untagged (shared by every night).
+
+    Returns {} when the lights are all from one night (or any light's night is
+    unknown) - no keyword is needed then. Otherwise {"numbers": night date ->
+    n, "folders": path -> night folder, "borrowed": [(night n, from night n,
+    filter key, flat paths)]}."""
+    light_nights = {p: frames.nights.get(p) for paths in frames.lights.values() for p in paths}
+    dates = set(light_nights.values())
+    if None in dates or len(dates) < 2:
+        return {}
+    numbers = {d: n for n, d in enumerate(sorted(dates), start=1)}
+    folders = {p: night_folder(numbers[d]) for p, d in light_nights.items()}
+
+    own_flats = {}  # filter key -> night date -> flat paths
+    shared = set()  # filter keys with untagged flats
+    for key, paths in frames.flats.items():
+        for p in paths:
+            d = frames.nights.get(p)
+            if d in numbers:
+                folders[p] = night_folder(numbers[d])
+                own_flats.setdefault(key, {}).setdefault(d, []).append(p)
+            else:
+                shared.add(key)
+
+    borrowed = []
+    for key, paths in sorted(frames.lights.items()):
+        by_night = own_flats.get(key)
+        if key in shared or not by_night:
+            continue  # every night uses the untagged flats, or there are none for this filter
+        for d in sorted({light_nights[p] for p in paths} - set(by_night)):
+            source = min(by_night, key=lambda other: (_night_distance(other, d), other))
+            borrowed.append((numbers[d], numbers[source], key, by_night[source]))
+    return {"numbers": numbers, "folders": folders, "borrowed": borrowed}
+
+
 def _frame_groups(frames, layout):
     """(staged folder, Siril sequence name, source paths) for every group."""
     for key, paths in sorted(frames.lights.items()):
@@ -451,7 +547,7 @@ def _set_fits_frame_type(path, kind):
 
 
 def stage_workspace(frames, frames_dir, copy_files=False, progress_callback=None, is_cancelled=None,
-                    fix_frame_types=False, siril_sequences=False):
+                    fix_frame_types=False, siril_sequences=False, night_folders=False, filter_names=False):
     """Link (or copy) every frame into frames_dir/<group folder>/. Hard links
     cost no disk space and leave the originals untouched; a file on another
     volume (or a filesystem without hard links) is copied instead.
@@ -467,6 +563,15 @@ def stage_workspace(frames, frames_dir, copy_files=False, progress_callback=None
     in frames.retype are copied instead and the copy's IMAGETYP corrected;
     XISF ones can't be and are returned as unfixed.
 
+    With night_folders (for WBPP), a multi-night session's lights and flats go
+    under NIGHT_<n>/ (see plan_nights; the plan is returned as layout['nights']).
+
+    With filter_names (for WBPP), subs in frames.corrected_filters get
+    _FILTER_<name> at the end of their staged name, which WBPP's smart naming
+    override reads in place of the header (the last match in a path wins, so
+    it beats any FILTER_ already in the name). layout['smart_naming'] says
+    whether any did - pass it to pixinsight_wbpp_args.
+
     Subs that have disappeared since the session was loaded are left out
     (and moved to frames.missing) rather than failing the whole staging.
 
@@ -474,6 +579,8 @@ def stage_workspace(frames, frames_dir, copy_files=False, progress_callback=None
     is_cancelled()."""
     remove_frames(frames, find_missing_frames(frames))
     layout = plan_layout(frames)
+    layout["nights"] = plan_nights(frames) if night_folders else {}
+    night_of = layout["nights"].get("folders", {})
     jobs = []  # (destination folder, destination name or None to keep the source's, source)
     for folder, sequence, paths in _frame_groups(frames, layout):
         all_fits = all(os.path.splitext(p)[1].lower() in SessionFileScanner.FITS_EXTENSIONS for p in paths)
@@ -482,11 +589,14 @@ def stage_workspace(frames, frames_dir, copy_files=False, progress_callback=None
             jobs.extend((SIRIL_PROCESS_DIR, f"{sequence}_{n:05d}.{SIRIL_SEQUENCE_EXT}", p)
                         for n, p in enumerate(paths, start=1))
         else:
-            jobs.extend((folder, None, p) for p in paths)
+            jobs.extend((os.path.join(night_of.get(p, ""), folder), None, p) for p in paths)
+    for night, _source, key, paths in layout["nights"].get("borrowed", []):
+        jobs.extend((os.path.join(night_folder(night), layout["flats"][key]), None, p) for p in paths)
 
     linked = copied = 0
     unfixed = []
     used_names = {}
+    layout["smart_naming"] = False
     for i, (folder, fixed_name, src) in enumerate(jobs):
         if is_cancelled and is_cancelled():
             break
@@ -499,6 +609,10 @@ def stage_workspace(frames, frames_dir, copy_files=False, progress_callback=None
             # nothing is overwritten (and sort order stays chronological).
             names = used_names.setdefault(folder, set())
             base = os.path.basename(src)
+            if filter_names and src in frames.corrected_filters:
+                stem, ext = os.path.splitext(base)
+                base = f"{stem}_FILTER_{wbpp_filter_name(frames.corrected_filters[src])}{ext}"
+                layout["smart_naming"] = True
             name = base if base.lower() not in names else f"{len(names):04d}_{base}"
             names.add(name.lower())
         dest = os.path.join(dest_dir, name)

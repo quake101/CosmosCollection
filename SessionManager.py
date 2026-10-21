@@ -1661,6 +1661,11 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         self.delete_obs_btn = QPushButton("Delete")
         self.delete_obs_btn.clicked.connect(self._delete_observation)
         buttons.addWidget(self.delete_obs_btn)
+        self.night_filters_btn = QPushButton("Set Filters...")
+        self.night_filters_btn.setToolTip("Set the filter of this night's lights and flats when the files don't "
+                                          "record it (a manual filter) or record the wrong one.")
+        self.night_filters_btn.clicked.connect(self._set_night_filters)
+        buttons.addWidget(self.night_filters_btn)
         buttons.addStretch()
         attach_btn = QPushButton("Attach Files ▾")
         attach_menu = QMenu(attach_btn)
@@ -1681,6 +1686,8 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         breakdown_layout = QVBoxLayout(breakdown_widget)
         breakdown_layout.setContentsMargins(0, 0, 0, 0)
         self.breakdown_label = QLabel("Select an observation to see its per-filter breakdown.")
+        self.breakdown_label.setTextFormat(Qt.RichText)
+        self.breakdown_label.linkActivated.connect(lambda _link: self._clear_night_filters())
         breakdown_layout.addWidget(self.breakdown_label)
         self.breakdown_table = _make_table(["Filter", "Exposure", "Files", "Logged", "Counted", "Integration"])
         self.breakdown_table.setSelectionMode(QAbstractItemView.NoSelection)
@@ -2105,14 +2112,18 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         obs = self._selected_observation()
         self.edit_obs_btn.setEnabled(obs is not None)
         self.delete_obs_btn.setEnabled(obs is not None)
+        self.night_filters_btn.setEnabled(bool(obs and self._night_filter_files(obs)))
         if obs is None:
             self.breakdown_label.setText("Select an observation to see its per-filter breakdown.")
             self.breakdown_table.setRowCount(0)
             return
 
         rows = self._breakdown(obs)
-        self.breakdown_label.setText(
-            f"<b>Night of {obs['night_date']}</b> — {obs['file_count']} attached file(s)")
+        text = f"<b>Night of {obs['night_date']}</b> — {obs['file_count']} attached file(s)"
+        corrected = sum(1 for f in self._night_filter_files(obs) if f["filter_corrected"])
+        if corrected:
+            text += f" · filter set by you on {corrected} file(s) &nbsp;<a href='clear'>Clear</a>"
+        self.breakdown_label.setText(text)
         self.breakdown_table.setRowCount(len(rows) + (1 if rows else 0))
         for row, r in enumerate(rows):
             self.breakdown_table.setItem(row, 0, _table_item(r["filter_name"] or "(no filter)"))
@@ -2233,7 +2244,13 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
             night = f["night_date"] or ("—" if f["date_obs"] else "(no date)")
             self.files_table.setItem(row, 1, _table_item(night, Qt.AlignCenter))
             self.files_table.setItem(row, 2, _table_item(f["frame_type"] or "", Qt.AlignCenter))
-            self.files_table.setItem(row, 3, _table_item(f["filter_name"] or "", Qt.AlignCenter))
+            filter_item = _table_item(f["filter_name"] or "", Qt.AlignCenter)
+            if f["filter_corrected"]:
+                font = filter_item.font()
+                font.setItalic(True)
+                filter_item.setFont(font)
+                filter_item.setToolTip(f"Set by you. The file says: {f['filter_from_file'] or '(none)'}")
+            self.files_table.setItem(row, 3, filter_item)
             exposure = format_exposure(f["exptime_seconds"]) if f["exptime_seconds"] is not None else ""
             self.files_table.setItem(row, 4, _table_item(exposure, Qt.AlignCenter))
             gain = f"{f['gain']:g}" if f["gain"] is not None else ""
@@ -2574,9 +2591,21 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         path = self.files_table.item(item.row(), 0).toolTip()
         count = len(self._selected_file_ids())
 
+        selected = set(self._selected_file_ids())
+        filterable = [f for f in self._files if f["id"] in selected and f["frame_type"] in ("Light", "Flat")]
+        corrected = [f for f in filterable if f["filter_corrected"]]
+
         menu = QMenu(self)
         menu.addAction("Open Containing Folder").triggered.connect(lambda: self._open_folder(path))
         menu.addSeparator()
+        if filterable:
+            menu.addAction(f"Set Filter for {len(filterable)} File(s)...").triggered.connect(
+                lambda: self._set_files_filter(filterable))
+        if corrected:
+            menu.addAction(f"Use the Files' Own Filter ({len(corrected)})").triggered.connect(
+                lambda: self._write_filter_changes({f["id"]: None for f in corrected}))
+        if filterable:
+            menu.addSeparator()
         menu.addAction(f"Remove {count} File(s) from Session...").triggered.connect(self._remove_selected_files)
         menu.exec(self.files_table.viewport().mapToGlobal(position))
 
@@ -2626,6 +2655,70 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
             _rollback(self.db_manager)
             logger.error(f"Error removing session files: {e}")
             QMessageBox.critical(self, "Error", f"Failed to remove files: {e}")
+            return
+        self._after_immediate_write()
+
+    # ---- Filter corrections (written immediately) --------------------------
+
+    def _night_filter_files(self, obs):
+        """A saved night's lights and flats - the files Set Filters works on."""
+        if obs is None or obs["id"] is None:
+            return []
+        return [f for f in self._files if f["observation_id"] == obs["id"] and f["frame_type"] in ("Light", "Flat")]
+
+    def _set_night_filters(self):
+        obs = self._selected_observation()
+        files = self._night_filter_files(obs)
+        if not files:
+            return
+        from FilterCorrections import NightFiltersDialog
+        try:
+            with self.db_manager.get_connection() as conn:
+                tz_name = SessionObservations.session_timezone(conn, self.session_id)
+        except Exception as e:
+            logger.debug(f"No session timezone: {e}")
+            tz_name = None
+        dialog = NightFiltersDialog(obs["night_date"], files, tz_name, self._filter_choices(), parent=self)
+        if dialog.exec() == QDialog.Accepted and dialog.changes:
+            self._write_filter_changes(dialog.changes)
+
+    def _clear_night_filters(self):
+        obs = self._selected_observation()
+        corrected = [f for f in self._night_filter_files(obs) if f["filter_corrected"]]
+        if not corrected:
+            return
+        if QMessageBox.question(
+                self, "Clear Filters",
+                f"Use the files' own filters again for the {len(corrected)} file(s) you set on the night of "
+                f"{obs['night_date']}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
+            return
+        self._write_filter_changes({f["id"]: None for f in corrected})
+
+    def _set_files_filter(self, files):
+        from PySide6.QtWidgets import QInputDialog
+        current = {f["filter_name"] or "" for f in files}
+        choices = sorted(self._filter_choices() | {f["filter_from_file"] for f in files if f["filter_from_file"]},
+                         key=str.lower)
+        start = next(iter(current)) if len(current) == 1 else ""
+        name, ok = QInputDialog.getItem(
+            self, "Set Filter", f"Filter for the {len(files)} selected light/flat file(s):",
+            choices or [""], max(choices.index(start), 0) if start in choices else 0, True)
+        name = (name or "").strip()
+        if ok and name:
+            self._write_filter_changes({f["id"]: name for f in files})
+
+    def _write_filter_changes(self, changes):
+        """Save filter corrections ({file id: filter or None for the file's own})."""
+        if not self._save_pending_before("Setting filters"):
+            return
+        try:
+            with self.db_manager.get_connection() as conn:
+                SessionObservations.set_file_filters(conn, self.session_id, changes)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error saving filter corrections: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save the filters: {e}")
             return
         self._after_immediate_write()
 
