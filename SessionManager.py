@@ -3098,6 +3098,7 @@ class SessionCalendarWidget(QWidget):
         self.visibility_hours = {}
         self.session_markers = {}
         self.on_date_with_session_clicked = None
+        self.on_open_visibility_calculator = None
         self._weather_key = None
         self._visibility_thread = None
 
@@ -3141,6 +3142,12 @@ class SessionCalendarWidget(QWidget):
         self.show_all_checkbox.setChecked(settings.value(self.SHOW_ALL_SETTING, False, type=bool))
         self.show_all_checkbox.toggled.connect(self._on_show_all_toggled)
         row.addWidget(self.show_all_checkbox)
+
+        self.visibility_calc_btn = QPushButton("Visibility Calculator")
+        self.visibility_calc_btn.setToolTip("Open the DSO Visibility Calculator for the selected session's object.")
+        self.visibility_calc_btn.setEnabled(False)  # until a session is selected
+        self.visibility_calc_btn.clicked.connect(lambda: self._open_visibility_calculator())
+        row.addWidget(self.visibility_calc_btn)
 
         row.addStretch()
 
@@ -3268,7 +3275,12 @@ class SessionCalendarWidget(QWidget):
 
     def set_active_session(self, session):
         self._current_session = session
+        self.visibility_calc_btn.setEnabled(bool(session))
         self._trigger_recalculation()
+
+    def _open_visibility_calculator(self):
+        if self._current_session and self.on_open_visibility_calculator:
+            self.on_open_visibility_calculator(self._current_session)
 
     def _trigger_recalculation(self):
         self.refresh_session_markers()
@@ -3654,6 +3666,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
 
         self.calendar_widget = SessionCalendarWidget(self.db_manager)
         self.calendar_widget.on_date_with_session_clicked = self._on_calendar_date_clicked
+        self.calendar_widget.on_open_visibility_calculator = self._open_visibility_calculator
 
         self.tab_widget = QTabWidget()
         self.tab_widget.addTab(sessions_tab, "Sessions")
@@ -4249,6 +4262,8 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
 
         menu.addAction("FOV Simulator").triggered.connect(lambda: self._open_fov_simulator(session))
         menu.addAction("DSO Details").triggered.connect(lambda: self._open_dso_details(session))
+        menu.addAction("Visibility Calculator").triggered.connect(
+            lambda: self._open_visibility_calculator(session))
 
         if NINAIntegration.is_enabled():
             nina_menu = menu.addMenu("NINA")
@@ -4315,6 +4330,34 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         except Exception as e:
             logger.error(f"Error opening FOV Simulator: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to open FOV Simulator: {e}")
+
+    def _open_visibility_calculator(self, session):
+        """DSO Visibility Calculator for the session's object, opened on the session's night."""
+        if not session:
+            return
+        ra_deg, dec_deg = self._session_coordinates(session)
+        if ra_deg is None or dec_deg is None:
+            QMessageBox.warning(self, "No Coordinates",
+                                f"This session has no coordinates and {session.get('dso_name', 'its object')} "
+                                "wasn't found in the DSO catalog.")
+            return
+        try:
+            from DSOVisibilityCalculator import DSOVisibilityApp
+            window = DSOVisibilityApp()
+            window.dso_input.setText(session.get("dso_name") or "")
+            window.set_dso_coordinates(ra_deg, dec_deg)
+            session_date = QDate.fromString(str(session.get("session_date") or "")[:10], "yyyy-MM-dd")
+            if session_date.isValid():
+                window.date_input.setDate(session_date)
+            self._visibility_window = window  # keep a reference so it isn't garbage collected
+            window.show()
+            window.raise_()
+            window.activateWindow()
+            # Same short delay as the other places that open it, so the window is fully up first
+            QTimer.singleShot(500, window.calculate_visibility)
+        except Exception as e:
+            logger.error(f"Error opening Visibility Calculator: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Visibility Calculator: {e}")
 
     def _nina_action(self, session, nina_function):
         ra_deg, dec_deg = self._session_coordinates(session)
