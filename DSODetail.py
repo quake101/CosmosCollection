@@ -1486,7 +1486,8 @@ class DSODetailWindow(QDialog):
             self._update_zoom()
 
     def _open_image_viewer(self):
-        """Open the current image in a new window"""
+        """Open the current image in a new window - which steps through the
+        object's other images too"""
         if self.original_pixmap is not None:
             try:
                 from ImageViewer import ImageViewerWindow
@@ -1495,9 +1496,12 @@ class DSODetailWindow(QDialog):
                 ra_deg = self.data.get("ra_deg")
                 dec_deg = self.data.get("dec_deg")
                 title = display_name(self.data["name"], self.data.get("dsodetailid"), self.data.get("designations"))
+                # No pixmap: the viewer loads the file itself (in the background), which
+                # it needs to do to step through the versions
+                versions = [img['image_path'] for img in self.user_images]
                 viewer = ImageViewerWindow(
-                    self.original_pixmap, title, self.current_image_path, self,
-                    dso_ra=ra_deg, dso_dec=dec_deg
+                    None, title, self.current_image_path, self,
+                    dso_ra=ra_deg, dso_dec=dec_deg, versions=versions
                 )
                 viewer.setModal(False)
                 viewer.show()
