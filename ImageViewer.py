@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QSettings, QThread, QRect
 from PySide6.QtGui import QPixmap, QPainter, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
-    QGroupBox, QScrollArea, QMessageBox, QProgressBar, QMenu
+    QGroupBox, QScrollArea, QMessageBox, QProgressBar, QMenu, QApplication
 )
 
 import ImageDetails
@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 # destroyed while still running crashes the app, so keep a reference until
 # the load finishes instead of blocking the window close on it.
 _orphaned_workers = set()
+
+# The Session Manager opened from a viewer, when there's no main window to open it
+_session_manager_window = None
 
 
 # File Information values may wrap after these (path separators, punctuation -
@@ -813,6 +816,16 @@ class ImageViewerWindow(QDialog):
             open_location_button.clicked.connect(self._open_file_location)
             toolbar.addWidget(open_location_button)
 
+            # The Session Manager session the image came from: open it, or link
+            # one (images in the gallery only)
+            toolbar.addSpacing(6)
+            self.session_button = QPushButton("Session")
+            self.session_button.setFixedHeight(30)
+            self.session_menu = QMenu(self.session_button)
+            self.session_menu.aboutToShow.connect(self._fill_session_menu)
+            self.session_button.setMenu(self.session_menu)
+            toolbar.addWidget(self.session_button)
+
             # What's drawn over the image, in one menu: the annotations (as in the
             # gallery: on/off, which layers, plate solving) and the capture details
             # (ImageDetails.py: on/off, and which and how)
@@ -1075,6 +1088,7 @@ class ImageViewerWindow(QDialog):
         # Update status
         self._update_annotation_controls()
         self._update_version_controls()
+        self._update_session_button()
         self._update_status()
 
         if self.file_path:
@@ -1120,6 +1134,7 @@ class ImageViewerWindow(QDialog):
         self._clear_solve_message()
         self._update_version_controls()
         self._update_annotation_controls()
+        self._update_session_button()
         self._start_image_load()
         if self.file_info_panel.isVisible():
             self._load_file_information()  # Read alongside the image, not after it
@@ -1474,6 +1489,96 @@ class ImageViewerWindow(QDialog):
             success = ResourceManager.open_file_manager(self.file_path)
             if not success:
                 QMessageBox.critical(self, "Error", "Failed to open file location")
+
+    # The image's session (userimages.session_id)
+
+    def _update_session_button(self):
+        """Shown for an image in the gallery, its tooltip naming the linked session."""
+        if not self.file_path:
+            return
+        try:
+            from DatabaseManager import DatabaseManager
+            with DatabaseManager().get_connection() as conn:
+                shown = ImageDetails.in_library(conn, self.file_path)
+                session_id = ImageDetails.session_id_for(conn, self.file_path) if shown else None
+                session = conn.execute("SELECT dso_name, session_date, status FROM usersessions WHERE id = ?",
+                                       (session_id,)).fetchone() if session_id else None
+        except Exception as e:
+            logger.error(f"Couldn't read the image's session: {e}", exc_info=True)
+            shown, session = False, None
+        self.session_button.setVisible(shown)
+        self.session_button.setToolTip(
+            f"Linked to the session {self._session_text(*session)}" if session
+            else "Link this image to the Session Manager session it was captured in")
+
+    @staticmethod
+    def _session_text(name, date, status):
+        return f"{date or 'No date'} – {name} ({status})"
+
+    def _fill_session_menu(self):
+        """Open the linked session, link another of the object's sessions, or unlink."""
+        menu = self.session_menu
+        menu.clear()
+        try:
+            from DatabaseManager import DatabaseManager
+            with DatabaseManager().get_connection() as conn:
+                linked, sessions = ImageDetails.session_choices(conn, self.file_path)
+        except Exception as e:
+            logger.error(f"Couldn't list the image's sessions: {e}", exc_info=True)
+            menu.addAction("Couldn't list the sessions").setEnabled(False)
+            return
+        if linked:
+            open_action = menu.addAction("Open Session")
+            open_action.triggered.connect(lambda: self._open_session(linked))
+        else:
+            menu.addAction("Not linked to a session").setEnabled(False)
+        menu.addSeparator()
+        link_menu = menu.addMenu("Change Linked Session" if linked else "Link to Session")
+        if not sessions:
+            link_menu.addAction("No sessions for this object").setEnabled(False)
+        for session_id, name, date, status in sessions:
+            action = link_menu.addAction(self._session_text(name, date, status))
+            action.setCheckable(True)
+            action.setChecked(session_id == linked)
+            action.triggered.connect(lambda checked=False, sid=session_id: self._link_session(sid))
+        if linked:
+            unlink_action = menu.addAction("Remove Link")
+            unlink_action.triggered.connect(lambda: self._link_session(None))
+
+    def _link_session(self, session_id):
+        """Link the image to the session (None unlinks), and gather its details again."""
+        try:
+            from DatabaseManager import DatabaseManager
+            with DatabaseManager().get_connection() as conn:
+                ImageDetails.link_session(conn, self.file_path, session_id)
+        except Exception as e:
+            logger.error(f"Couldn't link the image to the session: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Couldn't link the image to the session:\n{e}")
+            return
+        self._update_session_button()
+        # The details come partly from the session
+        self._details = None
+        self._details_reading = None
+        if self.details_dialog is not None:
+            self.details_dialog.set_details(self.file_path, None, None)
+        self._load_details()
+        self._details_layout_changed()
+
+    def _open_session(self, session_id):
+        """The Session Manager with the session selected - the main window's, when there is one."""
+        global _session_manager_window
+        try:
+            main = next((w for w in QApplication.topLevelWidgets() if hasattr(w, "_context_open_session")), None)
+            if main is not None:
+                main._context_open_session(session_id)
+                return
+            from SessionManager import SessionManagerWindow
+            if _session_manager_window is None or not _session_manager_window.isVisible():
+                _session_manager_window = SessionManagerWindow()
+            _session_manager_window.open_and_select_session(session_id)
+        except Exception as e:
+            logger.error(f"Error opening Session Manager: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Session Manager: {e}")
 
     # Export (ImageExport.py)
 

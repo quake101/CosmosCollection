@@ -301,7 +301,7 @@ def _library_rows(conn, image_path):
         return []
     rows = conn.execute(f"""
         SELECT ui.image_path, ui.dsodetailid, ui.session_id, ui.date_taken, ui.integration_time,
-               {EquipmentMapper.select_sql('ui')}
+               {EquipmentMapper.select_sql('ui')}, ui.id
         FROM userimages ui
         WHERE ui.image_path LIKE ? ESCAPE '\\'
         ORDER BY ui.session_id IS NULL, ui.id
@@ -312,7 +312,7 @@ def _library_rows(conn, image_path):
         if path_key(row[0]) != key:
             continue
         entry = {"dsodetailid": row[1], "session_id": row[2], "date_taken": row[3],
-                 "integration_time": row[4]}
+                 "integration_time": row[4], "id": row[11]}
         entry.update(EquipmentMapper.image_equipment(tuple(row[5:11])))
         result.append(entry)
     return result
@@ -321,6 +321,45 @@ def _library_rows(conn, image_path):
 def session_id_for(conn, image_path):
     """The session the image's library entry is linked to, or None."""
     return next((row["session_id"] for row in _library_rows(conn, image_path) if row["session_id"]), None)
+
+
+def in_library(conn, image_path):
+    """Whether the file is in the gallery (under any object)."""
+    return bool(_library_rows(conn, image_path))
+
+
+def session_choices(conn, image_path):
+    """(linked session id or None, [(id, name, date, status)]) - the sessions the
+    image could be linked to: those of the objects it's in the gallery under
+    (FOVSimulator.sessions_for_object), newest first, with the linked one among them."""
+    from FOVSimulator import sessions_for_object
+    rows = _library_rows(conn, image_path)
+    linked = next((row["session_id"] for row in rows if row["session_id"]), None)
+    found = {}
+    for dsodetailid in dict.fromkeys(row["dsodetailid"] for row in rows if row["dsodetailid"]):
+        position = conn.execute("SELECT ra, dec FROM dsodetail WHERE id = ?", (dsodetailid,)).fetchone()
+        ra, dec = position if position else (None, None)
+        for session_id, name, date, status, _ in sessions_for_object(conn, "", ra, dec, dsodetailid):
+            found[session_id] = (session_id, name, date, status)
+    if linked and linked not in found:
+        row = conn.execute("SELECT id, dso_name, session_date, status FROM usersessions WHERE id = ?",
+                           (linked,)).fetchone()
+        if row:
+            found[linked] = tuple(row)
+        else:
+            linked = None  # A session that's gone
+    sessions = sorted(found.values(), key=lambda s: (s[2] or "", s[0]), reverse=True)
+    return linked, sessions
+
+
+def link_session(conn, image_path, session_id):
+    """Link the file's gallery entries (one per object it shows) to the session -
+    or unlink them, with None. Commits."""
+    ids = [row["id"] for row in _library_rows(conn, image_path)]
+    if ids:
+        conn.execute(f"UPDATE userimages SET session_id = ? WHERE id IN ({','.join('?' * len(ids))})",
+                     [session_id] + ids)
+        conn.commit()
 
 
 def _object_names(conn, dsodetailids):
