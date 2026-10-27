@@ -1500,16 +1500,22 @@ class ImageViewerWindow(QDialog):
             from DatabaseManager import DatabaseManager
             with DatabaseManager().get_connection() as conn:
                 shown = ImageDetails.in_library(conn, self.file_path)
-                session_id = ImageDetails.session_id_for(conn, self.file_path) if shown else None
+                session_id, stored = ImageDetails.session_link(conn, self.file_path) if shown else (None, None)
                 session = conn.execute("SELECT dso_name, session_date, status FROM usersessions WHERE id = ?",
                                        (session_id,)).fetchone() if session_id else None
+                nights = ImageDetails.session_nights(conn, session_id) if session else []
         except Exception as e:
             logger.error(f"Couldn't read the image's session: {e}", exc_info=True)
-            shown, session = False, None
+            shown, session, nights, stored = False, None, [], None
         self.session_button.setVisible(shown)
-        self.session_button.setToolTip(
-            f"Linked to the session {self._session_text(*session)}" if session
-            else "Link this image to the Session Manager session it was captured in")
+        tip = "Link this image to the Session Manager session it was captured in"
+        if session:
+            tip = f"Linked to the session {self._session_text(*session)}"
+            dated = [key for key, _subs, _seconds in nights if key != ImageDetails.NO_NIGHT]
+            chosen = [key for key in ImageDetails.chosen_nights(nights, stored) if key != ImageDetails.NO_NIGHT]
+            if len(dated) > 1:
+                tip += f"\nStacked from {len(chosen)} of its {len(dated)} nights"
+        self.session_button.setToolTip(tip)
 
     @staticmethod
     def _session_text(name, date, status):
@@ -1530,6 +1536,9 @@ class ImageViewerWindow(QDialog):
         if linked:
             open_action = menu.addAction("Open Session")
             open_action.triggered.connect(lambda: self._open_session(linked))
+            nights_action = menu.addAction("Choose Nights...")
+            nights_action.setToolTip("The nights of the session this image was stacked from")
+            nights_action.triggered.connect(lambda: self._choose_nights(linked))
         else:
             menu.addAction("Not linked to a session").setEnabled(False)
         menu.addSeparator()
@@ -1546,15 +1555,70 @@ class ImageViewerWindow(QDialog):
             unlink_action.triggered.connect(lambda: self._link_session(None))
 
     def _link_session(self, session_id):
-        """Link the image to the session (None unlinks), and gather its details again."""
+        """Link the image to the session (None unlinks) - to the nights of its
+        subs (header dates, else those before the file was made), shown to
+        check when there's more than one - and gather its details again."""
+        nights, guess, hint = [], None, ""
         try:
             from DatabaseManager import DatabaseManager
             with DatabaseManager().get_connection() as conn:
-                ImageDetails.link_session(conn, self.file_path, session_id)
+                if session_id:
+                    nights = ImageDetails.session_nights(conn, session_id)
+                    guess, hint = ImageDetails.guess_nights(nights, ImageDetails.made_date(self.file_path),
+                                                            ImageDetails.sub_nights(self._header_keywords()))
+                ImageDetails.link_session(conn, self.file_path, session_id, guess)
         except Exception as e:
             logger.error(f"Couldn't link the image to the session: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Couldn't link the image to the session:\n{e}")
             return
+        self._session_link_changed()
+        if sum(key != ImageDetails.NO_NIGHT for key, _subs, _seconds in nights) > 1:
+            self._choose_nights(session_id, hint)
+
+    def _header_keywords(self):
+        """The FITS/XISF header keywords of the image - the ones already read
+        when there are, else read now - or {}."""
+        info = self._file_info[1] if self._file_info and self._file_info[0] == self.file_path else None
+        header = info.get("header") if isinstance(info, dict) else None
+        if header is None and Path(self.file_path).suffix.lower() in FITS_EXTENSIONS | XISF_EXTENSIONS:
+            try:
+                header = read_image_header(self.file_path)
+            except Exception as e:
+                logger.debug(f"Couldn't read the header of {self.file_path}: {e}")
+        return header.keywords if header is not None else {}
+
+    def _choose_nights(self, session_id, hint=""):
+        """Let the user choose the session's nights the image was stacked from."""
+        try:
+            from DatabaseManager import DatabaseManager
+            with DatabaseManager().get_connection() as conn:
+                _linked, stored = ImageDetails.session_link(conn, self.file_path)
+                nights = ImageDetails.session_nights(conn, session_id)
+                session = conn.execute("SELECT dso_name, session_date, status FROM usersessions WHERE id = ?",
+                                       (session_id,)).fetchone()
+        except Exception as e:
+            logger.error(f"Couldn't read the session's nights: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Couldn't read the session's nights:\n{e}")
+            return
+        if not nights:
+            QMessageBox.information(self, "Choose Nights", "The session has no nights with subs yet.")
+            return
+        dialog = ImageDetails.SessionNightsDialog(
+            f"\"{session[0]}\"" if session and session[0] else "the session", nights,
+            ImageDetails.chosen_nights(nights, stored), hint, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            with DatabaseManager().get_connection() as conn:
+                ImageDetails.link_session(conn, self.file_path, session_id, dialog.chosen_keys())
+        except Exception as e:
+            logger.error(f"Couldn't save the image's nights: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Couldn't save the image's nights:\n{e}")
+            return
+        self._session_link_changed()
+
+    def _session_link_changed(self):
+        """The image's session or nights changed: gather its details again."""
         self._update_session_button()
         # The details come partly from the session
         self._details = None

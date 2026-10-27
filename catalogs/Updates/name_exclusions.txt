@@ -1,0 +1,17 @@
+# Names DSO_Name_Updater.py never adds, one per line (case, spaces, hyphens
+# and a leading "The" don't matter). For junk labels the automatic filters
+# can't recognize. Lines starting with # are comments.
+#
+#   Name            never added to any object
+#   dsoid | Name    not added to that object only (a name put on the wrong
+#                   object, so the right object can still get it)
+
+# Wikidata vandalism / not names
+Jeon Jungkook
+Single Star
+Carlos Manuel Brenes Mena C R
+Nebula Thor Helmet
+Krab Nebula
+
+# Wikidata names on the wrong object
+NGC246 | Pac-man Nebula

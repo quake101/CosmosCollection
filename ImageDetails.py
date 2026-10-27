@@ -23,7 +23,7 @@ import os
 import sqlite3
 import statistics
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 
 from PySide6.QtCore import Qt, QObject, QRectF, QRunnable, QSettings, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPainterPath, QPen
@@ -284,6 +284,9 @@ def format_filter_breakdown(groups):
 # Gathering (worker thread - no Qt widgets)
 # ---------------------------------------------------------------------------
 
+# The night key of a session's Light files that couldn't be put on a night
+NO_NIGHT = "none"
+
 def path_key(path):
     """How a file path is matched: case and separators as Windows treats them."""
     return os.path.normcase(os.path.normpath(path or ""))
@@ -301,7 +304,7 @@ def _library_rows(conn, image_path):
         return []
     rows = conn.execute(f"""
         SELECT ui.image_path, ui.dsodetailid, ui.session_id, ui.date_taken, ui.integration_time,
-               {EquipmentMapper.select_sql('ui')}, ui.id
+               {EquipmentMapper.select_sql('ui')}, ui.id, ui.session_nights
         FROM userimages ui
         WHERE ui.image_path LIKE ? ESCAPE '\\'
         ORDER BY ui.session_id IS NULL, ui.id
@@ -312,15 +315,111 @@ def _library_rows(conn, image_path):
         if path_key(row[0]) != key:
             continue
         entry = {"dsodetailid": row[1], "session_id": row[2], "date_taken": row[3],
-                 "integration_time": row[4], "id": row[11]}
+                 "integration_time": row[4], "id": row[11], "session_nights": _parse_nights(row[12])}
         entry.update(EquipmentMapper.image_equipment(tuple(row[5:11])))
         result.append(entry)
     return result
 
 
+def _parse_nights(text):
+    """The night dates stored for an image - None for all of its session's nights."""
+    nights = [night.strip() for night in (text or "").split(",") if night.strip()]
+    return nights or None
+
+
 def session_id_for(conn, image_path):
     """The session the image's library entry is linked to, or None."""
     return next((row["session_id"] for row in _library_rows(conn, image_path) if row["session_id"]), None)
+
+
+def session_link(conn, image_path):
+    """(session id, [night keys] or None for all its nights) the image is linked
+    to - (None, None) when it isn't."""
+    row = next((row for row in _library_rows(conn, image_path) if row["session_id"]), None)
+    return (row["session_id"], row["session_nights"]) if row else (None, None)
+
+
+def session_nights(conn, session_id):
+    """[(night key, counted subs, counted seconds)] of the session, oldest first -
+    each night's date, then NO_NIGHT for Light files that aren't on a night."""
+    import SessionObservations as so
+    observations = conn.execute("""
+        SELECT id, night_date FROM usersessionobservations WHERE session_id = ? ORDER BY night_date
+    """, (session_id,)).fetchall()
+    breakdowns = so.load_breakdowns(conn, [obs_id for obs_id, _night in observations])
+    nights = []
+    for obs_id, night in observations:
+        subs, seconds, _filters = so.summarize_breakdown(breakdowns.get(obs_id) or [])
+        nights.append((night, subs, seconds))
+    count, seconds = conn.execute("""
+        SELECT COUNT(*), COALESCE(SUM(exptime_seconds), 0) FROM usersessionfiles
+        WHERE session_id = ? AND observation_id IS NULL AND frame_type = 'Light'
+    """, (session_id,)).fetchone()
+    if count:
+        nights.append((NO_NIGHT, count, seconds))
+    return nights
+
+
+def chosen_nights(nights, stored):
+    """The keys of nights (session_nights) the image counts - every one for
+    stored None, or when none of the stored ones are left."""
+    keys = [key for key, _subs, _seconds in nights]
+    chosen = [key for key in keys if stored is None or key in stored]
+    return chosen or keys
+
+
+def nights_total(nights, chosen):
+    """(subs, seconds) of the chosen nights."""
+    picked = [night for night in nights if night[0] in chosen]
+    return sum(subs for _key, subs, _seconds in picked), sum(seconds for _key, _subs, seconds in picked)
+
+
+def made_date(image_path):
+    """The day the image file was made - the earlier of its created and
+    modified times (a copy is created later, an edit modifies it later) - or None."""
+    try:
+        info = os.stat(image_path)
+        return datetime.fromtimestamp(min(info.st_mtime, info.st_ctime)).date()
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+def sub_nights(keywords):
+    """(first night, last night) of a stack's subs from its header's DATE-OBS
+    and DATE-END (UTC) - a night being the evening's date, here - or None."""
+    from ImageViewer import _parse_iso_datetime
+
+    def night_of(value):
+        when = _parse_iso_datetime(value)
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return (when.astimezone() - timedelta(hours=12)).date()
+
+    first, last = night_of((keywords or {}).get('DATE-OBS')), night_of((keywords or {}).get('DATE-END'))
+    return (first, last) if first and last and first <= last else None
+
+
+def guess_nights(nights, made, subs_range=None):
+    """([night keys] or None for all of them, why) - the nights an image was
+    stacked from: those of its header's sub dates (sub_nights), else those
+    before the day it was made."""
+    dated = [key for key, _subs, _seconds in nights if key != NO_NIGHT]
+    chosen, why = [], ""
+    if subs_range:
+        first, last = subs_range
+        chosen = [key for key in dated if first <= (_parse_date(key) or date.max) <= last]
+        why = f"The nights of the image's subs ({night_name(first.isoformat())} – " \
+              f"{night_name(last.isoformat())}, from its header) are ticked - check them."
+    if not chosen and made is not None:
+        chosen = [key for key in dated if (_parse_date(key) or date.max) < made]
+        why = f"The nights before the image was made ({night_name(made.isoformat())}) are ticked - check them."
+    if not chosen:
+        return None, "All of its nights are ticked."
+    if len(chosen) == len(dated):
+        return [key for key, _subs, _seconds in nights], why  # All of them, so the undated subs too
+    return chosen, why
 
 
 def in_library(conn, image_path):
@@ -352,14 +451,45 @@ def session_choices(conn, image_path):
     return linked, sessions
 
 
-def link_session(conn, image_path, session_id):
-    """Link the file's gallery entries (one per object it shows) to the session -
-    or unlink them, with None. Commits."""
-    ids = [row["id"] for row in _library_rows(conn, image_path)]
-    if ids:
-        conn.execute(f"UPDATE userimages SET session_id = ? WHERE id IN ({','.join('?' * len(ids))})",
-                     [session_id] + ids)
-        conn.commit()
+def _linked_total_texts(conn, session_id, stored):
+    """The integration texts the gallery field could have been filled with
+    from this link: its nights' total and the whole session's."""
+    if not session_id:
+        return set()
+    nights = session_nights(conn, session_id)
+    totals = {nights_total(nights, chosen_nights(nights, stored))[1],
+              nights_total(nights, chosen_nights(nights, None))[1]}
+    texts = {format_total(seconds) for seconds in totals if seconds > 0}
+    row = conn.execute("SELECT integration_seconds FROM usersessions WHERE id = ?", (session_id,)).fetchone()
+    if row and row[0]:
+        texts.add(format_total(row[0]))
+    return texts
+
+
+def link_session(conn, image_path, session_id, nights=None):
+    """Link the file's gallery entries (one per object it shows) to the session
+    and its nights (night keys, None for all) - or unlink them, with None.
+    Their Integration field takes the nights' total when it's empty or still
+    holds the old link's total; one the user typed is kept. Commits."""
+    rows = _library_rows(conn, image_path)
+    if not rows:
+        return
+    old_session, old_nights = session_link(conn, image_path)
+    filled = _linked_total_texts(conn, old_session, old_nights)
+    new_text = ""
+    if session_id:
+        available = session_nights(conn, session_id)
+        seconds = nights_total(available, chosen_nights(available, nights))[1]
+        new_text = format_total(seconds) if seconds > 0 else ""
+    stored = ",".join(nights) if session_id and nights else None
+    for row in rows:
+        integration = row["integration_time"]
+        current = (integration or "").strip()
+        if new_text and (not current or current in filled):
+            integration = new_text
+        conn.execute("UPDATE userimages SET session_id = ?, session_nights = ?, integration_time = ? WHERE id = ?",
+                     (session_id, stored, integration, row["id"]))
+    conn.commit()
 
 
 def _object_names(conn, dsodetailids):
@@ -384,9 +514,10 @@ def _mode(values):
     return Counter(values).most_common(1)[0][0] if values else None
 
 
-def _session_details(conn, session_id, details, numbers):
+def _session_details(conn, session_id, details, numbers, nights=None):
     """Fill details from the session: its nights, integration by filter, gear,
-    location, mount and camera settings."""
+    location, mount and camera settings. nights: the night keys the image was
+    stacked from - None for all of them."""
     import EquipmentMapper
     import MountDetection
     import SessionObservations as so
@@ -410,6 +541,12 @@ def _session_details(conn, session_id, details, numbers):
     # files that couldn't be put on a night
     observations = conn.execute("SELECT id, night_date FROM usersessionobservations WHERE session_id = ?",
                                 (session_id,)).fetchall()
+    selected = set(nights) if nights else None
+    if selected is not None and not selected & ({night for _obs_id, night in observations} | {NO_NIGHT}):
+        selected = None  # None of its nights are left - count them all
+    if selected is not None:
+        observations = [(obs_id, night) for obs_id, night in observations if night in selected]
+    loose = selected is None or NO_NIGHT in selected
     breakdowns = so.load_breakdowns(conn, [obs_id for obs_id, _night in observations])
     groups = {}  # (filter key, exposure bucket) -> [name, exposure, subs, seconds]
     nights = []
@@ -425,14 +562,18 @@ def _session_details(conn, session_id, details, numbers):
     for filter_name, exposure, count, seconds in conn.execute("""
             SELECT filter_name, exptime_seconds, COUNT(*), COALESCE(SUM(exptime_seconds), 0) FROM usersessionfiles
             WHERE session_id = ? AND observation_id IS NULL AND frame_type = 'Light'
-            GROUP BY filter_name, exptime_seconds""", (session_id,)).fetchall():
+            GROUP BY filter_name, exptime_seconds""", (session_id,)).fetchall() if loose else []:
         group = groups.setdefault((so.normalize_filter(filter_name), so.exposure_bucket(exposure)),
                                   [filter_name or "", exposure or 0, 0, 0.0])
         group[2] += count
         group[3] += seconds
     ordered = sorted(groups.values(), key=lambda g: (so.normalize_filter(g[0]), g[1]))
 
-    if not nights:
+    if selected is not None:
+        # Only the image's nights
+        sub_count = sum(group[2] for group in ordered)
+        integration_seconds = sum(group[3] for group in ordered)
+    if not nights and selected is None:
         nights = [d for d in (_parse_date(earliest), _parse_date(latest)) if d]
     if nights:
         details["dates"] = format_dates(nights)
@@ -464,9 +605,15 @@ def _session_details(conn, session_id, details, numbers):
     if mount:
         details["mount"] = mount
 
-    lights = conn.execute("""
+    on_nights, params = "", [session_id]
+    if selected is not None:
+        obs_ids = [obs_id for obs_id, _night in observations]
+        on_nights = (f" AND (observation_id IN ({','.join('?' * len(obs_ids))})"
+                     f"{' OR observation_id IS NULL' if loose else ''})")
+        params += obs_ids
+    lights = conn.execute(f"""
         SELECT gain, offset_value, ccd_temp, xbinning FROM usersessionfiles
-        WHERE session_id = ? AND frame_type = 'Light'""", (session_id,)).fetchall()
+        WHERE session_id = ? AND frame_type = 'Light'{on_nights}""", params).fetchall()
     if lights:
         temperatures = [r[2] for r in lights if r[2] is not None]
         settings = format_camera_settings(_mode(r[0] for r in lights), _mode(r[1] for r in lights),
@@ -581,10 +728,10 @@ def gather(conn, image_path, header=None, image_size=None, wcs_header=None, fall
         details["camera"] = first["camera"]
         numbers["telescope_id"] = first["telescope_id"]
         numbers["camera_id"] = first["camera_id"]
-        session_id = next((r["session_id"] for r in rows if r["session_id"]), None)
-        if session_id:
+        linked = next((r for r in rows if r["session_id"]), None)
+        if linked:
             try:
-                _session_details(conn, session_id, details, numbers)
+                _session_details(conn, linked["session_id"], details, numbers, linked["session_nights"])
             except sqlite3.Error as e:
                 logger.warning(f"Couldn't read the image's session: {e}")
         if not details["dates"]:
@@ -952,6 +1099,94 @@ def compose(image, lines, style):
 # ---------------------------------------------------------------------------
 # Dialog
 # ---------------------------------------------------------------------------
+
+def night_name(key):
+    """'Oct 4, 2025' for a night key."""
+    if key == NO_NIGHT:
+        return "Subs without a night"
+    night = _parse_date(key)
+    return format_dates([night]) if night else str(key)
+
+
+def _night_amount(subs, seconds):
+    return f"{_subs(subs)}, {format_total(seconds)}" if subs else "no subs"
+
+
+class SessionNightsDialog(QDialog):
+    """Which of the session's nights an image was stacked from - its details
+    count only their subs. chosen_keys() once accepted."""
+
+    def __init__(self, session_text, nights, chosen, hint="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose Nights - Cosmos Collection")
+        self.resize(420, 420)
+        self.nights = nights
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(f"Choose the nights of {session_text} this image was stacked from. "
+                       "Its dates and integration count only their subs.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        if hint:
+            hint_label = QLabel(hint)
+            hint_label.setWordWrap(True)
+            themed_style(hint_label, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_size(9)};")
+            layout.addWidget(hint_label)
+
+        self.night_list = QListWidget()
+        for key, subs, seconds in nights:
+            item = QListWidgetItem(f"{night_name(key)} – {_night_amount(subs, seconds)}")
+            item.setData(Qt.UserRole, key)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if key in chosen else Qt.Unchecked)
+            self.night_list.addItem(item)
+        self.night_list.itemChanged.connect(self._update_total)
+        layout.addWidget(self.night_list, 1)
+
+        row = QHBoxLayout()
+        all_button = QPushButton("All")
+        all_button.clicked.connect(lambda: self._check_all(Qt.Checked))
+        row.addWidget(all_button)
+        none_button = QPushButton("None")
+        none_button.clicked.connect(lambda: self._check_all(Qt.Unchecked))
+        row.addWidget(none_button)
+        row.addStretch()
+        layout.addLayout(row)
+        self.total_label = QLabel()
+        layout.addWidget(self.total_label)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.ok_button = QPushButton("OK")
+        self.ok_button.setDefault(True)
+        self.ok_button.clicked.connect(self.accept)
+        buttons.addWidget(self.ok_button)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        self._update_total()
+
+    def _check_all(self, state):
+        self.night_list.blockSignals(True)
+        for row in range(self.night_list.count()):
+            self.night_list.item(row).setCheckState(state)
+        self.night_list.blockSignals(False)
+        self._update_total()
+
+    def chosen_keys(self):
+        return [self.night_list.item(row).data(Qt.UserRole) for row in range(self.night_list.count())
+                if self.night_list.item(row).checkState() == Qt.Checked]
+
+    def _update_total(self, *_args):
+        chosen = self.chosen_keys()
+        dated = [key for key, _subs, _seconds in self.nights if key != NO_NIGHT]
+        picked = [key for key in chosen if key != NO_NIGHT]
+        subs, seconds = nights_total(self.nights, chosen)
+        self.total_label.setText(f"Selected: {len(picked)} of {len(dated)} night{'s' if len(dated) != 1 else ''}"
+                                 f" – {_night_amount(subs, seconds)}" if chosen else "Choose at least one night")
+        self.ok_button.setEnabled(bool(chosen))
+
 
 class ImageDetailsDialog(WindowPositionMixin, QDialog):
     """Which details show on the image and how - non-modal beside the viewer,

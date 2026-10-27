@@ -139,6 +139,13 @@ class DatabaseManager:
                 except sqlite3.OperationalError:
                     pass  # Column already exists
 
+                # The nights of that session the image was stacked from - night
+                # dates, comma separated (ImageDetails.py); NULL for all of them
+                try:
+                    cursor.execute("ALTER TABLE userimages ADD COLUMN session_nights TEXT")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
                 # The telescope and camera each image was taken with, linked to
                 # the user's Equipment (EquipmentMapper.py) - converted below
                 import EquipmentMapper

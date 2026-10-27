@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dso_name_updater.py (v1.3)
+DSO_Name_Updater.py (v1.5)
 ==========================
 
 Generates a supplementary SQLite database of missing "NAME" catalog records
@@ -18,20 +18,51 @@ attach it and union the results at query time.
 USAGE
 -----
     # All sources (default):
-    python3 dso_name_updater.py --source-db DSO.sqlite
+    python3 DSO_Name_Updater.py --source-db DSO.sqlite
 
     # One source:
-    python3 dso_name_updater.py --source-db DSO.sqlite --source openngc
-    python3 dso_name_updater.py --source-db DSO.sqlite --source simbad
-    python3 dso_name_updater.py --source-db DSO.sqlite --source wikidata
+    python3 DSO_Name_Updater.py --source-db DSO.sqlite --source openngc
+    python3 DSO_Name_Updater.py --source-db DSO.sqlite --source simbad
+    python3 DSO_Name_Updater.py --source-db DSO.sqlite --source wikidata
 
     # Combinations:
-    python3 dso_name_updater.py --source-db DSO.sqlite \
+    python3 DSO_Name_Updater.py --source-db DSO.sqlite \
         --source openngc,wikidata
 
     # Offline OpenNGC:
-    python3 dso_name_updater.py --source-db DSO.sqlite --source openngc \
+    python3 DSO_Name_Updater.py --source-db DSO.sqlite --source openngc \
         --openngc-dir ./opennfc_cache
+
+    # Review what was added and skipped:
+    python3 DSO_Name_Updater.py --source-db DSO.sqlite \
+        --review-csv review.csv
+
+v1.5 CHANGES
+------------
+* Wikidata names are cleaned and vetted. Rejected: catalog numbers in
+  words ("New General Catalogue 1123", "Messier Object 36"), any one or
+  two word name ending in a number ("Mrk 590", "Haro 30", "LH-41"), lists
+  of designations, notes, and star designations ("R Mon", "19 Puppis")
+  unless the object is a star or globular cluster. Wiki markup and a
+  leading "NAME " are stripped; all-lowercase names are capitalized.
+* Names on name_exclusions.txt (next to this script) are never added,
+  for every object or ("dsoid | Name") just one.
+* --skip-shared-names skips a name that would also belong to another
+  object (so each name finds one object). Off by default: real names are
+  often shared (the source DB has Lagoon Nebula on NGC 6533, so M 8
+  couldn't get it), and junk shared ones are caught by the filters above.
+  The exclusion list can block a name on one wrong object.
+* Names already in other update databases in the output folder are not
+  added again (the app attaches every .sqlite there and unions them).
+* A batch that fails after its retries is queried again in six smaller
+  pieces, so one heavy batch doesn't sink the run.
+* A run with failed batches no longer replaces the output unless
+  --allow-partial is given, and the output is written to a temp file
+  and swapped in, so a crash can't leave a missing or half-written DB.
+* --review-csv lists every added and skipped name with the reason.
+* User-Agent names the CosmosCollection project, per Wikimedia's policy.
+* Names compare ignoring a leading "The", spaces, and hyphens
+  ("The Sombrero Galaxy" = "Sombrero Galaxy", "Bow-Tie" = "Bowtie").
 
 v1.4 CHANGES
 ------------
@@ -89,13 +120,19 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+# The app's own "is this a catalog number, not a name" rule, so the names
+# this script adds pass the same test the app uses to pick a common name.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from DSONames import CATALOG_NUMBER_NAME, CONSTELLATIONS  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 OPENNGC_NGC_URL = (
     "https://raw.githubusercontent.com/mattiaverga/OpenNGC/"
@@ -117,8 +154,12 @@ WIKIDATA_Q_NGC = "Q14534"       # New General Catalogue
 WIKIDATA_Q_IC = "Q741672"       # Index Catalogue
 
 USER_AGENT = (
-    f"dso-name-updater/{VERSION} (stdlib; "
-    "github.com/anthropics/claude generated tool)"
+    f"CosmosCollection-DSO-Name-Updater/{VERSION} "
+    "(https://github.com/quake101/CosmosCollection) Python-urllib"
+)
+
+DEFAULT_EXCLUDE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "name_exclusions.txt"
 )
 
 # OpenNGC CSV column headers we care about, looked up case-insensitively.
@@ -154,8 +195,24 @@ LABEL_BY_SOURCE = {
 
 
 def _norm_name(n: str) -> str:
-    """Normalize a friendly name for dedup (case + whitespace insensitive)."""
-    return re.sub(r"\s+", " ", n.strip()).casefold()
+    """Normalize a friendly name for dedup: ignores case, a leading "The",
+    spaces and hyphens ("The Bow-Tie Nebula" = "Bowtie Nebula")."""
+    s = n.strip().casefold()
+    s = re.sub(r"^the\s+", "", s)
+    return re.sub(r"[\s\-]+", "", s)
+
+
+def _ro_uri(path: str) -> str:
+    """Read-only SQLite URI for a path (safe with spaces, '#', '?').
+
+    Built from abspath, not Path.resolve().as_uri(): resolving a mapped
+    network drive gives a \\\\host\\share path, and SQLite rejects a host
+    in a file: URI. An empty host plus a //host/share path works.
+    """
+    p = os.path.abspath(path).replace("\\", "/")
+    if not p.startswith("/"):
+        p = "/" + p  # "C:/x" -> "/C:/x"
+    return "file://" + urllib.parse.quote(p, safe="/:") + "?mode=ro"
 
 
 def _norm_designation(raw: str) -> str:
@@ -172,41 +229,96 @@ def _simbad_norm_key(s: str) -> str:
     return re.sub(r"\s+", "", s.strip()).upper()
 
 
-# A loose detector for "this looks like a catalog code, not a friendly name".
-# Used to filter Wikidata altLabels that are just designations like "M 94",
-# "NGC4736", "PGC 43495", "UGC 7995", "Caldwell 4", "Messier 94", etc.
-_CATALOG_CODE_RE = re.compile(
-    r"""
-    ^\s*
-    (?:
-        # Either a short uppercase abbreviation (1-6 chars, possibly with
-        # digits/star) OR a known full catalog name.
-        (?:
-            [A-Z][A-Z0-9]{0,5}\*?
-          | (?i:Messier|Caldwell|Sharpless|Barnard|Collinder|Melotte
-            |Trumpler|Berkeley|Abell|Arp|Hickson|Palomar|Stock
-            |Ruprecht|Tombaugh|Basel|Dolidze|Harvard|King)
-        )
-        \s*
-        \d+
-        [A-Za-z]?
-        (?:[-+]\d+)?              # IRAS-style suffix
-        \s*$
-    )
-    """,
-    re.VERBOSE,
+# Wikidata labels are crowd-edited and full of designations, translations
+# and notes. These rules decide which ones are friendly names.
+
+# Catalog numbers in words that DSONames.CATALOG_NUMBER_NAME doesn't know:
+# "New General Galaxy 149", "Nuevo Catálogo General 55".
+_CATALOG_WORDS_RE = re.compile(r"(?i)(?=.*\d).*\b(?:new general|catálogo|katalog)\b")
+
+_GREEK_LETTERS = (
+    "alpha|beta|gamma|delta|epsilon|zeta|eta|theta|iota|kappa|lambda|mu|nu|"
+    "xi|omicron|pi|rho|sigma|tau|upsilon|phi|chi|psi|omega|"
+    "alf|bet|gam|del|eps|zet|tet|iot|kap|lam|omi|sig|ups|ome"
 )
+_CONSTELLATION_GENITIVES = (
+    "Andromedae|Antliae|Apodis|Aquarii|Aquilae|Arae|Arietis|Aurigae|Bootis|"
+    "Boötis|Caeli|Camelopardalis|Cancri|Canum Venaticorum|Canis Majoris|"
+    "Canis Minoris|Capricorni|Carinae|Cassiopeiae|Centauri|Cephei|Ceti|"
+    "Chamaeleontis|Circini|Columbae|Comae Berenices|Coronae Australis|"
+    "Coronae Borealis|Corvi|Crateris|Crucis|Cygni|Delphini|Doradus|Draconis|"
+    "Equulei|Eridani|Fornacis|Geminorum|Gruis|Herculis|Horologii|Hydrae|"
+    "Hydri|Indi|Lacertae|Leonis|Leonis Minoris|Leporis|Librae|Lupi|Lyncis|"
+    "Lyrae|Mensae|Microscopii|Monocerotis|Muscae|Normae|Octantis|Ophiuchi|"
+    "Orionis|Pavonis|Pegasi|Persei|Phoenicis|Pictoris|Piscium|"
+    "Piscis Austrini|Puppis|Pyxidis|Reticuli|Sagittae|Sagittarii|Scorpii|"
+    "Sculptoris|Scuti|Serpentis|Sextantis|Tauri|Telescopii|Trianguli|"
+    "Trianguli Australis|Tucanae|Ursae Majoris|Ursae Minoris|Velorum|"
+    "Virginis|Volantis|Vulpeculae"
+)
+# Flamsteed, Bayer and variable-star names: "19 Puppis", "R Mon",
+# "Omega Centauri", "V1059 Sagittarii", "ZZ Leporis".
+_STAR_DESIGNATION_RE = re.compile(
+    r"(?i)^(?:\d{1,3}|[A-Z]{1,2}|V\d{3,4}|[α-ω]|" + _GREEK_LETTERS + r")\s+"
+    r"(?:" + _CONSTELLATION_GENITIVES + "|" + "|".join(CONSTELLATIONS) + r")$"
+)
+# Objects whose name may be a star designation ("47 Tucanae" is a globular
+# cluster, "19 Puppis" is the star NGC 2542).
+_STAR_NAMED_TYPES = {"1STAR", "2STAR", "3STAR", "4STAR", "GLOCL", "LMCGC", "SMCGC"}
+
+_MAX_NAME_LENGTH = 50
 
 
-def _looks_like_catalog_code(s: str) -> bool:
-    """True if `s` looks like a catalog designation rather than a friendly name."""
-    s = s.strip()
-    if not s:
+def _clean_name(raw: str) -> str:
+    """Tidy a crowd-edited label: wiki markup ('''Cat's Eye Nebula'''), a
+    SIMBAD-style "NAME " prefix, extra spaces; capitalizes an all-lowercase
+    name ("skull nebula" -> "Skull Nebula")."""
+    s = re.sub(r"\s+", " ", raw).strip()
+    s = re.sub(r"^'{2,}|'{2,}$", "", s).strip().strip('"').strip()
+    if s.startswith("NAME "):
+        s = s[len("NAME "):].strip()
+    if s and s == s.lower():
+        s = " ".join(w[:1].upper() + w[1:] for w in s.split(" "))
+    return s
+
+
+def _is_code_like(name: str) -> bool:
+    """One or two words ending in a number ("Mrk 590", "Haro 30", "LH-41",
+    "Δ252", "MITG J2132+4435"), or only uppercase abbreviations and numbers
+    ("GCRV 128 E"). Longer names ("Robert's Quartet 1") and names without
+    digits ("Andromeda II", "Orion B") aren't."""
+    words = name.split()
+    if not any(re.search(r"\d", w) for w in words):
+        return False
+    if all(w.isupper() or re.search(r"\d", w) for w in words):
         return True
-    # Pure numeric or near-pure numeric -> definitely a code
-    if re.match(r"^\d+\s*[A-Za-z]?$", s):
-        return True
-    return bool(_CATALOG_CODE_RE.match(s))
+    if len(words) > 2 or not re.search(r"\d", words[-1]):
+        return False
+    return "'" not in words[0] and "’" not in words[0]
+
+
+def _reject_reason(name: str, dsotype: str = "") -> Optional[str]:
+    """Why `name` isn't a friendly name for an object of `dsotype`, or None
+    when it is one."""
+    if len(name) < 4:
+        return "too short"
+    if "," in name:
+        return "list of designations"
+    if (
+        "(" in name
+        or name.casefold().startswith("aka ")
+        or len(name) > _MAX_NAME_LENGTH
+    ):
+        return "note, not a name"
+    if name.startswith("["):
+        return "catalog code"
+    if CATALOG_NUMBER_NAME.search(name) or _CATALOG_WORDS_RE.search(name):
+        return "catalog number"
+    if _is_code_like(name):
+        return "catalog code"
+    if _STAR_DESIGNATION_RE.match(name) and dsotype not in _STAR_NAMED_TYPES:
+        return "star designation"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -219,10 +331,10 @@ def load_source_info(
 ) -> Tuple[
     Dict[str, Set[str]],               # dsoid -> set of normalized existing NAMEs
     Dict[str, List[Tuple[str, str]]],  # dsoid -> list of (cat, norm_desig)
+    Dict[str, str],                    # dsoid -> dsotype ("GALXY", "GLOCL"...)
 ]:
     """Read the source DB once (read-only). See module docstring."""
-    uri = f"file:{os.path.abspath(source_db_path)}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    conn = sqlite3.connect(_ro_uri(source_db_path), uri=True)
     try:
         cur = conn.cursor()
         cur.execute(
@@ -235,9 +347,72 @@ def load_source_info(
                 existing_names[dsoid].add(_norm_name(desig))
             elif cat in ("NGC", "IC", "M"):
                 xrefs[dsoid].append((cat, _norm_designation(desig)))
-        return existing_names, xrefs
+        types = {
+            dsoid: (dsotype or "")
+            for dsoid, dsotype in cur.execute("SELECT id, dsotype FROM dsodetail")
+        }
+        return existing_names, xrefs, types
     finally:
         conn.close()
+
+
+def load_other_update_names(
+    output_path: str,
+    source_db_path: str,
+) -> Tuple[Dict[str, Set[str]], List[str]]:
+    """Normalized NAMEs already in the other update DBs beside the output.
+
+    The app attaches every .sqlite in catalogs/Updates and unions them, so a
+    name in one of them must not be added again by this run. The output file
+    itself is skipped (it is being regenerated), as is the source DB.
+    Returns (dsoid -> names, file names read).
+    """
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+    skip = {
+        os.path.normcase(os.path.abspath(p))
+        for p in (output_path, source_db_path)
+    }
+    names: Dict[str, Set[str]] = defaultdict(set)
+    used: List[str] = []
+    for fn in sorted(os.listdir(out_dir)):
+        path = os.path.join(out_dir, fn)
+        if not fn.lower().endswith(".sqlite") or os.path.normcase(path) in skip:
+            continue
+        conn = sqlite3.connect(_ro_uri(path), uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT dsodetailid, designation FROM cataloguenr "
+                "WHERE catalogue = ?",
+                (NAME_CATALOGUE,),
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            continue  # not an update DB
+        finally:
+            conn.close()
+        for dsoid, desig in rows:
+            names[dsoid].add(_norm_name(desig))
+        used.append(fn)
+    return names, used
+
+
+def load_exclusions(path: Optional[str]) -> Set[Tuple[str, str]]:
+    """Names never to add, as (dsoid or "", normalized name).
+
+    One per line, '#' starts a comment. "Name" blocks the name for every
+    object; "dsoid | Name" blocks it for that object only (a name Wikidata
+    puts on the wrong object, "NGC246 | Pac-man Nebula").
+    """
+    if not path or not os.path.isfile(path):
+        return set()
+    out: Set[Tuple[str, str]] = set()
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            dsoid, _, name = line.rpartition("|")
+            out.add((dsoid.strip(), _norm_name(name)))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +595,50 @@ def _simbad_candidate_ids(xrefs: List[Tuple[str, str]]) -> List[str]:
     return out
 
 
+# A batch that fails after its retries is queried again in this many pieces.
+_SPLIT_PIECES = 6
+
+
+def _run_batch(batch: List, run, sleep_between: float, what: str):
+    """Query `batch` with run(items) -> result.
+
+    If that fails after its retries, query the batch again in _SPLIT_PIECES
+    smaller pieces (each with its own retries), so one heavy batch - many
+    labels, or a busy moment on the server - doesn't lose the whole batch.
+    Only one level of splitting, so a server that is down costs a bounded
+    number of extra requests.
+
+    Returns (results, failed pieces, whether it was split).
+    """
+    try:
+        return [run(batch)], 0, False
+    except Exception as exc:  # noqa: BLE001
+        if len(batch) == 1:
+            print(f" FAILED: {exc}")
+            return [], 1, False
+        size = -(-len(batch) // _SPLIT_PIECES)
+        pieces = [batch[i:i + size] for i in range(0, len(batch), size)]
+        print(f" failed ({exc}); retrying in {len(pieces)} pieces")
+
+    results: List = []
+    failed = 0
+    for i, piece in enumerate(pieces, 1):
+        if sleep_between > 0:
+            time.sleep(sleep_between)
+        print(
+            f"    piece {i}/{len(pieces)} ({len(piece)} {what})...",
+            end="",
+            flush=True,
+        )
+        try:
+            results.append(run(piece))
+            print(" ok")
+        except Exception as exc:  # noqa: BLE001
+            print(f" FAILED: {exc}")
+            failed += 1
+    return results, failed, True
+
+
 def _simbad_tap_csv(adql: str, timeout: float = 90.0) -> str:
     """POST an ADQL query to SIMBAD's sync TAP endpoint; return CSV body."""
     body = urllib.parse.urlencode(
@@ -478,8 +697,9 @@ def simbad_additions(
     sleep_between: float = 1.0,
     verbose: bool = False,
     _query_fn=None,
-) -> Dict[str, List[str]]:
-    """Query SIMBAD for NAME identifiers; return dsoid -> [new names]."""
+) -> Tuple[Dict[str, List[str]], int]:
+    """Query SIMBAD for NAME identifiers; return (dsoid -> [new names],
+    number of failed batches)."""
     if _query_fn is None:
         _query_fn = _simbad_tap_csv_with_retry
 
@@ -501,7 +721,7 @@ def simbad_additions(
         f"{len({d for ds in key_to_dsoids.values() for d in ds}):,} DSOs"
     )
     if not send_ids:
-        return {}
+        return {}, 0
 
     total_batches = (len(send_ids) + batch_size - 1) // batch_size
     print(
@@ -512,31 +732,33 @@ def simbad_additions(
     names_by_key: Dict[str, List[str]] = defaultdict(list)
     names_by_key_seen: Dict[str, Set[str]] = defaultdict(set)
     sample_returned_forms: List[str] = []
+    failed = 0
 
-    for b_idx in range(total_batches):
-        batch = send_ids[b_idx * batch_size : (b_idx + 1) * batch_size]
-        in_list = ", ".join("'" + s.replace("'", "''") + "'" for s in batch)
-        adql = (
+    def run(ids: List[str]) -> str:
+        in_list = ", ".join("'" + s.replace("'", "''") + "'" for s in ids)
+        return _query_fn(
             "SELECT i1.id AS input_id, i2.id AS name_id "
             "FROM ident AS i1 "
             "JOIN ident AS i2 ON i1.oidref = i2.oidref "
             f"WHERE i1.id IN ({in_list}) "
             "AND i2.id LIKE 'NAME %'"
         )
+
+    for b_idx in range(total_batches):
+        batch = send_ids[b_idx * batch_size : (b_idx + 1) * batch_size]
         print(
             f"  batch {b_idx + 1}/{total_batches} ({len(batch)} IDs)...",
             end="",
             flush=True,
         )
-        try:
-            body = _query_fn(adql)
-        except Exception as exc:  # noqa: BLE001
-            print(f" FAILED: {exc}")
+        bodies, batch_failed, split = _run_batch(batch, run, sleep_between, "IDs")
+        failed += batch_failed
+        if not bodies:
             continue
 
-        reader = csv.DictReader(io.StringIO(body))
+        rows = [r for body in bodies for r in csv.DictReader(io.StringIO(body))]
         batch_rows = 0
-        for row in reader:
+        for row in rows:
             input_id_raw = (row.get("input_id") or "").strip()
             name_id = (row.get("name_id") or "").strip()
             if not input_id_raw or not name_id.startswith("NAME "):
@@ -553,7 +775,10 @@ def simbad_additions(
             names_by_key_seen[key].add(nkey)
             names_by_key[key].append(friendly)
             batch_rows += 1
-        print(f" ok ({batch_rows} NAME rows)")
+        if split:
+            print(f"    batch {b_idx + 1} done ({batch_rows} NAME rows)")
+        else:
+            print(f" ok ({batch_rows} NAME rows)")
 
         if sleep_between > 0 and b_idx + 1 < total_batches:
             time.sleep(sleep_between)
@@ -589,7 +814,7 @@ def simbad_additions(
             out[dsoid] = names
             if verbose:
                 print(f"  [SIMBAD] {dsoid}: +{names}")
-    return out
+    return out, failed
 
 
 # ---------------------------------------------------------------------------
@@ -608,8 +833,9 @@ def simbad_additions(
 #   The query uses a server-side normalization that strips spaces and the
 #   catalog prefix from the stored value before comparing to ours.
 # * For each matched item we collect rdfs:label and skos:altLabel in the
-#   chosen language, then strip out anything that looks like a catalog
-#   designation (so "M 94" doesn't end up as a NAME for itself).
+#   chosen language, then clean them and drop anything that isn't a
+#   friendly name (_reject_reason), so "M 94", "New General Catalogue 4736"
+#   and "Mrk 590" don't end up as NAMEs.
 #
 # Output: dsoid -> [friendly names]
 
@@ -732,18 +958,24 @@ SELECT DISTINCT ?catalog ?codeNorm ?item ?label ?altLabel WHERE {{
 def wikidata_additions(
     existing_by_dso: Dict[str, Set[str]],
     xrefs_by_dso: Dict[str, List[Tuple[str, str]]],
+    types_by_dso: Optional[Dict[str, str]] = None,
     language: str = "en",
     batch_size: int = 30,
     sleep_between: float = 1.0,
     verbose: bool = False,
+    rejected: Optional[List[Tuple[str, str, str, str]]] = None,
     _query_fn=None,
-) -> Dict[str, List[str]]:
+) -> Tuple[Dict[str, List[str]], int]:
     """
-    Query Wikidata for friendly names; return dsoid -> [new names].
+    Query Wikidata for friendly names; return (dsoid -> [new names],
+    number of failed batches).
 
-    Names come from rdfs:label and skos:altLabel. Anything that pattern-
-    matches a catalog designation (e.g., "M 94", "PGC 43495") is filtered.
+    Names come from rdfs:label and skos:altLabel, cleaned by _clean_name.
+    Ones that aren't friendly names (_reject_reason: "M 94", "PGC 43495",
+    "New General Catalogue 4736", "R Mon"...) are appended to `rejected` as
+    (dsoid, name, source label, reason) instead.
     """
+    types_by_dso = types_by_dso or {}
     if _query_fn is None:
         _query_fn = _sparql_post_json_with_retry
 
@@ -764,7 +996,7 @@ def wikidata_additions(
         f"{len({d for ds in key_to_dsoids.values() for d in ds}):,} DSOs"
     )
     if not keys:
-        return {}
+        return {}, 0
 
     total_batches = (len(keys) + batch_size - 1) // batch_size
     print(
@@ -772,33 +1004,33 @@ def wikidata_additions(
         f"{batch_size} pairs (lang={language})..."
     )
 
-    # matched_key -> ordered list of friendly names
+    # matched_key -> ordered list of cleaned labels (vetted per DSO below)
     names_by_key: Dict[Tuple[str, str], List[str]] = defaultdict(list)
     names_by_key_seen: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    failed = 0
 
-    def _add_name(key: Tuple[str, str], n: str) -> None:
-        n = n.strip()
-        if not n or _looks_like_catalog_code(n):
-            return
+    def _add_name(key: Tuple[str, str], n: str) -> bool:
+        n = _clean_name(n)
         nkey = _norm_name(n)
-        if nkey in names_by_key_seen[key]:
-            return
+        if not nkey or nkey in names_by_key_seen[key]:
+            return False
         names_by_key_seen[key].add(nkey)
         names_by_key[key].append(n)
+        return True
 
-    for b_idx in range(total_batches):
-        batch = keys[b_idx * batch_size : (b_idx + 1) * batch_size]
+    cat_to_prefix = {
+        WIKIDATA_Q_MESSIER: "M",
+        WIKIDATA_Q_NGC: "NGC",
+        WIKIDATA_Q_IC: "IC",
+    }
+
+    def run(pairs: List[Tuple[str, str]]) -> Dict:
         # Build VALUES block. Each (catalog Q, codeNorm) pair from the user's
         # DB expands into N rows -- one per literal stored-form variant we
         # want to match against P528. The query engine then does direct
         # equality lookups, which are index-backed and fast.
-        cat_to_prefix = {
-            WIKIDATA_Q_MESSIER: "M",
-            WIKIDATA_Q_NGC: "NGC",
-            WIKIDATA_Q_IC: "IC",
-        }
         lines = []
-        for qid, code in batch:
+        for qid, code in pairs:
             prefix = cat_to_prefix.get(qid, "")
             for variant in _wikidata_code_variants(prefix, code):
                 esc_code = code.replace("\\", "\\\\").replace('"', '\\"')
@@ -807,21 +1039,24 @@ def wikidata_additions(
                     f'    (wd:{qid} "{esc_code}" "{esc_var}")'
                 )
         values_block = "\n".join(lines).strip()
-        sparql = _wikidata_sparql(values_block, language)
+        return _query_fn(_wikidata_sparql(values_block, language))
 
+    for b_idx in range(total_batches):
+        batch = keys[b_idx * batch_size : (b_idx + 1) * batch_size]
         print(
             f"  batch {b_idx + 1}/{total_batches} ({len(batch)} pairs)...",
             end="",
             flush=True,
         )
-        try:
-            payload = _query_fn(sparql)
-        except Exception as exc:  # noqa: BLE001
-            print(f" FAILED: {exc}")
+        payloads, batch_failed, split = _run_batch(batch, run, sleep_between, "pairs")
+        failed += batch_failed
+        if not payloads:
             continue
 
-        bindings = payload.get("results", {}).get("bindings", [])
-        rows_added = 0
+        bindings = [
+            b for p in payloads for b in p.get("results", {}).get("bindings", [])
+        ]
+        labels_added = 0
         for b in bindings:
             try:
                 cat_uri = b["catalog"]["value"]  # http://www.wikidata.org/entity/Q14534
@@ -830,18 +1065,20 @@ def wikidata_additions(
                 continue
             qid = cat_uri.rsplit("/", 1)[-1]
             key = (qid, code)
-            if "label" in b:
-                _add_name(key, b["label"]["value"])
-                rows_added += 1
-            if "altLabel" in b:
-                _add_name(key, b["altLabel"]["value"])
-                rows_added += 1
-        print(f" ok ({rows_added} label/altLabel rows)")
+            for field in ("label", "altLabel"):
+                if field in b and _add_name(key, b[field]["value"]):
+                    labels_added += 1
+        if split:
+            print(f"    batch {b_idx + 1} done ({labels_added} labels)")
+        else:
+            print(f" ok ({labels_added} labels)")
 
         if sleep_between > 0 and b_idx + 1 < total_batches:
             time.sleep(sleep_between)
 
-    # Map matched keys back to DSOs, dedup against existing NAMEs
+    # Map matched keys back to DSOs, dedup against existing NAMEs, and keep
+    # only friendly names (whether a star designation is one depends on the
+    # object's type, so this happens per DSO).
     per_dso: Dict[str, List[str]] = defaultdict(list)
     per_dso_seen: Dict[str, Set[str]] = defaultdict(set)
     for key, names in names_by_key.items():
@@ -852,6 +1089,11 @@ def wikidata_additions(
                 if k in existing or k in per_dso_seen[dsoid]:
                     continue
                 per_dso_seen[dsoid].add(k)
+                reason = _reject_reason(n, types_by_dso.get(dsoid, ""))
+                if reason:
+                    if rejected is not None:
+                        rejected.append((dsoid, n, LABEL_WIKIDATA, reason))
+                    continue
                 per_dso[dsoid].append(n)
 
     out: Dict[str, List[str]] = {}
@@ -861,7 +1103,7 @@ def wikidata_additions(
             out[dsoid] = names
             if verbose:
                 print(f"  [Wikidata] {dsoid}: +{names}")
-    return out
+    return out, failed
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1143,65 @@ def merge_additions(
             ordered = [s for s in order if s in sources]
             rows.append((dsoid, name, "+".join(ordered)))
     return rows
+
+
+def drop_unwanted(
+    rows: List[Tuple[str, str, str]],
+    existing_by_dso: Dict[str, Set[str]],
+    excluded: Set[Tuple[str, str]],
+    skip_shared: bool = False,
+) -> Tuple[List[Tuple[str, str, str]], List[Tuple[str, str, str, str]]]:
+    """
+    Split merged rows into (kept, rejected); rejected rows carry a reason.
+
+    Drops names on the exclusion list (load_exclusions), and - with
+    skip_shared - names that would also belong to another object, already
+    (in the source or another update DB) or in this run, so a name looked
+    up finds one object. Excluded rows don't count as owners, so blocking a
+    name on the wrong object lets the right one keep it.
+    """
+    candidates: List[Tuple[str, str, str]] = []
+    rejected: List[Tuple[str, str, str, str]] = []
+    for dsoid, name, sources in rows:
+        k = _norm_name(name)
+        if ("", k) in excluded or (dsoid, k) in excluded:
+            rejected.append((dsoid, name, sources, "on exclusion list"))
+        else:
+            candidates.append((dsoid, name, sources))
+
+    owners: Dict[str, Set[str]] = defaultdict(set)
+    for dsoid, names in existing_by_dso.items():
+        for k in names:
+            owners[k].add(dsoid)
+    for dsoid, name, _ in candidates:
+        owners[_norm_name(name)].add(dsoid)
+
+    kept: List[Tuple[str, str, str]] = []
+    for dsoid, name, sources in candidates:
+        k = _norm_name(name)
+        others = owners[k] - {dsoid}
+        if others and skip_shared:
+            rejected.append(
+                (dsoid, name, sources, "also names " + ", ".join(sorted(others)))
+            )
+            continue
+        kept.append((dsoid, name, sources))
+    return kept, rejected
+
+
+def write_review_csv(
+    path: str,
+    kept: List[Tuple[str, str, str]],
+    rejected: List[Tuple[str, str, str, str]],
+) -> None:
+    """Every added and skipped name, with the reason, for a quick look over."""
+    lines = [(d, n, s, "added", "") for d, n, s in kept]
+    lines += [(d, n, s, "skipped", r) for d, n, s, r in rejected]
+    lines.sort(key=lambda r: (r[0], r[3], r[1].casefold()))
+    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["dsodetailid", "name", "sources", "status", "reason"])
+        w.writerows(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1026,11 +1327,17 @@ def write_update_db(
     sources_used: List[str],
     run_meta: Dict[str, str],
 ) -> None:
-    """Create (or replace) the update DB and populate it."""
-    if os.path.exists(output_path):
-        os.remove(output_path)
+    """Create (or replace) the update DB and populate it.
 
-    conn = sqlite3.connect(output_path)
+    Written to a temp file and swapped in, so a crash leaves the previous
+    DB in place. The temp name doesn't end in .sqlite, so the app never
+    attaches a half-written file.
+    """
+    tmp_path = output_path + ".tmp"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    conn = sqlite3.connect(tmp_path)
     try:
         conn.executescript(UPDATE_DB_SCHEMA)
 
@@ -1060,8 +1367,16 @@ def write_update_db(
             list(run_meta.items()),
         )
         conn.commit()
-    finally:
+    except BaseException:
         conn.close()
+        os.remove(tmp_path)
+        raise
+    conn.close()
+    try:
+        os.replace(tmp_path, output_path)
+    except OSError:
+        os.remove(tmp_path)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1139,7 +1454,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "variants. Lower this further if you hit 504s.")
     p.add_argument("--wikidata-sleep", type=float, default=1.0,
                    help="Sleep between Wikidata batches (default: 1.0).")
+    # Vetting
+    p.add_argument("--exclude-file", default=None,
+                   help="Names never to add, one per line (default: "
+                        "name_exclusions.txt next to this script, if any).")
+    p.add_argument("--skip-shared-names", action="store_true",
+                   help="Skip names that another object already has or "
+                        "gets in this run, so each name finds one object.")
+    p.add_argument("--review-csv", default=None,
+                   help="Write every added and skipped name, with the "
+                        "reason, to this CSV.")
     # Run control
+    p.add_argument("--allow-partial", action="store_true",
+                   help="Write the output even if some query batches "
+                        "failed (by default the old output is kept).")
     p.add_argument("--dry-run", action="store_true",
                    help="Compute the diff and print a summary; no output.")
     p.add_argument("--verbose", action="store_true",
@@ -1154,20 +1482,41 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: source DB not found: {args.source_db}", file=sys.stderr)
         return 2
 
+    exclude_file = args.exclude_file
+    if exclude_file is None:
+        exclude_file = DEFAULT_EXCLUDE_FILE
+    elif not os.path.isfile(exclude_file):
+        print(f"error: exclude file not found: {exclude_file}", file=sys.stderr)
+        return 2
+    excluded = load_exclusions(exclude_file)
+
     sources: List[str] = args.source  # already a list
     print(
-        f"dso_name_updater.py v{VERSION} -- sources: "
+        f"DSO_Name_Updater.py v{VERSION} -- sources: "
         f"{', '.join(LABEL_BY_SOURCE[s] for s in sources)}"
     )
 
     print("[1/N] Reading source DB cross-references...")
-    existing_by_dso, xrefs_by_dso = load_source_info(args.source_db)
+    existing_by_dso, xrefs_by_dso, types_by_dso = load_source_info(args.source_db)
     print(
         f"      {len(existing_by_dso):,} DSOs with existing NAME rows; "
         f"{len(xrefs_by_dso):,} DSOs with NGC/IC/M cross-refs"
     )
+    other_names, other_files = load_other_update_names(
+        args.output_db, args.source_db
+    )
+    for dsoid, names in other_names.items():
+        existing_by_dso[dsoid] |= names
+    if other_files:
+        print(
+            f"      also skipping names already in: {', '.join(other_files)}"
+        )
+    if excluded:
+        print(f"      {len(excluded):,} names on the exclusion list")
 
     by_source: Dict[str, Dict[str, List[str]]] = {}
+    rejected: List[Tuple[str, str, str, str]] = []
+    failed_batches = 0
 
     step = 2
     if SOURCE_OPENNGC in sources:
@@ -1187,12 +1536,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if SOURCE_SIMBAD in sources:
         print(f"[{step}/N] SIMBAD lookup:")
-        by_source[LABEL_SIMBAD] = simbad_additions(
+        by_source[LABEL_SIMBAD], failed = simbad_additions(
             existing_by_dso, xrefs_by_dso,
             batch_size=args.simbad_batch_size,
             sleep_between=args.simbad_sleep,
             verbose=args.verbose,
         )
+        failed_batches += failed
         print(
             f"      SIMBAD found new names for "
             f"{len(by_source[LABEL_SIMBAD]):,} DSOs"
@@ -1201,24 +1551,53 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if SOURCE_WIKIDATA in sources:
         print(f"[{step}/N] Wikidata lookup:")
-        by_source[LABEL_WIKIDATA] = wikidata_additions(
+        by_source[LABEL_WIKIDATA], failed = wikidata_additions(
             existing_by_dso, xrefs_by_dso,
+            types_by_dso=types_by_dso,
             language=args.wikidata_language,
             batch_size=args.wikidata_batch_size,
             sleep_between=args.wikidata_sleep,
             verbose=args.verbose,
+            rejected=rejected,
         )
+        failed_batches += failed
         print(
             f"      Wikidata found new names for "
             f"{len(by_source[LABEL_WIKIDATA]):,} DSOs"
         )
         step += 1
 
-    rows = merge_additions(by_source)
+    merged = merge_additions(by_source)
+    rows, dropped = drop_unwanted(
+        merged, existing_by_dso, excluded, args.skip_shared_names
+    )
+    rejected += dropped
     affected = len({r[0] for r in rows})
     print(
-        f"      merged: {len(rows):,} NAME rows across {affected:,} objects"
+        f"      merged: {len(rows):,} NAME rows across {affected:,} objects; "
+        f"skipped {len(rejected):,} names"
     )
+    if args.verbose:
+        for dsoid, name, label, reason in rejected:
+            print(f"  [skip] {dsoid}: {name!r} ({label}: {reason})")
+
+    if args.review_csv:
+        write_review_csv(args.review_csv, rows, rejected)
+        print(f"      review list written to {args.review_csv}")
+
+    if failed_batches:
+        print(
+            f"[warn] {failed_batches} query batch(es) failed, so names may be "
+            "missing.",
+            file=sys.stderr,
+        )
+        if not args.dry_run and not args.allow_partial:
+            print(
+                f"error: {args.output_db} left as it was. Re-run, or pass "
+                "--allow-partial to write the incomplete result.",
+                file=sys.stderr,
+            )
+            return 1
 
     if args.dry_run:
         print("Dry-run: no output written.")
@@ -1228,10 +1607,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     run_meta = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "generator": f"dso_name_updater.py v{VERSION}",
+        "generator": f"DSO_Name_Updater.py v{VERSION}",
         "source_db": os.path.abspath(args.source_db),
         "sources_used": ", ".join(sources_used),
         "rows_inserted": str(len(rows)),
+        "names_skipped": str(len(rejected)),
+        "failed_batches": str(failed_batches),
         "openngc_ngc_url": (
             args.ngc_url if SOURCE_OPENNGC in sources else ""
         ),
@@ -1255,7 +1636,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     }
 
     print(f"Writing {args.output_db}...")
-    write_update_db(args.output_db, rows, sources_used, run_meta)
+    try:
+        write_update_db(args.output_db, rows, sources_used, run_meta)
+    except PermissionError as exc:
+        print(
+            f"error: could not replace {args.output_db} ({exc}). Close "
+            "CosmosCollection (it keeps update DBs open) and re-run.",
+            file=sys.stderr,
+        )
+        return 1
     print(f"      done. {len(rows):,} rows inserted.")
 
     print()

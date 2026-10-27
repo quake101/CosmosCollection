@@ -919,7 +919,8 @@ def delete_session_children(conn, session_id):
     cursor.execute("DELETE FROM usersessionfiles WHERE session_id = ?", (session_id,))
     # Images stay in the gallery, no longer linked to it (foreign keys aren't enforced)
     try:
-        cursor.execute("UPDATE userimages SET session_id = NULL WHERE session_id = ?", (session_id,))
+        cursor.execute("UPDATE userimages SET session_id = NULL, session_nights = NULL WHERE session_id = ?",
+                       (session_id,))
     except Exception:
         pass  # A database from before userimages.session_id
 
