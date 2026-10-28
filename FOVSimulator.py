@@ -4,6 +4,7 @@ import math
 import re
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta
 import urllib.parse
 import numpy as np
@@ -13,7 +14,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout,
     QComboBox, QCheckBox, QPushButton, QMessageBox,
     QToolButton, QMenu, QSpinBox, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
-    QDateEdit, QToolTip, QLineEdit, QCompleter
+    QDateEdit, QToolTip, QLineEdit, QCompleter, QStatusBar
 )
 from astropy import units as u
 from astropy.time import Time
@@ -36,6 +37,16 @@ ALADIN_SCRIPT = "https://aladin.cds.unistra.fr/AladinLite/api/v3/3.8.2/aladin.js
 ALADIN_BASE_URL = "https://aladin.cds.unistra.fr/"
 ALADIN_BROWSER_URL = "https://aladin.cds.unistra.fr/AladinLite/"
 SURVEY = "P/DSS2/color"
+# Where the viewer gets the sky images: CDS, else the same survey mirrored elsewhere (a
+# mirror must allow requests from web pages - IRSA's doesn't). "probe": a quick check
+# that the server answers, as Aladin can take a long time to give up on one that doesn't
+SKY_SOURCES = (
+    {"id": SURVEY, "name": "CDS, Strasbourg", "probe": "https://alasky.cds.unistra.fr/DSS/DSSColor/properties"},
+    {"id": "https://skies.esac.esa.int/DSSColor", "name": "ESA Sky, Madrid"},
+)
+SKY_PROBE_MS = 8000
+SKY_BACKUP_MINUTES = 15   # After CDS failed, windows opened within this start on the backup
+_sky_backup_since = None  # time.monotonic() when a viewer last fell back from CDS
 
 CAMERA_COLOR = "#ff8800"
 EYEPIECE_COLOR = "#00ff00"
@@ -43,6 +54,7 @@ HORIZON_COLOR = "#ffaa00"
 HORIZON_DIM_COLOR = "rgba(255, 170, 0, 0.45)"   # The flat 0° line, when a custom horizon is drawn too
 BLOCKED_FILL = "rgba(255, 140, 0, 0.28)"        # Sky hidden by the custom horizon
 MERIDIAN_COLOR = "#4fc3f7"
+RETICLE_COLOR = "#ff4dff"                       # The view's center cross: bright on the dark sky, whatever the theme
 SKY_REFRESH_MS = 5 * 60 * 1000                  # The sky turns: redraw horizon/meridian every 5 minutes
 PATH_COLOR = "rgba(255, 255, 255, 0.85)"        # Night View: the target's path for the night
 NIGHT_VIEW_FOV = 110.0                          # Night View: a wide look at the sky
@@ -671,6 +683,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
                font: bold 13px "Segoe UI", Arial, sans-serif; text-shadow: 0 0 3px #000, 0 0 3px #000, 0 0 2px #000; }
   #indicator { position: absolute; left: 0; right: 0; text-align: center; display: none; pointer-events: none; z-index: 21;
                font: bold 13px "Segoe UI", Arial, sans-serif; text-shadow: 0 0 3px #000, 0 0 3px #000; }
+  #notice { position: absolute; left: 50%; top: 10px; transform: translateX(-50%); max-width: 80%; display: none;
+            padding: 6px 12px; border-radius: 4px; z-index: 25; pointer-events: none; text-align: center;
+            background: rgba(0, 0, 0, 0.7); color: #fff; font: 13px "Segoe UI", Arial, sans-serif; }
   #message { position: absolute; left: 0; top: 0; right: 0; bottom: 0; display: none; align-items: center; justify-content: center;
              text-align: center; padding: 20px; z-index: 30; background: var(--bg); color: var(--text);
              font: 14px "Segoe UI", Arial, sans-serif; }
@@ -678,7 +693,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 </head>
 <body>
 <div id="aladin"></div><div id="labels"></div><div id="knob" title="Drag to rotate the frame (Shift: 15° steps)"></div>
-<div id="tint"></div><div id="indicator"></div><div id="message"></div>
+<div id="tint"></div><div id="indicator"></div><div id="notice"></div><div id="message"></div>
 <script>
 var config = __CONFIG__;
 function applyColors(colors) {
@@ -705,6 +720,50 @@ function showMessage(text) {
 var aladin = null, frameLayer = null, skyLayer = null;
 var state = {frames: null, sky: null};
 var labels = [];
+
+// Where the sky images come from: config.surveys in order (CDS, then a mirror). The next
+// one is used when the current one fails - Aladin rejects with "HiPS <id> error: ...",
+// or the current one's server doesn't answer a quick check (probe)
+var surveyIndex = 0;
+function useSurvey(i) {
+    surveyIndex = i;
+    var survey = config.surveys[i];
+    if (!survey) {
+        // None left: the frames and lines still work, so a note over the view
+        var n = document.getElementById('notice');
+        n.textContent = "The sky images couldn't be loaded - none of their servers is answering. " +
+                        "Check your internet connection, or try again later.";
+        n.style.display = 'block';
+        report({survey: ''});
+        return;
+    }
+    if (aladin) aladin.setBaseImageLayer(survey.id);  // Before then, A.init picks it up
+    report({survey: survey.id});
+    if (survey.probe && window.AbortController) {
+        var abort = new AbortController();
+        var timer = setTimeout(function () { abort.abort(); }, config.probeMs);
+        // no-cors: only whether the server answers at all
+        fetch(survey.probe, {mode: 'no-cors', cache: 'no-store', signal: abort.signal})
+            .then(function () { clearTimeout(timer); })
+            .catch(function () { clearTimeout(timer); surveyFailed(i); });
+    }
+}
+function surveyFailed(i) {
+    if (i === surveyIndex) useSurvey(i + 1);  // Once per survey, however often it fails
+}
+window.addEventListener('unhandledrejection', function (e) {
+    var reason = String(e.reason && e.reason.message || e.reason);
+    if (reason.indexOf('HiPS ') !== 0) return;
+    config.surveys.forEach(function (survey, i) {
+        if (reason.indexOf(survey.id) < 0) return;
+        // Handled here (and often after the switch already happened): not an
+        // uncaught error - just its first line, for the debug log
+        e.preventDefault();
+        console.log('Sky images: ' + reason.split('\n')[0]);
+        surveyFailed(i);
+    });
+});
+useSurvey(0);
 
 function makeShape(s) {
     // Hover/selection keep the same color - these outlines aren't clickable objects
@@ -947,7 +1006,8 @@ window.ccColors = function (colors) {
 if (typeof A !== 'undefined') {
     A.init.then(function () {
         var options = {
-            survey: config.survey, fov: config.fov, projection: 'SIN', cooFrame: 'ICRS',
+            survey: (config.surveys[surveyIndex] || config.surveys[0]).id,
+            fov: config.fov, projection: 'SIN', cooFrame: 'ICRS',
             showZoomControl: false, showLayersControl: false, showFullscreenControl: false,
             showSimbadPointerControl: false, showCooGridControl: false, showSettingsControl: false,
             showColorPickerControl: false, showShareControl: false, showFrame: false, showFov: false,
@@ -1046,11 +1106,18 @@ def new_web_page(view):
             # Instead of Qt printing "js: ..." to the console
             expected = any(text in message for text in _EXPECTED_PAGE_MESSAGES)
             if level == QWebEnginePage.JavaScriptConsoleMessageLevel.ErrorMessageLevel and not expected:
-                logger.warning(f"Sky viewer: {message} ({source.rsplit('/', 1)[-1].split('#')[0]}:{line})")
+                # Aladin repeats a failure (e.g. a survey server that's down) on every
+                # redraw - say each one once
+                if message in self.logged:
+                    return
+                self.logged.add(message)
+                # The page's address carries its config after "#" - not part of the file name
+                logger.warning(f"Sky viewer: {message} ({source.split('#')[0].rsplit('/', 1)[-1]}:{line})")
             else:
                 logger.debug(f"Sky viewer: {message}")
 
     page = SkyPage(web_profile(), view)
+    page.logged = set()  # Errors already logged
     _web_pages.append(page)
     return page
 
@@ -1066,14 +1133,22 @@ def _release_web_pages():
 
 def viewer_page(config):
     """The viewer page's HTML for config ({"ra", "dec", "target", "fov",
-    "survey", "colors"})."""
+    "surveys", "probeMs", "colors"})."""
     return (PAGE_TEMPLATE.replace("__SCRIPT__", ALADIN_SCRIPT)
             .replace("__CONFIG__", json.dumps(config).replace("</", "<\\/")))
 
 
+def sky_sources():
+    """SKY_SOURCES in the order to try them: the backup first while CDS
+    failed recently, so each new window doesn't wait for it again."""
+    if _sky_backup_since is not None and time.monotonic() - _sky_backup_since < SKY_BACKUP_MINUTES * 60:
+        return list(SKY_SOURCES[1:]) + [SKY_SOURCES[0]]
+    return list(SKY_SOURCES)
+
+
 def page_colors():
     """Theme colors for the viewer page."""
-    return {"background": COLORS["background"], "text": COLORS["text"], "reticle": COLORS["accent"],
+    return {"background": COLORS["background"], "text": COLORS["text"], "reticle": RETICLE_COLOR,
             "frame": CAMERA_COLOR}
 
 
@@ -1122,6 +1197,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self._shown_time = None       # The time the horizon/meridian (and Night View) show
         self._rotate_seq = None       # The last rotation report handled
         self._page_error = False
+        self._sky_source = None       # The sky images' source the page last reported
         self.session_id = session_id
         self.framing_note = None      # Why a saved framing couldn't be restored exactly
 
@@ -2127,7 +2203,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             "ra": ra, "dec": dec,
             "target": f"{view_ra} {view_dec}" if view_ra is not None else str(name),
             "fov": self.current_fov,
-            "survey": SURVEY,
+            "surveys": sky_sources(),
+            "probeMs": SKY_PROBE_MS,
             "colors": page_colors(),
         }
         self.page_loaded = False
@@ -2653,9 +2730,28 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self._save_aladin_settings()
         self._push_sky()
 
+    def _on_sky_source(self, survey):
+        """The page now gets the sky images from survey (an id in SKY_SOURCES, or
+        "" when none answered): say so in the status bar when it's a backup."""
+        global _sky_backup_since
+        previous, self._sky_source = self._sky_source, survey
+        if survey and survey != SURVEY:
+            name = next((s["name"] for s in SKY_SOURCES if s["id"] == survey), survey)
+            if previous == SURVEY:
+                _sky_backup_since = time.monotonic()  # Other windows start on the backup
+                logger.info(f"Sky viewer: CDS isn't answering - sky images from {name}")
+            self.statusBar().showMessage(
+                f"Sky images from a backup server ({name}) - the usual one (CDS, Strasbourg) isn't answering")
+        else:
+            if not survey:
+                _sky_backup_since = None  # Likely no internet at all - try CDS first next time
+                logger.warning("Sky viewer: none of the sky image servers is answering")
+            if self.findChild(QStatusBar):  # Only shown once a backup was used
+                self.statusBar().clearMessage()
+
     def _on_page_report(self, title):
         """The page reports through its title: "cc:{json}" with the view's
-        width ("fov") or an error it showed ("error")."""
+        width ("fov"), the sky images' source ("survey") or an error it showed ("error")."""
         if not title.startswith("cc:"):
             return
         try:
@@ -2666,6 +2762,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             self._page_error = True
             logger.error(f"Sky viewer: {report['error']}")
             self._add_browser_fallback_button()
+        if report.get("survey") not in (None, self._sky_source):
+            self._on_sky_source(report["survey"])
         if report.get("rotateSeq") not in (None, self._rotate_seq):
             self._rotate_seq = report["rotateSeq"]
             if report.get("rotating") and report.get("rotate") is not None:
