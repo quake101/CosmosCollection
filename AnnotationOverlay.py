@@ -239,18 +239,15 @@ def query_bright_stars(ra: float, dec: float, radius: float, magnitude_limit: fl
         return None
     stars = []
     try:
-        from astroquery.simbad import Simbad
+        from SimbadQuery import query
         from astropy.coordinates import SkyCoord
         import astropy.units as u
 
         coord = SkyCoord(ra=ra, dec=dec, unit='deg')
-        simbad = Simbad()
-        simbad.add_votable_fields('flux(V)', 'ids', 'otype')
 
         logger.info(f"Querying SIMBAD for stars at RA={ra:.2f}, Dec={dec:.2f}, radius={radius:.2f}")
-        from OnlineLimits import online_request
-        with online_request("simbad"):
-            result = simbad.query_region(coord, radius=radius * u.deg)
+        result = query(lambda simbad: simbad.query_region(coord, radius=radius * u.deg),
+                       fields=('flux(V)', 'ids', 'otype'))
 
         if result is not None:
             # astroquery 0.4.8+ returns lowercase columns (main_id, ra, dec in degrees);

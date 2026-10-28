@@ -615,37 +615,22 @@ class SimbadQueryWorker(QThread):
 
     def run(self):
         """Query SIMBAD in background thread"""
+        from SimbadQuery import SimbadUnavailable
         try:
-            from astroquery.simbad import Simbad
+            from SimbadQuery import query
             from astropy.coordinates import SkyCoord
             import astropy.units as u
 
             logger.debug(f"Querying SIMBAD for: {self.search_term}")
 
-            # Configure SIMBAD to return comprehensive data
-            custom_simbad = Simbad()
-            custom_simbad.add_votable_fields(
-                'otype',  # Object type
-                'dimensions',  # Dimensions
-                'V',  # V magnitude
-                'B',  # B magnitude
-            )
-
-            # Try to query by identifier
-            from OnlineLimits import online_request
-            try:
-                with online_request("simbad"):
-                    result = custom_simbad.query_object(self.search_term)
-            except Exception as query_error:
-                # PyInstaller builds have hit certificate-chain failures here. Retry
-                # unverified on this Simbad instance's session only - never patch
-                # requests globally, which would disable verification app-wide.
-                if not (getattr(sys, 'frozen', False) and self._is_ssl_error(query_error)):
-                    raise
-                logger.warning(f"SIMBAD SSL verification failed ({query_error}); retrying without verification")
-                self._disable_session_verification(custom_simbad._session)
-                with online_request("simbad"):
-                    result = custom_simbad.query_object(self.search_term)
+            # Query by identifier, with comprehensive data
+            result = query(lambda simbad: simbad.query_object(self.search_term),
+                           fields=(
+                               'otype',  # Object type
+                               'dimensions',  # Dimensions
+                               'V',  # V magnitude
+                               'B',  # B magnitude
+                           ))
 
             if result is None or len(result) == 0:
                 logger.debug(f"No SIMBAD data found for {self.search_term}")
@@ -746,35 +731,11 @@ class SimbadQueryWorker(QThread):
 
             self.object_found.emit(object_data)
 
+        except SimbadUnavailable as e:
+            self.error_occurred.emit(str(e))
         except Exception as e:
             logger.error(f"Error querying SIMBAD: {str(e)}", exc_info=True)
-            self.error_occurred.emit(f"Error querying SIMBAD: {str(e)}")
-
-    @staticmethod
-    def _is_ssl_error(error):
-        """Whether an exception (or anything it wraps - pyvo wraps requests errors) is an SSL failure"""
-        seen = set()
-        while error is not None and id(error) not in seen:
-            seen.add(id(error))
-            if "SSLError" in type(error).__name__ or "CERTIFICATE_VERIFY_FAILED" in str(error):
-                return True
-            error = error.__cause__ or error.__context__ or getattr(error, 'cause', None)
-        return False
-
-    @staticmethod
-    def _disable_session_verification(session):
-        """Force verify=False on every request made through this one session.
-
-        Setting session.verify = False isn't enough: requests lets the
-        REQUESTS_CA_BUNDLE environment variable (set at startup for PyInstaller
-        builds) override a session-level verify setting."""
-        original_request = session.request
-
-        def unverified_request(method, url, *args, **kwargs):
-            kwargs['verify'] = False
-            return original_request(method, url, *args, **kwargs)
-
-        session.request = unverified_request
+            self.error_occurred.emit(f"Error querying SIMBAD:\n\n{str(e)}")
 
     # SIMBAD object type codes (current short codes and legacy long forms) -> DSO type
     _SIMBAD_TYPE_MAP = {
@@ -5293,12 +5254,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         if hasattr(self, 'simbad_loading_dialog'):
             self.simbad_loading_dialog.close()
 
-        QMessageBox.warning(
-            self,
-            "SIMBAD Query Error",
-            f"Error querying SIMBAD:\n\n{error_message}\n\n"
-            "Please check your internet connection and try again."
-        )
+        QMessageBox.warning(self, "SIMBAD Query Error", error_message)
 
         # Clean up worker
         if hasattr(self, 'simbad_worker'):

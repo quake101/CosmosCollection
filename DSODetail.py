@@ -6,7 +6,6 @@ Provides detailed object information, image management, and visibility data
 
 import logging
 import os
-import sys
 from typing import Optional, Dict
 
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, QThread, QUrl
@@ -50,36 +49,19 @@ class SimbadQueryThread(QThread):
 
     def run(self):
         """Query SIMBAD in background thread"""
+        from SimbadQuery import SimbadUnavailable
         try:
-            from astroquery.simbad import Simbad
+            from SimbadQuery import query
             from astropy.coordinates import SkyCoord
             import astropy.units as u
 
-            if getattr(sys, 'frozen', False):
-                try:
-                    from astroquery.query import BaseQuery
-                    BaseQuery.TIMEOUT = 30
-                    import requests
-                    original_request = requests.Session.request
-                    def patched_request(self, *args, **kwargs):
-                        kwargs['verify'] = False
-                        return original_request(self, *args, **kwargs)
-                    requests.Session.request = patched_request
-                    logger.info("Disabled SSL verification for astroquery (PyInstaller workaround)")
-                except Exception as ssl_config_error:
-                    logger.warning(f"Could not configure SSL for astroquery: {ssl_config_error}")
-
             logger.debug(f"Querying SIMBAD for emission data: {self.object_name} at RA={self.ra_deg}, Dec={self.dec_deg}")
-
-            custom_simbad = Simbad()
-            custom_simbad.add_votable_fields('U', 'B', 'V', 'R', 'I', 'sp', 'otype')
 
             result = None
             if self.ra_deg is not None and self.dec_deg is not None:
                 coords = SkyCoord(ra=self.ra_deg*u.degree, dec=self.dec_deg*u.degree, frame='icrs')
-                from OnlineLimits import online_request
-                with online_request("simbad"):
-                    result = custom_simbad.query_region(coords, radius=3*u.arcmin)
+                result = query(lambda simbad: simbad.query_region(coords, radius=3*u.arcmin),
+                               fields=('U', 'B', 'V', 'R', 'I', 'sp', 'otype'))
                 if result is not None and len(result) > 0:
                     logger.debug(f"SIMBAD data found for {self.object_name} at coordinates")
                 else:
@@ -89,9 +71,11 @@ class SimbadQueryThread(QThread):
 
             self.query_complete.emit(result, self.object_name, self.ra_deg, self.dec_deg)
 
+        except SimbadUnavailable as e:
+            self.query_failed.emit(self.object_name, str(e))
         except Exception as e:
             logger.error(f"SIMBAD query failed for {self.object_name}: {type(e).__name__}: {str(e)}", exc_info=True)
-            self.query_failed.emit(self.object_name, str(e))
+            self.query_failed.emit(self.object_name, "SIMBAD query failed")
 
 
 # Image loader threads whose result is no longer wanted (the user switched image
@@ -409,7 +393,7 @@ class DSODetailWindow(QDialog):
 
         except Exception as e:
             logger.error(f"Error initiating SIMBAD query: {str(e)}", exc_info=True)
-            self.emission_label.setText(f"Error querying SIMBAD (check internet connection)")
+            self.emission_label.setText("Error querying SIMBAD")
             themed_style(self.emission_label, lambda: f"color: {COLORS['error']};")
 
     def _on_simbad_query_complete(self, result, object_name, ra_deg, dec_deg):
@@ -432,10 +416,10 @@ class DSODetailWindow(QDialog):
             self.emission_label.setText("Error processing SIMBAD data")
             themed_style(self.emission_label, lambda: f"color: {COLORS['error']};")
 
-    def _on_simbad_query_failed(self, object_name, error_message):
-        """Handle SIMBAD query failure"""
-        logger.warning(f"SIMBAD query failed for {object_name}: {error_message}")
-        self.emission_label.setText(f"SIMBAD query failed (check internet connection)")
+    def _on_simbad_query_failed(self, object_name, message):
+        """Handle SIMBAD query failure - message says why, for the user"""
+        logger.warning(f"SIMBAD query failed for {object_name}: {message}")
+        self.emission_label.setText(message)
         themed_style(self.emission_label, lambda: f"color: {COLORS['error']};")
 
     @staticmethod
