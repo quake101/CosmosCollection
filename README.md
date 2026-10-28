@@ -70,6 +70,8 @@ A personal astrophotography catalog and session planning tools for organizing an
 
 The app checks for updates and can install them for you.
 
+New to the app? The **[Getting Started guide](docs/GETTING-STARTED.md)** walks you through setup, importing your images and planning your first night.
+
 <details>
 <summary><b>macOS: first launch</b></summary>
 
@@ -105,6 +107,7 @@ sudo pacman -S libxml2-legacy
 
 ## More
 
+- [Getting Started guide](docs/GETTING-STARTED.md): setup and first steps for new users
 - [Building from source](docs/BUILDING.md)
 - [Command line interface](docs/CLI.md): add images and search objects from scripts
 
