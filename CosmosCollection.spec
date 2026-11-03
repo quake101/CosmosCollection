@@ -137,6 +137,14 @@ if sys.platform.startswith('linux'):
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# Product name/version in the .exe files' details, which SignPath code
+# signing checks (see version_resource.py)
+sys.path.insert(0, SPECPATH)
+from version_resource import version_info
+
+def _windows_version(exe_name, description):
+    return version_info(SPECPATH, exe_name, description) if sys.platform == 'win32' else None
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -154,6 +162,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='images/CosmosCollection.png',
+    version=_windows_version('CosmosCollection', 'Cosmos Collection'),
 )
 
 # Separate CLI executable with console enabled
@@ -174,6 +183,7 @@ exe_cli = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='images/CosmosCollection.png',
+    version=_windows_version('CosmosCollection-CLI', 'Cosmos Collection command line'),
 )
 
 coll = COLLECT(

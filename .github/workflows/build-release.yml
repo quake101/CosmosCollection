@@ -42,10 +42,13 @@ jobs:
         pip install -r requirements.txt
 
     - name: Update version file (Windows)
+      id: version
       if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'windows-latest'
       run: |
         $tag = "${{ github.ref }}".Replace("refs/tags/", "")
         python update_version.py $tag
+        # For the SignPath signing request, which checks the .exe files' product version
+        "version=$($tag.TrimStart('v'))" >> $env:GITHUB_OUTPUT
 
     - name: Update version file (Linux/macOS)
       if: startsWith(github.ref, 'refs/tags/') && matrix.os != 'windows-latest'
@@ -66,6 +69,49 @@ jobs:
       if: matrix.os == 'windows-latest'
       run: |
         Copy-Item dist/CosmosCollectionUpdater.exe dist/CosmosCollection/CosmosCollectionUpdater.exe
+
+    # Code signing by SignPath Foundation (see docs/CODE-SIGNING.md). Release
+    # builds only, and skipped until the SIGNPATH_ORGANIZATION_ID repository
+    # variable and SIGNPATH_API_TOKEN secret are set. The signing request waits
+    # for an approver to approve it on signpath.io.
+    - name: Upload unsigned executables for signing (Windows)
+      id: upload-unsigned
+      if: matrix.os == 'windows-latest' && startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_ORGANIZATION_ID != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: CosmosCollection-Windows-unsigned
+        path: |
+          dist/CosmosCollection/CosmosCollection.exe
+          dist/CosmosCollection/CosmosCollection-CLI.exe
+          dist/CosmosCollection/CosmosCollectionUpdater.exe
+        if-no-files-found: error
+        retention-days: 1
+
+    - name: Sign executables with SignPath (Windows)
+      if: steps.upload-unsigned.outcome == 'success'
+      uses: signpath/github-action-submit-signing-request@v3
+      with:
+        api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+        organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+        project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'CosmosCollection' }}
+        signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG || 'release-signing' }}
+        github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+        wait-for-completion: true
+        # Time for the approver to approve the request
+        wait-for-completion-timeout-in-seconds: 3600
+        output-artifact-directory: dist/signed
+        parameters: |
+          version: "${{ steps.version.outputs.version }}"
+
+    - name: Put signed executables into distribution (Windows)
+      if: steps.upload-unsigned.outcome == 'success'
+      run: |
+        Copy-Item dist/signed/*.exe dist/CosmosCollection/ -Force
+        foreach ($exe in Get-ChildItem dist/CosmosCollection/*.exe) {
+          $signature = Get-AuthenticodeSignature $exe.FullName
+          if ($signature.Status -ne 'Valid') { throw "$($exe.Name) is not signed: $($signature.StatusMessage)" }
+          "$($exe.Name): signed by $($signature.SignerCertificate.Subject)"
+        }
 
     - name: Bundle updater helper into distribution (Linux)
       if: matrix.os == 'ubuntu-latest'
@@ -144,3 +190,6 @@ jobs:
         draft: false
         prerelease: false
         generate_release_notes: true
+        # SignPath Foundation requires a link to the code signing policy on the download page
+        body: |
+          [Code signing policy](https://github.com/quake101/CosmosCollection/blob/master/docs/CODE-SIGNING.md)

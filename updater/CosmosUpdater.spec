@@ -5,6 +5,7 @@
 #   pyinstaller updater/CosmosUpdater.spec
 
 import os
+import sys
 
 block_cipher = None
 
@@ -53,6 +54,12 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# Product name/version in the .exe's details, which SignPath code signing
+# checks (see version_resource.py at the repo root)
+repo_dir = os.path.join(SPECPATH, '..')
+sys.path.insert(0, repo_dir)
+from version_resource import version_info
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -74,4 +81,6 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=os.path.join(SPECPATH, '..', 'images', 'CosmosCollectionUpdater.png'),
+    version=(version_info(repo_dir, 'CosmosCollectionUpdater', 'Cosmos Collection updater')
+             if sys.platform == 'win32' else None),
 )

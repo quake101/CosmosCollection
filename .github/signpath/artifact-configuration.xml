@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for the Windows release (see docs/CODE-SIGNING.md).
+  SignPath reads it from the project's settings on signpath.io, not from here: this
+  copy keeps it with the code. Paste it in again after changing it.
+
+  The signing request (build-release.yml) sends the three .exe files, zipped by
+  actions/upload-artifact, and the release's version as the version parameter.
+  Each file must say it's Cosmos Collection at that version (version_resource.py).
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file path="CosmosCollection.exe" product-name="Cosmos Collection" product-version="${version}">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="CosmosCollection-CLI.exe" product-name="Cosmos Collection" product-version="${version}">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="CosmosCollectionUpdater.exe" product-name="Cosmos Collection" product-version="${version}">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>
