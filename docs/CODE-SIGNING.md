@@ -2,7 +2,9 @@
 
 Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org).
 
-The Windows release (`CosmosCollection.exe`, `CosmosCollection-CLI.exe` and `CosmosCollectionUpdater.exe`) is signed. Windows shows **SignPath Foundation** as the publisher. Only files built from this repository by its [GitHub Actions release workflow](../.github/workflows/build-release.yml) are signed, and every release is approved by hand before it's signed.
+> **Status:** Cosmos Collection has applied to SignPath Foundation and is waiting for approval. Until then, Windows releases are unsigned, so Windows may show "Unknown publisher" or a SmartScreen warning.
+
+Once approved, the Windows release (`CosmosCollection.exe`, `CosmosCollection-CLI.exe` and `CosmosCollectionUpdater.exe`) is signed, and Windows shows **SignPath Foundation** as the publisher. Only files built from this repository by its [GitHub Actions release workflow](../.github/workflows/build-release.yml) are signed, and every release is approved by hand before it's signed.
 
 ## Team Roles
 

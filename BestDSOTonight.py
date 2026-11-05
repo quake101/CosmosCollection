@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
+from WindowLifetime import release_on_close, window_is_open
 from Theme import COLORS, adapt_color, font_px, theme_manager, themed_style, tint
 from TimeFormatHelper import format_time, format_datetime
 from NINAIntegration import NINAIntegration
@@ -694,6 +695,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
     def __init__(self, use_target_list=False):
         super().__init__()
+        release_on_close(self)  # Freed once closed (see WindowLifetime)
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("Best DSO Tonight - Cosmos Collection")
         self.resize(930, 920)
@@ -1714,6 +1716,8 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                     visibility_window.activateWindow()
 
                     # Store reference after showing to prevent garbage collection
+                    # (closed ones dropped - they're freed once closed)
+                    self.visibility_windows = [w for w in self.visibility_windows if window_is_open(w)]
                     self.visibility_windows.append(visibility_window)
 
                     # Automatically trigger calculation after a short delay
@@ -1855,7 +1859,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
                     # Import and open Session Manager, then create a session for the DSO
                     from SessionManager import SessionManagerWindow
-                    if not hasattr(self, 'session_manager_window') or not self.session_manager_window.isVisible():
+                    if not window_is_open(getattr(self, 'session_manager_window', None)):
                         self.session_manager_window = SessionManagerWindow()
 
                     self.session_manager_window.create_session_from_dso(target_data)
@@ -1904,7 +1908,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
                     # Import and open Target List window, then add the DSO
                     from DSOTargetList import DSOTargetListWindow
-                    if not hasattr(self, 'target_list_window') or not self.target_list_window.isVisible():
+                    if not window_is_open(getattr(self, 'target_list_window', None)):
                         self.target_list_window = DSOTargetListWindow()
 
                     self.target_list_window.show()
@@ -1948,7 +1952,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
                     # Import and open Target List window
                     from DSOTargetList import DSOTargetListWindow
-                    if not hasattr(self, 'target_list_window') or not self.target_list_window.isVisible():
+                    if not window_is_open(getattr(self, 'target_list_window', None)):
                         self.target_list_window = DSOTargetListWindow()
 
                     # Open and select the target

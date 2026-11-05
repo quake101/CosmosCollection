@@ -41,6 +41,7 @@ from NINAIntegration import NINAIntegration
 from AnnotationOverlay import (AnnotationData, WCSTransform, paint_annotations, saved_annotation_layers,
                                screen_name_px, stars_in_view)
 from WindowPositionManager import WindowPositionMixin
+from WindowLifetime import release_on_close
 from Theme import (
     COLORS, adapt_color, chart_background, chart_color, chart_font_size, font_px, theme_manager,
     themed_style,
@@ -1692,6 +1693,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
     def __init__(self):
         super().__init__()
+        release_on_close(self)  # Freed once closed (see WindowLifetime)
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("NINA Dashboard - Cosmos Collection")
         self.resize(900, 700)

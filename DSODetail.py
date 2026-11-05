@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 import EquipmentMapper
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager
+from WindowLifetime import release_on_close, window_is_open
 from Theme import COLORS, adapt_color, font_size, themed_style, themed_text
 from NINAIntegration import NINAIntegration
 from UrlOpener import open_url
@@ -213,6 +214,7 @@ class DSODetailWindow(QDialog):
 
     def __init__(self, data: dict, parent=None):
         super().__init__(None)
+        release_on_close(self)  # Freed once closed (see WindowLifetime)
         logger.debug(f"Creating DSODetailWindow for {data['name']}")
         from DSONames import display_name
         self.setWindowTitle(f"{display_name(data['name'], data.get('dsodetailid'), data.get('designations'))}"
@@ -1352,7 +1354,7 @@ class DSODetailWindow(QDialog):
             # Import here to avoid circular imports
             from main import AladinLiteWindow
 
-            if not hasattr(self, 'aladin_window') or not self.aladin_window.isVisible():
+            if not window_is_open(getattr(self, 'aladin_window', None)):
                 self.aladin_window = AladinLiteWindow(data, self)
                 self.aladin_window.show()
                 logger.debug(f"Opened Aladin Lite window for {data['name']}")
@@ -2019,7 +2021,7 @@ class DSODetailWindow(QDialog):
                 return
 
             from DSOTargetList import DSOTargetListWindow
-            if not hasattr(self, 'target_list_window') or not self.target_list_window.isVisible():
+            if not window_is_open(getattr(self, 'target_list_window', None)):
                 self.target_list_window = DSOTargetListWindow()
 
             success = self.target_list_window.open_and_select_target(target_name)

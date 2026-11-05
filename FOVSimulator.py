@@ -24,6 +24,7 @@ from DSONames import display_name
 from HorizonProfile import load_active_horizon
 from ResourceManager import ResourceManager
 from WindowPositionManager import WindowPositionMixin
+from WindowLifetime import release_on_close, window_is_open
 from Theme import COLORS, contrast_text, font_px, font_size, themed_style, theme_manager
 from UrlOpener import open_url
 from TimeFormatHelper import format_time, get_time_format_24h
@@ -1172,6 +1173,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         """framing: a session's saved framing to show (see load_session_framing);
         session_id: the session it was opened from - Save to Session offers it first."""
         super().__init__(parent)
+        release_on_close(self)  # Freed once closed (see WindowLifetime)
         self.setWindowTitle(f"{display_name(data['name'], data.get('dsodetailid'), data.get('designations'))}"
                             " - FOV Simulator - Cosmos Collection")
         self.resize(1200, 800)
@@ -3130,7 +3132,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                     f"Could not find '{self.data.get('name', '')}' in your target list.")
                 return
             from DSOTargetList import DSOTargetListWindow
-            if not hasattr(self, '_target_list_window') or not self._target_list_window.isVisible():
+            if not window_is_open(getattr(self, '_target_list_window', None)):
                 self._target_list_window = DSOTargetListWindow()
             self._target_list_window.show()
             self._target_list_window.raise_()

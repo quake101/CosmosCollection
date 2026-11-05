@@ -23,6 +23,7 @@ from PySide6.QtGui import QFont, QColor
 from DatabaseManager import DatabaseManager
 from DSONames import designation_candidates, display_name, suggestion_names
 from WindowPositionManager import WindowPositionMixin
+from WindowLifetime import release_on_close, window_is_open
 from Theme import COLORS, font_px, theme_manager, themed_style, themed_text
 from NINAIntegration import NINAIntegration
 import SessionFileScanner
@@ -1642,6 +1643,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
     
     def __init__(self):
         super().__init__()
+        release_on_close(self)  # Freed once closed (see WindowLifetime)
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("DSO Target List - Cosmos Collection")
         self.resize(1210, 850)
@@ -2790,7 +2792,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         target_data = name_item.data(Qt.UserRole)
         try:
             from SessionManager import SessionManagerWindow
-            if not hasattr(self, 'session_manager_window') or not self.session_manager_window.isVisible():
+            if not window_is_open(getattr(self, 'session_manager_window', None)):
                 self.session_manager_window = SessionManagerWindow()
             self.session_manager_window.create_session_from_dso(target_data)
         except Exception as e:

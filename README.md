@@ -110,7 +110,7 @@ sudo pacman -S libxml2-legacy
 - [Getting Started guide](docs/GETTING-STARTED.md): setup and first steps for new users
 - [Building from source](docs/BUILDING.md)
 - [Command line interface](docs/CLI.md): add images and search objects from scripts
-- [Code signing policy](docs/CODE-SIGNING.md): free code signing provided by SignPath.io, certificate by SignPath Foundation
+- [Code signing policy](docs/CODE-SIGNING.md): free code signing provided by SignPath.io, certificate by SignPath Foundation (waiting for approval)
 - [Privacy policy](docs/PRIVACY.md): what the app sends over the internet, and how to turn it off
 
 ## Contributing

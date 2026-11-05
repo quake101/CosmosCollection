@@ -12,6 +12,14 @@ import json
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from typing import Optional, Dict
 
+# numpy's math library (OpenBLAS) reserves a buffer for every CPU thread when numpy is
+# first imported: about 750 MB on a 32-thread PC, held for as long as the app runs. The
+# app's numpy work is small matrices and per-pixel math, which doesn't use more than a
+# few threads, so cap it at 8 (about 240 MB). Set before anything imports numpy; a value
+# already in the environment wins.
+if (os.cpu_count() or 1) > 8:
+    os.environ.setdefault('OPENBLAS_NUM_THREADS', '8')
+
 # Configure SSL certificates BEFORE any network imports (CRITICAL for PyInstaller)
 if getattr(sys, 'frozen', False):
     # Running in a PyInstaller bundle - configure SSL first
@@ -83,6 +91,7 @@ from PySide6.QtWidgets import (
 # Local imports (always needed)
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionManager, WindowPositionMixin
+from WindowLifetime import keep_when_closed, window_is_open
 from ResourceManager import ResourceManager
 from CollageBuilder import open_collage_builder
 from Theme import (
@@ -4602,7 +4611,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Show the DSO Visibility Calculator window"""
         try:
             from DSOVisibilityCalculator import DSOVisibilityApp
-            if not hasattr(self, 'dso_visibility_window') or not self.dso_visibility_window.isVisible():
+            if not window_is_open(getattr(self, 'dso_visibility_window', None)):
                 self.dso_visibility_window = DSOVisibilityApp()
             self.dso_visibility_window.show()
             self.dso_visibility_window.raise_()
@@ -4616,7 +4625,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Show the Weather Forecast window"""
         try:
             from WeatherForecast import WeatherForecastWindow
-            if not hasattr(self, 'weather_forecast_window') or not self.weather_forecast_window.isVisible():
+            if not window_is_open(getattr(self, 'weather_forecast_window', None)):
                 self.weather_forecast_window = WeatherForecastWindow()
             self.weather_forecast_window.show()
             self.weather_forecast_window.raise_()
@@ -4639,7 +4648,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
         try:
             from NINADashboard import NINADashboardWindow
-            if not hasattr(self, 'nina_dashboard_window') or not self.nina_dashboard_window.isVisible():
+            if not window_is_open(getattr(self, 'nina_dashboard_window', None)):
                 self.nina_dashboard_window = NINADashboardWindow()
             self.nina_dashboard_window.show()
             self.nina_dashboard_window.raise_()
@@ -4664,6 +4673,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                     needs_new = True
             if needs_new:
                 self.best_dso_window = BestDSOTonightWindow()
+                # This one window is shown again each time, so it isn't freed on close
+                keep_when_closed(self.best_dso_window)
             else:
                 # Location/timezone may have changed in settings since the window
                 # was last shown - refresh the displayed label (cheap single query).
@@ -4684,7 +4695,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Show the DSO Target List window"""
         try:
             from DSOTargetList import DSOTargetListWindow
-            if not hasattr(self, 'target_list_window') or not self.target_list_window.isVisible():
+            if not window_is_open(getattr(self, 'target_list_window', None)):
                 self.target_list_window = DSOTargetListWindow()
             self.target_list_window.show()
             self.target_list_window.raise_()
@@ -4698,7 +4709,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Show the Session Manager window"""
         try:
             from SessionManager import SessionManagerWindow
-            if not hasattr(self, 'session_manager_window') or not self.session_manager_window.isVisible():
+            if not window_is_open(getattr(self, 'session_manager_window', None)):
                 self.session_manager_window = SessionManagerWindow()
             self.session_manager_window.show()
             self.session_manager_window.raise_()
@@ -4734,7 +4745,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Show the DSO Image Gallery window"""
         try:
             from DSOGallery import DSOGalleryWindow
-            if not hasattr(self, 'gallery_window') or not self.gallery_window.isVisible():
+            if not window_is_open(getattr(self, 'gallery_window', None)):
                 self.gallery_window = DSOGalleryWindow()
             self.gallery_window.show()
             self.gallery_window.raise_()
@@ -4760,7 +4771,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             }
 
             # Store reference to prevent garbage collection and manage window lifecycle
-            if not hasattr(self, 'aladin_window') or not self.aladin_window.isVisible():
+            if not window_is_open(getattr(self, 'aladin_window', None)):
                 self.aladin_window = AladinLiteWindow(default_data, self)
                 self.aladin_window.show()
                 logger.debug("Opened Aladin Lite window from toolbar")
@@ -5420,7 +5431,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Open the Target List with this object's entry selected"""
         try:
             from DSOTargetList import DSOTargetListWindow
-            if not hasattr(self, 'target_list_window') or not self.target_list_window.isVisible():
+            if not window_is_open(getattr(self, 'target_list_window', None)):
                 self.target_list_window = DSOTargetListWindow()
             if not self.target_list_window.open_and_select_target(target_entry['name']):
                 QMessageBox.warning(self, "Not Found", f"Could not find '{target_entry['name']}' in your target list.")
@@ -5432,7 +5443,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Open the Session Manager with this session selected"""
         try:
             from SessionManager import SessionManagerWindow
-            if not hasattr(self, 'session_manager_window') or not self.session_manager_window.isVisible():
+            if not window_is_open(getattr(self, 'session_manager_window', None)):
                 self.session_manager_window = SessionManagerWindow()
             self.session_manager_window.open_and_select_session(session_id)
         except Exception as e:
@@ -5452,7 +5463,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 'designations': entry.get('designations', '')
             }
             from SessionManager import SessionManagerWindow
-            if not hasattr(self, 'session_manager_window') or not self.session_manager_window.isVisible():
+            if not window_is_open(getattr(self, 'session_manager_window', None)):
                 self.session_manager_window = SessionManagerWindow()
             self.session_manager_window.create_session_from_dso(dso_data)
         except Exception as e:
@@ -5532,7 +5543,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
             # Import and open Aladin Lite window
             # Store reference to prevent garbage collection and manage window lifecycle
-            if not hasattr(self, 'aladin_window') or not self.aladin_window.isVisible():
+            if not window_is_open(getattr(self, 'aladin_window', None)):
                 self.aladin_window = AladinLiteWindow(detail_data, self)
                 self.aladin_window.show()
             else:
@@ -5565,7 +5576,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
             # Import and open Target List window, then add the DSO
             from DSOTargetList import DSOTargetListWindow
-            if not hasattr(self, 'target_list_window') or not self.target_list_window.isVisible():
+            if not window_is_open(getattr(self, 'target_list_window', None)):
                 self.target_list_window = DSOTargetListWindow()
 
             self.target_list_window.show()
@@ -5608,7 +5619,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
         dialog = BulkAddToTargetDialog(to_add, parent=self)
         if dialog.exec() == QDialog.Accepted:
-            if hasattr(self, 'target_list_window') and self.target_list_window.isVisible():
+            if window_is_open(getattr(self, 'target_list_window', None)):
                 self.target_list_window._load_targets()
 
     def _context_send_to_nina(self, row):
@@ -5746,6 +5757,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             # Start hourly update check
             self._start_tray_update_check()
             logger.debug("Window minimized to tray")
+            from Diagnostics import log_memory
+            log_memory("minimized to tray")
 
     def _restore_from_tray(self):
         """Restore window from system tray"""
@@ -5764,6 +5777,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.raise_()
         self.activateWindow()
         logger.debug("Window restored from tray")
+        from Diagnostics import log_memory
+        log_memory("restored from tray")
 
     def _start_tray_weather_refresh(self):
         """Start background weather refresh timer when in tray"""
@@ -6514,6 +6529,10 @@ if __name__ == "__main__":
         initial_loader.data_loaded.connect(on_initial_data_loaded)
         initial_loader.load_failed.connect(on_initial_load_failed)
         initial_loader.start()
+
+        # Freezes, slow memory cleanups and memory use go to the log file
+        from Diagnostics import start_diagnostics
+        start_diagnostics(app)
 
         sys.exit(app.exec())
 

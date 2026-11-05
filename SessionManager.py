@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
 from DatabaseManager import DatabaseManager
 from DSONames import SESSION_COMMON_NAMES_SETTING, display_name, suggestion_names
 from WindowPositionManager import WindowPositionMixin
+from WindowLifetime import release_on_close, window_is_open
 from TimeFormatHelper import format_time
 from Theme import COLORS, font_px, font_size, themed_style
 import MountDetection
@@ -3575,6 +3576,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
 
     def __init__(self):
         super().__init__()
+        release_on_close(self)  # Freed once closed (see WindowLifetime)
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("Session Manager - Cosmos Collection")
         self.resize(1200, 800)
@@ -4247,7 +4249,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             return
         try:
             from DSOTargetList import DSOTargetListWindow
-            if not hasattr(self, "target_list_window") or not self.target_list_window.isVisible():
+            if not window_is_open(getattr(self, "target_list_window", None)):
                 self.target_list_window = DSOTargetListWindow()
             self.target_list_window.open_and_select_target(self._current_session.get("dso_name"))
         except Exception as e:

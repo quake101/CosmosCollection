@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 import ImageDetails
 from Theme import COLORS, adapt_color, font_size, theme_manager, themed_style
 from WindowPositionManager import WindowPositionManager
+from WindowLifetime import window_is_open
 from ResourceManager import ResourceManager
 from TimeFormatHelper import format_datetime
 from SessionFileScanner import (FITS_EXTENSIONS, XISF_EXTENSIONS, read_xisf_xml,
@@ -1637,7 +1638,7 @@ class ImageViewerWindow(QDialog):
                 main._context_open_session(session_id)
                 return
             from SessionManager import SessionManagerWindow
-            if _session_manager_window is None or not _session_manager_window.isVisible():
+            if not window_is_open(_session_manager_window):
                 _session_manager_window = SessionManagerWindow()
             _session_manager_window.open_and_select_session(session_id)
         except Exception as e:

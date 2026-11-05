@@ -50,6 +50,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # Import DatabaseManager from separate file
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
+from WindowLifetime import release_on_close
 from TimeFormatHelper import format_time
 
 
@@ -1978,6 +1979,7 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
 
     def __init__(self):
         super().__init__()
+        release_on_close(self)  # Freed once closed (see WindowLifetime)
         self.setWindowTitle("DSO Visibility Calculator - Cosmos Collection")
         self.resize(1650, 900)
         self.setup_window_position()

@@ -25,6 +25,7 @@ from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QFontMetrics
 import EquipmentMapper
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
+from WindowLifetime import release_on_close
 from Theme import COLORS, font_px, font_size, themed_style
 from ImageLoader import load_astro_pixmap, load_astro_qimage, read_image_file, write_image_file
 from PlateSolver import describe_solving
@@ -1907,6 +1908,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     def __init__(self):
         """Initialize DSO Image Gallery window"""
         super().__init__()
+        release_on_close(self)  # Freed once closed (see WindowLifetime)
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("DSO Image Gallery - Cosmos Collection")
         self.resize(1200, 800)

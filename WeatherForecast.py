@@ -38,6 +38,7 @@ from PySide6.QtGui import QColor
 
 from DatabaseManager import DatabaseManager
 from WindowPositionManager import WindowPositionMixin
+from WindowLifetime import release_on_close
 from Theme import COLORS, chart_background, chart_font_size, font_size, sky_shade, theme_manager, themed_style
 from TimeFormatHelper import format_time, format_datetime, get_time_format_24h
 from UrlOpener import open_url
@@ -2195,6 +2196,7 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
 
     def __init__(self):
         super().__init__()
+        release_on_close(self)  # Freed once closed (see WindowLifetime)
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("Weather Forecast - Cosmos Collection")
         self.resize(815, 500)
