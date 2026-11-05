@@ -15,6 +15,42 @@ from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication, QWidget
 logger = logging.getLogger(__name__)
 
 
+class _TrayMenu(QMenu):
+    """
+    Tray menu that only runs an item on a click made inside the menu.
+
+    QMenu runs an item on any mouse button release over it. With the tray
+    menu, Windows can hand Qt a release with no click behind it - the
+    right-button release from the click that opened the menu never reaches
+    Qt, so when the cursor comes back onto the menu (after leaving it to the
+    side, where the taskbar takes the mouse) Qt sees the button as up and
+    makes a release. That ran whatever item the cursor landed on. Here a
+    release only counts when a press inside the menu came first, after the
+    menu opened. Keyboard selection (arrows + Enter) is unaffected.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pressed_inside = False
+
+    def showEvent(self, event):
+        self._pressed_inside = False
+        super().showEvent(event)
+
+    def mousePressEvent(self, event):
+        if self.rect().contains(event.position().toPoint()):
+            self._pressed_inside = True
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if not self._pressed_inside:
+            logger.debug("Tray menu: ignored a mouse release with no click inside the menu")
+            event.accept()
+            return
+        self._pressed_inside = False
+        super().mouseReleaseEvent(event)
+
+
 class SystemTrayManager(QObject):
     """Manages the system tray icon, menu, and tooltip for Cosmos Collection"""
 
@@ -59,7 +95,9 @@ class SystemTrayManager(QObject):
             # Create context menu — must have a QWidget parent so Windows has a
             # valid HWND when rendering hover highlights while the main window is hidden.
             parent_widget = self.parent() if isinstance(self.parent(), QWidget) else None
-            self._menu = QMenu(parent_widget)
+            # _TrayMenu ignores button releases that had no click inside the
+            # menu - the last line of defense against items firing on hover.
+            self._menu = _TrayMenu(parent_widget)
             self._create_menu()
 
             # On Windows and macOS, deliberately NOT calling setContextMenu():
