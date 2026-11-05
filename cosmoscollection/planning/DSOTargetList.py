@@ -549,7 +549,7 @@ def find_full_dso_data(db_manager, target_name, target_data):
         if split:
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                # Query the full DSO data using the same method as Main.py
+                # Query the full DSO data the same way the main window does
                 cursor.execute(_DSO_DETAIL_QUERY + """
                     WHERE d.id = (
                         SELECT d2.id FROM dsodetail d2
@@ -658,7 +658,7 @@ def _format_dec_for_display(dec_deg):
 # Finds Target List entries that are probably the same object, suggests how to
 # merge them, and performs merges/deletes (moving linked sessions along). Also
 # the shared "is this already on the list?" check used wherever a target can be
-# added (DSODetail, FOVSimulator, BestDSOTonight, main.py), so new duplicates
+# added (DSODetail, FOVSimulator, BestDSOTonight, the main window), so new duplicates
 # aren't created.
 #
 # - Duplicate: names match once spacing, punctuation and parenthetical common
@@ -2150,7 +2150,6 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             target_data = name_item.data(Qt.UserRole)
             target_name = target_data.get("name", "")
             
-            # Import DSODetailWindow from main.py
             from cosmoscollection.catalog.DSODetail import DSODetailWindow
             
             # Try to find the complete DSO data in the main database
@@ -2165,7 +2164,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
                                   f"Could not find complete information for {target_name} in the main DSO database.")
             
         except ImportError as e:
-            QMessageBox.critical(self, "Error", "Could not import DSODetailWindow. Please ensure Main.py is available.")
+            QMessageBox.critical(self, "Error", "Could not open the object details window.")
             logger.error(f"Failed to import DSODetailWindow: {str(e)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open target details: {str(e)}")

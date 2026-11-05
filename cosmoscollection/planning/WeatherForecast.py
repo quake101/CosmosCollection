@@ -494,7 +494,7 @@ class WeatherWorker(QThread):
             )
 
             # Cert verification is left on its default (True) here and everywhere else in
-            # this file. main.py points SSL_CERT_FILE/REQUESTS_CA_BUNDLE at the bundled
+            # this file. app/Bootstrap.py points SSL_CERT_FILE/REQUESTS_CA_BUNDLE at the bundled
             # certifi CA file before any network imports, so requests picks that up as an
             # explicit ca_certs path in both dev and frozen builds. A previous "verify =
             # not frozen" workaround here disabled verification in frozen builds without

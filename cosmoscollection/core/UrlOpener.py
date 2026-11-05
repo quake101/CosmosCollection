@@ -59,7 +59,7 @@ def clean_subprocess_env():
     """
     Environment for launching external programs, without the variables this
     app sets for its own use:
-    - QTWEBENGINE_CHROMIUM_FLAGS (main.py) is read by every QtWebEngine app,
+    - QTWEBENGINE_CHROMIUM_FLAGS (app/Bootstrap.py) is read by every QtWebEngine app,
       e.g. PixInsight - its --enable-logging makes each of their Chromium
       helper processes flash a console window on Windows.
     - SSL/CA bundle variables and XDG_CACHE_HOME point at this app's own

@@ -2807,7 +2807,7 @@ class SessionScanThread(QThread):
 
 
 class VisibilityCalcThread(QThread):
-    """Runs a DSOVisibilityCalculator calculation off the GUI thread. main.py's
+    """Runs a DSOVisibilityCalculator calculation off the GUI thread. The app's
     startup pre-warm already exercises DSOVisibilityCalculator once, single-threaded,
     before any window exists - so by the time this thread ever runs, the one-time
     astropy/matplotlib setup cost has already been paid and there's no risk of racing
