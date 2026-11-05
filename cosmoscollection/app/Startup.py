@@ -4,6 +4,7 @@ import faulthandler
 import logging
 import os
 import sys
+import threading
 
 from PySide6.QtCore import QCoreApplication, QSettings, QTimer, Qt
 from PySide6.QtGui import QIcon
@@ -201,6 +202,20 @@ def main():
         logger.debug("Pre-warmed astropy/erfa machinery")
     except Exception as e:
         logger.warning(f"Could not pre-warm astropy machinery (will retry lazily later): {e}")
+
+    # pytz checks a zone name against its list of installed zones, which it builds the first
+    # time by opening every zone file (~600). That froze the window that first used a real
+    # time zone - 2.5 s for Best DSO Tonight with the app on a network drive. Build it now,
+    # in the background: it's only file reads under pytz's own lock, so a lookup made before
+    # it finishes just waits for the rest.
+    def _fill_pytz_zone_list():
+        try:
+            import pytz
+            len(pytz.all_timezones_set)
+        except Exception as e:
+            logger.debug(f"Could not pre-load the pytz time zone list: {e}")
+
+    threading.Thread(target=_fill_pytz_zone_list, name="pytz-zone-list", daemon=True).start()
 
     splash.set_status("Loading database...")
 
