@@ -6,7 +6,7 @@
 
   The signing request (build-release.yml) sends the three .exe files, zipped by
   actions/upload-artifact, and the release's version as the version parameter.
-  Each file must say it's Cosmos Collection at that version (version_resource.py).
+  Each file must say it's Cosmos Collection at that version (build_tools/version_resource.py).
 -->
 <artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
   <parameters>

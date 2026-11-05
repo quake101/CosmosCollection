@@ -126,7 +126,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 # The app's own "is this a catalog number, not a name" rule, so the names
 # this script adds pass the same test the app uses to pick a common name.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from DSONames import CATALOG_NUMBER_NAME, CONSTELLATIONS  # noqa: E402
+from cosmoscollection.catalog.DSONames import CATALOG_NUMBER_NAME, CONSTELLATIONS  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants

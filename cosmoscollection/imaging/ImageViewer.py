@@ -1,0 +1,2178 @@
+#!/usr/bin/env python3
+"""
+ImageViewer module for Cosmos Collection
+Provides the ImageViewerWindow class for displaying images with zoom, pan, and annotation support.
+"""
+
+import json
+import logging
+import math
+import re
+import os
+from collections import namedtuple
+from html import escape
+from pathlib import Path
+from datetime import datetime, timezone
+
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QSettings, QThread, QRectF, QObject, QRunnable, QThreadPool
+from PySide6.QtGui import QPixmap, QPainter, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
+    QGroupBox, QScrollArea, QMessageBox, QProgressBar, QMenu, QApplication
+)
+
+from cosmoscollection.imaging import ImageDetails
+from cosmoscollection.ui.Theme import COLORS, adapt_color, font_size, theme_manager, themed_style
+from cosmoscollection.ui.WindowPositionManager import WindowPositionManager
+from cosmoscollection.ui.WindowLifetime import window_is_open
+from cosmoscollection.core.ResourceManager import ResourceManager
+from cosmoscollection.ui.TimeFormatHelper import format_datetime
+from cosmoscollection.sessions.SessionFileScanner import (FITS_EXTENSIONS, XISF_EXTENSIONS, read_xisf_xml,
+                                _coerce_fits_value, _file_coordinates, _parse_sexagesimal)
+from cosmoscollection.imaging.AnnotationOverlay import (ANNOTATION_LAYER_SETTINGS, ANNOTATION_LAYERS, AnnotationData, annotation_store,
+                               image_pixel_size, paint_annotations, read_wcs_header, saved_annotation_layers,
+                               screen_name_px)
+
+# Set up logging
+logger = logging.getLogger(__name__)
+
+
+# Image load workers that outlived their viewer window. A QThread that's
+# destroyed while still running crashes the app, so keep a reference until
+# the load finishes instead of blocking the window close on it.
+_orphaned_workers = set()
+
+# The Session Manager opened from a viewer, when there's no main window to open it
+_session_manager_window = None
+
+
+# File Information values may wrap after these (path separators, punctuation -
+# not dots, which would split numbers like 300.00 and file extensions)...
+_WRAP_AFTER = re.compile(r'([\\/_,-])')
+# ...and within any longer run of characters that has none of them
+_LONGEST_UNWRAPPED = 16
+
+
+def _wrappable(text):
+    """Text that wraps to the File Information panel's narrow column - zero-width
+    spaces (places to wrap) after separators and punctuation, and within long
+    runs without any. One unwrappable file name widened the whole table past
+    the panel, cutting off every long value."""
+    text = _WRAP_AFTER.sub('\\1\u200b', text)
+    return re.sub(rf'([^\s\u200b]{{{_LONGEST_UNWRAPPED}}})(?=[^\s\u200b])', '\\1\u200b', text)
+
+
+def _megabytes(count):
+    """A byte count for people: '4.2 MB', '166 MB', '1.2 GB'."""
+    mb = count / (1024 * 1024)
+    if mb >= 1000:
+        return f"{mb / 1024:.1f} GB"
+    return f"{mb:.1f} MB" if mb < 10 else f"{mb:.0f} MB"
+
+
+class _LoadCancelled(Exception):
+    """Raised from a load's progress callback to stop reading the file."""
+
+
+class ImageLoadWorker(QThread):
+    """Decodes an image file (including FITS/XISF) into a QImage off the GUI
+    thread - for the Image Viewer and DSO Details. Each signal names the file,
+    so a window can ignore a load it no longer wants."""
+    image_loaded = Signal(object, str)  # QImage, file
+    load_failed = Signal(str, str)  # error message, file
+    progress = Signal(str, object, object)  # file, bytes read, file size - when they're equal, it's decoding
+
+    def __init__(self, file_path, screen_stretch=False):
+        super().__init__()
+        self.file_path = file_path
+        self.screen_stretch = screen_stretch
+        self._cancelled = False
+
+    def cancel(self):
+        """Stop reading the file (another image is wanted instead)."""
+        self._cancelled = True
+
+    def _progress(self, done, total):
+        if self._cancelled:
+            raise _LoadCancelled()
+        self.progress.emit(self.file_path, done, total)
+
+    def run(self):
+        try:
+            from cosmoscollection.imaging.ImageLoader import load_image_qimage, load_screen_stretched_qimage
+            is_astro = os.path.splitext(self.file_path)[1].lower() in ('.fits', '.fit', '.fts', '.xisf')
+            if self.screen_stretch and is_astro:
+                qimage, error = load_screen_stretched_qimage(self.file_path)
+            else:
+                qimage, error = load_image_qimage(self.file_path, progress=self._progress)
+            if self._cancelled:
+                return
+            if qimage is not None:
+                self.image_loaded.emit(qimage, self.file_path)
+            else:
+                self.load_failed.emit(error, self.file_path)
+        except _LoadCancelled:
+            pass
+        except Exception as e:
+            if self._cancelled:
+                return
+            logger.error(f"Failed to load image {self.file_path}: {e}", exc_info=True)
+            self.load_failed.emit(str(e), self.file_path)
+
+
+# ------------------------------------------------------------------------------
+# FITS/XISF header info for the File Information panel. Only the header is read,
+# never the pixel data, and each section lists only what the file records.
+# ------------------------------------------------------------------------------
+
+# keywords: upper-case FITS keyword -> value (first occurrence wins)
+# history: HISTORY card texts
+# image: 'width'/'height'/'channels'/'sample_format'/'color_space'/'software' where known
+HeaderData = namedtuple('HeaderData', ['keywords', 'history', 'image'])
+
+# XISF Properties that hold the same data as a FITS keyword. Only used when the
+# file doesn't also carry that FITS keyword.
+XISF_PROPERTY_KEYWORDS = {
+    'Observation:Object:Name': 'OBJECT',
+    'Observation:Center:RA': 'RA',
+    'Observation:Center:Dec': 'DEC',
+    'Observation:Time:Start': 'DATE-OBS',
+    'Observation:Location:Latitude': 'SITELAT',
+    'Observation:Location:Longitude': 'SITELONG',
+    'Observation:Location:Elevation': 'SITEELEV',
+    'Instrument:Camera:Name': 'INSTRUME',
+    'Instrument:Camera:XBinning': 'XBINNING',
+    'Instrument:Camera:YBinning': 'YBINNING',
+    'Instrument:ExposureTime': 'EXPTIME',
+    'Instrument:Filter:Name': 'FILTER',
+    'Instrument:Focuser:Position': 'FOCPOS',
+    'Instrument:Sensor:Temperature': 'CCD-TEMP',
+    'Instrument:Sensor:TargetTemperature': 'SET-TEMP',
+    'Instrument:Sensor:XPixelSize': 'XPIXSZ',
+    'Instrument:Sensor:YPixelSize': 'YPIXSZ',
+    'Instrument:Telescope:Name': 'TELESCOP',
+    'Instrument:Telescope:FocalLength': 'FOCALLEN',
+    'Instrument:Telescope:Aperture': 'APTDIA',
+    'PCL:CFASourcePattern': 'BAYERPAT',
+}
+# XISF stores these in meters, FITS in millimeters
+XISF_METER_PROPERTIES = {'Instrument:Telescope:FocalLength', 'Instrument:Telescope:Aperture'}
+
+BITPIX_FORMATS = {
+    8: '8-bit unsigned integer',
+    16: '16-bit integer',
+    32: '32-bit integer',
+    -32: '32-bit float',
+    -64: '64-bit float',
+}
+XISF_SAMPLE_FORMATS = {
+    'UInt8': '8-bit unsigned integer',
+    'UInt16': '16-bit unsigned integer',
+    'UInt32': '32-bit unsigned integer',
+    'UInt64': '64-bit unsigned integer',
+    'Float32': '32-bit float',
+    'Float64': '64-bit float',
+}
+
+# Keywords that make up a WCS (plate solution), including SIP distortion terms
+WCS_KEYWORD_PATTERN = re.compile(
+    r'^(WCSAXES|CTYPE\d|CUNIT\d|CRVAL\d|CRPIX\d|CDELT\d|CROTA\d|CD\d_\d|PC\d_\d|'
+    r'RADESYS|EQUINOX|LONPOLE|LATPOLE|(A|B|AP|BP)_(ORDER|\d+_\d+))$')
+
+
+def read_image_header(file_path):
+    """Read a FITS/XISF file's header into a HeaderData. Raises on unreadable files."""
+    if Path(file_path).suffix.lower() in XISF_EXTENSIONS:
+        return _read_xisf_header(file_path)
+    return _read_fits_header(file_path)
+
+
+def read_file_info(file_path):
+    """What the File Information panel shows from the file system: the file's
+    stat, its FITS/XISF header (else EXIF), and a plate solution saved next to
+    it. Slow from the network drive - opening a file there the first time
+    waits seconds for Windows Defender to scan it - so it's read off the GUI
+    thread (_FileInfoTask). Raises if the file can't be read at all."""
+    info = {'stats': os.stat(file_path), 'header': None, 'exif': None, 'saved_wcs': None}
+    if Path(file_path).suffix.lower() in FITS_EXTENSIONS | XISF_EXTENSIONS:
+        try:
+            info['header'] = read_image_header(file_path)
+        except Exception as e:
+            logger.warning(f"Failed to read header from {file_path}: {e}")
+    if info['header'] is not None:
+        if Path(file_path).with_suffix('.wcs').exists():
+            info['saved_wcs'] = read_wcs_header(file_path)
+    else:
+        info['exif'] = _exif_info(file_path)
+    return info
+
+
+# EXIF tags the File Information panel shows, and their labels
+_EXIF_LABELS = {
+    'Make': 'Camera Make',
+    'Model': 'Camera Model',
+    'DateTime': 'Date Taken',
+    'ExposureTime': 'Exposure Time',
+    'FNumber': 'F-Number',
+    'ISO': 'ISO Speed',
+    'FocalLength': 'Focal Length',
+    'Flash': 'Flash',
+    'WhiteBalance': 'White Balance',
+    'ExposureProgram': 'Exposure Program',
+    'MeteringMode': 'Metering Mode'
+}
+
+
+def _exif_info(file_path):
+    """Basic EXIF information from an image file, {label: text} - or None."""
+    try:
+        from PIL import Image
+        from PIL.ExifTags import TAGS
+        from cosmoscollection.imaging.ImageLoader import header_exif
+
+        # From the header only, as the format its extension names - trying
+        # every format imports all of Pillow's plugins and reads the file with
+        # each, for seconds on a network drive when a file is damaged
+        formats = {'.png': ['PNG'], '.jpg': ['JPEG'], '.jpeg': ['JPEG'], '.tif': ['TIFF'],
+                   '.tiff': ['TIFF']}.get(Path(file_path).suffix.lower())
+        with Image.open(file_path, formats=formats) as img:
+            exif_data = header_exif(img)
+        if not exif_data:
+            return None
+
+        exif_info = {}
+        for tag_id, value in exif_data.items():
+            tag_name = TAGS.get(tag_id, tag_id)
+            if tag_name in _EXIF_LABELS:
+                # Format specific values
+                if tag_name == 'ExposureTime' and isinstance(value, tuple):
+                    value = f"{value[0]}/{value[1]} sec"
+                elif tag_name == 'FNumber' and isinstance(value, tuple):
+                    value = f"f/{value[0]/value[1]:.1f}"
+                elif tag_name == 'FocalLength' and isinstance(value, tuple):
+                    value = f"{value[0]/value[1]:.1f}mm"
+                exif_info[_EXIF_LABELS[tag_name]] = str(value)
+        return exif_info or None
+    except Exception:
+        return None  # No Pillow, or no readable EXIF
+
+
+class _FileInfoSignals(QObject):
+    ready = Signal(str, object)  # file path, read_file_info() result (or the exception)
+
+
+class _FileInfoTask(QRunnable):
+    """Reads a file's information for the File Information panel in the background."""
+
+    def __init__(self, file_path, signals):
+        super().__init__()
+        self.file_path, self.signals = file_path, signals
+
+    def run(self):
+        try:
+            info = read_file_info(self.file_path)
+        except Exception as e:
+            info = e
+        try:
+            self.signals.ready.emit(self.file_path, info)
+        except RuntimeError:
+            pass  # The viewer closed meanwhile
+
+
+def _read_fits_header(file_path):
+    from astropy.io import fits
+
+    keywords = {}
+    history = []
+    with fits.open(file_path) as hdul:
+        headers = [hdul[0].header]
+        # Compressed (fpack) files and some writers keep the image in an extension
+        if hdul[0].header.get('NAXIS', 0) == 0:
+            for hdu in hdul[1:]:
+                if hdu.is_image and hdu.header.get('NAXIS', 0) >= 2:
+                    headers.append(hdu.header)
+                    break
+
+        for header in headers:
+            for card in header.cards:
+                try:
+                    key, value = card.keyword, card.value
+                except Exception:
+                    continue  # Malformed card
+                if key == 'HISTORY':
+                    history.append(str(value))
+                elif key and key != 'COMMENT' and key not in keywords and _has_value(value):
+                    keywords[key] = value
+
+    image = {}
+    image_header = headers[-1]
+    naxis = image_header.get('NAXIS', 0)
+    if naxis >= 2:
+        image['width'] = image_header.get('NAXIS1')
+        image['height'] = image_header.get('NAXIS2')
+        image['channels'] = image_header.get('NAXIS3', 1) if naxis >= 3 else 1
+    bitpix = image_header.get('BITPIX')
+    if bitpix in BITPIX_FORMATS:
+        sample_format = BITPIX_FORMATS[bitpix]
+        # Unsigned 16/32-bit data is stored signed with a BZERO offset
+        if bitpix in (16, 32) and image_header.get('BZERO') == 2 ** (bitpix - 1):
+            sample_format = sample_format.replace('integer', 'unsigned integer')
+        image['sample_format'] = sample_format
+
+    return HeaderData(keywords, history, image)
+
+
+def _read_xisf_header(file_path):
+    root, image_el, ns = read_xisf_xml(file_path)
+
+    def children(scope, tag):
+        if scope is None:
+            return []
+        return scope.findall(f'xisf:{tag}', ns) or scope.findall(tag)
+
+    keywords = {}
+    history = []
+    for kw_el in children(image_el, 'FITSKeyword'):
+        name = (kw_el.get('name') or '').strip().upper()
+        value = kw_el.get('value')
+        if name == 'HISTORY':
+            # PixInsight puts the history text in the comment attribute
+            history.append(kw_el.get('comment') or _coerce_fits_value(value or ''))
+        elif name and name != 'COMMENT' and name not in keywords and value is not None:
+            value = _coerce_fits_value(value)
+            if _has_value(value):
+                keywords[name] = value
+
+    metadata_el = root.find('xisf:Metadata', ns)
+    if metadata_el is None:
+        metadata_el = root.find('Metadata')
+
+    properties = {}
+    for scope in (image_el, root, metadata_el):
+        for prop_el in children(scope, 'Property'):
+            prop_id = prop_el.get('id')
+            if not prop_id or prop_id in properties:
+                continue
+            value = prop_el.get('value')
+            if value is None:
+                value = (prop_el.text or '').strip()  # String properties can hold the text inline
+            if prop_el.get('type', '').startswith(('Float', 'Int', 'UInt')):
+                try:
+                    value = float(value) if '.' in value or 'e' in value.lower() else int(value)
+                except ValueError:
+                    pass
+            properties[prop_id] = value
+
+    for prop_id, keyword in XISF_PROPERTY_KEYWORDS.items():
+        value = properties.get(prop_id)
+        if keyword in keywords or not _has_value(value):
+            continue
+        if prop_id in XISF_METER_PROPERTIES and isinstance(value, (int, float)):
+            value = value * 1000.0
+        keywords[keyword] = value
+
+    image = {}
+    if image_el is not None:
+        dims = (image_el.get('geometry') or '').split(':')
+        if len(dims) >= 2 and all(d.isdigit() for d in dims):
+            image['width'], image['height'] = int(dims[0]), int(dims[1])
+            image['channels'] = int(dims[2]) if len(dims) >= 3 else 1
+        sample_format = image_el.get('sampleFormat')
+        if sample_format:
+            image['sample_format'] = XISF_SAMPLE_FORMATS.get(sample_format, sample_format)
+        if image_el.get('colorSpace'):
+            image['color_space'] = image_el.get('colorSpace')
+    if _has_value(properties.get('XISF:CreatorApplication')):
+        image['software'] = properties['XISF:CreatorApplication']
+
+    return HeaderData(keywords, history, image)
+
+
+def build_header_sections(header, image_size=None, fallback_wcs=None):
+    """Organize a HeaderData into [(section title, [(label, value), ...]), ...].
+
+    image_size: (width, height) of the decoded image, used when the header
+        doesn't record its dimensions
+    fallback_wcs: WCS keyword dict (e.g. a cached plate solve) to use when the
+        file itself isn't plate solved
+    """
+    kw = header.keywords
+    if header.image.get('width') and header.image.get('height'):
+        image_size = (header.image['width'], header.image['height'])
+
+    sections = [
+        ("Target", _target_rows(kw)),
+        ("Capture", _capture_rows(kw, header.history)),
+        ("Equipment", _equipment_rows(kw, image_size)),
+        ("Plate Solution", _plate_solution_rows(kw, image_size, fallback_wcs)),
+        ("Site", _site_rows(kw)),
+        ("Image Data", _image_rows(kw, header.image)),
+    ]
+    return [(title, rows) for title, rows in sections if rows]
+
+
+def _target_rows(kw):
+    rows = []
+    _add_row(rows, "Object", _first_value(kw, 'OBJECT', 'OBJNAME'))
+    coords = _file_coordinates(kw)
+    if coords:
+        rows.append(("RA", format_ra(coords[0])))
+        rows.append(("Dec", format_dec(coords[1])))
+    altitude = _to_float(_first_value(kw, 'OBJCTALT', 'CENTALT', 'ALTITUDE'))
+    if altitude is not None:
+        rows.append(("Altitude", f"{altitude:.1f}°"))
+    azimuth = _to_float(_first_value(kw, 'OBJCTAZ', 'CENTAZ', 'AZIMUTH'))
+    if azimuth is not None:
+        rows.append(("Azimuth", f"{azimuth:.1f}°"))
+    airmass = _to_float(kw.get('AIRMASS'))
+    if airmass is not None:
+        rows.append(("Airmass", f"{airmass:.3f}"))
+    rotation = _to_float(kw.get('OBJCTROT'))
+    if rotation is not None:
+        rows.append(("Rotation", f"{_fmt_num(rotation, 2)}°"))
+    _add_row(rows, "Pier Side", kw.get('PIERSIDE'))
+    return rows
+
+
+def _capture_rows(kw, history):
+    rows = []
+    _add_row(rows, "Frame Type", _first_value(kw, 'IMAGETYP', 'FRAME'))
+
+    date_obs = kw.get('DATE-OBS')
+    utc = _parse_iso_datetime(date_obs)
+    if utc is not None:
+        utc = utc.replace(tzinfo=timezone.utc) if utc.tzinfo is None else utc.astimezone(timezone.utc)
+        rows.append(("Date (UTC)", format_datetime(utc, seconds=True)))
+        # Prefer the capture site's local time when the file records it
+        local = _parse_iso_datetime(kw.get('DATE-LOC'))
+        if local is None:
+            local = utc.astimezone()
+        rows.append(("Date (Local)", format_datetime(local, seconds=True)))
+    else:
+        _add_row(rows, "Date", date_obs)
+
+    exposure = _to_float(_first_value(kw, 'EXPTIME', 'EXPOSURE'))
+    if exposure is not None:
+        rows.append(("Exposure", format_duration(exposure)))
+
+    frames = _to_float(_first_value(kw, 'NCOMBINE', 'STACKCNT'))
+    if frames is None:
+        # PixInsight records the integration count in the HISTORY cards
+        for line in history:
+            match = re.search(r'ImageIntegration\.numberOfImages:\s*(\d+)', str(line))
+            if match:
+                frames = float(match.group(1))
+                break
+    if frames is not None and frames > 1:
+        rows.append(("Frames Stacked", f"{frames:.0f}"))
+        live_time = _to_float(kw.get('LIVETIME'))
+        if live_time is not None:
+            rows.append(("Total Integration", format_duration(live_time)))
+
+    _add_row(rows, "Filter", kw.get('FILTER'))
+    for label, keyword in (("Gain", 'GAIN'), ("Offset", 'OFFSET')):
+        number = _to_float(kw.get(keyword))
+        _add_row(rows, label, _fmt_num(number, 2) if number is not None else kw.get(keyword))
+    egain = _to_float(kw.get('EGAIN'))
+    if egain is not None:
+        rows.append(("e-/ADU", _fmt_num(egain, 3)))
+
+    x_bin, y_bin = _to_float(kw.get('XBINNING')), _to_float(kw.get('YBINNING'))
+    if x_bin is not None:
+        rows.append(("Binning", f"{x_bin:.0f}x{(y_bin if y_bin is not None else x_bin):.0f}"))
+
+    sensor_temp = _to_float(_first_value(kw, 'CCD-TEMP', 'CCD_TEMP', 'TEMPERAT'))
+    set_temp = _to_float(_first_value(kw, 'SET-TEMP', 'SET_TEMP'))
+    if sensor_temp is not None:
+        text = f"{_fmt_num(sensor_temp, 1)} °C"
+        if set_temp is not None:
+            text += f" (set {_fmt_num(set_temp, 1)} °C)"
+        rows.append(("Sensor Temp", text))
+    elif set_temp is not None:
+        rows.append(("Set Temp", f"{_fmt_num(set_temp, 1)} °C"))
+
+    _add_row(rows, "Readout Mode", kw.get('READOUTM'))
+    _add_row(rows, "Bayer Pattern", kw.get('BAYERPAT'))
+    hfr = _to_float(kw.get('HFR'))
+    if hfr is not None:
+        rows.append(("HFR", f"{_fmt_num(hfr, 2)} px"))
+    fwhm = _to_float(kw.get('FWHM'))
+    if fwhm is not None:
+        rows.append(("FWHM", _fmt_num(fwhm, 2)))
+    return rows
+
+
+def _equipment_rows(kw, image_size):
+    rows = []
+    _add_row(rows, "Telescope", kw.get('TELESCOP'))
+    _add_row(rows, "Camera", kw.get('INSTRUME'))
+
+    focal_length = _to_float(kw.get('FOCALLEN'))
+    aperture = _to_float(kw.get('APTDIA'))
+    if focal_length:
+        rows.append(("Focal Length", f"{_fmt_num(focal_length, 1)} mm"))
+    if aperture:
+        rows.append(("Aperture", f"{_fmt_num(aperture, 1)} mm"))
+    focal_ratio = _to_float(kw.get('FOCRATIO'))
+    if not focal_ratio and focal_length and aperture:
+        focal_ratio = focal_length / aperture
+    if focal_ratio:
+        rows.append(("Focal Ratio", f"f/{_fmt_num(focal_ratio, 1)}"))
+
+    x_pixel, y_pixel = _to_float(kw.get('XPIXSZ')), _to_float(kw.get('YPIXSZ'))
+    if x_pixel:
+        text = f"{_fmt_num(x_pixel, 2)} µm"
+        if y_pixel and abs(y_pixel - x_pixel) > 1e-6:
+            text = f"{_fmt_num(x_pixel, 2)} x {_fmt_num(y_pixel, 2)} µm"
+        rows.append(("Pixel Size", text))
+
+    # Image scale as recorded, or from the optics (XPIXSZ already includes binning)
+    scale = _to_float(_first_value(kw, 'PIXSCALE', 'SCALE'))
+    if not scale and x_pixel and focal_length:
+        scale = 206.265 * x_pixel / focal_length
+    if scale:
+        rows.append(("Image Scale", f"{scale:.2f}\"/px"))
+        if image_size:
+            rows.append(("Field of View", format_fov(scale, *image_size)))
+
+    _add_row(rows, "Focuser Position", _first_value(kw, 'FOCPOS', 'FOCUSPOS'))
+    focuser_temp = _to_float(_first_value(kw, 'FOCTEMP', 'FOCUSTEM'))
+    if focuser_temp is not None:
+        rows.append(("Focuser Temp", f"{_fmt_num(focuser_temp, 1)} °C"))
+    rotator = _to_float(_first_value(kw, 'ROTATANG', 'ROTATOR'))
+    if rotator is not None:
+        rows.append(("Rotator Angle", f"{_fmt_num(rotator, 2)}°"))
+    return rows
+
+
+def _plate_solution_rows(kw, image_size, fallback_wcs):
+    source = None
+    wcs_keywords = {key: value for key, value in kw.items() if WCS_KEYWORD_PATTERN.match(key)}
+    if _is_plate_solved(wcs_keywords):
+        source = "File header"
+    elif fallback_wcs:
+        wcs_keywords = {key: value for key, value in fallback_wcs.items()
+                        if WCS_KEYWORD_PATTERN.match(str(key))}
+        if _is_plate_solved(wcs_keywords):
+            source = "Cached plate solve"
+    if source is None or not image_size:
+        return []
+
+    try:
+        import numpy as np
+        from astropy.wcs import WCS
+        from astropy.wcs.utils import proj_plane_pixel_scales
+
+        wcs = WCS(wcs_keywords, naxis=2)
+        width, height = image_size
+        center = wcs.all_pix2world(np.array([[(width - 1) / 2.0, (height - 1) / 2.0]]), 0)[0]
+        scale = float(np.mean(proj_plane_pixel_scales(wcs))) * 3600.0
+        cd = wcs.pixel_scale_matrix
+        rotation = math.degrees(math.atan2(-cd[0][1], cd[1][1]))
+    except Exception as e:
+        logger.debug(f"Could not evaluate plate solution: {e}")
+        return []
+
+    return [
+        ("Center RA", format_ra(center[0])),
+        ("Center Dec", format_dec(center[1])),
+        ("Image Scale", f"{scale:.2f}\"/px"),
+        ("Rotation", f"{rotation:.2f}°"),
+        ("Field of View", format_fov(scale, width, height)),
+        ("Source", source),
+    ]
+
+
+def _site_rows(kw):
+    rows = []
+    latitude = _to_degrees(_first_value(kw, 'SITELAT', 'OBSGEO-B', 'LAT-OBS'))
+    if latitude is not None:
+        rows.append(("Latitude", f"{abs(latitude):.4f}° {'N' if latitude >= 0 else 'S'}"))
+    longitude = _to_degrees(_first_value(kw, 'SITELONG', 'OBSGEO-L', 'LONG-OBS'))
+    if longitude is not None:
+        if longitude > 180:
+            longitude -= 360
+        rows.append(("Longitude", f"{abs(longitude):.4f}° {'E' if longitude >= 0 else 'W'}"))
+    elevation = _to_float(_first_value(kw, 'SITEELEV', 'OBSGEO-H', 'ALT-OBS'))
+    if elevation is not None:
+        rows.append(("Elevation", f"{elevation:.0f} m"))
+    return rows
+
+
+def _image_rows(kw, image):
+    rows = []
+    channels = image.get('channels')
+    if channels:
+        rows.append(("Channels", f"{channels} ({'mono' if channels == 1 else 'color'})"))
+    _add_row(rows, "Sample Format", image.get('sample_format'))
+    _add_row(rows, "Color Space", image.get('color_space'))
+    _add_row(rows, "Created By", _first_value(kw, 'SWCREATE', 'CREATOR', 'PROGRAM') or image.get('software'))
+    _add_row(rows, "Modified By", kw.get('SWMODIFY'))
+    return rows
+
+
+def _has_value(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    # astropy represents a keyword without a value as an Undefined instance
+    return type(value).__name__ != 'Undefined'
+
+
+def _first_value(kw, *names):
+    """Value of the first keyword in names that the header has"""
+    for name in names:
+        if _has_value(kw.get(name)):
+            return kw[name]
+    return None
+
+
+def _add_row(rows, label, value):
+    """Append (label, value) if there's a value"""
+    if _has_value(value) and not isinstance(value, bool):
+        rows.append((label, str(value).strip()))
+
+
+def _to_float(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _to_degrees(value):
+    """Degrees from a number or a sexagesimal string like '+40 30 00'"""
+    result = _to_float(value)
+    if result is None and isinstance(value, str):
+        result = _parse_sexagesimal(value)
+    return result
+
+
+def _fmt_num(value, decimals):
+    """Number with up to `decimals` places, without trailing zeros"""
+    return f"{value:.{decimals}f}".rstrip('0').rstrip('.')
+
+
+def _parse_iso_datetime(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace('Z', '+00:00')
+    # fromisoformat only takes up to 6 fractional digits
+    text = re.sub(r'(\.\d{6})\d+', r'\1', text)
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _is_plate_solved(wcs_keywords):
+    return ('CRVAL1' in wcs_keywords and 'CRVAL2' in wcs_keywords and 'CRPIX1' in wcs_keywords
+            and ('CD1_1' in wcs_keywords or 'CDELT1' in wcs_keywords))
+
+
+def format_duration(seconds):
+    """'300 s (5m)' style exposure/integration time"""
+    text = f"{_fmt_num(seconds, 3)} s"
+    if seconds < 60:
+        return text
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours:.0f}h")
+    if minutes:
+        parts.append(f"{minutes:.0f}m")
+    if secs >= 0.05:
+        parts.append(f"{_fmt_num(secs, 1)}s")
+    return f"{text} ({' '.join(parts)})"
+
+
+def format_ra(ra_deg):
+    """RA in degrees as '05h 35m 17.3s'"""
+    total_seconds = round((ra_deg % 360.0) / 15.0 * 3600.0, 1) % 86400.0
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02.0f}h {minutes:02.0f}m {seconds:04.1f}s"
+
+
+def format_dec(dec_deg):
+    """Dec in degrees as '+22° 00' 52"'"""
+    sign = '-' if dec_deg < 0 else '+'
+    total_arcsec = round(abs(dec_deg) * 3600.0)
+    degrees, remainder = divmod(total_arcsec, 3600)
+    arcmin, arcsec = divmod(remainder, 60)
+    return f"{sign}{degrees:02d}° {arcmin:02d}' {arcsec:02d}\""
+
+
+def format_fov(scale_arcsec, width, height):
+    """Field of view for an image scale in arcsec/px, in arcmin or degrees"""
+    width_arcmin = scale_arcsec * width / 60.0
+    height_arcmin = scale_arcsec * height / 60.0
+    if max(width_arcmin, height_arcmin) >= 120:
+        return f"{width_arcmin / 60.0:.2f}° x {height_arcmin / 60.0:.2f}°"
+    return f"{width_arcmin:.1f}' x {height_arcmin:.1f}'"
+
+
+class ImageViewerWindow(QDialog):
+    """Window to display an image in full size with enhanced controls"""
+    zoom_changed = Signal(float)  # Signal for zoom level changes
+
+    def __init__(self, pixmap: QPixmap, title: str, file_path: str = None, parent=None,
+                 dso_ra: float = None, dso_dec: float = None, screen_stretch: bool = False, versions=None):
+        """pixmap may be None when file_path is given - the window then opens
+        straight away and loads the image in a background thread. screen_stretch
+        loads a FITS/XISF raw sub with an auto screen stretch (debayered on a color
+        camera) instead of the plain linear one - for reviewing light frames.
+        versions: other images of the same object (file paths, file_path among
+        them) to step through with the arrow buttons and keys."""
+        super().__init__(parent)
+        self.screen_stretch = screen_stretch
+        self.title = title
+        key = lambda path: os.path.normcase(os.path.normpath(path))
+        self.versions = list(versions or []) if file_path and pixmap is None else []
+        self.version_index = next((i for i, path in enumerate(self.versions) if key(path) == key(file_path)), None)
+        if self.version_index is None or len(self.versions) < 2:
+            self.versions = []
+        self._previous_size = None  # The size of the version shown before this one loaded
+        self.setWindowTitle(f"{title} - Image Viewer - Cosmos Collection")
+        self.setWindowFlags(
+            Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
+        self.resize(800, 600)
+        WindowPositionManager.restore_window_position(self, "ImageViewer")
+
+        self.setMinimumSize(300, 300)
+
+        # Store the original pixmap and file path
+        self.original_pixmap = pixmap
+        self.file_path = file_path
+        self.zoom_factor = 1.0
+        self.initial_zoom_factor = 1.0
+        self.image_position = [0, 0]
+        self.last_mouse_pos = None
+        self.is_panning = False
+        self._scaled_cache = None  # (zoom_factor, downscaled pixmap) for zoom < 100%
+        self.image_load_worker = None
+
+        # Store DSO coordinates for plate solving hints
+        self.dso_ra = dso_ra  # RA in degrees
+        self.dso_dec = dso_dec  # Dec in degrees
+
+        # Create main layout
+        main_layout = QVBoxLayout()
+
+        # Create toolbar for controls
+        toolbar = QHBoxLayout()
+
+        # Add zoom controls
+        zoom_out_button = QPushButton("-")
+        themed_style(zoom_out_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
+        zoom_out_button.setToolTip("Zoom out")
+        zoom_out_button.clicked.connect(self._zoom_out)
+        toolbar.addWidget(zoom_out_button)
+
+        zoom_in_button = QPushButton("+")
+        themed_style(zoom_in_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
+        zoom_in_button.setToolTip("Zoom in")
+        zoom_in_button.clicked.connect(self._zoom_in)
+        toolbar.addWidget(zoom_in_button)
+
+        reset_button = QPushButton("Reset")
+        reset_button.setFixedHeight(30)
+        reset_button.setToolTip("Reset zoom to 100%")
+        reset_button.clicked.connect(self._reset_zoom)
+        toolbar.addWidget(reset_button)
+
+        # The object's other images: back and forth through them, in this window
+        if self.versions:
+            toolbar.addSpacing(6)
+            self.previous_version_button = QPushButton("◀")
+            themed_style(self.previous_version_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
+            self.previous_version_button.setFixedSize(30, 30)
+            self.previous_version_button.setToolTip("Previous image of this object (Left arrow)")
+            self.previous_version_button.clicked.connect(lambda: self._show_version(self.version_index - 1))
+            toolbar.addWidget(self.previous_version_button)
+            self.version_label = QLabel()
+            self.version_label.setAlignment(Qt.AlignCenter)
+            toolbar.addWidget(self.version_label)
+            self.next_version_button = QPushButton("▶")
+            themed_style(self.next_version_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
+            self.next_version_button.setFixedSize(30, 30)
+            self.next_version_button.setToolTip("Next image of this object (Right arrow)")
+            self.next_version_button.clicked.connect(lambda: self._show_version(self.version_index + 1))
+            toolbar.addWidget(self.next_version_button)
+            # Shortcuts, so the arrows work whichever control has the focus
+            QShortcut(QKeySequence(Qt.Key_Left), self, lambda: self._show_version(self.version_index - 1))
+            QShortcut(QKeySequence(Qt.Key_Right), self, lambda: self._show_version(self.version_index + 1))
+            toolbar.addSpacing(6)
+
+        # Add file-specific buttons if file path is available
+        if self.file_path:
+            open_location_button = QPushButton("Open File Location")
+            open_location_button.setFixedHeight(30)
+            open_location_button.setToolTip("Open the folder containing this image")
+            open_location_button.clicked.connect(self._open_file_location)
+            toolbar.addWidget(open_location_button)
+
+            # The Session Manager session the image came from: open it, or link
+            # one (images in the gallery only)
+            toolbar.addSpacing(6)
+            self.session_button = QPushButton("Session")
+            self.session_button.setFixedHeight(30)
+            self.session_menu = QMenu(self.session_button)
+            self.session_menu.aboutToShow.connect(self._fill_session_menu)
+            self.session_button.setMenu(self.session_menu)
+            toolbar.addWidget(self.session_button)
+
+            # What's drawn over the image, in one menu: the annotations (as in the
+            # gallery: on/off, which layers, plate solving) and the capture details
+            # (ImageDetails.py: on/off, and which and how)
+            toolbar.addSpacing(6)
+            self.overlays_button = QPushButton("Overlays")
+            self.overlays_button.setFixedHeight(30)
+            overlays_menu = QMenu(self.overlays_button)
+            overlays_menu.setToolTipsVisible(True)
+            self.annotations_action = overlays_menu.addAction("Show Annotations")
+            self.annotations_action.setCheckable(True)
+            self.annotations_action.setToolTip("Mark the objects in the image (it needs a plate solve)")
+            layers_menu = overlays_menu.addMenu("Annotation Layers")
+            layers_menu.setToolTipsVisible(True)
+            self.layers_action = layers_menu.menuAction()
+            self.layers_action.setToolTip("What the annotations show")
+            layers = self._annotation_layers()
+            self.layer_actions = {}
+            for key, label in ANNOTATION_LAYERS:
+                action = layers_menu.addAction(label)
+                action.setCheckable(True)
+                action.setChecked(layers[key])
+                action.toggled.connect(self._update_annotation_settings)
+                self.layer_actions[key] = action
+            # Dark nebulae are among the DSOs
+            self.layer_actions["dark"].setEnabled(layers["dsos"])
+            self.layer_actions["dsos"].toggled.connect(self.layer_actions["dark"].setEnabled)
+            self.solve_action = overlays_menu.addAction("Plate Solve")
+            self.solve_action.triggered.connect(self._start_plate_solve)
+            overlays_menu.addSeparator()
+            self.details_action = overlays_menu.addAction("Show Details")
+            self.details_action.setCheckable(True)
+            self.details_action.setToolTip("Show the capture details on the image - object, integration, "
+                                           "equipment and more")
+            details_dialog_action = overlays_menu.addAction("Details...")
+            details_dialog_action.setToolTip("Choose the details shown and how they look")
+            details_dialog_action.triggered.connect(self._open_details_dialog)
+            self.overlays_button.setMenu(overlays_menu)
+            toolbar.addWidget(self.overlays_button)
+
+            # Every way the image leaves the app, in one dialog (ImageExport.py)
+            toolbar.addSpacing(6)
+            self.export_button = QPushButton("Export...")
+            self.export_button.setFixedHeight(30)
+            self.export_button.setToolTip("Save, copy, set as background or share this image")
+            self.export_button.clicked.connect(self._open_export_dialog)
+            toolbar.addWidget(self.export_button)
+
+        toolbar.addStretch()
+
+        # Add file info toggle button on the right side
+        if self.file_path:
+            self.info_toggle_button = QPushButton("Show File Info")
+            self.info_toggle_button.setFixedHeight(30)
+            self.info_toggle_button.setToolTip("Show/hide EXIF and file information")
+            self.info_toggle_button.setCheckable(True)
+            self.info_toggle_button.setChecked(False)
+            self.info_toggle_button.clicked.connect(self._toggle_file_info)
+            toolbar.addWidget(self.info_toggle_button)
+
+        # Annotations come from the shared store (loaded in the background from
+        # the image's .wcs), or from a solve that couldn't be saved next to it
+        self._unsaved_annotations = None
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        self.annotations_enabled = settings.value("annotation_enabled", False, type=bool)
+        if self.file_path:
+            annotation_store().ready.connect(self._on_annotations_ready)
+            self.annotations_action.setChecked(self.annotations_enabled)
+            self.annotations_action.toggled.connect(self._toggle_annotations)
+        self.plate_solve_result = None
+        self.plate_solve_worker = None
+        self._solve_message = None       # Plate solving's progress or result, for the status bar
+        self._solving = self._stopping = False
+        self._solve_message_timer = QTimer(self)  # Clears a result a moment after it shows
+        self._solve_message_timer.setSingleShot(True)
+        self._solve_message_timer.timeout.connect(self._clear_solve_message)
+        self.export_dialog = None
+
+        # The details, gathered in the background (ImageDetails.DetailsTask) for each image shown
+        self.details_style = ImageDetails.load_style()
+        self._details = None          # (file path, {"auto", "edits", "info"})
+        self._details_reading = None  # The file path being gathered
+        self._details_signals = ImageDetails.DetailsSignals(self)
+        self._details_signals.ready.connect(self._on_details_ready)
+        self._banner_cache = None     # (what it was measured for, banner height)
+        self.details_dialog = None
+        self._closing = False
+        # Edits are saved a moment after typing stops
+        self._pending_edits = None    # (file path, edits)
+        self._edits_timer = QTimer(self)
+        self._edits_timer.setSingleShot(True)
+        self._edits_timer.timeout.connect(self._save_details_edits)
+        if self.file_path:
+            self.details_action.setChecked(self.details_style["enabled"])
+            self.details_action.toggled.connect(self._toggle_details)
+
+        main_layout.addLayout(toolbar)
+
+        # Create horizontal layout for image and file info panel
+        content_layout = QHBoxLayout()
+
+        # Create a container widget for the image
+        self.image_container = QWidget()
+        self.image_container.setLayout(QVBoxLayout())
+        self.image_container.setStyleSheet("background-color: black;")
+
+        # Create image label
+        self.image_label = QLabel()
+        if pixmap is not None:
+            self.image_label.setPixmap(pixmap)
+        else:
+            self.image_label.setText(f"Loading {Path(file_path).name}..." if file_path else "No image")
+            themed_style(self.image_label, lambda: f"color: {adapt_color('#aaaaaa', on_dark=True)}; font-size: {font_size(12)};")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setMouseTracking(True)
+        self.image_label.installEventFilter(self)
+
+        # Add image label to container
+        self.image_container.layout().addWidget(self.image_label)
+        content_layout.addWidget(self.image_container)
+
+        # Create file information panel as a right-side groupbox (hidden by default)
+        self.file_info_panel = QGroupBox("File Information")
+        self.file_info_panel.setVisible(False)
+        self.file_info_panel.setFixedWidth(350)
+
+        # Dark mode styling for the groupbox
+        themed_style(self.file_info_panel, lambda: f"""
+            QGroupBox {{
+                font-weight: bold;
+                font-size: {font_size(12)};
+                color: {COLORS['text']};
+                background-color: {COLORS['background']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 8px;
+                margin: 5px;
+                padding-top: 15px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 8px 0 8px;
+                color: {COLORS['text']};
+                background-color: {COLORS['background']};
+            }}
+        """)
+
+        # Create file info layout
+        file_info_layout = QVBoxLayout()
+        file_info_layout.setContentsMargins(15, 10, 15, 15)
+
+        # Create scrollable area for file info content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # Values wrap to the panel width instead
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # Dark mode styling for scroll area
+        themed_style(scroll_area, lambda: f"""
+            QScrollArea {{
+                background-color: {COLORS['background']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+            }}
+            QScrollBar:vertical {{
+                background-color: {COLORS['background']};
+                width: 12px;
+                border-radius: 6px;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {COLORS['border']};
+                border-radius: 6px;
+                min-height: 20px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background-color: {COLORS['border_light']};
+            }}
+        """)
+
+        self.file_info_content = QLabel()
+        # Dark mode styling for the content label
+        themed_style(self.file_info_content, lambda: f"""
+            QLabel {{
+                font-size: {font_size(10)};
+                color: {COLORS['text_secondary']};
+                font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                padding: 10px;
+                background-color: {COLORS['background_light']};
+                border: none;
+            }}
+        """)
+        self.file_info_content.setWordWrap(True)
+        self.file_info_content.setAlignment(Qt.AlignTop)
+        self.file_info_content.setTextFormat(Qt.RichText)
+        # The file's information is read in the background (read_file_info)
+        self._file_info = None          # (file path, read_file_info() result or exception)
+        self._file_info_reading = None  # The file path being read
+        self._file_info_signals = _FileInfoSignals(self)
+        self._file_info_signals.ready.connect(self._on_file_info_read)
+        # The section colors are baked into the rich text, so re-render on theme changes
+        theme_manager().theme_changed.connect(self._refresh_file_info)
+
+        scroll_area.setWidget(self.file_info_content)
+        file_info_layout.addWidget(scroll_area)
+
+        self.file_info_panel.setLayout(file_info_layout)
+        content_layout.addWidget(self.file_info_panel)
+
+        # Set stretch ratios - image container gets most space, info panel gets fixed width
+        content_layout.setStretch(0, 1)  # image_container
+        content_layout.setStretch(1, 0)  # file_info_panel
+
+        main_layout.addLayout(content_layout)
+
+        # Add status bar - with a busy bar and Stop while plate solving
+        status_row = QHBoxLayout()
+        self.status_bar = QLabel()
+        self.status_bar.setMinimumWidth(1)  # Long messages are cut short, not widening the window
+        themed_style(self.status_bar, lambda: f"font-size: {font_size(10)};")
+        status_row.addWidget(self.status_bar, 1)
+        # Loading the image: how much of the file is read, then busy while it decodes
+        self.load_progress = QProgressBar()
+        self.load_progress.setTextVisible(False)
+        self.load_progress.setFixedSize(160, 12)
+        self.load_progress.hide()
+        status_row.addWidget(self.load_progress)
+        self._load_message = None  # The load's progress, for the status bar
+        self.solve_busy = QProgressBar()
+        self.solve_busy.setRange(0, 0)  # Busy, no percentage
+        self.solve_busy.setTextVisible(False)
+        self.solve_busy.setFixedSize(110, 12)
+        self.solve_busy.hide()
+        status_row.addWidget(self.solve_busy)
+        self.solve_stop = QPushButton("Stop")
+        self.solve_stop.setToolTip("Stop plate solving (after the solver that's running)")
+        self.solve_stop.clicked.connect(self._stop_plate_solve)
+        self.solve_stop.hide()
+        status_row.addWidget(self.solve_stop)
+        main_layout.addLayout(status_row)
+
+        # Set stretch to ensure content takes most space and status bar stays at bottom
+        main_layout.setStretch(0, 0)  # toolbar
+        main_layout.setStretch(1, 1)  # content_layout
+        main_layout.setStretch(2, 0)  # status_bar
+
+        self.setLayout(main_layout)
+
+        # Flag to track if initial fit has been done
+        self.initial_fit_done = False
+
+        # No pixmap given - load the file in the background so the UI stays responsive
+        if self.original_pixmap is None and self.file_path:
+            self._start_image_load()
+
+        # Reopen the file info panel if it was open last time
+        if self.file_path and QSettings("CosmosCollection", "CosmosCollection").value(
+                self.INFO_PANEL_SETTING, False, type=bool):
+            self._set_file_info_visible(True)
+
+        # Update status
+        self._update_annotation_controls()
+        self._update_version_controls()
+        self._update_session_button()
+        self._update_status()
+
+        if self.file_path:
+            if self.original_pixmap is not None:
+                self._load_details()  # Given the image - otherwise once it loads
+            # Reopen the details dialog if it was open last time
+            if self.details_style["enabled"] and QSettings("CosmosCollection", "CosmosCollection").value(
+                    ImageDetails.DIALOG_SETTING, False, type=bool):
+                QTimer.singleShot(0, self._open_details_dialog)
+
+    def _update_version_controls(self):
+        """Which of the object's images shows (n of N, its file in the title).
+        Stepping waits while a plate solve of this one runs."""
+        if not self.versions:
+            return
+        name = Path(self.file_path).name
+        self.setWindowTitle(f"{self.title} - {name} - Image Viewer - Cosmos Collection")
+        self.version_label.setText(f"{self.version_index + 1} of {len(self.versions)}")
+        self.version_label.setToolTip(name)
+        for button in (self.previous_version_button, self.next_version_button):
+            button.setEnabled(not self._solving)
+
+    def _show_version(self, index):
+        """Show another of the object's images (wrapping around at either end).
+        The current one stays until it loads; one the same size keeps the zoom
+        and position, to compare them."""
+        if not self.versions or self._solving:
+            return
+        index %= len(self.versions)
+        if index == self.version_index:
+            return
+        self._drop_image_load()
+        self._save_details_edits()  # The edits of the one being left
+        if self.original_pixmap is not None:
+            self._previous_size = self.original_pixmap.size()
+        self.version_index = index
+        self.file_path = self.versions[index]
+        self.original_pixmap = None
+        self._scaled_cache = None
+        self.plate_solve_result = None
+        self._unsaved_annotations = None
+        self._solve_message_timer.stop()
+        self._clear_solve_message()
+        self._update_version_controls()
+        self._update_annotation_controls()
+        self._update_session_button()
+        self._start_image_load()
+        if self.file_info_panel.isVisible():
+            self._load_file_information()  # Read alongside the image, not after it
+        if self.details_dialog is not None:
+            self.details_dialog.set_details(self.file_path, None, None)  # Gathered once it loads
+        self._update_status()
+        self._refresh_export()
+
+    def _drop_image_load(self):
+        """Stop an image that's still loading: its read stops (decoding can't be
+        interrupted), its result is dropped, and the thread object is kept
+        alive until it finishes."""
+        if self.image_load_worker and self.image_load_worker.isRunning():
+            worker = self.image_load_worker
+            worker.cancel()
+            worker.image_loaded.disconnect()
+            worker.load_failed.disconnect()
+            worker.progress.disconnect()
+            _orphaned_workers.add(worker)
+            worker.finished.connect(lambda: _orphaned_workers.discard(worker))
+        self.image_load_worker = None
+
+    def _image_buttons(self):
+        """Toolbar buttons that need the image to be loaded"""
+        return [getattr(self, name) for name in
+                ('export_button',)
+                if hasattr(self, name)]
+
+    def _start_image_load(self):
+        """Load self.file_path in a worker thread"""
+        for button in self._image_buttons():
+            button.setEnabled(False)
+
+        self.image_load_worker = ImageLoadWorker(self.file_path, screen_stretch=self.screen_stretch)
+        self.image_load_worker.image_loaded.connect(self._on_image_loaded)
+        self.image_load_worker.load_failed.connect(self._on_image_load_failed)
+        self.image_load_worker.progress.connect(self._on_load_progress)
+        self._load_message = "Loading image..."
+        self.load_progress.setRange(0, 0)  # Busy until the first progress arrives
+        self.load_progress.show()
+        self.image_load_worker.start()
+
+    def _on_load_progress(self, path, done, total):
+        """How much of the file is read (status bar, and over the image area
+        while it's empty) - then decoding, which can't report progress."""
+        if path != self.file_path or self.original_pixmap is not None:
+            return  # From a load that was dropped (another image was wanted)
+        name = Path(self.file_path).name
+        if done < total:
+            percent = int(done * 100 / total) if total else 0
+            self.load_progress.setRange(0, 1000)
+            self.load_progress.setValue(int(done * 1000 / total) if total else 0)
+            self._load_message = f"Loading image... {percent}% ({_megabytes(done)} of {_megabytes(total)})"
+            placeholder = f"Loading {name}...\n\n{percent}%"
+        else:
+            self.load_progress.setRange(0, 0)
+            self._load_message = "Decoding image..."
+            placeholder = f"Loading {name}...\n\nDecoding..."
+        if self.image_label.pixmap().isNull():  # Not still showing the previous image
+            self.image_label.setText(placeholder)
+        self._update_status()
+
+    def _on_image_loaded(self, qimage, path):
+        """Show the image once the worker has decoded it"""
+        if path != self.file_path:
+            return  # From a load that was dropped (another image was wanted)
+        # QPixmap must be created on the GUI thread
+        pixmap = QPixmap.fromImage(qimage)
+        if pixmap.isNull():
+            self._on_image_load_failed("Failed to convert image", path)
+            return
+
+        self.original_pixmap = pixmap
+        self._scaled_cache = None
+        self._end_load_progress()
+        self.image_label.setStyleSheet("")
+        self.image_label.setText("")
+        for button in self._image_buttons():
+            button.setEnabled(True)
+        # A panel opened before the image arrived is missing the image's size
+        if self.file_info_panel.isVisible():
+            self._load_file_information()
+        self._load_details()
+        self._refresh_export()
+
+        # Another of the object's images: fitted afresh unless it's the same size
+        if self._previous_size is not None and self._previous_size != pixmap.size():
+            self.initial_fit_done = False
+        self._previous_size = None
+
+        if self.isVisible():
+            if self.initial_fit_done:
+                self._update_zoom()
+            else:
+                self._do_initial_fit()
+        # Otherwise showEvent does the initial fit
+
+    def _on_image_load_failed(self, error_message, path):
+        """Show why the image couldn't be loaded"""
+        if path != self.file_path:
+            return
+        logger.error(f"Image viewer failed to load {self.file_path}: {error_message}")
+        self._end_load_progress("Couldn't load the image")
+        self.image_label.setText(f"Failed to load image:\n{Path(self.file_path).name}\n\n{error_message}")
+        self._update_status()
+
+    def _end_load_progress(self, message=None):
+        self._load_message = message
+        self.load_progress.hide()
+
+    def showEvent(self, event):
+        """Handle window show event - fit image to window on first show"""
+        super().showEvent(event)
+        if not self.initial_fit_done:
+            # Defer the initial fit to ensure the window is properly sized
+            QTimer.singleShot(50, self._do_initial_fit)
+
+    def _do_initial_fit(self):
+        """Perform initial fit to window and set up initial zoom factor"""
+        # Still loading - _on_image_loaded calls this again when the image arrives
+        if self.original_pixmap is None:
+            return
+
+        if not self.initial_fit_done:
+            self._fit_to_window()
+            self.initial_zoom_factor = self.zoom_factor
+            self.initial_fit_done = True
+
+    def eventFilter(self, obj, event):
+        """Handle mouse events for zooming and panning"""
+        if obj == self.image_label:
+            if event.type() == QEvent.Wheel:
+                if event.angleDelta().y() > 0:
+                    self._zoom_in()
+                else:
+                    self._zoom_out()
+                return True
+            elif event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self.is_panning = True
+                self.last_mouse_pos = event.position()
+                self.setCursor(Qt.ClosedHandCursor)
+                return True
+            elif event.type() == QEvent.MouseMove:
+                if self.is_panning and self.last_mouse_pos is not None:
+                    # Calculate the drag distance
+                    dx = event.position().x() - self.last_mouse_pos.x()
+                    dy = event.position().y() - self.last_mouse_pos.y()
+
+                    # Update image position
+                    self.image_position[0] += dx
+                    self.image_position[1] += dy
+
+                    # Update the display
+                    self._update_zoom()
+
+                    self.last_mouse_pos = event.position()
+                    return True
+            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self.is_panning = False
+                self.last_mouse_pos = None
+                self.setCursor(Qt.ArrowCursor)
+                return True
+        return super().eventFilter(obj, event)
+
+    def _update_zoom(self):
+        """Update the image display with current zoom level and position"""
+        if self.original_pixmap is None:
+            return
+
+        img_w = self.original_pixmap.width()
+        img_h = self.original_pixmap.height()
+
+        # Size of the whole image at the current zoom
+        new_width = int(img_w * self.zoom_factor)
+        new_height = int(img_h * self.zoom_factor)
+
+        # Create a new pixmap with the same size as the label
+        label_size = self.image_label.size()
+        final_pixmap = QPixmap(label_size)
+        final_pixmap.fill(Qt.transparent)
+
+        # Create a painter to draw the scaled image at the correct position
+        painter = QPainter(final_pixmap)
+
+        # Calculate the position to draw the image - centered with the details
+        # banner, when there's one above or below it
+        banner = self._banner_height()
+        x = (label_size.width() - new_width) // 2 + self.image_position[0]
+        y = (label_size.height() - int((img_h + banner) * self.zoom_factor)) // 2 + self.image_position[1]
+        if banner and self.details_style["layout"] == "banner_above":
+            banner_y = y
+            y += int(banner * self.zoom_factor)
+        else:
+            banner_y = y + new_height
+
+        # Draw only the part of the image that's visible in the label, rather
+        # than scaling the whole image on every pan/zoom (at high zoom on a large
+        # image that meant building a pixmap of a gigabyte or more each time).
+        # Zoomed out, use a downscaled copy cached per zoom level - Qt's smooth
+        # scaling averages pixels properly when shrinking, whereas the painter's
+        # bilinear filtering would alias. Zoomed in, sample the original directly.
+        if new_width < 1 or new_height < 1:
+            source_pixmap = None  # Window not sized yet - nothing to draw
+        elif self.zoom_factor < 1.0:
+            if self._scaled_cache is None or self._scaled_cache[0] != self.zoom_factor:
+                self._scaled_cache = (self.zoom_factor, self.original_pixmap.scaled(
+                    new_width, new_height, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            source_pixmap = self._scaled_cache[1]
+        else:
+            self._scaled_cache = None
+            source_pixmap = self.original_pixmap
+
+        # Visible region in image coordinates, clamped to the image bounds
+        if source_pixmap is not None:
+            left = max(0.0, -x / self.zoom_factor)
+            top = max(0.0, -y / self.zoom_factor)
+            right = min(float(img_w), (label_size.width() - x) / self.zoom_factor)
+            bottom = min(float(img_h), (label_size.height() - y) / self.zoom_factor)
+
+        if source_pixmap is not None and right > left and bottom > top:
+            target = QRectF(x + left * self.zoom_factor, y + top * self.zoom_factor,
+                            (right - left) * self.zoom_factor, (bottom - top) * self.zoom_factor)
+            # Source pixmap may be the downscaled copy - map image coords onto it
+            sx = source_pixmap.width() / img_w
+            sy = source_pixmap.height() / img_h
+            source = QRectF(left * sx, top * sy, (right - left) * sx, (bottom - top) * sy)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.drawPixmap(target, source_pixmap, source)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+
+        # Annotations over the whole image (clipped to it), names a readable size on screen
+        data = self._annotations() if self.annotations_enabled else None
+        if data is not None and new_width >= 1 and new_height >= 1:
+            whole = QRectF(x, y, img_w * self.zoom_factor, img_h * self.zoom_factor)
+            paint_annotations(painter, data, self._annotation_layers(), img_w, QRectF(0, 0, img_w, img_h),
+                              whole, font_px=screen_name_px(whole))
+
+        # The details, painted in image pixels and scaled down - just as they're saved
+        lines = self._details_lines()
+        if lines and new_width >= 1 and new_height >= 1:
+            painter.save()
+            painter.translate(x, banner_y if banner else y)
+            painter.scale(self.zoom_factor, self.zoom_factor)
+            if banner:
+                ImageDetails.paint_banner(painter, lines, QRectF(0, 0, img_w, banner), (img_w, img_h),
+                                          self.details_style)
+            else:
+                ImageDetails.paint_overlay(painter, lines, QRectF(0, 0, img_w, img_h), self.details_style)
+            painter.restore()
+
+        painter.end()
+
+        # Update the display
+        self.image_label.setPixmap(final_pixmap)
+
+        # Update status
+        self._update_status()
+        self.zoom_changed.emit(self.zoom_factor)  # Emit zoom level change signal
+
+    def _fit_to_window(self):
+        """Fit the image to the window size"""
+        if self.original_pixmap is None:
+            return
+
+        # Get available size
+        available_size = self.image_container.size()
+
+        # Calculate zoom factor to fit (with the details banner, if there's one)
+        width_ratio = available_size.width() / self.original_pixmap.width()
+        height_ratio = available_size.height() / (self.original_pixmap.height() + self._banner_height())
+        self.zoom_factor = min(width_ratio, height_ratio)
+
+        # Reset position
+        self.image_position = [0, 0]
+
+        # Update display
+        self._update_zoom()
+
+    def resizeEvent(self, event):
+        """Handle window resize event"""
+        super().resizeEvent(event)
+
+        if not self.initial_fit_done:
+            # If initial fit hasn't been done yet, just update the display
+            self._update_zoom()
+            return
+
+        # Store the current relative position of the image center before resize
+        old_size = event.oldSize() if event.oldSize().isValid() else self.size()
+        new_size = event.size()
+
+        # Only auto-fit if we're at the initial zoom level (user hasn't manually zoomed)
+        if abs(self.zoom_factor - self.initial_zoom_factor) < 0.001:
+            # User is at initial zoom - maintain fit to window behavior
+            self._fit_to_window()
+            self.initial_zoom_factor = self.zoom_factor
+        else:
+            # User has manually zoomed - preserve zoom level and try to maintain image position
+            if old_size.isValid() and old_size.width() > 0 and old_size.height() > 0:
+                # Calculate the ratio of size change
+                width_ratio = new_size.width() / old_size.width()
+                height_ratio = new_size.height() / old_size.height()
+
+                # Adjust image position proportionally to maintain relative position
+                self.image_position[0] = int(self.image_position[0] * width_ratio)
+                self.image_position[1] = int(self.image_position[1] * height_ratio)
+
+            # Update the display with preserved zoom and adjusted position
+            self._update_zoom()
+
+    def _zoom_in(self):
+        """Zoom in on the image"""
+        if self.original_pixmap is None:
+            return
+        self.zoom_factor = min(self.zoom_factor * 1.2, 8.0)
+        self._update_zoom()
+
+    def _zoom_out(self):
+        """Zoom out on the image"""
+        if self.original_pixmap is None:
+            return
+        self.zoom_factor = max(self.zoom_factor / 1.2, 0.1)
+        self._update_zoom()
+
+    def _reset_zoom(self):
+        """Reset zoom to 100%"""
+        if self.original_pixmap is None:
+            return
+        self.zoom_factor = 1.0
+        self.image_position = [0, 0]
+        self._update_zoom()
+
+    def _update_status(self, annotation_status=None):
+        """Update the status bar with current zoom level and image size"""
+        if self.original_pixmap is None:
+            self.status_bar.setText(self._load_message or "Loading image...")
+            return
+
+        zoom_percent = int(self.zoom_factor * 100)
+        image_size = f"{self.original_pixmap.width()}x{self.original_pixmap.height()}"
+        base_status = f"Zoom: {zoom_percent}% | Image Size: {image_size} pixels"
+
+        annotation_status = annotation_status or self._solve_message or self._annotation_status()
+        if annotation_status:
+            self.status_bar.setText(f"{base_status} | {annotation_status}")
+        else:
+            self.status_bar.setText(base_status)
+
+    def _open_file_location(self):
+        """Open the file location in the system's file explorer"""
+        if self.file_path:
+            success = ResourceManager.open_file_manager(self.file_path)
+            if not success:
+                QMessageBox.critical(self, "Error", "Failed to open file location")
+
+    # The image's session (userimages.session_id)
+
+    def _update_session_button(self):
+        """Shown for an image in the gallery, its tooltip naming the linked session."""
+        if not self.file_path:
+            return
+        try:
+            from cosmoscollection.core.DatabaseManager import DatabaseManager
+            with DatabaseManager().get_connection() as conn:
+                shown = ImageDetails.in_library(conn, self.file_path)
+                session_id, stored = ImageDetails.session_link(conn, self.file_path) if shown else (None, None)
+                session = conn.execute("SELECT dso_name, session_date, status FROM usersessions WHERE id = ?",
+                                       (session_id,)).fetchone() if session_id else None
+                nights = ImageDetails.session_nights(conn, session_id) if session else []
+        except Exception as e:
+            logger.error(f"Couldn't read the image's session: {e}", exc_info=True)
+            shown, session, nights, stored = False, None, [], None
+        self.session_button.setVisible(shown)
+        tip = "Link this image to the Session Manager session it was captured in"
+        if session:
+            tip = f"Linked to the session {self._session_text(*session)}"
+            dated = [key for key, _subs, _seconds in nights if key != ImageDetails.NO_NIGHT]
+            chosen = [key for key in ImageDetails.chosen_nights(nights, stored) if key != ImageDetails.NO_NIGHT]
+            if len(dated) > 1:
+                tip += f"\nStacked from {len(chosen)} of its {len(dated)} nights"
+        self.session_button.setToolTip(tip)
+
+    @staticmethod
+    def _session_text(name, date, status):
+        return f"{date or 'No date'} – {name} ({status})"
+
+    def _fill_session_menu(self):
+        """Open the linked session, link another of the object's sessions, or unlink."""
+        menu = self.session_menu
+        menu.clear()
+        try:
+            from cosmoscollection.core.DatabaseManager import DatabaseManager
+            with DatabaseManager().get_connection() as conn:
+                linked, sessions = ImageDetails.session_choices(conn, self.file_path)
+        except Exception as e:
+            logger.error(f"Couldn't list the image's sessions: {e}", exc_info=True)
+            menu.addAction("Couldn't list the sessions").setEnabled(False)
+            return
+        if linked:
+            open_action = menu.addAction("Open Session")
+            open_action.triggered.connect(lambda: self._open_session(linked))
+            nights_action = menu.addAction("Choose Nights...")
+            nights_action.setToolTip("The nights of the session this image was stacked from")
+            nights_action.triggered.connect(lambda: self._choose_nights(linked))
+        else:
+            menu.addAction("Not linked to a session").setEnabled(False)
+        menu.addSeparator()
+        link_menu = menu.addMenu("Change Linked Session" if linked else "Link to Session")
+        if not sessions:
+            link_menu.addAction("No sessions for this object").setEnabled(False)
+        for session_id, name, date, status in sessions:
+            action = link_menu.addAction(self._session_text(name, date, status))
+            action.setCheckable(True)
+            action.setChecked(session_id == linked)
+            action.triggered.connect(lambda checked=False, sid=session_id: self._link_session(sid))
+        if linked:
+            unlink_action = menu.addAction("Remove Link")
+            unlink_action.triggered.connect(lambda: self._link_session(None))
+
+    def _link_session(self, session_id):
+        """Link the image to the session (None unlinks) - to the nights of its
+        subs (header dates, else those before the file was made), shown to
+        check when there's more than one - and gather its details again."""
+        nights, guess, hint = [], None, ""
+        try:
+            from cosmoscollection.core.DatabaseManager import DatabaseManager
+            with DatabaseManager().get_connection() as conn:
+                if session_id:
+                    nights = ImageDetails.session_nights(conn, session_id)
+                    guess, hint = ImageDetails.guess_nights(nights, ImageDetails.made_date(self.file_path),
+                                                            ImageDetails.sub_nights(self._header_keywords()))
+                ImageDetails.link_session(conn, self.file_path, session_id, guess)
+        except Exception as e:
+            logger.error(f"Couldn't link the image to the session: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Couldn't link the image to the session:\n{e}")
+            return
+        self._session_link_changed()
+        if sum(key != ImageDetails.NO_NIGHT for key, _subs, _seconds in nights) > 1:
+            self._choose_nights(session_id, hint)
+
+    def _header_keywords(self):
+        """The FITS/XISF header keywords of the image - the ones already read
+        when there are, else read now - or {}."""
+        info = self._file_info[1] if self._file_info and self._file_info[0] == self.file_path else None
+        header = info.get("header") if isinstance(info, dict) else None
+        if header is None and Path(self.file_path).suffix.lower() in FITS_EXTENSIONS | XISF_EXTENSIONS:
+            try:
+                header = read_image_header(self.file_path)
+            except Exception as e:
+                logger.debug(f"Couldn't read the header of {self.file_path}: {e}")
+        return header.keywords if header is not None else {}
+
+    def _choose_nights(self, session_id, hint=""):
+        """Let the user choose the session's nights the image was stacked from."""
+        try:
+            from cosmoscollection.core.DatabaseManager import DatabaseManager
+            with DatabaseManager().get_connection() as conn:
+                _linked, stored = ImageDetails.session_link(conn, self.file_path)
+                nights = ImageDetails.session_nights(conn, session_id)
+                session = conn.execute("SELECT dso_name, session_date, status FROM usersessions WHERE id = ?",
+                                       (session_id,)).fetchone()
+        except Exception as e:
+            logger.error(f"Couldn't read the session's nights: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Couldn't read the session's nights:\n{e}")
+            return
+        if not nights:
+            QMessageBox.information(self, "Choose Nights", "The session has no nights with subs yet.")
+            return
+        dialog = ImageDetails.SessionNightsDialog(
+            f"\"{session[0]}\"" if session and session[0] else "the session", nights,
+            ImageDetails.chosen_nights(nights, stored), hint, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            with DatabaseManager().get_connection() as conn:
+                ImageDetails.link_session(conn, self.file_path, session_id, dialog.chosen_keys())
+        except Exception as e:
+            logger.error(f"Couldn't save the image's nights: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Couldn't save the image's nights:\n{e}")
+            return
+        self._session_link_changed()
+
+    def _session_link_changed(self):
+        """The image's session or nights changed: gather its details again."""
+        self._update_session_button()
+        # The details come partly from the session
+        self._details = None
+        self._details_reading = None
+        if self.details_dialog is not None:
+            self.details_dialog.set_details(self.file_path, None, None)
+        self._load_details()
+        self._details_layout_changed()
+
+    def _open_session(self, session_id):
+        """The Session Manager with the session selected - the main window's, when there is one."""
+        global _session_manager_window
+        try:
+            main = next((w for w in QApplication.topLevelWidgets() if hasattr(w, "_context_open_session")), None)
+            if main is not None:
+                main._context_open_session(session_id)
+                return
+            from cosmoscollection.sessions.SessionManager import SessionManagerWindow
+            if not window_is_open(_session_manager_window):
+                _session_manager_window = SessionManagerWindow()
+            _session_manager_window.open_and_select_session(session_id)
+        except Exception as e:
+            logger.error(f"Error opening Session Manager: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Session Manager: {e}")
+
+    # Export (ImageExport.py)
+
+    def _open_export_dialog(self):
+        """The export dialog beside the viewer - including what the viewer shows."""
+        if not self.file_path:
+            return
+        if self.export_dialog is None:
+            from cosmoscollection.imaging import ImageExport
+            dialog = ImageExport.ExportDialog(self)
+            dialog.finished.connect(self._on_export_dialog_closed)
+            self.export_dialog = dialog
+            self._load_details()  # For the details and descriptions
+            dialog.refresh()
+        self.export_dialog.show()
+        self.export_dialog.raise_()
+        self.export_dialog.activateWindow()
+
+    def _on_export_dialog_closed(self, _result=None):
+        self.export_dialog = None
+
+    def _refresh_export(self):
+        """What the export dialog shows changed (loaded, edited, another image)."""
+        if self.export_dialog is not None:
+            self.export_dialog.refresh()
+
+    def export_annotations(self):
+        """For the export dialog: (state, AnnotationData) - "ready", "loading"
+        (the solution or its star names) or "unsolved"."""
+        data = self._annotations()
+        if data is None:
+            return ("unsolved" if annotation_store().known(self.file_path) else "loading"), None
+        if self._annotation_layers()["stars"] and data is not self._unsaved_annotations and data.stars is None:
+            return "loading", data
+        return "ready", data
+
+    def export_layers(self):
+        return self._annotation_layers()
+
+    def export_details(self):
+        """For the export dialog: the image's {"auto", "edits"}, or None while
+        they're gathered."""
+        if not self._details_loaded():
+            self._load_details()
+            return None
+        return self._details[1]
+
+    INFO_PANEL_SETTING = "image_viewer/file_info_visible"
+
+    def _toggle_file_info(self):
+        """Toggle the file information panel, remembering the choice for next time"""
+        if hasattr(self, 'file_info_panel'):
+            visible = not self.file_info_panel.isVisible()
+            self._set_file_info_visible(visible)
+            QSettings("CosmosCollection", "CosmosCollection").setValue(self.INFO_PANEL_SETTING, visible)
+
+    def _set_file_info_visible(self, visible):
+        self.file_info_panel.setVisible(visible)
+        if hasattr(self, 'info_toggle_button'):
+            self.info_toggle_button.setChecked(visible)
+            self.info_toggle_button.setText("Hide File Info" if visible else "Show File Info")
+        if visible:
+            # Load and display file information when showing
+            self._load_file_information()
+
+    def _load_file_information(self):
+        """Show the file's information - read in the background (read_file_info)
+        the first time, then from what was read (when the image arrives with
+        its size, or the theme changes)."""
+        if not self.file_path or not hasattr(self, 'file_info_content'):
+            return
+        if self._file_info is None or self._file_info[0] != self.file_path:
+            if self._file_info_reading != self.file_path:
+                self._file_info_reading = self.file_path
+                QThreadPool.globalInstance().start(_FileInfoTask(self.file_path, self._file_info_signals))
+            self.file_info_content.setText(escape(f"Reading {Path(self.file_path).name}..."))
+            return
+        info = self._file_info[1]
+        if isinstance(info, Exception):
+            self.file_info_content.setText(f"Error loading file information:<br>{escape(str(info))}")
+            return
+
+        try:
+            # Get file stats
+            file_stats = info['stats']
+            file_path_obj = Path(self.file_path)
+
+            # Basic file information
+            file_name = file_path_obj.name
+            file_dir = str(file_path_obj.parent)
+            file_size_bytes = file_stats.st_size
+
+            # Format file size
+            if file_size_bytes < 1024:
+                file_size = f"{file_size_bytes} bytes"
+            elif file_size_bytes < 1024 * 1024:
+                file_size = f"{file_size_bytes / 1024:.1f} KB"
+            elif file_size_bytes < 1024 * 1024 * 1024:
+                file_size = f"{file_size_bytes / (1024 * 1024):.1f} MB"
+            else:
+                file_size = f"{file_size_bytes / (1024 * 1024 * 1024):.1f} GB"
+
+            # Dates
+            created_time = format_datetime(datetime.fromtimestamp(file_stats.st_ctime), seconds=True)
+            modified_time = format_datetime(datetime.fromtimestamp(file_stats.st_mtime), seconds=True)
+
+            # FITS/XISF header - its dimensions show even while the image itself is still loading
+            header = info['header']
+
+            # Image dimensions
+            if self.original_pixmap:
+                image_size = (self.original_pixmap.width(), self.original_pixmap.height())
+            elif header and header.image.get('width') and header.image.get('height'):
+                image_size = (header.image['width'], header.image['height'])
+            else:
+                image_size = None
+
+            if image_size:
+                width, height = image_size
+                megapixels = (width * height) / 1000000
+                if megapixels >= 1:
+                    dimensions = f"{width} x {height} pixels ({megapixels:.1f} MP)"
+                else:
+                    dimensions = f"{width} x {height} pixels ({megapixels * 1000:.0f}K pixels)"
+            else:
+                dimensions = "Unknown"
+
+            sections = [("File", [
+                ("Filename", file_name),
+                ("Location", file_dir),
+                ("File Size", file_size),
+                ("Dimensions", dimensions),
+                ("Created", created_time),
+                ("Modified", modified_time),
+            ])]
+
+            if header is not None:
+                cached_wcs = self._cached_wcs_header()
+                if cached_wcs and image_size:
+                    cached_wcs = self._wcs_for_display(cached_wcs, image_size[1])
+                sections.extend(build_header_sections(header, image_size, cached_wcs))
+            elif info['exif']:
+                sections.append(("EXIF", list(info['exif'].items())))
+
+            self.file_info_content.setText(self._file_info_html(sections))
+
+        except Exception as e:
+            self.file_info_content.setText(f"Error loading file information:<br>{escape(str(e))}")
+
+    def _on_file_info_read(self, path, info):
+        """A file's information arrived from the background read: show it,
+        if it's still this image's."""
+        if self._file_info_reading == path:
+            self._file_info_reading = None
+        if path != self.file_path:
+            return  # Another image is showing now
+        self._file_info = (path, info)
+        if self.file_info_panel.isVisible():
+            self._load_file_information()
+
+    @staticmethod
+    def _file_info_html(sections):
+        """Render [(title, [(label, value), ...]), ...] as rich text for the
+        File Information panel - one label/value table with a heading row per
+        section, so the value column lines up across sections"""
+        parts = ["<table width='100%' cellspacing='0' cellpadding='1'>"]
+        for index, (title, rows) in enumerate(sections):
+            padding = 0 if index == 0 else 10
+            parts.append(f"<tr><td colspan='2' style='font-weight: bold; color: {COLORS['info']}; "
+                         f"padding-top: {padding}px;'>{escape(title)}</td></tr>")
+            for label, value in rows:
+                value_html = escape(_wrappable(str(value)))
+                parts.append(
+                    f"<tr><td style='color: {COLORS['text_disabled']}; padding-right: 8px; "
+                    f"white-space: nowrap;' valign='top'>{escape(label)}</td>"
+                    f"<td style='color: {COLORS['text']};'>{value_html}</td></tr>")
+        parts.append("</table>")
+        return "".join(parts)
+
+    def _wcs_for_display(self, wcs_header, image_height):
+        """A plate solve's WCS with y running up the image as displayed.
+
+        ASTAP solves a FITS file with its rows in stored order (first row =
+        y 1, ignoring ROWORDER), and this viewer shows the first stored row at
+        the top, so FITS solutions are flipped. Solves of PNG/JPG (and XISF,
+        converted bottom-up before solving) already match the display.
+        """
+        if self.file_path and Path(self.file_path).suffix.lower() in FITS_EXTENSIONS:
+            from cosmoscollection.imaging.AnnotationOverlay import flip_wcs_rows
+            return flip_wcs_rows(wcs_header, image_height)
+        return wcs_header
+
+    def _cached_wcs_header(self):
+        """WCS keywords from this image's plate solve - the loaded result, or
+        the cached .wcs file next to the image (as read_file_info found it) - or None"""
+        if self.plate_solve_result and self.plate_solve_result.success and self.plate_solve_result.wcs_header:
+            return self.plate_solve_result.wcs_header
+        if self._file_info and self._file_info[0] == self.file_path and isinstance(self._file_info[1], dict):
+            return self._file_info[1]['saved_wcs']
+        return None
+
+    def _refresh_file_info(self):
+        """Re-render the File Information panel (e.g. with the new theme's colors)"""
+        if self.file_info_panel.isVisible():
+            self._load_file_information()
+
+    def _update_annotation_controls(self):
+        """The Overlays menu: Layers works while the annotations show, and
+        plate solving reads Re-Plate Solve once solved (as in the gallery)."""
+        if not hasattr(self, 'annotations_action'):
+            return
+        solved = self._unsaved_annotations is not None or bool(annotation_store().is_solved(self.file_path))
+        self.layers_action.setEnabled(self.annotations_enabled)
+        self.solve_action.setEnabled(not self._solving)
+        self.solve_action.setText("Re-Plate Solve" if solved else "Plate Solve")
+        self.solve_action.setToolTip("Solve the image again, replacing its saved solution" if solved
+                                     else "Find where the image is in the sky, so its objects can be marked")
+        self._update_overlays_button()
+
+    def _update_overlays_button(self):
+        """The Overlays button says what's on the image."""
+        shown = [name for name, on in (("annotations", self.annotations_enabled),
+                                       ("details", self.details_style["enabled"])) if on]
+        self.overlays_button.setToolTip("Showing the " + " and ".join(shown) if shown
+                                        else "Annotations and capture details over the image - none showing")
+        self.overlays_button.setText(f"Overlays ({len(shown)})" if shown else "Overlays")
+
+    def _start_plate_solve(self):
+        """Plate solve the image in the background - progress in the status bar."""
+        if not self.file_path or self._solving:
+            return
+        from cosmoscollection.solving.PlateSolver import PlateSolverWorker
+        hints = None
+        if self.dso_ra is not None and self.dso_dec is not None:
+            hints = {'ra': self.dso_ra, 'dec': self.dso_dec, 'radius': 15}  # Near the image's object
+        # Re-solving replaces the image's saved solution
+        worker = PlateSolverWorker(self.file_path, hints, fresh=read_wcs_header(self.file_path) is not None)
+        worker.progress.connect(lambda message: self._show_solving(f"Plate solving - {message}"))
+        worker.solve_finished.connect(self._on_plate_solve_finished)
+        self.plate_solve_worker = worker
+        self._solving, self._stopping = True, False
+        self._solve_message_timer.stop()
+        self._show_solving("Plate solving...")
+        worker.start()
+
+    def _show_solving(self, message):
+        """Plate solving's progress in the status bar, with the busy bar and Stop."""
+        self._solve_message = message if not self._stopping else "Stopping plate solving..."
+        self.status_bar.setToolTip(self._solve_message)
+        self.solve_busy.setVisible(self._solving)
+        self.solve_stop.setVisible(self._solving)
+        self.solve_stop.setEnabled(not self._stopping)
+        self._update_annotation_controls()
+        self._update_version_controls()
+        self._update_status()
+
+    def _stop_plate_solve(self):
+        """Stop once the solver that's running finishes (they can't be interrupted)."""
+        if self._solving and self.plate_solve_worker is not None:
+            self._stopping = True
+            self.plate_solve_worker.cancel()
+            self._show_solving("")
+
+    def _on_plate_solve_finished(self, result):
+        """The plate solve's result in the status bar for a moment, and its annotations."""
+        self._solving = False
+        self.plate_solve_result = result
+        if result.success:
+            scale = f", {result.pixel_scale:.2f}\"/px" if result.pixel_scale else ""
+            solver = "the built-in solver" if result.solver_used == "Built-in" else result.solver_used
+            message, details = f"Plate solved with {solver}{scale} ✓", None
+            self._use_new_solution(result)
+        elif self._stopping:
+            message, details = "Plate solving stopped", None
+        else:
+            details = (result.error_message or "No solution").strip()
+            message = f"Couldn't plate solve - {details.splitlines()[0]}"
+        self._stopping = False
+        self._show_solving(message)
+        self.status_bar.setToolTip(details or message)  # Every solver's reason when it failed
+        self._solve_message_timer.start(6000 if result.success else 12000)
+
+    def _clear_solve_message(self):
+        self._solve_message = None
+        self.status_bar.setToolTip("")
+        self._update_status()
+
+    _annotation_layers = staticmethod(saved_annotation_layers)
+
+    def _annotations(self):
+        """This image's AnnotationData - None if it isn't plate solved, or while
+        it loads in the background (_on_annotations_ready repaints then)."""
+        if not self.file_path:
+            return None
+        if self._unsaved_annotations is not None:
+            return self._unsaved_annotations
+        return annotation_store().get(self.file_path, want_stars=self._annotation_layers()["stars"])
+
+    def _on_annotations_ready(self, path):
+        if path == self.file_path:
+            self._update_annotation_controls()
+            self._update_status()
+            if self.annotations_enabled:
+                self._update_zoom()
+            self._refresh_export()
+
+    def _annotation_status(self):
+        """Status bar text about the annotations, or None when they're off."""
+        if not (self.annotations_enabled and self.file_path):
+            return None
+        data = self._annotations()
+        if data is None:
+            if not annotation_store().known(self.file_path):
+                return "Loading annotations..."
+            return "Not plate solved - use Plate Solve to find its objects"
+        count = len(data.dsos)
+        text = f"Annotations: {count} DSO{'s' if count != 1 else ''}"
+        if self._annotation_layers()["stars"] and data is not self._unsaved_annotations:
+            stars = data.stars
+            text += (", looking up stars..." if stars is None
+                     else f", {len(stars)} star{'s' if len(stars) != 1 else ''}")
+        return text
+
+    def _use_new_solution(self, result):
+        """Show the annotations of a plate solve that just finished"""
+        self._unsaved_annotations = None
+        annotation_store().forget(self.file_path)
+        if read_wcs_header(self.file_path) is None and result.wcs_header:
+            # It couldn't be saved next to the image (e.g. a read-only folder) - keep it here
+            try:
+                width, height = image_pixel_size(self.file_path)
+                self._unsaved_annotations = AnnotationData.from_header(
+                    result.wcs_header, width, height,
+                    fits_rows=Path(self.file_path).suffix.lower() in FITS_EXTENSIONS)
+            except Exception as e:
+                logger.warning(f"Could not use the plate solve for annotations: {e}")
+        # The details' image scale, now measured
+        if self._details is not None and self._details[0] == self.file_path:
+            self._details = None
+            self._load_details()
+        self._update_zoom()
+        self._refresh_export()
+
+    def _update_annotation_settings(self):
+        """Save the layer choices and redraw"""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        for key, setting in ANNOTATION_LAYER_SETTINGS.items():
+            settings.setValue(setting, self.layer_actions[key].isChecked())
+        self._update_zoom()
+        self._refresh_export()
+
+    def _toggle_annotations(self, enabled):
+        """Turn the annotations overlay on or off"""
+        self.annotations_enabled = enabled
+        QSettings("CosmosCollection", "CosmosCollection").setValue("annotation_enabled", enabled)
+        self._update_annotation_controls()
+        self._update_zoom()
+        if self.export_dialog is not None:
+            self.export_dialog.follow_viewer()
+
+    # Details (ImageDetails.py)
+
+    def _details_on(self):
+        return bool(self.file_path) and self.details_style["enabled"]
+
+    def _details_loaded(self):
+        return self._details is not None and self._details[0] == self.file_path
+
+    def _details_wanted(self):
+        """Shown, or the details or export dialog is open."""
+        return self._details_on() or self.details_dialog is not None or self.export_dialog is not None
+
+    def _load_details(self):
+        """Gather this image's details in the background, when they're
+        wanted (shown, or a dialog that uses them is open) and not gathered yet."""
+        if not self.file_path or self.original_pixmap is None:
+            return
+        if not self._details_wanted() or self._details_loaded():
+            return
+        if self._details_reading == self.file_path:
+            return
+        self._details_reading = self.file_path
+        info = self._file_info[1] if (self._file_info and self._file_info[0] == self.file_path
+                                      and isinstance(self._file_info[1], dict)) else None
+        solved = self.plate_solve_result
+        wcs = solved.wcs_header if solved and solved.success and solved.wcs_header else None
+        QThreadPool.globalInstance().start(ImageDetails.DetailsTask(
+            self.file_path, self._details_signals, (self.original_pixmap.width(), self.original_pixmap.height()),
+            info, wcs, self.title))
+
+    def _on_details_ready(self, path, result):
+        """An image's details arrived: show them, if it's still this image."""
+        if self._details_reading == path:
+            self._details_reading = None
+        if path != self.file_path:
+            if self._details_wanted():
+                self._load_details()  # Another image is showing now
+            return
+        if isinstance(result, Exception):
+            result = {"auto": {}, "edits": {}, "info": None}
+        self._details = (path, result)
+        # The file was read for them - the File Information panel needn't read it again
+        if isinstance(result.get("info"), dict) and not (self._file_info and self._file_info[0] == path):
+            self._file_info = (path, result["info"])
+            if self.file_info_panel.isVisible():
+                self._load_file_information()
+        if self.details_dialog is not None:
+            self.details_dialog.set_details(path, result["auto"], result["edits"])
+        self._details_layout_changed()
+
+    def _details_lines(self):
+        """[(key, text)] of the details shown on this image - none while they're off or loading."""
+        if not self._details_on() or not self._details_loaded():
+            return []
+        details = self._details[1]
+        return ImageDetails.detail_lines(details["auto"], details["edits"], self.details_style)
+
+    def _banner_height(self):
+        """The details banner's height in image pixels (0 when there isn't one)."""
+        if self.original_pixmap is None or not ImageDetails.is_banner(self.details_style):
+            return 0
+        lines = self._details_lines()
+        size = (self.original_pixmap.width(), self.original_pixmap.height())
+        key = (tuple(lines), size, json.dumps(self.details_style, sort_keys=True))
+        if self._banner_cache is None or self._banner_cache[0] != key:
+            self._banner_cache = (key, ImageDetails.banner_height(lines, size, self.details_style))
+        return self._banner_cache[1]
+
+    def _details_layout_changed(self):
+        """Redraw after the details changed - fitted to the window again if it
+        was fitted, as a banner changes the size of what's shown."""
+        if self.initial_fit_done and abs(self.zoom_factor - self.initial_zoom_factor) < 0.001:
+            self._fit_to_window()
+            self.initial_zoom_factor = self.zoom_factor
+        else:
+            self._update_zoom()
+        self._refresh_export()
+
+    def _toggle_details(self, enabled):
+        """Turn the details on or off"""
+        self.details_style["enabled"] = enabled
+        ImageDetails.save_style(self.details_style)
+        if self.details_dialog is not None:
+            self.details_dialog.style["enabled"] = enabled
+        self._load_details()
+        self._details_layout_changed()
+        self._update_overlays_button()
+        if self.export_dialog is not None:
+            self.export_dialog.follow_viewer()
+
+    def _open_details_dialog(self):
+        """The details dialog beside the viewer - opening it shows the details."""
+        if not self.file_path:
+            return
+        if self.details_dialog is None:
+            dialog = ImageDetails.ImageDetailsDialog(self.details_style, self)
+            dialog.setAttribute(Qt.WA_DeleteOnClose)
+            dialog.style_changed.connect(self._on_details_style_changed)
+            dialog.edits_changed.connect(self._on_details_edited)
+            dialog.save_requested.connect(self._open_export_dialog)
+            dialog.finished.connect(self._on_details_dialog_closed)
+            self.details_dialog = dialog
+            if self._details_loaded():
+                dialog.set_details(self.file_path, self._details[1]["auto"], self._details[1]["edits"])
+            else:
+                dialog.set_details(self.file_path, None, None)
+        if not self.details_action.isChecked():
+            self.details_action.setChecked(True)
+        self._load_details()
+        self.details_dialog.show()
+        self.details_dialog.raise_()
+        self.details_dialog.activateWindow()
+
+    def _on_details_dialog_closed(self, _result=None):
+        if not self._closing:
+            QSettings("CosmosCollection", "CosmosCollection").setValue(ImageDetails.DIALOG_SETTING, False)
+        self.details_dialog = None
+
+    def _on_details_style_changed(self, style):
+        style["enabled"] = self.details_action.isChecked()
+        self.details_style = style
+        ImageDetails.save_style(style)
+        self._details_layout_changed()
+
+    def _on_details_edited(self, path, edits):
+        """A line typed in the dialog: shown now, saved a moment after typing stops."""
+        if self._details is not None and self._details[0] == path:
+            self._details[1]["edits"] = dict(edits)
+        if self._pending_edits is not None and self._pending_edits[0] != path:
+            self._save_details_edits()
+        self._pending_edits = (path, dict(edits))
+        self._edits_timer.start(600)
+        self._details_layout_changed()
+
+    def _save_details_edits(self):
+        self._edits_timer.stop()
+        if self._pending_edits is None:
+            return
+        path, edits = self._pending_edits
+        self._pending_edits = None
+        try:
+            from cosmoscollection.core.DatabaseManager import DatabaseManager
+            with DatabaseManager().get_connection() as conn:
+                ImageDetails.save_edits(conn, path, edits)
+        except Exception as e:
+            logger.error(f"Couldn't save the image's details: {e}", exc_info=True)
+
+    def closeEvent(self, event):
+        """Save window position when closing"""
+        # The details: their edits saved, the dialog closed (and remembered as open)
+        self._save_details_edits()
+        if self.details_dialog is not None:
+            self._closing = True
+            QSettings("CosmosCollection", "CosmosCollection").setValue(ImageDetails.DIALOG_SETTING, True)
+            self.details_dialog.close()
+
+        # Cancel any running plate solve
+        # Cancel any running plate solve
+        if self.plate_solve_worker and self.plate_solve_worker.isRunning():
+            self.plate_solve_worker.cancel()
+            self.plate_solve_worker.wait(1000)
+
+        # Don't block the close on a slow load
+        self._drop_image_load()
+
+        # The export dialog: a save or background change it started carries on
+        # in the background, so the file still gets written
+        if self.export_dialog is not None:
+            self.export_dialog.close()
+
+        WindowPositionManager.save_window_position(self, "ImageViewer")
+        event.accept()

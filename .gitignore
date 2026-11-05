@@ -1,7 +1,7 @@
 # Python
 __pycache__
-.py[cod]
-.so
+*.py[cod]
+*.so
 
 # PyInstaller  packaging
 dist
@@ -11,6 +11,7 @@ build
 # Virtualenv
 .env
 venv
+.venv
 
 # OS generated files
 .DS_Store

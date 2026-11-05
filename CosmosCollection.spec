@@ -40,10 +40,10 @@ a = Analysis(
         'requests',
         'urllib3',
         'keyring',
-        'BestDSOTonight',
-        'DSOVisibilityCalculator',
-        'DSOTargetList',
-        'HorizonProfile',
+        'cosmoscollection.planning.BestDSOTonight',
+        'cosmoscollection.planning.DSOVisibilityCalculator',
+        'cosmoscollection.planning.DSOTargetList',
+        'cosmoscollection.planning.HorizonProfile',
         'concurrent.futures',
     ],
     hookspath=[],
@@ -138,8 +138,8 @@ if sys.platform.startswith('linux'):
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 # Product name/version in the .exe files' details, which SignPath code
-# signing checks (see version_resource.py)
-sys.path.insert(0, SPECPATH)
+# signing checks (see build_tools/version_resource.py)
+sys.path.insert(0, os.path.join(SPECPATH, 'build_tools'))
 from version_resource import version_info
 
 def _windows_version(exe_name, description):
@@ -207,7 +207,7 @@ if sys.platform == 'darwin':
     # see build-release.yml) is what actually consolidates that into one prompt --
     # this BUNDLE() just gives it something bundle-shaped to sign.
     import re as _re
-    with open('version.py', 'r', encoding='utf-8') as _vf:
+    with open(os.path.join(SPECPATH, 'cosmoscollection', 'version.py'), 'r', encoding='utf-8') as _vf:
         _version_match = _re.search(r'_FALLBACK_VERSION = "([^"]*)"', _vf.read())
     _app_version = _version_match.group(1) if _version_match else '0.0.0'
 

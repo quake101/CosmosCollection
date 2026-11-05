@@ -55,9 +55,9 @@ a = Analysis(
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 # Product name/version in the .exe's details, which SignPath code signing
-# checks (see version_resource.py at the repo root)
+# checks (see build_tools/version_resource.py)
 repo_dir = os.path.join(SPECPATH, '..')
-sys.path.insert(0, repo_dir)
+sys.path.insert(0, os.path.join(repo_dir, 'build_tools'))
 from version_resource import version_info
 
 exe = EXE(

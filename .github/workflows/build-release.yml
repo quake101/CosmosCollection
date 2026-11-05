@@ -46,7 +46,7 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'windows-latest'
       run: |
         $tag = "${{ github.ref }}".Replace("refs/tags/", "")
-        python update_version.py $tag
+        python build_tools/update_version.py $tag
         # For the SignPath signing request, which checks the .exe files' product version
         "version=$($tag.TrimStart('v'))" >> $env:GITHUB_OUTPUT
 
@@ -55,7 +55,7 @@ jobs:
       run: |
         tag="${{ github.ref }}"
         tag="${tag#refs/tags/}"
-        python update_version.py "$tag"
+        python build_tools/update_version.py "$tag"
 
     - name: Build with PyInstaller
       run: |

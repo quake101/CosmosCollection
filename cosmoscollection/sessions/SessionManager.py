@@ -1,0 +1,4663 @@
+#!/usr/bin/env python3
+"""
+Session Manager
+Plan future observing sessions and log past ones: DSO target, date/time, location,
+equipment, and (via drag-and-drop) the FITS/XISF subs a session produced.
+"""
+
+import os
+import calendar
+import logging
+import threading
+from collections import Counter
+from datetime import datetime, date as date_cls, timedelta
+
+from PySide6.QtCore import (Qt, QDate, QDateTime, QEvent, QTime, QTimer, QPoint, QSettings, Signal, QThread,
+                            QStringListModel, QUrl)
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QPen
+from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
+                               QWidget, QPushButton, QLabel, QTableWidget,
+                               QTableWidgetItem, QGroupBox, QMessageBox,
+                               QHeaderView, QTextEdit, QDialog, QComboBox,
+                               QLineEdit, QCheckBox, QDateEdit, QTimeEdit, QMenu,
+                               QCompleter, QSplitter, QFormLayout, QRadioButton,
+                               QListWidget, QListWidgetItem, QProgressDialog,
+                               QCalendarWidget, QTabWidget, QTableView, QDateTimeEdit,
+                               QSpinBox, QDoubleSpinBox, QFileDialog, QAbstractItemView,
+                               QStyledItemDelegate)
+
+from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.catalog.DSONames import SESSION_COMMON_NAMES_SETTING, display_name, suggestion_names
+from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
+from cosmoscollection.ui.WindowLifetime import release_on_close, window_is_open
+from cosmoscollection.ui.TimeFormatHelper import format_time
+from cosmoscollection.ui.Theme import COLORS, font_px, font_size, themed_style
+from cosmoscollection.sessions import MountDetection
+from cosmoscollection.sessions import SessionFileScanner
+from cosmoscollection.sessions import SessionObservations
+
+logger = logging.getLogger(__name__)
+
+COMMON_TIMEZONES = [
+    "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
+    "America/Phoenix", "America/Anchorage", "Pacific/Honolulu", "UTC",
+    "Europe/London", "Europe/Paris", "Europe/Berlin", "Asia/Tokyo", "Australia/Sydney",
+]
+
+# Dropped subs whose mean pointing is within this of a session's coordinates are
+# treated as the same target - loose enough to absorb framing offsets.
+DROP_MATCH_MAX_SEPARATION_DEG = 1.0
+
+target_name_match = SessionObservations.target_name_match
+
+
+class LocationOverrideWidget(QWidget):
+    """Per-session location picker: defaults to the active saved location, with a
+    custom lat/lon/name/timezone entry (and map picker) for a one-off override."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.db_manager = DatabaseManager()
+        self._locations = {}
+        self._setup_ui()
+        self._populate_locations()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        combo_row = QHBoxLayout()
+        combo_row.addWidget(QLabel("Location:"))
+        self.location_combo = QComboBox()
+        self.location_combo.currentIndexChanged.connect(self._on_combo_changed)
+        combo_row.addWidget(self.location_combo, 1)
+        layout.addLayout(combo_row)
+
+        self.custom_widget = QWidget()
+        custom_layout = QVBoxLayout(self.custom_widget)
+        custom_layout.setContentsMargins(0, 0, 0, 0)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        self.name_edit = QLineEdit()
+        name_row.addWidget(self.name_edit)
+        custom_layout.addLayout(name_row)
+
+        coord_row = QHBoxLayout()
+        coord_row.addWidget(QLabel("Lat:"))
+        self.lat_edit = QLineEdit()
+        coord_row.addWidget(self.lat_edit)
+        coord_row.addWidget(QLabel("Lon:"))
+        self.lon_edit = QLineEdit()
+        coord_row.addWidget(self.lon_edit)
+        custom_layout.addLayout(coord_row)
+
+        tz_row = QHBoxLayout()
+        tz_row.addWidget(QLabel("Timezone:"))
+        self.timezone_combo = QComboBox()
+        self.timezone_combo.setEditable(True)
+        self.timezone_combo.addItems(COMMON_TIMEZONES)
+        tz_row.addWidget(self.timezone_combo)
+        map_btn = QPushButton("Pick on Map...")
+        map_btn.clicked.connect(self._pick_on_map)
+        tz_row.addWidget(map_btn)
+        custom_layout.addLayout(tz_row)
+
+        layout.addWidget(self.custom_widget)
+        self.custom_widget.setVisible(False)
+
+    def _populate_locations(self):
+        self.location_combo.blockSignals(True)
+        self.location_combo.clear()
+        self._locations = {}
+        active_index = 0
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, location_lat, location_lon, location_name, timezone, is_active
+                    FROM usersettings ORDER BY id
+                """)
+                for row in cursor.fetchall():
+                    loc_id, lat, lon, name, tz, is_active = row
+                    display = name or (f"{lat:.4f}, {lon:.4f}" if lat is not None else "Unnamed Location")
+                    if is_active:
+                        display = f"(Active) {display}"
+                    self.location_combo.addItem(display, loc_id)
+                    self._locations[loc_id] = {"lat": lat, "lon": lon, "name": name, "timezone": tz}
+                    if is_active:
+                        active_index = self.location_combo.count() - 1
+        except Exception as e:
+            logger.error(f"Error loading locations: {e}")
+
+        self.location_combo.addItem("Custom / Other Location...", -1)
+        if self.location_combo.count() > 1:
+            self.location_combo.setCurrentIndex(active_index)
+        self.location_combo.blockSignals(False)
+        self._on_combo_changed(self.location_combo.currentIndex())
+
+    def _on_combo_changed(self, _index):
+        loc_id = self.location_combo.currentData()
+        is_custom = (loc_id == -1)
+        self.custom_widget.setVisible(is_custom)
+        if is_custom and not self.timezone_combo.currentText():
+            active_tz = next((v["timezone"] for v in self._locations.values() if v.get("timezone")), None)
+            if active_tz:
+                self.timezone_combo.setCurrentText(active_tz)
+
+    def _pick_on_map(self):
+        from cosmoscollection.ui.MapLocationPicker import MapLocationPickerDialog
+        try:
+            lat0 = float(self.lat_edit.text()) if self.lat_edit.text().strip() else 40.7128
+            lon0 = float(self.lon_edit.text()) if self.lon_edit.text().strip() else -74.0060
+        except ValueError:
+            lat0, lon0 = 40.7128, -74.0060
+
+        dialog = MapLocationPickerDialog(lat0, lon0, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            result = dialog.get_selected_coordinates()
+            if result:
+                lat, lon, name = result
+                self.lat_edit.setText(f"{lat:.6f}")
+                self.lon_edit.setText(f"{lon:.6f}")
+                if name:
+                    self.name_edit.setText(name)
+
+    def get_location(self):
+        """Returns (lat, lon, name, timezone, source)."""
+        loc_id = self.location_combo.currentData()
+        if loc_id == -1:
+            try:
+                lat = float(self.lat_edit.text()) if self.lat_edit.text().strip() else None
+            except ValueError:
+                lat = None
+            try:
+                lon = float(self.lon_edit.text()) if self.lon_edit.text().strip() else None
+            except ValueError:
+                lon = None
+            return (lat, lon, self.name_edit.text().strip() or None,
+                    self.timezone_combo.currentText().strip() or None, "custom")
+
+        loc = self._locations.get(loc_id)
+        if not loc:
+            return (None, None, None, None, "active")
+        current_text = self.location_combo.itemText(self.location_combo.currentIndex())
+        source = "active" if current_text.startswith("(Active)") else "saved"
+        return (loc["lat"], loc["lon"], loc["name"], loc["timezone"], source)
+
+    def set_location(self, lat, lon, name, timezone, source):
+        if source != "custom" and lat is not None and lon is not None:
+            for loc_id, loc in self._locations.items():
+                if loc["lat"] is None or loc["lon"] is None:
+                    continue
+                if abs(loc["lat"] - lat) < 0.0001 and abs(loc["lon"] - lon) < 0.0001:
+                    index = self.location_combo.findData(loc_id)
+                    if index >= 0:
+                        self.location_combo.setCurrentIndex(index)
+                        return
+
+        for i in range(self.location_combo.count()):
+            if self.location_combo.itemData(i) == -1:
+                self.location_combo.setCurrentIndex(i)
+                break
+        self.lat_edit.setText(f"{lat:.6f}" if lat is not None else "")
+        self.lon_edit.setText(f"{lon:.6f}" if lon is not None else "")
+        self.name_edit.setText(name or "")
+        if timezone:
+            self.timezone_combo.setCurrentText(timezone)
+
+
+def _rollback(db_manager):
+    try:
+        with db_manager.get_connection() as conn:
+            conn.rollback()
+    except Exception as e:
+        logger.error(f"Error rolling back: {e}")
+
+
+# Sessions still to be imaged - listed above finished ones
+OPEN_STATUSES = ("Planned", "In Progress")
+
+
+class SortItem(QTableWidgetItem):
+    """A table cell that sorts by a number rather than its text ('10.5 h' after
+    '2.0 h'), and within its group: groups keep their order whichever way a
+    column is sorted (open sessions stay above finished ones)."""
+    SORT_ROLE = Qt.UserRole + 1
+    GROUP_ROLE = Qt.UserRole + 2
+
+    def __init__(self, text, sort_key=None, align=None, group=None):
+        super().__init__(text)
+        if sort_key is not None:
+            self.setData(self.SORT_ROLE, sort_key)
+        if group is not None:
+            self.setData(self.GROUP_ROLE, group)
+        if align is not None:
+            self.setTextAlignment(align)
+
+    def __lt__(self, other):
+        group, other_group = self.data(self.GROUP_ROLE), other.data(self.GROUP_ROLE)
+        if group is not None and other_group is not None and group != other_group:
+            table = self.tableWidget()
+            # Qt sorts descending by asking other < self - turn that around to keep groups in place
+            if table is not None and table.horizontalHeader().sortIndicatorOrder() == Qt.DescendingOrder:
+                return group > other_group
+            return group < other_group
+        key, other_key = self.data(self.SORT_ROLE), other.data(self.SORT_ROLE)
+        if key is not None and other_key is not None:
+            try:
+                return key < other_key
+            except TypeError:
+                pass
+        # Not super().__lt__(): PySide sends that back to this override
+        return self.text() < other.text()
+
+
+class GroupDividerDelegate(QStyledItemDelegate):
+    """Draws a line above the first row of a new group (SortItem's), so open and
+    finished sessions read as two blocks. Worked out as it paints, so it follows
+    sorting and filtering - with only one group showing there's no line."""
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        group = index.data(SortItem.GROUP_ROLE)
+        table = self.parent()
+        above = index.row() - 1
+        while above >= 0 and table.isRowHidden(above):
+            above -= 1
+        if group is None or above < 0 or index.siblingAtRow(above).data(SortItem.GROUP_ROLE) == group:
+            return
+        painter.save()
+        painter.setPen(QPen(QColor(COLORS['accent']), 2))
+        y = option.rect.top() + 1
+        painter.drawLine(option.rect.left(), y, option.rect.right(), y)
+        painter.restore()
+
+
+class SessionFormWidget(QWidget):
+    """The session's own fields (DSO, schedule, location, equipment, notes), shared
+    by AddEditSessionDialog and SessionDetailsDialog's Overview tab. write() never
+    commits, so a caller can save it in the same transaction as other changes."""
+
+    def __init__(self, session_data=None, target_data=None, parsed_metadata=None,
+                 initial_status="Planned", parent=None):
+        super().__init__(parent)
+
+        self.db_manager = DatabaseManager()
+        self.is_edit_mode = False
+        self.session_id = None
+        self.saved_session_data = None
+        self._dso_cache = {}
+        self._ra_deg = None
+        self._dec_deg = None
+        self._target_id = None
+        self._scanned_aggregate = None
+        self._existing_aggregate = None
+
+        self._search_timer = QTimer()
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self._do_dso_search)
+        self._pending_search_text = ""
+
+        self._setup_ui()
+        self.status_combo.setCurrentText(initial_status)
+
+        if target_data:
+            self._populate_from_target_data(target_data)
+        if parsed_metadata:
+            self._populate_from_parsed_metadata(parsed_metadata)
+        if session_data:
+            self._populate_from_session_data(session_data)
+
+    def _setup_ui(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        schedule_group = QGroupBox("DSO && Schedule")
+        schedule_layout = QVBoxLayout()
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("DSO Name:"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("e.g., M 31, NGC 7000, IC 1396")
+        self._completer_model = QStringListModel()
+        self._completer = QCompleter()
+        self._completer.setModel(self._completer_model)
+        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._completer.setFilterMode(Qt.MatchContains)
+        self.name_edit.setCompleter(self._completer)
+        self._completer.activated.connect(self._on_dso_selected)
+        self.name_edit.textChanged.connect(self._on_name_text_changed)
+        name_row.addWidget(self.name_edit)
+        # For a session made from scanned files: "M 31" or "M 31 (Andromeda Galaxy)"
+        self.common_name_check = QCheckBox("Add common name")
+        self.common_name_check.setToolTip('Name the session like "M 31 (Andromeda Galaxy)" rather than "M 31". '
+                                          'Remembered for the next scan and the import wizard.')
+        self.common_name_check.setVisible(False)
+        self.common_name_check.toggled.connect(self._on_common_name_toggled)
+        self._scanned_names = None  # (plain, with common name) for the check box
+        name_row.addWidget(self.common_name_check)
+        schedule_layout.addLayout(name_row)
+
+        status_row = QHBoxLayout()
+        status_row.addWidget(QLabel("Status:"))
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(["Planned", "In Progress", "Completed", "Cancelled"])
+        status_row.addWidget(self.status_combo)
+        status_row.addWidget(QLabel("Date:"))
+        self.date_edit = QDateEdit(QDate.currentDate())
+        self.date_edit.setCalendarPopup(True)
+        status_row.addWidget(self.date_edit)
+        schedule_layout.addLayout(status_row)
+
+        time_row = QHBoxLayout()
+        self.time_checkbox = QCheckBox("Specify start/end time")
+        self.time_checkbox.toggled.connect(self._on_time_checkbox_toggled)
+        time_row.addWidget(self.time_checkbox)
+        time_row.addWidget(QLabel("Start:"))
+        self.start_time_edit = QTimeEdit(QTime(20, 0))
+        self.start_time_edit.setEnabled(False)
+        time_row.addWidget(self.start_time_edit)
+        time_row.addWidget(QLabel("End:"))
+        self.end_time_edit = QTimeEdit(QTime(23, 0))
+        self.end_time_edit.setEnabled(False)
+        time_row.addWidget(self.end_time_edit)
+        schedule_layout.addLayout(time_row)
+
+        schedule_group.setLayout(schedule_layout)
+        layout.addWidget(schedule_group)
+
+        location_group = QGroupBox("Location")
+        location_layout = QVBoxLayout()
+        self.location_widget = LocationOverrideWidget()
+        location_layout.addWidget(self.location_widget)
+        location_group.setLayout(location_layout)
+        layout.addWidget(location_group)
+
+        equipment_group = QGroupBox("Equipment")
+        equipment_layout = QVBoxLayout()
+
+        telescope_row = QHBoxLayout()
+        telescope_row.addWidget(QLabel("Telescope:"))
+        self.telescope_combo = QComboBox()
+        self._populate_telescope_combo()
+        telescope_row.addWidget(self.telescope_combo, 1)
+        equipment_layout.addLayout(telescope_row)
+
+        camera_row = QHBoxLayout()
+        camera_row.addWidget(QLabel("Camera:"))
+        # The user's cameras - or any name typed (saving asks about one that isn't in Equipment)
+        self.camera_combo = QComboBox()
+        self.camera_combo.setEditable(True)
+        self.camera_combo.setInsertPolicy(QComboBox.NoInsert)
+        self._populate_camera_combo()
+        camera_row.addWidget(self.camera_combo, 1)
+        equipment_layout.addLayout(camera_row)
+
+        mount_row = QHBoxLayout()
+        mount_row.addWidget(QLabel("Mount:"))
+        # Detected from the lights (each night's header, or how far the field turned) - or chosen here
+        self.mount_combo = QComboBox()
+        self.mount_combo.addItem("Detected", None)
+        self.mount_combo.addItem(MountDetection.EQUATORIAL, MountDetection.EQUATORIAL)
+        self.mount_combo.addItem(MountDetection.ALT_AZ, MountDetection.ALT_AZ)
+        self.mount_combo.setToolTip("Equatorial or alt-az: detected from the light frames (a Seestar's header, or "
+                                    "how far the field turned during each night), or choose it yourself.")
+        mount_row.addWidget(self.mount_combo, 1)
+        equipment_layout.addLayout(mount_row)
+        self.set_detected_mount(None, "")
+
+        filters_row = QHBoxLayout()
+        filters_row.addWidget(QLabel("Filters:"))
+        self.filters_edit = QLineEdit()
+        self.filters_edit.setPlaceholderText("e.g., Ha, OIII, SII")
+        filters_row.addWidget(self.filters_edit)
+        equipment_layout.addLayout(filters_row)
+
+        equipment_group.setLayout(equipment_layout)
+        layout.addWidget(equipment_group)
+
+        notes_group = QGroupBox("Notes")
+        notes_layout = QVBoxLayout()
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setMaximumHeight(80)
+        notes_layout.addWidget(self.notes_edit)
+        notes_group.setLayout(notes_layout)
+        layout.addWidget(notes_group)
+        layout.addStretch()
+
+        self.setLayout(layout)
+
+    def _on_time_checkbox_toggled(self, checked):
+        self.start_time_edit.setEnabled(checked)
+        self.end_time_edit.setEnabled(checked)
+
+    def set_detected_mount(self, mount, how):
+        """What the Mount choice's first item says - MountDetection.summarize() without the override."""
+        if how == "equipment":
+            text = f"Detected (none yet; the telescope's Equipment says {mount})"
+        elif mount:
+            text = f"Detected ({mount})"
+        else:
+            text = "Detected (none yet)"
+        self.mount_combo.setItemText(0, text)
+
+    def _populate_telescope_combo(self):
+        self.telescope_combo.clear()
+        self.telescope_combo.addItem("Any", None)
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, name, aperture, focal_length
+                    FROM usertelescopes WHERE is_active = 1 ORDER BY name
+                """)
+                for tel_id, name, aperture, focal_length in cursor.fetchall():
+                    if aperture and focal_length and aperture > 0:
+                        display_text = f"{name} ({int(aperture)}mm f/{focal_length / aperture:.1f})"
+                    elif aperture:
+                        display_text = f"{name} ({int(aperture)}mm)"
+                    else:
+                        display_text = name
+                    self.telescope_combo.addItem(display_text, tel_id)
+        except Exception as e:
+            logger.error(f"Error loading telescopes: {e}")
+
+    def _populate_camera_combo(self):
+        self.camera_combo.clear()
+        try:
+            with self.db_manager.get_connection() as conn:
+                for (name,) in conn.execute("SELECT name FROM userequipment WHERE equipment_type = 'camera' "
+                                            "AND COALESCE(is_active, 1) = 1 ORDER BY name COLLATE NOCASE"):
+                    self.camera_combo.addItem(name)
+        except Exception as e:
+            logger.error(f"Error loading cameras: {e}")
+        self.camera_combo.setCurrentIndex(-1)
+        self.camera_combo.lineEdit().clear()
+
+    def _equipment_info(self):
+        """The user's equipment and the names matched to it (LibraryScanner.EquipmentInfo)."""
+        from cosmoscollection.sessions import LibraryScanner
+        try:
+            with self.db_manager.get_connection() as conn:
+                return LibraryScanner.load_equipment_info(conn)
+        except Exception as e:
+            logger.error(f"Error loading the equipment matches: {e}")
+            return LibraryScanner.EquipmentInfo()
+
+    def _on_name_text_changed(self, text):
+        text = text.strip()
+        if len(text) < 2:
+            self._completer_model.setStringList([])
+            self._dso_cache.clear()
+            return
+        self._pending_search_text = text
+        self._search_timer.start()
+
+    def _do_dso_search(self):
+        if len(self._pending_search_text) < 2:
+            return
+        self._search_dso_catalog(self._pending_search_text)
+
+    def _search_dso_catalog(self, text):
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                catalogue = None
+                designation_part = None
+                text_upper = text.upper().strip()
+                for prefix in ("NGC", "IC", "M"):
+                    if text_upper.startswith(prefix):
+                        remainder = text_upper[len(prefix):]
+                        if remainder == "" or remainder[0] in (" ", "-") or remainder[0].isdigit():
+                            catalogue = prefix
+                            designation_part = remainder.strip()
+                            break
+
+                if catalogue and designation_part is not None:
+                    cursor.execute("""
+                        SELECT c.dsodetailid, c.catalogue, c.designation, d.ra, d.dec
+                        FROM cataloguenr c
+                        JOIN dsodetail d ON d.id = c.dsodetailid
+                        WHERE c.catalogue = ? AND c.designation LIKE ?
+                        ORDER BY CAST(c.designation AS INTEGER), c.designation
+                        LIMIT 20
+                    """, (catalogue, designation_part + "%"))
+                else:
+                    cursor.execute("""
+                        SELECT c.dsodetailid, c.catalogue, c.designation, d.ra, d.dec
+                        FROM cataloguenr c
+                        JOIN dsodetail d ON d.id = c.dsodetailid
+                        WHERE c.catalogue || ' ' || c.designation LIKE ?
+                        ORDER BY c.catalogue, CAST(c.designation AS INTEGER), c.designation
+                        LIMIT 20
+                    """, ("%" + text + "%",))
+
+                self._dso_cache.clear()
+                names = []
+                # One suggestion per object, with its common name; a common
+                # name typed in ("Andromeda") finds the object too
+                results = [tuple(row) for row in cursor.fetchall()]
+                position = {str(row[0]): row[3:5] for row in results}
+                for name, dso in suggestion_names(conn, [row[:3] for row in results], text):
+                    names.append(name)
+                    self._dso_cache[name] = {"ra": position[dso][0], "dec": position[dso][1]}
+                self._completer_model.setStringList(names)
+        except Exception as e:
+            logger.error(f"Error searching DSO catalog: {e}")
+
+    def _on_dso_selected(self, text):
+        data = self._dso_cache.get(text)
+        if not data:
+            return
+        if data.get("ra") is not None:
+            self._ra_deg = round(data["ra"], 6)
+        if data.get("dec") is not None:
+            self._dec_deg = round(data["dec"], 6)
+
+    def _populate_from_target_data(self, target_data):
+        # A new session is named with its common name, "M 31 (Andromeda Galaxy)"
+        self.name_edit.setText(display_name(target_data.get("name", "") or "", target_data.get("dsodetailid"),
+                                            target_data.get("designations")))
+        self._ra_deg = target_data.get("ra_deg")
+        self._dec_deg = target_data.get("dec_deg")
+        self._target_id = target_data.get("id")
+        from cosmoscollection.equipment.EquipmentManager import select_telescope
+        select_telescope(self.telescope_combo, self.db_manager, target_data.get("telescope_id"))
+
+    def _on_common_name_toggled(self, checked):
+        """Switch the scanned name to/from its common-name form (unless it's been
+        retyped) and remember the choice"""
+        QSettings("CosmosCollection", "CosmosCollection").setValue(SESSION_COMMON_NAMES_SETTING, checked)
+        if self._scanned_names and self.name_edit.text().strip() in self._scanned_names:
+            self.name_edit.setText(self._scanned_names[1] if checked else self._scanned_names[0])
+
+    def _populate_from_parsed_metadata(self, summary):
+        self._scanned_aggregate = summary
+        dso_name = summary.get("dso_name")
+        if dso_name:
+            named = display_name(dso_name)
+            if named != dso_name:
+                # Offer the common name, as last chosen
+                self._scanned_names = (dso_name, named)
+                self.common_name_check.blockSignals(True)
+                self.common_name_check.setChecked(QSettings("CosmosCollection", "CosmosCollection").value(
+                    SESSION_COMMON_NAMES_SETTING, True, type=bool))
+                self.common_name_check.blockSignals(False)
+                self.common_name_check.setVisible(True)
+                dso_name = named if self.common_name_check.isChecked() else dso_name
+            self.name_edit.setText(dso_name)
+        # Where the subs were pointed (their headers' mean RA/Dec), so later drops
+        # of this target can be matched to the session by position too
+        if summary.get("ra_deg") is not None and summary.get("dec_deg") is not None:
+            self._ra_deg = round(summary["ra_deg"], 6)
+            self._dec_deg = round(summary["dec_deg"], 6)
+        # The files' camera and telescope as the user's equipment (through their
+        # matches) - the telescope only when none is chosen yet
+        camera, telescope = summary.get("camera"), summary.get("telescope")
+        if camera or telescope:
+            from cosmoscollection.equipment import EquipmentMapper
+            from cosmoscollection.equipment.EquipmentManager import select_telescope
+            info = self._equipment_info()
+            if camera:
+                self.camera_combo.setCurrentText(EquipmentMapper.display_name(EquipmentMapper.CAMERA, camera, info))
+            telescope_id = EquipmentMapper.resolve(EquipmentMapper.TELESCOPE, telescope, info)
+            if telescope_id is not None and self.telescope_combo.currentData() is None:
+                select_telescope(self.telescope_combo, self.db_manager, telescope_id)
+        filters = summary.get("filters_used") or []
+        if filters:
+            self.filters_edit.setText(", ".join(filters))
+        if summary.get("mount_detected"):
+            self.set_detected_mount(*MountDetection.summarize(summary["mount_detected"]))
+        earliest = summary.get("earliest_sub_date")
+        if earliest:
+            try:
+                dt = datetime.fromisoformat(str(earliest).replace('Z', '+00:00'))
+                self.date_edit.setDate(QDate(dt.year, dt.month, dt.day))
+            except ValueError:
+                pass
+
+    def _populate_from_session_data(self, session_data, edit_mode=True):
+        if edit_mode:
+            self.is_edit_mode = True
+            self.session_id = session_data.get("id")
+            self._existing_aggregate = {
+                "sub_count": session_data.get("sub_count", 0),
+                "integration_seconds": session_data.get("integration_seconds", 0),
+                "earliest_sub_date": session_data.get("earliest_sub_date"),
+                "latest_sub_date": session_data.get("latest_sub_date"),
+            }
+
+        self.name_edit.setText(session_data.get("dso_name", "") or "")
+        self.status_combo.setCurrentText(session_data.get("status") or "Planned")
+        self._ra_deg = session_data.get("ra_deg")
+        self._dec_deg = session_data.get("dec_deg")
+        self._target_id = session_data.get("target_id")
+
+        session_date = session_data.get("session_date")
+        if session_date:
+            try:
+                y, m, d = (int(p) for p in session_date.split("-"))
+                self.date_edit.setDate(QDate(y, m, d))
+            except Exception:
+                pass
+
+        start_time = session_data.get("start_time")
+        end_time = session_data.get("end_time")
+        if start_time or end_time:
+            self.time_checkbox.setChecked(True)
+            if start_time:
+                h, mnt = (int(p) for p in start_time.split(":")[:2])
+                self.start_time_edit.setTime(QTime(h, mnt))
+            if end_time:
+                h, mnt = (int(p) for p in end_time.split(":")[:2])
+                self.end_time_edit.setTime(QTime(h, mnt))
+
+        from cosmoscollection.equipment.EquipmentManager import select_telescope
+        select_telescope(self.telescope_combo, self.db_manager, session_data.get("telescope_id"))
+
+        self.camera_combo.setCurrentText(session_data.get("camera") or "")
+        self.filters_edit.setText(session_data.get("filters_used") or "")
+        self.notes_edit.setPlainText(session_data.get("notes") or "")
+        if edit_mode:
+            self.set_detected_mount(*MountDetection.summarize(session_data.get("mount_detected"), None,
+                                                              session_data.get("telescope_mount")))
+        index = self.mount_combo.findData(session_data.get("mount_override"))
+        self.mount_combo.setCurrentIndex(max(index, 0))
+
+        self.location_widget.set_location(
+            session_data.get("location_lat"), session_data.get("location_lon"),
+            session_data.get("location_name"), session_data.get("location_timezone"),
+            session_data.get("location_source") or "active",
+        )
+
+    def load_as_duplicate(self, session_data):
+        """Pre-fill this (new, non-edit) dialog from an existing session's fields."""
+        self._populate_from_session_data(session_data, edit_mode=False)
+        self.status_combo.setCurrentText("Planned")
+
+    def _resolve_target_id_by_name(self, name):
+        """Auto-link to a Target List entry whose name matches the session's DSO
+        name, so a target doesn't have to be planned via "Plan a Session" to get
+        linked - typing/scanning in a name that's already on the target list is
+        enough. Matches loosely since FITS OBJECT headers and target list names
+        often differ in spacing (e.g. "M31" vs "M 31"), and target list names often
+        carry a common name ("vdB 152 (Wolf's Cave Nebula)"): a case/whitespace-only
+        match wins, then one ignoring parenthetical names and punctuation."""
+        if not (name or "").strip():
+            return None
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, name FROM usertargetlist")
+                targets = cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error resolving target list link for '{name}': {e}")
+            return None
+        for wanted in (2, 1):
+            for target_id, target_name in targets:
+                if target_name_match(name, target_name) == wanted:
+                    return target_id
+        return None
+
+    def validate(self):
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Validation Error", "DSO name is required.")
+            return False
+        # The camera, linked to the user's Equipment - asking about one that isn't in it
+        from cosmoscollection.equipment.EquipmentManager import choose_equipment
+        return choose_equipment(self, None, self.camera_combo.currentText(), record="session") is not None
+
+    def collect(self):
+        """The form's values as a usersessions row dict (not validated)."""
+        from cosmoscollection.equipment import EquipmentMapper
+        name = self.name_edit.text().strip()
+        camera = self.camera_combo.currentText().strip()
+        lat, lon, loc_name, tz, source = self.location_widget.get_location()
+        has_times = self.time_checkbox.isChecked()
+        aggregate = self._scanned_aggregate or self._existing_aggregate or {}
+        resolved_target_id = self._resolve_target_id_by_name(name)
+        return {
+            "target_id": resolved_target_id if resolved_target_id is not None else self._target_id,
+            "dso_name": name,
+            "ra_deg": self._ra_deg,
+            "dec_deg": self._dec_deg,
+            "status": self.status_combo.currentText(),
+            "session_date": self.date_edit.date().toString("yyyy-MM-dd"),
+            "start_time": self.start_time_edit.time().toString("HH:mm") if has_times else None,
+            "end_time": self.end_time_edit.time().toString("HH:mm") if has_times else None,
+            "location_lat": lat,
+            "location_lon": lon,
+            "location_name": loc_name,
+            "location_timezone": tz,
+            "location_source": source,
+            "telescope_id": self.telescope_combo.currentData(),
+            # The user's camera this names (its own name, or matched to it) - else just the name
+            "camera_id": EquipmentMapper.resolve(EquipmentMapper.CAMERA, camera, self._equipment_info())
+            if camera else None,
+            "camera": camera,
+            "filters_used": self.filters_edit.text().strip(),
+            "mount_override": self.mount_combo.currentData(),
+            "sub_count": aggregate.get("sub_count", 0),
+            "integration_seconds": aggregate.get("integration_seconds", 0),
+            "earliest_sub_date": aggregate.get("earliest_sub_date"),
+            "latest_sub_date": aggregate.get("latest_sub_date"),
+            "notes": self.notes_edit.toPlainText().strip(),
+            "modified_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def snapshot(self):
+        """Comparable form state, for detecting unsaved edits."""
+        data = self.collect()
+        data.pop("modified_date", None)
+        return data
+
+    def write(self, conn):
+        """Insert or update the session row. Does not commit."""
+        data = self.collect()
+        cursor = conn.cursor()
+        if self.is_edit_mode and self.session_id:
+            cursor.execute("""
+                UPDATE usersessions SET
+                    target_id=?, dso_name=?, ra_deg=?, dec_deg=?, status=?, session_date=?,
+                    start_time=?, end_time=?, location_lat=?, location_lon=?, location_name=?,
+                    location_timezone=?, location_source=?, telescope_id=?, camera_id=?, camera=?, filters_used=?,
+                    mount_override=?, sub_count=?, integration_seconds=?, earliest_sub_date=?, latest_sub_date=?,
+                    notes=?, modified_date=?
+                WHERE id=?
+            """, (
+                data["target_id"], data["dso_name"], data["ra_deg"], data["dec_deg"], data["status"],
+                data["session_date"], data["start_time"], data["end_time"], data["location_lat"],
+                data["location_lon"], data["location_name"], data["location_timezone"],
+                data["location_source"], data["telescope_id"], data["camera_id"], data["camera"], data["filters_used"],
+                data["mount_override"], data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
+                data["latest_sub_date"], data["notes"], data["modified_date"], self.session_id,
+            ))
+        else:
+            cursor.execute("""
+                INSERT INTO usersessions (
+                    target_id, dso_name, ra_deg, dec_deg, status, session_date, start_time, end_time,
+                    location_lat, location_lon, location_name, location_timezone, location_source,
+                    telescope_id, camera_id, camera, filters_used, mount_override, sub_count, integration_seconds,
+                    earliest_sub_date, latest_sub_date, notes, modified_date
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                data["target_id"], data["dso_name"], data["ra_deg"], data["dec_deg"], data["status"],
+                data["session_date"], data["start_time"], data["end_time"], data["location_lat"],
+                data["location_lon"], data["location_name"], data["location_timezone"],
+                data["location_source"], data["telescope_id"], data["camera_id"], data["camera"], data["filters_used"],
+                data["mount_override"], data["sub_count"], data["integration_seconds"], data["earliest_sub_date"],
+                data["latest_sub_date"], data["notes"], data["modified_date"],
+            ))
+            self.session_id = cursor.lastrowid
+            self.is_edit_mode = True
+        self.saved_session_data = data
+        return data
+
+
+class AddEditSessionDialog(WindowPositionMixin, QDialog):
+    """Add dialog for a planned or logged session (also used to duplicate one)."""
+
+    WINDOW_POSITION_KEY = "AddEditSessionDialog"
+
+    def __init__(self, session_data=None, target_data=None, parsed_metadata=None,
+                 initial_status="Planned", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Session" if session_data else "New Session")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setModal(True)
+        self.resize(520, 680)  # default size the first time this dialog is ever opened
+
+        self.db_manager = DatabaseManager()
+        self.form = SessionFormWidget(session_data=session_data, target_data=target_data,
+                                      parsed_metadata=parsed_metadata, initial_status=initial_status)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.form)
+
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons_layout.addWidget(cancel_btn)
+        self.save_btn = QPushButton("Save Changes" if session_data else "Save Session")
+        self.save_btn.setDefault(True)
+        self.save_btn.clicked.connect(self._save_session)
+        buttons_layout.addWidget(self.save_btn)
+        layout.addLayout(buttons_layout)
+
+        self.setup_window_position()
+
+    @property
+    def session_id(self):
+        return self.form.session_id
+
+    @property
+    def saved_session_data(self):
+        return self.form.saved_session_data
+
+    def load_as_duplicate(self, session_data):
+        self.form.load_as_duplicate(session_data)
+
+    def _save_session(self):
+        if not self.form.validate():
+            return
+        try:
+            with self.db_manager.get_connection() as conn:
+                self.form.write(conn)
+                conn.commit()
+            self.accept()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error saving session: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save session: {e}")
+
+
+class DropMatchDialog(WindowPositionMixin, QDialog):
+    """Always-shown confirmation for drag-and-dropped FITS/XISF metadata: create a
+    new session or attach to an existing one - never auto-attached silently."""
+
+    WINDOW_POSITION_KEY = "SessionDropMatchDialog"
+
+    def __init__(self, summary, db_manager, mounts=None, parent=None):
+        super().__init__(parent)
+        self.summary = summary
+        self.db_manager = db_manager
+        self.mounts = mounts or []      # Each night's MountDetection.NightMount
+        self.summary["mount_detected"] = [m.mount for m in self.mounts]
+        self.result_session_id = None
+        self.setWindowTitle("Attach Scanned Files")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setModal(True)
+        self.resize(520, 480)  # default size the first time this dialog is ever opened
+        try:
+            with self.db_manager.get_connection() as conn:
+                self._already_attached = SessionObservations.count_already_attached(conn, summary.get("files", []))
+        except Exception as e:
+            logger.error(f"Error checking for already-attached files: {e}")
+            self._already_attached = Counter()
+        self._already_attached_total = sum(self._already_attached.values())
+        self._setup_ui()
+        self._load_existing_sessions()
+        self.setup_window_position()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        summary_group = QGroupBox("Scanned Files")
+        form = QFormLayout()
+        frame_counts = self.summary.get("frame_type_counts", {})
+        counts_text = ", ".join(f"{v} {k}" for k, v in frame_counts.items()) or "0 files"
+        form.addRow("DSO Name:", QLabel(self.summary.get("dso_name") or "(unknown)"))
+        form.addRow("Coordinates:", QLabel(self._format_coordinates()))
+        form.addRow("Date Range:", QLabel(self._format_date_range()))
+        form.addRow("Files:", QLabel(f"{self.summary.get('sub_count', 0)} ({counts_text})"))
+        form.addRow("Integration Time:", QLabel(self._format_integration()))
+        form.addRow("Camera:", QLabel(self.summary.get("camera") or "(unknown)"))
+        form.addRow("Telescope:", QLabel(self.summary.get("telescope") or "(unknown)"))
+        if self.mounts:
+            mount_label = QLabel(MountDetection.count_text([m.mount for m in self.mounts]))
+            mount_label.setToolTip("\n".join(f"{m.night:%b} {m.night.day}: {m.mount or 'Unknown'} - {m.evidence}"
+                                             for m in sorted(self.mounts, key=lambda m: m.night)))
+            form.addRow("Mount:", mount_label)
+        form.addRow("Filters:", QLabel(", ".join(self.summary.get("filters_used", [])) or "(none)"))
+        if self._already_attached_total:
+            already_label = QLabel(
+                f"{self._already_attached_total} file(s) already belong to a session and will be skipped:\n"
+                + self._already_attached_text()
+            )
+            already_label.setWordWrap(True)
+            themed_style(already_label, lambda: f"color: {COLORS['warning']};")
+            form.addRow("Already Attached:", already_label)
+        summary_group.setLayout(form)
+        layout.addWidget(summary_group)
+
+        attach_group = QGroupBox("Attach to")
+        attach_layout = QVBoxLayout()
+        self.create_radio = QRadioButton("Create New Session")
+        self.create_radio.setChecked(True)
+        self.existing_radio = QRadioButton("Add to Existing Session")
+        attach_layout.addWidget(self.create_radio)
+        attach_layout.addWidget(self.existing_radio)
+
+        self.sessions_list = QListWidget()
+        self.sessions_list.setEnabled(False)
+        attach_layout.addWidget(self.sessions_list)
+        self.create_radio.toggled.connect(lambda checked: self.sessions_list.setEnabled(not checked))
+
+        attach_group.setLayout(attach_layout)
+        layout.addWidget(attach_group)
+
+        buttons_row = QHBoxLayout()
+        buttons_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons_row.addWidget(cancel_btn)
+        ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self._on_confirm)
+        buttons_row.addWidget(ok_btn)
+        layout.addLayout(buttons_row)
+
+    def _format_date_range(self):
+        earliest = self.summary.get("earliest_sub_date")
+        latest = self.summary.get("latest_sub_date")
+        if not earliest:
+            return "(unknown)"
+        if latest and latest[:10] != earliest[:10]:
+            return f"{earliest[:10]} to {latest[:10]}"
+        return earliest[:10]
+
+    def _format_integration(self):
+        seconds = self.summary.get("integration_seconds", 0)
+        return f"{seconds / 3600.0:.2f} h ({int(seconds)} s)"
+
+    def _format_coordinates(self):
+        ra, dec = self.summary.get("ra_deg"), self.summary.get("dec_deg")
+        if ra is None or dec is None:
+            return "(unknown)"
+        return f"RA {ra:.3f}°, Dec {dec:+.3f}°"
+
+    def _match_score(self, dso_name, ra_deg, dec_deg):
+        """How strongly a session looks like the scanned subs' target: 2 = name and
+        pointing agree, 1 = either does, 0 = neither. A session's dso_name is free
+        text ('Sh2 129 (Squid Nebula)') while OBJECT is whatever the capture app
+        wrote ('SH2 129'), so pointing catches what name normalization can't."""
+        normalized_dso = SessionFileScanner.normalize_object_name(self.summary.get("dso_name"))
+        name_match = bool(normalized_dso) and SessionFileScanner.normalize_object_name(dso_name) == normalized_dso
+        coord_match = False
+        scan_ra, scan_dec = self.summary.get("ra_deg"), self.summary.get("dec_deg")
+        if None not in (scan_ra, scan_dec, ra_deg, dec_deg):
+            separation = SessionFileScanner.angular_separation_deg(scan_ra, scan_dec, ra_deg, dec_deg)
+            coord_match = separation <= DROP_MATCH_MAX_SEPARATION_DEG
+        return int(name_match) + int(coord_match)
+
+    # Sessions the dropped subs can be suggested for - a Planned one is promoted
+    # to In Progress when files are attached
+    OPEN_STATUSES = OPEN_STATUSES
+
+    def _taken_on(self, session_date):
+        """True when the subs could be from the night a session is dated. A
+        session's date is the local evening, while DATE-OBS is UTC - after
+        midnight UTC (evening in the Americas) the subs carry the next day."""
+        earliest = self.summary.get("earliest_sub_date")
+        latest = self.summary.get("latest_sub_date") or earliest
+        if not earliest or not session_date:
+            return False
+        try:
+            first = date_cls.fromisoformat(earliest[:10]) - timedelta(days=1)
+            last = date_cls.fromisoformat(latest[:10])
+            return first <= date_cls.fromisoformat(str(session_date)[:10]) <= last
+        except ValueError:
+            return False
+
+    def _load_existing_sessions(self):
+        rows = []
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, dso_name, status, session_date, ra_deg, dec_deg FROM usersessions
+                    ORDER BY session_date DESC, id DESC
+                """)
+                rows = cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error loading sessions for drop match: {e}")
+
+        # Matching sessions float to the top - open ones (Planned / In Progress)
+        # first, then one dated the night these subs were taken, then ongoing over
+        # planned, then strongest match. Everything else keeps its newest-first
+        # order below them (sorted() is stable).
+        def rank(entry):
+            (_id, _name, status, session_date, _ra, _dec), score = entry
+            return (score == 0, status not in self.OPEN_STATUSES, not self._taken_on(session_date),
+                    status != "In Progress", -score)
+        scored = sorted(((row, self._match_score(row[1], row[4], row[5])) for row in rows), key=rank)
+
+        suggested_item = None
+        for (session_id, dso_name, status, session_date, _ra, _dec), score in scored:
+            label = f"{dso_name} — {status} — {session_date}"
+            # The first open match is the suggestion: the session planned for this
+            # night, or the one already in progress for this target
+            suggest = score > 0 and status in self.OPEN_STATUSES and suggested_item is None
+            if suggest:
+                reason = ("planned for this night" if status == "Planned" and self._taken_on(session_date)
+                          else "ongoing" if status == "In Progress" else "planned")
+                label += f"  ({reason} — suggested match)"
+            elif score > 0:
+                label += "  (same target)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, session_id)
+            self.sessions_list.addItem(item)
+            if suggest:
+                suggested_item = item
+
+        # Still always requires the user to click OK - this only changes the
+        # dialog's *default* selection so continuing a planned or ongoing session
+        # for the same DSO is the path of least resistance, per the "always
+        # confirm, never silently auto-attach" rule.
+        if suggested_item is not None:
+            self.sessions_list.setCurrentItem(suggested_item)
+            self.existing_radio.setChecked(True)
+
+    def _on_confirm(self):
+        if self.create_radio.isChecked():
+            files = self.summary.get("files", [])
+            if files and self._already_attached_total >= len(files):
+                QMessageBox.information(
+                    self, "Already Attached",
+                    "Every scanned file already belongs to an existing session, so a new session "
+                    "would have no data.\n\n" + self._already_attached_text(),
+                )
+                return
+            dialog = AddEditSessionDialog(parsed_metadata=self.summary, initial_status="In Progress", parent=self)
+            if dialog.exec() == QDialog.Accepted and dialog.session_id:
+                if self._attach_to(dialog.session_id):
+                    self.accept()
+        else:
+            item = self.sessions_list.currentItem()
+            if not item:
+                QMessageBox.warning(self, "No Selection", "Please select an existing session.")
+                return
+            if self._attach_to(item.data(Qt.UserRole)):
+                self.accept()
+
+    def _already_attached_text(self):
+        return "\n".join(f"• {count} in {label}" for label, count in self._already_attached.most_common())
+
+    def _attach_to(self, session_id):
+        """Attach the scanned files (skipping duplicates), place them on their
+        observing nights and recompute the session's totals, in one transaction."""
+        try:
+            with self.db_manager.get_connection() as conn:
+                report = SessionObservations.attach_files(conn, session_id, self.summary.get("files", []))
+                SessionObservations.assign_files_to_observations(conn, session_id)
+                SessionObservations.recompute_session_aggregates(conn, session_id)
+                MountDetection.save(conn, session_id, self.mounts)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error attaching session files: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to attach files: {e}")
+            return False
+
+        message = SessionObservations.format_attach_report(report)
+        if report["inserted"] == 0:
+            QMessageBox.information(self, "Nothing New Attached",
+                                    message or "No new files were attached.")
+        elif message:
+            QMessageBox.information(self, "Files Attached", message)
+        self.result_session_id = session_id
+        return True
+
+
+class LinkTargetDialog(WindowPositionMixin, QDialog):
+    """Pick a Target List entry to link a session to (sets usersessions.target_id -
+    doesn't touch the session's own dso_name/ra_deg/dec_deg, same as the existing
+    automatic name-match linking in SessionFormWidget._resolve_target_id_by_name).
+
+    Targets whose name or position match the session are suggested at the top and
+    the best one is preselected; any other target can still be picked instead."""
+
+    WINDOW_POSITION_KEY = "LinkTargetDialog"
+
+    def __init__(self, db_manager, parent=None, session_name=None, ra_deg=None, dec_deg=None,
+                 current_target_id=None):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.selected_target = None
+        self._session_name = session_name
+        self._ra_deg, self._dec_deg = ra_deg, dec_deg
+        self._current_target_id = current_target_id
+        self.setWindowTitle("Link to Target List")
+        self.setModal(True)
+        self.resize(460, 480)  # default size the first time this dialog is ever opened
+        self._setup_ui()
+        self._load_targets()
+        self.setup_window_position()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        self.suggestion_label = QLabel("")
+        self.suggestion_label.setWordWrap(True)
+        themed_style(self.suggestion_label, lambda: f"color: {COLORS['text_secondary']};")
+        layout.addWidget(self.suggestion_label)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search:"))
+        self.search_box = QLineEdit()
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.textChanged.connect(self._filter_targets)
+        search_row.addWidget(self.search_box)
+        layout.addLayout(search_row)
+
+        self.targets_list = QListWidget()
+        self.targets_list.itemSelectionChanged.connect(self._on_selection_changed)
+        self.targets_list.itemDoubleClicked.connect(lambda _: self._on_confirm())
+        layout.addWidget(self.targets_list, 1)
+
+        buttons_row = QHBoxLayout()
+        buttons_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons_row.addWidget(cancel_btn)
+        self.ok_btn = QPushButton("Link")
+        self.ok_btn.setDefault(True)
+        self.ok_btn.setEnabled(False)
+        self.ok_btn.clicked.connect(self._on_confirm)
+        buttons_row.addWidget(self.ok_btn)
+        layout.addLayout(buttons_row)
+
+    def _suggestion(self, name, ra_deg, dec_deg):
+        """(name score, separation in degrees or None) for a target, against the session."""
+        separation = None
+        if None not in (self._ra_deg, self._dec_deg, ra_deg, dec_deg):
+            separation = SessionFileScanner.angular_separation_deg(self._ra_deg, self._dec_deg, ra_deg, dec_deg)
+        return target_name_match(self._session_name, name), separation
+
+    def _load_targets(self):
+        rows = []
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, name, dso_type, constellation, magnitude, ra_deg, dec_deg
+                    FROM usertargetlist ORDER BY name
+                """)
+                rows = cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error loading target list for linking: {e}")
+
+        # Suggestions: a matching name, or a position within the same distance the
+        # drop dialog uses to call subs the same target
+        scored = []
+        for row in rows:
+            name_score, separation = self._suggestion(row[1], row[5], row[6])
+            nearby = separation is not None and separation <= DROP_MATCH_MAX_SEPARATION_DEG
+            scored.append((row, name_score, separation if nearby else None))
+        suggested = sorted((entry for entry in scored if entry[1] or entry[2] is not None),
+                           key=lambda entry: (-entry[1], entry[2] if entry[2] is not None else 99))
+        others = [entry for entry in scored if not (entry[1] or entry[2] is not None)]
+
+        best_item = None
+        for (target_id, name, dso_type, constellation, magnitude, ra_deg, dec_deg), name_score, separation \
+                in suggested + others:
+            details = ", ".join(p for p in (dso_type, constellation) if p)
+            label = f"{name} ({details})" if details else name
+            if magnitude is not None:
+                label += f" - Mag {magnitude:.1f}"
+            reasons = []
+            if name_score:
+                reasons.append("same name")
+            if separation is not None:
+                reasons.append(f"{separation * 60:.0f}′ away" if separation < 1 else f"{separation:.1f}° away")
+            if target_id == self._current_target_id:
+                reasons.insert(0, "currently linked")
+            if reasons:
+                label += f"  ({', '.join(reasons)})"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, {
+                "id": target_id, "name": name, "ra_deg": ra_deg, "dec_deg": dec_deg,
+            })
+            if name_score or separation is not None:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                if best_item is None:
+                    best_item = item
+            self.targets_list.addItem(item)
+
+        if best_item is not None:
+            self.targets_list.setCurrentItem(best_item)
+            self.targets_list.scrollToItem(best_item)
+            more = len(suggested) - 1
+            self.suggestion_label.setText(
+                f"Suggested: {best_item.data(Qt.UserRole)['name']}"
+                + (f" ({more} other possible match{'es' if more > 1 else ''} below it)" if more else "")
+                + ". Pick any other target to link that instead.")
+        else:
+            self.suggestion_label.setText(
+                "No target matches this session's name or position - pick one to link.")
+
+    def _filter_targets(self, text):
+        text = text.strip().lower()
+        for i in range(self.targets_list.count()):
+            item = self.targets_list.item(i)
+            item.setHidden(text not in item.text().lower())
+
+    def _on_selection_changed(self):
+        self.ok_btn.setEnabled(bool(self.targets_list.selectedItems()))
+
+    def _on_confirm(self):
+        items = self.targets_list.selectedItems()
+        if not items:
+            return
+        self.selected_target = items[0].data(Qt.UserRole)
+        self.accept()
+
+
+def format_duration(seconds):
+    """'2h 05m', '45m', '30s' - integration times read better than decimal hours."""
+    seconds = float(seconds or 0)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    total_minutes = int(round(seconds / 60.0))
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+
+
+def format_exposure(exposure_seconds):
+    return f"{float(exposure_seconds or 0):g}s"
+
+
+def dropped_sub_paths(mime_data):
+    """Local folders and FITS/XISF files in a drag's mime data (empty if none)."""
+    if not mime_data.hasUrls():
+        return []
+    paths = []
+    for url in mime_data.urls():
+        if not url.isLocalFile():
+            continue
+        path = url.toLocalFile()
+        if os.path.isdir(path) or os.path.splitext(path)[1].lower() in SessionFileScanner.SUPPORTED_EXTENSIONS:
+            paths.append(path)
+    return paths
+
+
+def _make_table(columns, stretch_last=True):
+    table = QTableWidget(0, len(columns))
+    table.setHorizontalHeaderLabels(columns)
+    table.setEditTriggers(QTableWidget.NoEditTriggers)
+    table.setSelectionBehavior(QTableWidget.SelectRows)
+    table.setAlternatingRowColors(True)
+    table.verticalHeader().setVisible(False)
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.ResizeToContents)
+    header.setStretchLastSection(stretch_last)
+    return table
+
+
+def _table_item(text, align=None, user_data=None, tooltip=None):
+    item = QTableWidgetItem(text)
+    if align is not None:
+        item.setTextAlignment(align)
+    if user_data is not None:
+        item.setData(Qt.UserRole, user_data)
+    if tooltip:
+        item.setToolTip(tooltip)
+    return item
+
+
+def _to_qdatetime(dt):
+    return QDateTime(QDate(dt.year, dt.month, dt.day), QTime(dt.hour, dt.minute))
+
+
+class ObservationDialog(WindowPositionMixin, QDialog):
+    """Add/edit one observation (one observing night): its time span, notes and
+    hand-logged subs. The night's scanned files are shown read-only - files always
+    follow their own timestamps, so they can't be moved or edited here."""
+
+    WINDOW_POSITION_KEY = "ObservationDialog"
+
+    def __init__(self, observation=None, default_date=None, filter_choices=(), taken_nights=(), parent=None):
+        super().__init__(parent)
+        self.observation = observation or {}
+        self.filter_choices = sorted({f for f in filter_choices if f}, key=str.lower)
+        self.taken_nights = set(taken_nights)
+        self.result = None
+        self.setWindowTitle("Edit Observation" if observation else "Add Observation")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setModal(True)
+        self.resize(580, 600)  # default size the first time this dialog is ever opened
+        self._setup_ui(default_date or date_cls.today())
+        self.setup_window_position()
+
+    def _setup_ui(self, default_date):
+        layout = QVBoxLayout(self)
+
+        time_group = QGroupBox("Night")
+        time_form = QFormLayout()
+        self.start_edit = QDateTimeEdit()
+        self.end_edit = QDateTimeEdit()
+        for edit in (self.start_edit, self.end_edit):
+            edit.setCalendarPopup(True)
+            edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+
+        start = SessionObservations.parse_obs_datetime(self.observation.get("start_datetime"))
+        end = SessionObservations.parse_obs_datetime(self.observation.get("end_datetime"))
+        if start is None:
+            night = self.observation.get("night_date")
+            base = datetime.strptime(night, "%Y-%m-%d") if night else datetime.combine(default_date, datetime.min.time())
+            start = base.replace(hour=21, minute=0)
+        if end is None or end <= start:
+            end = start + timedelta(hours=3)
+        self.start_edit.setDateTime(_to_qdatetime(start))
+        self.end_edit.setDateTime(_to_qdatetime(end))
+        self._last_start = self.start_edit.dateTime()
+
+        self.start_edit.dateTimeChanged.connect(self._on_start_changed)
+        self.end_edit.editingFinished.connect(self._on_end_edited)
+        self.end_edit.dateTimeChanged.connect(lambda _dt: self._update_night_label())
+
+        time_form.addRow("Start:", self.start_edit)
+        time_form.addRow("End:", self.end_edit)
+        self.night_label = QLabel()
+        time_form.addRow("Observing night:", self.night_label)
+        hint = QLabel("A night that runs past midnight is one observation. An end time earlier "
+                      "than the start time moves to the next morning.")
+        hint.setWordWrap(True)
+        themed_style(hint, lambda: f"color: {COLORS['text_secondary']};")
+        time_form.addRow(hint)
+        time_group.setLayout(time_form)
+        layout.addWidget(time_group)
+
+        file_groups = self.observation.get("file_groups") or []
+        if self.observation.get("file_count"):
+            files_group = QGroupBox(f"Scanned Files ({self.observation['file_count']} attached, read-only)")
+            files_layout = QVBoxLayout()
+            files_table = _make_table(["Filter", "Exposure", "Subs", "Integration"])
+            files_table.setRowCount(len(file_groups))
+            for row, group in enumerate(sorted(file_groups, key=lambda g: (
+                    SessionObservations.normalize_filter(g["filter_name"]), g["exposure_seconds"] or 0))):
+                files_table.setItem(row, 0, _table_item(group["filter_name"] or "(no filter)"))
+                files_table.setItem(row, 1, _table_item(format_exposure(group["exposure_seconds"]), Qt.AlignCenter))
+                files_table.setItem(row, 2, _table_item(str(group["count"]), Qt.AlignCenter))
+                files_table.setItem(row, 3, _table_item(format_duration(group["seconds"]), Qt.AlignCenter))
+            files_table.setMaximumHeight(140)
+            files_layout.addWidget(files_table)
+            files_group.setLayout(files_layout)
+            layout.addWidget(files_group)
+
+        logged_group = QGroupBox("Logged Subs (entered by hand)")
+        logged_layout = QVBoxLayout()
+        logged_hint = QLabel("For subs you didn't import. Where these overlap scanned files with the same "
+                             "filter and exposure, the larger count is used - they are never added together.")
+        logged_hint.setWordWrap(True)
+        themed_style(logged_hint, lambda: f"color: {COLORS['text_secondary']};")
+        logged_layout.addWidget(logged_hint)
+        self.logged_table = _make_table(["Filter", "Exposure (s)", "Subs", "Integration"])
+        self.logged_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.logged_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        logged_layout.addWidget(self.logged_table)
+
+        row_buttons = QHBoxLayout()
+        add_row_btn = QPushButton("Add Filter")
+        add_row_btn.clicked.connect(lambda: self._add_logged_row())
+        row_buttons.addWidget(add_row_btn)
+        remove_row_btn = QPushButton("Remove Filter")
+        remove_row_btn.clicked.connect(self._remove_logged_row)
+        row_buttons.addWidget(remove_row_btn)
+        row_buttons.addStretch()
+        self.logged_total_label = QLabel()
+        row_buttons.addWidget(self.logged_total_label)
+        logged_layout.addLayout(row_buttons)
+        logged_group.setLayout(logged_layout)
+        layout.addWidget(logged_group, 1)
+
+        for logged in self.observation.get("logged") or []:
+            self._add_logged_row(logged["filter_name"] or "", logged["exposure_seconds"] or 0, logged["sub_count"] or 0)
+
+        notes_group = QGroupBox("Notes")
+        notes_layout = QVBoxLayout()
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setMaximumHeight(70)
+        self.notes_edit.setPlainText(self.observation.get("notes") or "")
+        notes_layout.addWidget(self.notes_edit)
+        notes_group.setLayout(notes_layout)
+        layout.addWidget(notes_group)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(cancel_btn)
+        ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self._on_ok)
+        buttons.addWidget(ok_btn)
+        layout.addLayout(buttons)
+
+        self._update_night_label()
+        self._update_logged_totals()
+
+    def _on_start_changed(self, new_start):
+        """Moving the start moves the end by the same amount, keeping the span."""
+        delta_secs = self._last_start.secsTo(new_start)
+        self._last_start = new_start
+        self.end_edit.blockSignals(True)
+        self.end_edit.setDateTime(self.end_edit.dateTime().addSecs(delta_secs))
+        self.end_edit.blockSignals(False)
+        self._update_night_label()
+
+    def _on_end_edited(self):
+        """An end earlier than the start on the same date means the next morning."""
+        start, end = self.start_edit.dateTime(), self.end_edit.dateTime()
+        if end <= start and end.date() == start.date():
+            self.end_edit.setDateTime(end.addDays(1))
+        self._update_night_label()
+
+    def _night_date(self):
+        return SessionObservations.night_date_for(self.start_edit.dateTime().toPython()).isoformat()
+
+    def _update_night_label(self):
+        start = self.start_edit.dateTime().toPython()
+        end = self.end_edit.dateTime().toPython()
+        text = f"Night of {self._night_date()}"
+        if end > start:
+            text += f"  ({format_duration((end - start).total_seconds())})"
+        self.night_label.setText(text)
+
+    def _add_logged_row(self, filter_name="", exposure=None, count=None):
+        row = self.logged_table.rowCount()
+        if exposure is None:
+            exposure = self.logged_table.cellWidget(row - 1, 1).value() if row else 300
+        self.logged_table.insertRow(row)
+
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.addItems(self.filter_choices)
+        combo.setCurrentText(filter_name)
+        exposure_spin = QDoubleSpinBox()
+        exposure_spin.setRange(0, 36000)
+        exposure_spin.setDecimals(1)
+        exposure_spin.setValue(float(exposure))
+        count_spin = QSpinBox()
+        count_spin.setRange(0, 100000)
+        count_spin.setValue(int(count if count is not None else 1))
+        exposure_spin.valueChanged.connect(self._update_logged_totals)
+        count_spin.valueChanged.connect(self._update_logged_totals)
+
+        self.logged_table.setCellWidget(row, 0, combo)
+        self.logged_table.setCellWidget(row, 1, exposure_spin)
+        self.logged_table.setCellWidget(row, 2, count_spin)
+        self.logged_table.setItem(row, 3, _table_item("", Qt.AlignCenter))
+        self._update_logged_totals()
+
+    def _remove_logged_row(self):
+        row = self.logged_table.currentRow()
+        if row < 0:
+            row = self.logged_table.rowCount() - 1
+        if row >= 0:
+            self.logged_table.removeRow(row)
+            self._update_logged_totals()
+
+    def _update_logged_totals(self):
+        total = 0.0
+        for row in range(self.logged_table.rowCount()):
+            seconds = self.logged_table.cellWidget(row, 1).value() * self.logged_table.cellWidget(row, 2).value()
+            total += seconds
+            item = self.logged_table.item(row, 3)
+            if item:
+                item.setText(format_duration(seconds))
+        self.logged_total_label.setText(f"Logged total: {format_duration(total)}")
+
+    def _on_ok(self):
+        start = self.start_edit.dateTime().toPython().replace(second=0, microsecond=0)
+        end = self.end_edit.dateTime().toPython().replace(second=0, microsecond=0)
+        if end <= start:
+            QMessageBox.warning(self, "Invalid Times", "The end must be after the start.")
+            return
+        if end - start > SessionObservations.MAX_OBSERVATION_SPAN:
+            QMessageBox.warning(self, "Invalid Times",
+                                "One observation covers a single night (at most 24 hours). "
+                                "Add another observation for the next night.")
+            return
+
+        night = self._night_date()
+        original_night = self.observation.get("night_date")
+        if self.observation.get("file_count") and night != original_night:
+            QMessageBox.warning(
+                self, "Night Can't Change",
+                f"This observation has {self.observation['file_count']} attached file(s) taken on the "
+                f"night of {original_night}, so it can't move to another night. Adjust the times only.",
+            )
+            return
+        if night != original_night and night in self.taken_nights:
+            QMessageBox.warning(self, "Night Already Logged",
+                                f"There is already an observation for the night of {night}. Edit that one instead.")
+            return
+
+        logged = []
+        for row in range(self.logged_table.rowCount()):
+            filter_name = self.logged_table.cellWidget(row, 0).currentText().strip()
+            exposure = self.logged_table.cellWidget(row, 1).value()
+            count = self.logged_table.cellWidget(row, 2).value()
+            if count == 0:
+                continue
+            if exposure <= 0:
+                QMessageBox.warning(self, "Invalid Exposure", f"Row {row + 1}: the exposure must be more than 0 seconds.")
+                return
+            logged.append({"filter_name": filter_name, "exposure_seconds": exposure, "sub_count": count})
+
+        self.result = {
+            "night_date": night,
+            "start_datetime": SessionObservations.format_datetime(start),
+            "end_datetime": SessionObservations.format_datetime(end),
+            "notes": self.notes_edit.toPlainText().strip(),
+            "logged": logged,
+        }
+        self.accept()
+
+
+class SessionDetailsDialog(WindowPositionMixin, QDialog):
+    """Everything about one session: its editable fields (Overview), its
+    observations with per-filter counted totals (Observations), whole-session
+    per-filter totals (Filter Summary) and every attached file (Files).
+
+    Observation adds/edits/deletes are held in memory and written together with
+    the session's fields in one transaction on Save. Attaching or removing files
+    scans/changes data on disk-backed rows, so those are written immediately
+    (saving any pending edits first)."""
+
+    WINDOW_POSITION_KEY = "SessionDetailsDialog"
+    OVERVIEW_TAB, OBSERVATIONS_TAB, FILTERS_TAB, FILES_TAB, FRAMING_TAB = range(5)
+
+    def __init__(self, session_data, start_tab=0, start_add=False, parent=None):
+        super().__init__(parent)
+        self.db_manager = DatabaseManager()
+        self.session_data = dict(session_data)
+        self.session_id = session_data["id"]
+        self.data_changed = False
+        self._observations = []
+        self._deleted_ids = []
+        self._files = []
+        self._session_meta = {}
+        self._framing = None          # The framing saved from the FOV Simulator, if any
+        self._obs_mounts = {}         # observation id -> (mount, source, evidence) (MountDetection)
+        self._fov_window = None
+        self._obs_dirty = False
+        self._added_any = False
+        self._scan_thread = None
+        self._file_check = None       # SessionFileCheck.FileCheckWorker of the last load
+        self._file_check_result = None  # its CheckResult, None until it's done
+
+        self.setWindowTitle(f"{display_name(session_data.get('dso_name', ''))} — {session_data.get('session_date', '')}")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.WindowMaximizeButtonHint)
+        self.setModal(True)
+        self.resize(1000, 720)  # default size the first time this dialog is ever opened
+
+        self._setup_ui()
+        self._enable_file_drops()
+        self._reload_from_db()
+        self._form_snapshot = self.form.snapshot()
+        self.tabs.setCurrentIndex(start_tab)
+        self.setup_window_position()
+        if start_add:
+            QTimer.singleShot(0, self._add_observation)
+
+    # ---- UI -------------------------------------------------------------
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_overview_tab(), "Overview")
+        self.tabs.addTab(self._build_observations_tab(), "Observations")
+        self.tabs.addTab(self._build_filters_tab(), "Filter Summary")
+        self.tabs.addTab(self._build_files_tab(), "Files")
+        self.tabs.addTab(self._build_framing_tab(), "Framing")
+        layout.addWidget(self.tabs, 1)
+
+        buttons = QHBoxLayout()
+        note = QLabel("Drop FITS/XISF files or folders anywhere here to attach them. "
+                      "Attaching or removing files is saved immediately.")
+        themed_style(note, lambda: f"color: {COLORS['text_secondary']};")
+        buttons.addWidget(note)
+        buttons.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(cancel_btn)
+        save_btn = QPushButton("Save Changes")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._save)
+        buttons.addWidget(save_btn)
+        layout.addLayout(buttons)
+
+    def _build_overview_tab(self):
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        self.form = SessionFormWidget(session_data=self.session_data)
+        layout.addWidget(self.form, 3)
+
+        summary_group = QGroupBox("Summary")
+        summary_form = QFormLayout()
+        self.summary_labels = {}
+        for key, label in (("subs", "Light Subs:"), ("integration", "Integration:"), ("nights", "Nights:"),
+                           ("filters", "Filters:"), ("mount", "Mount:"), ("range", "Date Range:"),
+                           ("files", "Attached Files:"),
+                           ("target", "Linked Target:"), ("created", "Created:"), ("modified", "Modified:")):
+            value_label = QLabel()
+            value_label.setWordWrap(True)
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            summary_form.addRow(label, value_label)
+            self.summary_labels[key] = value_label
+        summary_group.setLayout(summary_form)
+        self.form.mount_combo.currentIndexChanged.connect(lambda _index: self._refresh_summary())
+
+        summary_column = QVBoxLayout()
+        summary_column.addWidget(summary_group)
+        summary_column.addStretch()
+        layout.addLayout(summary_column, 2)
+        return tab
+
+    def _build_observations_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        hint = QLabel("Each observation is one observing night - a night that runs past midnight stays one "
+                      "observation. Hand-logged subs and scanned files with the same filter and exposure are the "
+                      "same subs, so the larger count is used, never both.")
+        hint.setWordWrap(True)
+        themed_style(hint, lambda: f"color: {COLORS['text_secondary']};")
+        layout.addWidget(hint)
+
+        buttons = QHBoxLayout()
+        add_btn = QPushButton("Add Observation...")
+        add_btn.clicked.connect(self._add_observation)
+        buttons.addWidget(add_btn)
+        self.edit_obs_btn = QPushButton("Edit...")
+        self.edit_obs_btn.clicked.connect(self._edit_observation)
+        buttons.addWidget(self.edit_obs_btn)
+        self.delete_obs_btn = QPushButton("Delete")
+        self.delete_obs_btn.clicked.connect(self._delete_observation)
+        buttons.addWidget(self.delete_obs_btn)
+        self.night_filters_btn = QPushButton("Set Filters...")
+        self.night_filters_btn.setToolTip("Set the filter of this night's lights and flats when the files don't "
+                                          "record it (a manual filter) or record the wrong one.")
+        self.night_filters_btn.clicked.connect(self._set_night_filters)
+        buttons.addWidget(self.night_filters_btn)
+        buttons.addStretch()
+        attach_btn = QPushButton("Attach Files ▾")
+        attach_menu = QMenu(attach_btn)
+        attach_menu.addAction("Sub Files...").triggered.connect(lambda: self._attach_files(folder=False))
+        attach_menu.addAction("Folder...").triggered.connect(lambda: self._attach_files(folder=True))
+        attach_btn.setMenu(attach_menu)
+        buttons.addWidget(attach_btn)
+        layout.addLayout(buttons)
+
+        splitter = QSplitter(Qt.Vertical)
+        self.obs_table = _make_table(["Night", "Filters", "Subs", "Integration", "Source", "Mount", "Notes"])
+        self.obs_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.obs_table.itemSelectionChanged.connect(self._on_observation_selected)
+        self.obs_table.itemDoubleClicked.connect(lambda _item: self._edit_observation())
+        splitter.addWidget(self.obs_table)
+
+        breakdown_widget = QWidget()
+        breakdown_layout = QVBoxLayout(breakdown_widget)
+        breakdown_layout.setContentsMargins(0, 0, 0, 0)
+        self.breakdown_label = QLabel("Select an observation to see its per-filter breakdown.")
+        self.breakdown_label.setTextFormat(Qt.RichText)
+        self.breakdown_label.linkActivated.connect(lambda _link: self._clear_night_filters())
+        breakdown_layout.addWidget(self.breakdown_label)
+        self.breakdown_table = _make_table(["Filter", "Exposure", "Files", "Logged", "Counted", "Integration"])
+        self.breakdown_table.setSelectionMode(QAbstractItemView.NoSelection)
+        breakdown_layout.addWidget(self.breakdown_table)
+        splitter.addWidget(breakdown_widget)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
+        return tab
+
+    def _build_filters_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.filter_table = _make_table(["Filter", "Subs", "Integration", "Nights"])
+        self.filter_table.setSelectionMode(QAbstractItemView.NoSelection)
+        layout.addWidget(self.filter_table)
+        return tab
+
+    def _build_files_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        top = QHBoxLayout()
+        self.files_count_label = QLabel()
+        top.addWidget(self.files_count_label, 1)
+        review_btn = QPushButton("Review Lights Quality...")
+        review_btn.setToolTip("Grade the light frames (stars, focus, trailing, clouds) to stack only the best.")
+        review_btn.clicked.connect(self._review_light_quality)
+        top.addWidget(review_btn)
+        check_btn = QPushButton("Check Files...")
+        check_btn.setToolTip("Find files that are missing on disk or on no night - relink moved ones, "
+                             "remove the rest from the session.")
+        check_btn.clicked.connect(self._open_file_check)
+        top.addWidget(check_btn)
+        layout.addLayout(top)
+
+        # Filled in by the background disk check (SessionFileCheck) after each load
+        self.files_problem_label = QLabel()
+        self.files_problem_label.setWordWrap(True)
+        self.files_problem_label.setTextFormat(Qt.RichText)
+        self.files_problem_label.linkActivated.connect(lambda _link: self._open_file_check())
+        self.files_problem_label.hide()
+        layout.addWidget(self.files_problem_label)
+
+        filters = QHBoxLayout()
+        self.files_filters = {}
+        for key, label, tip in (("night", "Night:", None), ("frame", "Frame:", None), ("filter", "Filter:", None),
+                                ("status", "Show:", "Missing on disk: not found where the session points. "
+                                                    "Not on a night: no observing night holds them.")):
+            filters.addWidget(QLabel(label))
+            combo = QComboBox()
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+            if tip:
+                combo.setToolTip(tip)
+            combo.currentIndexChanged.connect(lambda _index: self._refresh_files_table())
+            filters.addWidget(combo)
+            self.files_filters[key] = combo
+        filters.addStretch()
+        layout.addLayout(filters)
+
+        self.files_table = _make_table(["File", "Night", "Frame", "Filter", "Exposure", "Gain", "Temp", "Binning"])
+        self.files_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.files_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.files_table.customContextMenuRequested.connect(self._show_files_menu)
+        layout.addWidget(self.files_table)
+        return tab
+
+    def _build_framing_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.framing_summary_label = QLabel()
+        self.framing_summary_label.setWordWrap(True)
+        self.framing_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.framing_summary_label)
+
+        buttons = QHBoxLayout()
+        open_btn = QPushButton("Open in FOV Simulator")
+        open_btn.setToolTip("See the framing on the sky - change it there and Save to Session again")
+        open_btn.clicked.connect(self._open_framing_in_fov)
+        buttons.addWidget(open_btn)
+        self.framing_widgets = []
+        copy_btn = QPushButton("Copy Panels")
+        copy_btn.setToolTip("Copy the panel names and positions, to paste elsewhere")
+        copy_btn.clicked.connect(self._copy_panels)
+        export_btn = QPushButton("Export CSV...")
+        export_btn.setToolTip("Save the panels (name, RA, Dec, rotation) as a CSV file for other software")
+        export_btn.clicked.connect(self._export_panels)
+        buttons.addWidget(copy_btn)
+        buttons.addWidget(export_btn)
+        self.framing_widgets += [copy_btn, export_btn]
+        from cosmoscollection.nina.NINAIntegration import NINAIntegration
+        if NINAIntegration.is_enabled():
+            self.nina_panel_btn = QPushButton("NINA")
+            self.nina_panel_btn.setToolTip("Send the selected panel to NINA - only when you click")
+            nina_menu = QMenu(self.nina_panel_btn)
+            nina_menu.addAction("Send Panel to Framing Assistant").triggered.connect(self._send_panel_to_nina)
+            nina_menu.addAction("Slew to Panel").triggered.connect(self._slew_to_panel)
+            self.nina_panel_btn.setMenu(nina_menu)
+            buttons.addWidget(self.nina_panel_btn)
+        else:
+            self.nina_panel_btn = None
+        buttons.addStretch()
+        remove_btn = QPushButton("Remove Framing")
+        remove_btn.clicked.connect(self._remove_framing)
+        buttons.addWidget(remove_btn)
+        self.framing_widgets.append(remove_btn)
+        layout.addLayout(buttons)
+
+        self.panels_table = _make_table(["Panel", "Name", "RA", "Dec", "Subs", "Integration"])
+        self.panels_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.panels_table.itemSelectionChanged.connect(self._update_panel_buttons)
+        layout.addWidget(self.panels_table, 1)
+        self.framing_widgets.append(self.panels_table)
+        self.panels_note = QLabel()
+        self.panels_note.setWordWrap(True)
+        themed_style(self.panels_note, lambda: f"color: {COLORS['text_secondary']};")
+        layout.addWidget(self.panels_note)
+        return tab
+
+    # ---- Framing ----------------------------------------------------------
+
+    def _framing_panels(self):
+        from cosmoscollection.planning.FOVSimulator import framing_panels
+        return framing_panels(self._framing, self.session_data.get("dso_name")) if self._framing else []
+
+    def _refresh_framing(self):
+        """The saved framing, its panels and how many subs each has."""
+        from cosmoscollection.planning.FOVSimulator import framing_summary, load_session_framing, match_panels, format_ra, format_dec
+        import json
+        subs = []
+        try:
+            with self.db_manager.get_connection() as conn:
+                self._framing = load_session_framing(conn, self.session_id)
+                if self._framing:
+                    for header, object_name, seconds in conn.execute(
+                            "SELECT header_json, object_name, exptime_seconds FROM usersessionfiles "
+                            "WHERE session_id = ? AND frame_type = 'Light'", (self.session_id,)):
+                        ra = dec = None
+                        try:
+                            values = json.loads(header) if header else {}
+                            ra, dec = float(values["RA"]), float(values["DEC"])
+                        except (ValueError, KeyError, TypeError):
+                            pass
+                        subs.append({"ra": ra, "dec": dec, "object": object_name, "seconds": seconds})
+        except Exception as e:
+            logger.error(f"Error loading the session's framing: {e}")
+            self._framing = None
+        framing = self._framing
+        for widget in self.framing_widgets:
+            widget.setVisible(framing is not None)
+        if self.nina_panel_btn is not None:
+            self.nina_panel_btn.setVisible(framing is not None)
+        if not framing:
+            self.framing_summary_label.setText(
+                "No framing saved for this session.\n\nOpen the FOV Simulator, set up the frame or mosaic "
+                "(rotation, panels, where it sits), and use Save to Session.")
+            self.panels_table.setRowCount(0)
+            self.panels_note.setText("")
+            return
+        width, height = framing["panel_width"] * 60, framing["panel_height"] * 60
+        equipment = " + ".join(part for part in (framing.get("telescope"), framing.get("camera"),
+                                                 None if (framing.get("barlow") or "").startswith("None")
+                                                 else framing.get("barlow")) if part)
+        self.framing_summary_label.setText(
+            f"<b>{framing_summary(framing)}</b> - each frame {width:.1f}' × {height:.1f}'<br>"
+            f"Center: {format_ra(framing['ra'])}, {format_dec(framing['dec'])}<br>"
+            f"Equipment: {equipment or 'unknown'}<br>Saved: {framing.get('saved', '')}")
+        counts, unmatched = match_panels(framing, subs)
+        panels = self._framing_panels()
+        self.panels_table.setRowCount(len(panels))
+        for row, panel in enumerate(panels):
+            count = counts.get(panel["number"], {"subs": 0, "seconds": 0})
+            self.panels_table.setItem(row, 0, _table_item(str(panel["number"]), Qt.AlignCenter, user_data=panel))
+            self.panels_table.setItem(row, 1, _table_item(panel["name"]))
+            self.panels_table.setItem(row, 2, _table_item(format_ra(panel["ra"]), tooltip=f"{panel['ra']:.5f}°"))
+            self.panels_table.setItem(row, 3, _table_item(format_dec(panel["dec"]), tooltip=f"{panel['dec']:.5f}°"))
+            self.panels_table.setItem(row, 4, _table_item(str(count["subs"]), Qt.AlignRight | Qt.AlignVCenter))
+            self.panels_table.setItem(row, 5, _table_item(format_duration(count["seconds"]) if count["subs"] else "—",
+                                                          Qt.AlignRight | Qt.AlignVCenter))
+        notes = ["Subs are matched to the panel nearest where they were taken (from their headers), "
+                 "or by \"Panel N\" in their object name."] if len(panels) > 1 else []
+        if unmatched:
+            notes.append(f"{unmatched} light sub{'s' if unmatched != 1 else ''} didn't match a panel.")
+        self.panels_note.setText(" ".join(notes))
+        self._update_panel_buttons()
+
+    def _selected_panel(self):
+        row = self.panels_table.currentRow()
+        item = self.panels_table.item(row, 0) if row >= 0 else None
+        return item.data(Qt.UserRole) if item else None
+
+    def _update_panel_buttons(self):
+        if self.nina_panel_btn is not None:
+            has_panel = self._selected_panel() is not None
+            self.nina_panel_btn.setEnabled(has_panel)
+            self.nina_panel_btn.setToolTip("Send the selected panel to NINA - only when you click"
+                                           if has_panel else "Select a panel first")
+
+    def _panels_text(self, separator):
+        lines = [separator.join(("Panel", "Name", "RA (deg)", "Dec (deg)", "RA", "Dec", "Rotation (deg)"))]
+        from cosmoscollection.planning.FOVSimulator import format_ra, format_dec
+        for panel in self._framing_panels():
+            lines.append(separator.join((str(panel["number"]), panel["name"], f"{panel['ra']:.6f}",
+                                         f"{panel['dec']:.6f}", format_ra(panel["ra"]), format_dec(panel["dec"]),
+                                         str(self._framing.get("rotation", 0)))))
+        return lines
+
+    def _copy_panels(self):
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText("\n".join(self._panels_text("\t")))
+
+    def _export_panels(self):
+        from cosmoscollection.planning.FOVSimulator import short_object_name
+        name = short_object_name(self.session_data.get("dso_name"))
+        path, _ = QFileDialog.getSaveFileName(self, "Export Panels", f"{name} panels.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        import csv
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                for line in self._panels_text("\t"):
+                    writer.writerow(line.split("\t"))
+        except OSError as e:
+            QMessageBox.warning(self, "Export Failed", f"Couldn't save {path}:\n{e}")
+
+    def _send_panel_to_nina(self):
+        from cosmoscollection.nina.NINAIntegration import NINAIntegration
+        panel = self._selected_panel()
+        if panel is None:
+            return
+        NINAIntegration.frame_with_rotation(panel["ra"], panel["dec"], panel["name"],
+                                            self._framing.get("rotation", 0), self)
+
+    def _slew_to_panel(self):
+        from cosmoscollection.nina.NINAIntegration import NINAIntegration
+        panel = self._selected_panel()
+        if panel is not None:
+            NINAIntegration.slew_to_coordinates(panel["ra"], panel["dec"], panel["name"], self)
+
+    def _remove_framing(self):
+        if QMessageBox.question(self, "Remove Framing",
+                                "Remove this session's saved framing? Its subs are kept.") != QMessageBox.Yes:
+            return
+        from cosmoscollection.planning.FOVSimulator import save_session_framing
+        try:
+            with self.db_manager.get_connection() as conn:
+                save_session_framing(conn, self.session_id, None)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            QMessageBox.critical(self, "Error", f"Couldn't remove the framing: {e}")
+            return
+        self._refresh_framing()
+
+    def _open_framing_in_fov(self):
+        """The FOV Simulator with this session's framing (or a fresh one to make it)."""
+        from cosmoscollection.planning.DSOTargetList import find_full_dso_data
+        data = find_full_dso_data(self.db_manager, self.session_data.get("dso_name", ""), self.session_data)
+        if not data:
+            QMessageBox.warning(self, "Object Not Found",
+                                f"Could not find {self.session_data.get('dso_name', 'this object')} in the DSO catalogue.")
+            return
+        from cosmoscollection.planning.FOVSimulator import AladinLiteWindow
+        # A child of this dialog, so it can be used while the dialog is open
+        self._fov_window = AladinLiteWindow(data, self, framing=self._framing, session_id=self.session_id)
+        self._fov_window.show()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # Back from the FOV Simulator: a framing may have been saved
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow() and hasattr(self, "panels_table"):
+            self._refresh_framing()
+
+    # ---- Data -----------------------------------------------------------
+
+    def _reload_from_db(self):
+        try:
+            with self.db_manager.get_connection() as conn:
+                self._observations = SessionObservations.load_observations(conn, self.session_id)
+                self._files = SessionObservations.load_session_files(conn, self.session_id)
+                self._obs_mounts = MountDetection.observation_mounts(conn, self.session_id)
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT s.created_date, s.modified_date, t.name, tel.mount_type
+                    FROM usersessions s LEFT JOIN usertargetlist t ON t.id = s.target_id
+                    LEFT JOIN usertelescopes tel ON tel.id = s.telescope_id
+                    WHERE s.id = ?
+                """, (self.session_id,))
+                row = cursor.fetchone()
+                self._session_meta = {"created": row[0], "modified": row[1], "target": row[2],
+                                      "telescope_mount": row[3]} if row else {}
+        except Exception as e:
+            logger.error(f"Error loading session details: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to load session details: {e}")
+        for obs in self._observations:
+            obs["state"] = None
+        self._deleted_ids = []
+        self._obs_dirty = False
+        self._added_any = False
+        self._file_check_result = None
+        self._refresh_all()
+        self._start_file_check()
+
+    def _start_file_check(self):
+        """Which attached files are missing on disk - off the UI thread, as hundreds
+        of subs on a network drive can take a while."""
+        from cosmoscollection.sessions.SessionFileCheck import FileCheckWorker
+        if self._file_check is not None:
+            self._file_check.stop()
+            _retire_thread(self._file_check)
+        if not self._files:
+            return
+        # No parent: a check still running when the dialog closes is retired, not destroyed
+        self._file_check = FileCheckWorker(self._files)
+        self._file_check.checked.connect(self._on_file_check)
+        self._file_check.start()
+
+    def _on_file_check(self, result):
+        self._file_check_result = result
+        self._refresh_files_table()
+        self._refresh_summary()
+
+    def _visible_files(self):
+        """Files not belonging to an observation that's pending deletion."""
+        deleted = set(self._deleted_ids)
+        return [f for f in self._files if f["observation_id"] not in deleted]
+
+    def _loose_light_files(self):
+        """Light files that couldn't be placed on a night (no DATE-OBS)."""
+        return [f for f in self._files if f["observation_id"] is None and f["frame_type"] == "Light"]
+
+    @staticmethod
+    def _breakdown(obs):
+        return SessionObservations.combine_breakdown(obs["file_groups"], obs["logged"])
+
+    def _filter_totals(self):
+        """[(display name, subs, seconds, nights)] across the session, counted values."""
+        totals = {}
+        for obs in self._observations:
+            for row in self._breakdown(obs):
+                if not row["counted_subs"]:
+                    continue
+                key = SessionObservations.normalize_filter(row["filter_name"])
+                entry = totals.setdefault(key, {"name": row["filter_name"] or "(no filter)",
+                                                "subs": 0, "seconds": 0.0, "nights": set()})
+                entry["subs"] += row["counted_subs"]
+                entry["seconds"] += row["counted_seconds"]
+                entry["nights"].add(obs["night_date"])
+        for f in self._loose_light_files():
+            key = SessionObservations.normalize_filter(f["filter_name"])
+            entry = totals.setdefault(key, {"name": f["filter_name"] or "(no filter)",
+                                            "subs": 0, "seconds": 0.0, "nights": set()})
+            entry["subs"] += 1
+            entry["seconds"] += f["exptime_seconds"] or 0
+        return sorted(((e["name"], e["subs"], e["seconds"], len(e["nights"])) for e in totals.values()),
+                      key=lambda t: t[0].lower())
+
+    def _filter_choices(self):
+        choices = {f.strip() for f in (self.form.filters_edit.text() or "").split(",") if f.strip()}
+        for obs in self._observations:
+            choices.update(g["filter_name"] for g in obs["file_groups"] if g["filter_name"])
+            choices.update(l["filter_name"] for l in obs["logged"] if l["filter_name"])
+        return choices
+
+    def _has_unsaved_changes(self):
+        return self._obs_dirty or self.form.snapshot() != self._form_snapshot
+
+    # ---- Refresh --------------------------------------------------------
+
+    def _refresh_all(self):
+        self._observations.sort(key=lambda o: o["night_date"])
+        self._refresh_observations_table()
+        self._refresh_filter_table()
+        self._refresh_files_table()
+        self._refresh_summary()
+        self._refresh_framing()
+        has_observations = bool(self._observations)
+        self.form.filters_edit.setReadOnly(has_observations)
+        self.form.filters_edit.setToolTip(
+            "Calculated from this session's observations." if has_observations else "")
+
+    def _refresh_observations_table(self, select_obs=None):
+        if select_obs is None:
+            select_obs = self._selected_observation()
+        self.obs_table.setRowCount(len(self._observations))
+        select_row = -1
+        for row, obs in enumerate(self._observations):
+            subs, seconds, filters = SessionObservations.summarize_breakdown(self._breakdown(obs))
+            has_files = obs["file_count"] > 0
+            has_logged = any(l["sub_count"] for l in obs["logged"])
+            source = ("Files + Logged" if has_files and has_logged else
+                      "Files" if has_files else "Logged" if has_logged else "—")
+            night_text = SessionObservations.format_night_span(
+                obs["night_date"], obs["start_datetime"], obs["end_datetime"])
+            if obs["state"]:
+                night_text += "  *"
+            notes = (obs["notes"] or "").splitlines()[0] if obs["notes"] else ""
+            self.obs_table.setItem(row, 0, _table_item(night_text, tooltip="* unsaved" if obs["state"] else None))
+            self.obs_table.setItem(row, 1, _table_item(", ".join(filters)))
+            self.obs_table.setItem(row, 2, _table_item(str(subs), Qt.AlignCenter))
+            self.obs_table.setItem(row, 3, _table_item(format_duration(seconds), Qt.AlignCenter))
+            self.obs_table.setItem(row, 4, _table_item(source, Qt.AlignCenter))
+            mount, _source, evidence = self._obs_mounts.get(obs["id"], (None, None, ""))
+            self.obs_table.setItem(row, 5, _table_item(mount or ("Unknown" if evidence else ""), Qt.AlignCenter,
+                                                       tooltip=evidence or None))
+            self.obs_table.setItem(row, 6, _table_item(notes, tooltip=obs["notes"] or None))
+            if obs is select_obs:
+                select_row = row
+        if select_row < 0 and self._observations:
+            select_row = 0
+        if select_row >= 0:
+            self.obs_table.selectRow(select_row)
+        self._on_observation_selected()
+
+    def _selected_observation(self):
+        row = self.obs_table.currentRow()
+        if 0 <= row < len(self._observations):
+            return self._observations[row]
+        return None
+
+    def _on_observation_selected(self):
+        obs = self._selected_observation()
+        self.edit_obs_btn.setEnabled(obs is not None)
+        self.delete_obs_btn.setEnabled(obs is not None)
+        self.night_filters_btn.setEnabled(bool(obs and self._night_filter_files(obs)))
+        if obs is None:
+            self.breakdown_label.setText("Select an observation to see its per-filter breakdown.")
+            self.breakdown_table.setRowCount(0)
+            return
+
+        rows = self._breakdown(obs)
+        text = f"<b>Night of {obs['night_date']}</b> — {obs['file_count']} attached file(s)"
+        corrected = sum(1 for f in self._night_filter_files(obs) if f["filter_corrected"])
+        if corrected:
+            text += f" · filter set by you on {corrected} file(s) &nbsp;<a href='clear'>Clear</a>"
+        self.breakdown_label.setText(text)
+        self.breakdown_table.setRowCount(len(rows) + (1 if rows else 0))
+        for row, r in enumerate(rows):
+            self.breakdown_table.setItem(row, 0, _table_item(r["filter_name"] or "(no filter)"))
+            self.breakdown_table.setItem(row, 1, _table_item(format_exposure(r["exposure_seconds"]), Qt.AlignCenter))
+            self.breakdown_table.setItem(row, 2, _table_item(str(r["file_subs"]), Qt.AlignCenter))
+            self.breakdown_table.setItem(row, 3, _table_item(str(r["logged_subs"]), Qt.AlignCenter))
+            self.breakdown_table.setItem(row, 4, _table_item(str(r["counted_subs"]), Qt.AlignCenter))
+            self.breakdown_table.setItem(row, 5, _table_item(format_duration(r["counted_seconds"]), Qt.AlignCenter))
+        if rows:
+            subs, seconds, _filters = SessionObservations.summarize_breakdown(rows)
+            self._set_total_row(self.breakdown_table, len(rows),
+                                ["Total", "", str(sum(r["file_subs"] for r in rows)),
+                                 str(sum(r["logged_subs"] for r in rows)), str(subs), format_duration(seconds)])
+
+    @staticmethod
+    def _set_total_row(table, row, values):
+        bold = QFont()
+        bold.setBold(True)
+        for col, value in enumerate(values):
+            item = _table_item(value, Qt.AlignCenter if col else None)
+            item.setFont(bold)
+            table.setItem(row, col, item)
+
+    def _refresh_filter_table(self):
+        totals = self._filter_totals()
+        self.filter_table.setRowCount(len(totals) + (1 if totals else 0))
+        for row, (name, subs, seconds, nights) in enumerate(totals):
+            self.filter_table.setItem(row, 0, _table_item(name))
+            self.filter_table.setItem(row, 1, _table_item(str(subs), Qt.AlignCenter))
+            self.filter_table.setItem(row, 2, _table_item(format_duration(seconds), Qt.AlignCenter))
+            self.filter_table.setItem(row, 3, _table_item(str(nights), Qt.AlignCenter))
+        if totals:
+            self._set_total_row(self.filter_table, len(totals), [
+                "Total", str(sum(t[1] for t in totals)), format_duration(sum(t[2] for t in totals)),
+                str(len(self._observations)),
+            ])
+
+    FILES_ALL, FILES_MISSING, FILES_NO_NIGHT = "all", "missing", "no_night"
+
+    def _missing_file_ids(self):
+        return self._file_check_result.missing if self._file_check_result else set()
+
+    def _fill_files_filters(self, every):
+        """The Files tab's filter choices from the files there, keeping each one's selection."""
+        nights = sorted({f["night_date"] for f in every if f["night_date"]})
+        frames = sorted({f["frame_type"] or "Unknown" for f in every})
+        filter_names = sorted({f["filter_name"] or "" for f in every}, key=lambda n: (n == "", n.lower()))
+        checking = self._file_check_result is None and bool(every)
+        choices = {
+            "night": [("All nights", None)] + [(n, n) for n in nights],
+            "frame": [("All frames", None)] + [(t, t) for t in frames],
+            "filter": [("All filters", None)] + [(n or "(no filter)", n) for n in filter_names],
+            "status": [("All files", self.FILES_ALL),
+                       ("Missing on disk (checking...)" if checking else "Missing on disk", self.FILES_MISSING),
+                       ("Not on a night", self.FILES_NO_NIGHT)],
+        }
+        for key, items in choices.items():
+            combo = self.files_filters[key]
+            wanted = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            for text, data in items:
+                combo.addItem(text, data)
+            index = combo.findData(wanted)
+            combo.setCurrentIndex(max(index, 0))
+            combo.blockSignals(False)
+
+    def _filtered_files(self, every):
+        night = self.files_filters["night"].currentData()
+        frame = self.files_filters["frame"].currentData()
+        filter_name = self.files_filters["filter"].currentData()
+        status = self.files_filters["status"].currentData()
+        missing = self._missing_file_ids()
+        return [f for f in every
+                if (night is None or f["night_date"] == night)
+                and (frame is None or (f["frame_type"] or "Unknown") == frame)
+                and (filter_name is None or (f["filter_name"] or "") == filter_name)
+                and (status in (None, self.FILES_ALL)
+                     or (status == self.FILES_MISSING and f["id"] in missing)
+                     or (status == self.FILES_NO_NIGHT and f["observation_id"] is None))]
+
+    def _refresh_files_problem(self, every):
+        from cosmoscollection.sessions.SessionFileCheck import problem_summary
+        if self._file_check_result is None:
+            self.files_problem_label.hide()
+            return
+        text, warning = problem_summary(every, self._file_check_result)
+        if not text:
+            self.files_problem_label.hide()
+            return
+        self.files_problem_label.setText(f"{'⚠ ' if warning else ''}{text}  <a href='clean'>Clean Up...</a>")
+        color = COLORS["warning"] if warning else COLORS["text_secondary"]
+        self.files_problem_label.setStyleSheet(f"color: {color};")
+        self.files_problem_label.show()
+
+    def _refresh_files_table(self):
+        every = self._visible_files()
+        self._fill_files_filters(every)
+        self._refresh_files_problem(every)
+        files = self._filtered_files(every)
+        missing = self._missing_file_ids()
+        unreachable = self._file_check_result.unreachable if self._file_check_result else set()
+        # Columns sized to their contents re-measure every row after each setItem
+        # once the table is on screen - a minute for a few hundred files. Fill with
+        # that off, then size the columns once.
+        header = self.files_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        self.files_table.setUpdatesEnabled(False)
+        self.files_table.setRowCount(len(files))
+        for row, f in enumerate(files):
+            path = f["file_path"] or ""
+            name_item = _table_item(os.path.basename(path), user_data=f["id"], tooltip=path)
+            if f["id"] in missing:
+                name_item.setForeground(QColor(COLORS["warning"]))
+                name_item.setToolTip(f"{path}\n\n" + ("Its drive or network share isn't available."
+                                                      if f["id"] in unreachable else "Not found on disk."))
+            self.files_table.setItem(row, 0, name_item)
+            night = f["night_date"] or ("—" if f["date_obs"] else "(no date)")
+            self.files_table.setItem(row, 1, _table_item(night, Qt.AlignCenter))
+            self.files_table.setItem(row, 2, _table_item(f["frame_type"] or "", Qt.AlignCenter))
+            filter_item = _table_item(f["filter_name"] or "", Qt.AlignCenter)
+            if f["filter_corrected"]:
+                font = filter_item.font()
+                font.setItalic(True)
+                filter_item.setFont(font)
+                filter_item.setToolTip(f"Set by you. The file says: {f['filter_from_file'] or '(none)'}")
+            self.files_table.setItem(row, 3, filter_item)
+            exposure = format_exposure(f["exptime_seconds"]) if f["exptime_seconds"] is not None else ""
+            self.files_table.setItem(row, 4, _table_item(exposure, Qt.AlignCenter))
+            gain = f"{f['gain']:g}" if f["gain"] is not None else ""
+            self.files_table.setItem(row, 5, _table_item(gain, Qt.AlignCenter))
+            temp = f"{f['ccd_temp']:.1f}°C" if f["ccd_temp"] is not None else ""
+            self.files_table.setItem(row, 6, _table_item(temp, Qt.AlignCenter))
+            binning = f"{f['xbinning']}x{f['ybinning'] or f['xbinning']}" if f["xbinning"] else ""
+            self.files_table.setItem(row, 7, _table_item(binning, Qt.AlignCenter))
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.files_table.setUpdatesEnabled(True)
+
+        frame_counts = Counter(f["frame_type"] or "Unknown" for f in files)
+        breakdown = ", ".join(f"{count} {frame}" for frame, count in frame_counts.most_common())
+        shown = f"{len(files)} attached file(s)" if len(files) == len(every) else \
+            f"Showing {len(files)} of {len(every)} attached files"
+        self.files_count_label.setText(
+            shown + (f" — {breakdown}" if breakdown else "")
+            + ("   (right-click to open a folder or remove files)" if files else ""))
+
+    def _refresh_summary(self):
+        totals = self._filter_totals()
+        subs = sum(t[1] for t in totals)
+        seconds = sum(t[2] for t in totals)
+        starts = [o["start_datetime"] or o["night_date"] for o in self._observations]
+        ends = [o["end_datetime"] or o["night_date"] for o in self._observations]
+        if starts:
+            first, last = min(starts).replace("T", " ")[:16], max(ends).replace("T", " ")[:16]
+            date_range = first if first == last else f"{first} → {last}"
+        else:
+            date_range = "(no observations yet)"
+
+        labels = self.summary_labels
+        labels["subs"].setText(str(subs))
+        labels["integration"].setText(f"{format_duration(seconds)}  ({seconds / 3600.0:.2f} h)")
+        labels["nights"].setText(str(len(self._observations)))
+        labels["filters"].setText(", ".join(t[0] for t in totals) or "(none)")
+        labels["mount"].setText(self._mount_text())
+        labels["range"].setText(date_range)
+        missing = len(self._missing_file_ids() & {f["id"] for f in self._visible_files()})
+        labels["files"].setText(str(len(self._visible_files())) + (f"  ({missing} missing on disk)" if missing else ""))
+        labels["target"].setText(self._session_meta.get("target") or "(not linked)")
+        labels["created"].setText(self._session_meta.get("created") or "")
+        labels["modified"].setText(self._session_meta.get("modified") or "")
+
+    def _mount_text(self):
+        """The session's mount and what its nights showed; also updates the form's Detected choice."""
+        nights = [self._obs_mounts[o["id"]][0] for o in self._observations if o["id"] in self._obs_mounts]
+        telescope_mount = self._session_meta.get("telescope_mount")
+        self.form.set_detected_mount(*MountDetection.summarize(nights, None, telescope_mount))
+        mount, how = MountDetection.summarize(nights, self.form.mount_combo.currentData(), telescope_mount)
+        text = MountDetection.describe(mount, how)
+        detail = MountDetection.count_text(nights) if nights else ""
+        if detail and detail != mount:
+            text += f"\nDetected: {detail}"
+        return text
+
+    # ---- Observation edits (held in memory until Save) -------------------
+
+    def _mark_dirty(self, select_obs=None):
+        self._obs_dirty = True
+        self._observations.sort(key=lambda o: o["night_date"])
+        self._refresh_observations_table(select_obs=select_obs)
+        self._refresh_filter_table()
+        self._refresh_files_table()
+        self._refresh_summary()
+
+    def _add_observation(self):
+        self.tabs.setCurrentIndex(self.OBSERVATIONS_TAB)
+        taken = {o["night_date"] for o in self._observations}
+        default_date = self.form.date_edit.date().toPython()
+        if default_date.isoformat() in taken:
+            default_date = date_cls.today()
+        dialog = ObservationDialog(default_date=default_date, filter_choices=self._filter_choices(),
+                                   taken_nights=taken, parent=self)
+        if dialog.exec() != QDialog.Accepted or not dialog.result:
+            return
+        obs = {"id": None, "state": "new", "is_manual": True, "file_groups": [], "file_count": 0}
+        obs.update(dialog.result)
+        self._observations.append(obs)
+        self._added_any = True
+        self._mark_dirty(select_obs=obs)
+
+    def _edit_observation(self):
+        obs = self._selected_observation()
+        if obs is None:
+            return
+        taken = {o["night_date"] for o in self._observations if o is not obs}
+        dialog = ObservationDialog(observation=obs, filter_choices=self._filter_choices(),
+                                   taken_nights=taken, parent=self)
+        if dialog.exec() != QDialog.Accepted or not dialog.result:
+            return
+        obs.update(dialog.result)
+        if obs["id"] is not None:
+            obs["state"] = "modified"
+        self._mark_dirty(select_obs=obs)
+
+    def _delete_observation(self):
+        obs = self._selected_observation()
+        if obs is None:
+            return
+        message = f"Delete the observation for the night of {obs['night_date']}?"
+        if obs["file_count"]:
+            message += (f"\n\nIts {obs['file_count']} attached file(s) will also be removed from this session "
+                        f"(the files on disk are not touched).")
+        message += "\n\nThis takes effect when you click Save Changes."
+        if QMessageBox.question(self, "Delete Observation", message,
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._observations.remove(obs)
+        if obs["id"] is not None:
+            self._deleted_ids.append(obs["id"])
+        self._mark_dirty()
+
+    # ---- Saving ---------------------------------------------------------
+
+    @staticmethod
+    def _insert_logged(cursor, observation_id, logged_rows):
+        for logged in logged_rows:
+            cursor.execute("""
+                INSERT INTO usersessionobservationfilters (observation_id, filter_name, exposure_seconds, sub_count)
+                VALUES (?, ?, ?, ?)
+            """, (observation_id, logged["filter_name"], logged["exposure_seconds"], logged["sub_count"]))
+
+    def _commit(self):
+        """Write the form and every pending observation change in one transaction."""
+        if not self.form.validate():
+            self.tabs.setCurrentIndex(self.OVERVIEW_TAB)
+            return False
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                self.form.write(conn)
+                for obs_id in self._deleted_ids:
+                    SessionObservations.delete_observation(conn, obs_id)
+                for obs in self._observations:
+                    if obs["state"] == "modified":
+                        cursor.execute("""
+                            UPDATE usersessionobservations SET night_date = ?, start_datetime = ?, end_datetime = ?,
+                                notes = ?, is_manual = 1, modified_date = ?
+                            WHERE id = ?
+                        """, (obs["night_date"], obs["start_datetime"], obs["end_datetime"], obs["notes"],
+                              now, obs["id"]))
+                        cursor.execute("DELETE FROM usersessionobservationfilters WHERE observation_id = ?",
+                                       (obs["id"],))
+                        self._insert_logged(cursor, obs["id"], obs["logged"])
+                for obs in self._observations:
+                    if obs["state"] == "new":
+                        cursor.execute("""
+                            INSERT INTO usersessionobservations
+                                (session_id, night_date, start_datetime, end_datetime, notes, is_manual, modified_date)
+                            VALUES (?, ?, ?, ?, ?, 1, ?)
+                        """, (self.session_id, obs["night_date"], obs["start_datetime"], obs["end_datetime"],
+                              obs["notes"], now))
+                        self._insert_logged(cursor, cursor.lastrowid, obs["logged"])
+                SessionObservations.assign_files_to_observations(conn, self.session_id)
+                SessionObservations.recompute_session_aggregates(conn, self.session_id, promote=self._added_any)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error saving session details: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save session: {e}")
+            return False
+        self.data_changed = True
+        return True
+
+    def _save(self):
+        if self._commit():
+            self.accept()
+
+    def reject(self):
+        if self._has_unsaved_changes():
+            reply = QMessageBox.question(self, "Discard Changes?", "Discard your unsaved changes to this session?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+        super().reject()
+
+    def _save_pending_before(self, action):
+        """Immediate writes (attach/remove files) first save any pending edits,
+        so the dialog never mixes committed and uncommitted state."""
+        if not self._has_unsaved_changes():
+            return True
+        reply = QMessageBox.question(
+            self, "Save Changes First?",
+            f"{action} is saved immediately, so your other unsaved changes will be saved first. Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if reply != QMessageBox.Yes or not self._commit():
+            return False
+        self._after_immediate_write()
+        return True
+
+    def _after_immediate_write(self):
+        self.data_changed = True
+        self._reload_from_db()
+        self._form_snapshot = self.form.snapshot()
+
+    # ---- Files (written immediately) -------------------------------------
+
+    def _attach_files(self, folder):
+        if not self._save_pending_before("Attaching files"):
+            return
+        if folder:
+            path = QFileDialog.getExistingDirectory(self, "Attach a Folder of Subs")
+            paths = [path] if path else []
+        else:
+            patterns = " ".join(f"*{ext}" for ext in sorted(SessionFileScanner.SUPPORTED_EXTENSIONS))
+            paths, _ = QFileDialog.getOpenFileNames(self, "Attach Sub Files", "", f"FITS/XISF Files ({patterns})")
+        if paths:
+            self._scan_and_attach(paths)
+
+    def _enable_file_drops(self):
+        """Accept dropped files/folders anywhere in the dialog. Text fields accept
+        drops themselves (a dropped file would be pasted in as a path), so they're
+        filtered: a drop carrying sub files or folders goes to attaching instead."""
+        self.setAcceptDrops(True)
+        for widget in self.findChildren(QWidget):
+            if widget.acceptDrops():
+                widget.installEventFilter(self)
+
+    def _scan_running(self):
+        try:
+            return self._scan_thread is not None and self._scan_thread.isRunning()
+        except RuntimeError:
+            return False  # Finished and deleted
+
+    def _accept_file_drag(self, event):
+        if not self._scan_running() and dropped_sub_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return True
+        return False
+
+    def _handle_file_drop(self, event):
+        paths = dropped_sub_paths(event.mimeData())
+        if not paths or self._scan_running():
+            return False
+        event.acceptProposedAction()
+        # Defer: showing dialogs inside dropEvent would keep the source app's
+        # drag operation (e.g. Explorer) blocked until they close.
+        QTimer.singleShot(0, lambda: self._attach_dropped(paths))
+        return True
+
+    def _attach_dropped(self, paths):
+        if self._save_pending_before("Attaching files"):
+            self._scan_and_attach(paths)
+
+    def dragEnterEvent(self, event):
+        if not self._accept_file_drag(event):
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if not self._accept_file_drag(event):
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not self._handle_file_drop(event):
+            event.ignore()
+
+    def eventFilter(self, obj, event):
+        event_type = event.type()
+        if event_type in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+            if self._accept_file_drag(event):
+                return True
+        elif event_type == QEvent.Type.Drop:
+            if self._handle_file_drop(event):
+                return True
+        return super().eventFilter(obj, event)
+
+    def _scan_and_attach(self, paths):
+        self._progress_dialog = QProgressDialog("Scanning files...", "Cancel", 0, 0, self)
+        self._progress_dialog.setWindowTitle("Attach Files")
+        self._progress_dialog.setWindowModality(Qt.WindowModal)
+        self._progress_dialog.setMinimumDuration(0)
+        self._progress_dialog.show()
+
+        # Where subs without a site in their headers were taken: the session's location
+        lat, lon = self.session_data.get("location_lat"), self.session_data.get("location_lon")
+        site = (lat, lon) if lat is not None and lon is not None else _active_site(self.db_manager)
+        self._scan_thread = SessionScanThread(paths, site, parent=self)
+        self._scan_thread.progress.connect(self._on_scan_progress)
+        self._scan_thread.status.connect(self._progress_dialog.setLabelText)
+        self._scan_thread.scan_finished.connect(self._on_scan_finished)
+        self._scan_thread.scan_error.connect(self._on_scan_error)
+        self._progress_dialog.canceled.connect(self._scan_thread.stop)
+        self._scan_thread.start()
+
+    def _on_scan_progress(self, current, total):
+        if total > 0:
+            self._progress_dialog.setMaximum(total)
+            self._progress_dialog.setValue(current)
+
+    def _on_scan_error(self, message):
+        self._progress_dialog.close()
+        QMessageBox.critical(self, "Scan Error", f"Failed to scan files: {message}")
+
+    def done(self, result):
+        # A stopped scan finishes its current file or night first
+        if self._scan_running():
+            self._scan_thread.stop()
+            self._scan_thread.wait(30000)
+        if self._file_check is not None:
+            self._file_check.stop()
+            _retire_thread(self._file_check)
+        super().done(result)
+
+    def _on_scan_finished(self, files, mounts):
+        self._progress_dialog.close()
+        if not files:
+            QMessageBox.information(self, "No Files Found", "No supported FITS/XISF files were found.")
+            return
+        try:
+            with self.db_manager.get_connection() as conn:
+                report = SessionObservations.attach_files(conn, self.session_id, files)
+                SessionObservations.assign_files_to_observations(conn, self.session_id)
+                SessionObservations.recompute_session_aggregates(conn, self.session_id)
+                MountDetection.save(conn, self.session_id, mounts)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error attaching files: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to attach files: {e}")
+            return
+        self._after_immediate_write()
+        QMessageBox.information(self, "Attach Files",
+                                SessionObservations.format_attach_report(report)
+                                or f"{report['inserted']} new file(s) attached.")
+
+    def _selected_file_ids(self):
+        rows = sorted({index.row() for index in self.files_table.selectedIndexes()})
+        return [self.files_table.item(row, 0).data(Qt.UserRole) for row in rows if self.files_table.item(row, 0)]
+
+    def _show_files_menu(self, position):
+        item = self.files_table.itemAt(position)
+        if not item:
+            return
+        if not self.files_table.item(item.row(), 0).isSelected():
+            self.files_table.selectRow(item.row())
+        path = self.files_table.item(item.row(), 0).toolTip()
+        count = len(self._selected_file_ids())
+
+        selected = set(self._selected_file_ids())
+        filterable = [f for f in self._files if f["id"] in selected and f["frame_type"] in ("Light", "Flat")]
+        corrected = [f for f in filterable if f["filter_corrected"]]
+
+        menu = QMenu(self)
+        menu.addAction("Open Containing Folder").triggered.connect(lambda: self._open_folder(path))
+        menu.addSeparator()
+        if filterable:
+            menu.addAction(f"Set Filter for {len(filterable)} File(s)...").triggered.connect(
+                lambda: self._set_files_filter(filterable))
+        if corrected:
+            menu.addAction(f"Use the Files' Own Filter ({len(corrected)})").triggered.connect(
+                lambda: self._write_filter_changes({f["id"]: None for f in corrected}))
+        if filterable:
+            menu.addSeparator()
+        menu.addAction(f"Remove {count} File(s) from Session...").triggered.connect(self._remove_selected_files)
+        menu.exec(self.files_table.viewport().mapToGlobal(position))
+
+    def _open_folder(self, path):
+        folder = os.path.dirname(path)
+        if not os.path.isdir(folder):
+            QMessageBox.warning(self, "Folder Not Found", f"The folder no longer exists:\n{folder}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def _review_light_quality(self):
+        if not self._save_pending_before("Removing, moving or deleting frames in the review"):
+            return
+        from cosmoscollection.imaging.LightQualityReview import LightQualityDialog
+        dialog = LightQualityDialog(self.session_data, parent=self)
+        dialog.exec()
+        if dialog.files_changed:
+            self._after_immediate_write()
+
+    def _open_file_check(self):
+        if not self._save_pending_before("Cleaning up files"):
+            return
+        from cosmoscollection.sessions.SessionFileCheck import SessionFileCheckDialog
+        dialog = SessionFileCheckDialog(self.session_data, parent=self)
+        dialog.exec()
+        if dialog.changed:
+            self._after_immediate_write()
+
+    def _remove_selected_files(self):
+        file_ids = self._selected_file_ids()
+        if not file_ids:
+            return
+        if QMessageBox.question(
+                self, "Remove Files",
+                f"Remove {len(file_ids)} file(s) from this session? The files on disk are not touched.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        if not self._save_pending_before("Removing files"):
+            return
+        from cosmoscollection.sessions.SessionFileCheck import ask_stranded
+        file_ids += ask_stranded(self, self.db_manager, self.session_id, file_ids)
+        try:
+            with self.db_manager.get_connection() as conn:
+                SessionObservations.remove_files(conn, self.session_id, file_ids)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error removing session files: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to remove files: {e}")
+            return
+        self._after_immediate_write()
+
+    # ---- Filter corrections (written immediately) --------------------------
+
+    def _night_filter_files(self, obs):
+        """A saved night's lights and flats - the files Set Filters works on."""
+        if obs is None or obs["id"] is None:
+            return []
+        return [f for f in self._files if f["observation_id"] == obs["id"] and f["frame_type"] in ("Light", "Flat")]
+
+    def _set_night_filters(self):
+        obs = self._selected_observation()
+        files = self._night_filter_files(obs)
+        if not files:
+            return
+        from cosmoscollection.sessions.FilterCorrections import NightFiltersDialog
+        try:
+            with self.db_manager.get_connection() as conn:
+                tz_name = SessionObservations.session_timezone(conn, self.session_id)
+        except Exception as e:
+            logger.debug(f"No session timezone: {e}")
+            tz_name = None
+        dialog = NightFiltersDialog(obs["night_date"], files, tz_name, self._filter_choices(), parent=self)
+        if dialog.exec() == QDialog.Accepted and dialog.changes:
+            self._write_filter_changes(dialog.changes)
+
+    def _clear_night_filters(self):
+        obs = self._selected_observation()
+        corrected = [f for f in self._night_filter_files(obs) if f["filter_corrected"]]
+        if not corrected:
+            return
+        if QMessageBox.question(
+                self, "Clear Filters",
+                f"Use the files' own filters again for the {len(corrected)} file(s) you set on the night of "
+                f"{obs['night_date']}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
+            return
+        self._write_filter_changes({f["id"]: None for f in corrected})
+
+    def _set_files_filter(self, files):
+        from PySide6.QtWidgets import QInputDialog
+        current = {f["filter_name"] or "" for f in files}
+        choices = sorted(self._filter_choices() | {f["filter_from_file"] for f in files if f["filter_from_file"]},
+                         key=str.lower)
+        start = next(iter(current)) if len(current) == 1 else ""
+        name, ok = QInputDialog.getItem(
+            self, "Set Filter", f"Filter for the {len(files)} selected light/flat file(s):",
+            choices or [""], max(choices.index(start), 0) if start in choices else 0, True)
+        name = (name or "").strip()
+        if ok and name:
+            self._write_filter_changes({f["id"]: name for f in files})
+
+    def _write_filter_changes(self, changes):
+        """Save filter corrections ({file id: filter or None for the file's own})."""
+        if not self._save_pending_before("Setting filters"):
+            return
+        try:
+            with self.db_manager.get_connection() as conn:
+                SessionObservations.set_file_filters(conn, self.session_id, changes)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error saving filter corrections: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save the filters: {e}")
+            return
+        self._after_immediate_write()
+
+
+class _ScanStopped(Exception):
+    pass
+
+
+def _active_site(db_manager):
+    """(lat, lon) of the active saved location, or None."""
+    try:
+        with db_manager.get_connection() as conn:
+            row = conn.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 "
+                               "AND location_lat IS NOT NULL AND location_lon IS NOT NULL").fetchone()
+        return (row[0], row[1]) if row else None
+    except Exception as e:
+        logger.debug(f"No active location: {e}")
+        return None
+
+
+class SessionScanThread(QThread):
+    """Background scan of dropped files/folders so large folders don't block the
+    UI, then each night's mount (MountDetection). stop() ends it at the next
+    file or night - stopping a thread part way through a database write isn't safe."""
+    progress = Signal(int, int)
+    status = Signal(str)
+    scan_finished = Signal(list, list)  # file dicts, [MountDetection.NightMount]
+    scan_error = Signal(str)
+
+    def __init__(self, paths, site=None, parent=None):
+        super().__init__(parent)
+        self.paths = paths
+        self.site = site
+        self.cancel = threading.Event()
+        self.finished.connect(self.deleteLater)
+
+    def stop(self):
+        self.cancel.set()
+
+    def _progress(self, current, total):
+        if self.cancel.is_set():
+            raise _ScanStopped()
+        self.progress.emit(current, total)
+
+    def run(self):
+        try:
+            all_files = []
+            for path in self.paths:
+                if self.cancel.is_set():
+                    return
+                if os.path.isdir(path):
+                    all_files.extend(SessionFileScanner.scan_folder(path, progress_callback=self._progress))
+                elif os.path.splitext(path)[1].lower() in SessionFileScanner.SUPPORTED_EXTENSIONS:
+                    data = SessionFileScanner.scan_file(path)
+                    if data is not None:
+                        all_files.append(data)
+            mounts = self._detect_mounts(all_files)
+            if not self.cancel.is_set():
+                self.scan_finished.emit(all_files, mounts)
+        except _ScanStopped:
+            return
+        except Exception as e:
+            logger.error(f"Error scanning dropped files: {e}")
+            self.scan_error.emit(str(e))
+
+    def _detect_mounts(self, files):
+        nights = MountDetection.nights_from_file_dicts(files, self.site[1] if self.site else None)
+        if not nights:
+            return []
+        self.status.emit("Checking how the mount tracked each night...")
+        cache = None
+        try:
+            cache = MountDetection.MountCache()
+        except Exception as e:
+            logger.warning(f"Could not open the mount cache: {e}")
+        try:
+            return MountDetection.detect(nights, self.site, cache, cancel=self.cancel,
+                                         progress=lambda done, total: self.progress.emit(done, total))
+        except Exception as e:
+            logger.warning(f"Mount detection failed: {e}", exc_info=True)
+            return []
+        finally:
+            if cache:
+                cache.close()
+
+
+class VisibilityCalcThread(QThread):
+    """Runs a DSOVisibilityCalculator calculation off the GUI thread. main.py's
+    startup pre-warm already exercises DSOVisibilityCalculator once, single-threaded,
+    before any window exists - so by the time this thread ever runs, the one-time
+    astropy/matplotlib setup cost has already been paid and there's no risk of racing
+    that same cold-import machinery against another thread (e.g. the weather worker)."""
+    result_ready = Signal(dict)
+
+    def __init__(self, ra_deg, dec_deg, dso_name, location_lat, location_lon, location_timezone, visibility_date):
+        super().__init__()
+        self.ra_deg = ra_deg
+        self.dec_deg = dec_deg
+        self.dso_name = dso_name
+        self.location_lat = location_lat
+        self.location_lon = location_lon
+        self.location_timezone = location_timezone
+        self.visibility_date = visibility_date
+
+    def run(self):
+        try:
+            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityCalculator
+            from astropy.coordinates import SkyCoord
+            from astropy import units as u
+            import pytz
+
+            from cosmoscollection.planning.HorizonProfile import load_horizon_for_coordinates
+
+            calc = DSOVisibilityCalculator(
+                location_lat=self.location_lat,
+                location_lon=self.location_lon,
+                timezone=self.location_timezone,
+            )
+            # Custom horizon of the saved location this session uses (active or
+            # not); None for a custom location
+            horizon = load_horizon_for_coordinates(self.location_lat, self.location_lon)
+
+            coord = None
+            if self.ra_deg is not None and self.dec_deg is not None:
+                coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
+                result = calc.calculate_visibility_for_coordinates(coord, self.visibility_date, dso_name=self.dso_name,
+                                                                   horizon=horizon)
+            elif self.dso_name:
+                result = calc.calculate_visibility_for_date(self.dso_name, self.visibility_date, horizon=horizon)
+            else:
+                self.result_ready.emit({"error": "No coordinates or name available."})
+                return
+
+            if result.get("error"):
+                self.result_ready.emit({"error": result["error"]})
+                return
+
+            max_alt_time_local = result["max_alt_time"].to_datetime(timezone=pytz.UTC).astimezone(calc.timezone)
+            lines = [f"Max altitude: {result['max_altitude']:.1f}° at {format_time(max_alt_time_local)}"]
+
+            above = "above 30° and custom horizon" if horizon else "above 30°"
+            windows = result.get("viewing_windows", [])
+            if windows:
+                best_window = max(windows, key=lambda w: w["duration_hours"])
+                start_local = best_window["start_time"].to_datetime(timezone=pytz.UTC).astimezone(calc.timezone)
+                end_local = best_window["end_time"].to_datetime(timezone=pytz.UTC).astimezone(calc.timezone)
+                lines.append(
+                    f"Best window: {format_time(start_local)} - {format_time(end_local)} "
+                    f"({best_window['duration_hours']:.1f}h {above}, dark sky)"
+                )
+            else:
+                lines.append(f"No window {above} during dark sky on this date.")
+
+            obs_time = result["max_alt_time"]
+            illumination = DSOVisibilityCalculator.get_moon_illumination(obs_time)
+            lines.append(f"Moon illumination: {illumination * 100:.0f}%")
+            if coord is not None:
+                separation = DSOVisibilityCalculator.get_moon_separation(coord, obs_time)
+                if separation is not None:
+                    lines.append(f"Moon separation: {separation:.0f}°")
+
+            self.result_ready.emit({"lines": lines})
+        except Exception as e:
+            logger.error(f"Error calculating visibility: {e}")
+            self.result_ready.emit({"error": f"Visibility calculation failed: {e}"})
+
+
+class SessionMonthlyVisibilityThread(QThread):
+    """Computes per-day visibility hours across a date range spanning one or more
+    displayed calendar months, for a specific session's DSO/location. Modeled on
+    DSOVisibilityCalculator.MonthlyVisibilityThread, but takes explicit location
+    (a session's own location override, not the DB's default active location) and
+    an arbitrary start/end date range instead of a single calendar month, since the
+    calendar view can show 1-3 months at once. Runs off the GUI thread - a 3-month
+    span is ~90 sequential per-day calls, the same per-call cost already proven
+    acceptable for the existing single-month DSOVisibilityCalculator feature."""
+    progress = Signal(int, int)  # days completed, total days
+    # object, not dict: Signal(dict) marshals through QVariantMap across threads,
+    # which requires string keys and silently drops non-string keys (our keys are
+    # datetime.date objects) - see the same fix already applied in
+    # DSOVisibilityCalculator.MonthlyVisibilityThread.finished.
+    finished_calc = Signal(object)  # {date: hours}
+    error = Signal(str)
+
+    def __init__(self, ra_deg, dec_deg, dso_name, location_lat, location_lon, location_timezone,
+                 start_date, end_date, min_altitude=30):
+        super().__init__()
+        self.ra_deg = ra_deg
+        self.dec_deg = dec_deg
+        self.dso_name = dso_name
+        self.location_lat = location_lat
+        self.location_lon = location_lon
+        self.location_timezone = location_timezone
+        self.start_date = start_date
+        self.end_date = end_date
+        self.min_altitude = min_altitude
+
+    def run(self):
+        try:
+            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityCalculator
+            from astropy.coordinates import SkyCoord
+            from astropy import units as u
+            from datetime import timedelta
+
+            from cosmoscollection.planning.HorizonProfile import load_horizon_for_coordinates
+
+            calc = DSOVisibilityCalculator(
+                location_lat=self.location_lat,
+                location_lon=self.location_lon,
+                timezone=self.location_timezone,
+            )
+            if calc.location is None:
+                self.error.emit("Observer location not configured.")
+                return
+            # Custom horizon of the saved location this session uses (active or
+            # not); None for a custom location
+            horizon = load_horizon_for_coordinates(self.location_lat, self.location_lon)
+
+            if self.ra_deg is not None and self.dec_deg is not None:
+                coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
+            elif self.dso_name:
+                coord, err = calc.get_dso_coordinates_enhanced(self.dso_name)
+                if coord is None:
+                    self.error.emit(f"Could not find coordinates: {err}")
+                    return
+            else:
+                self.error.emit("No coordinates or name available.")
+                return
+
+            total_days = (self.end_date - self.start_date).days + 1
+            results = {}
+            current = self.start_date
+            completed = 0
+            while current <= self.end_date:
+                hours = calc.calculate_visibility_hours_for_day(coord, current.strftime("%Y-%m-%d"), self.min_altitude,
+                                                                horizon=horizon)
+                results[current] = hours
+                completed += 1
+                self.progress.emit(completed, total_days)
+                current += timedelta(days=1)
+
+            self.finished_calc.emit(results)
+        except Exception as e:
+            logger.error(f"Error calculating monthly visibility: {e}")
+            self.error.emit(str(e))
+
+
+class SessionMonthCalendar(QCalendarWidget):
+    """One month of the Session Manager calendar view. Combines three independent,
+    date-keyed layers on the same cells: DSO visibility hours (background fill),
+    weather astro score (a stripe across the top, only for the ~7 dates with a live
+    forecast), and session markers (small status-colored dots). Reuses the
+    paintCell()-override technique from DSOVisibilityCalculator.VisibilityCalendar
+    rather than setDateTextFormat, which that class already found doesn't suit
+    per-cell custom painting."""
+
+    STATUS_COLOR_KEYS = {
+        "Planned": "info",
+        "In Progress": "warning",
+        "Completed": "success",
+        "Cancelled": "text_disabled",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.visibility_hours = {}   # date -> hours
+        self.weather_scores = {}     # date -> astro_score (0-100)
+        self.weather_details = {}    # date -> {"cloud_cover": float, "seeing": str}
+        self.session_markers = {}    # date -> [(session_id, dso_name, status, night_seconds, night_filters), ...]
+        self.setGridVisible(True)
+        self.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        self.setMouseTracking(True)
+
+        self.tooltip_label = QLabel(self)
+        self.tooltip_label.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        themed_style(self.tooltip_label, lambda: f"""
+            QLabel {{
+                background-color: {COLORS['background_lighter']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border_light']};
+                border-radius: 3px;
+                padding: 4px 8px;
+                font-size: {font_size(10)};
+            }}
+        """)
+        self.tooltip_label.hide()
+
+        # QCalendarWidget renders its day grid via a private internal QTableView
+        # subclass - overriding mouseMoveEvent/leaveEvent on the QCalendarWidget
+        # itself never fires while hovering over day cells, since those mouse
+        # events are consumed by that internal view and don't propagate up to us.
+        # Install an event filter on the view's viewport instead, which is where
+        # the events actually land.
+        self._day_view = self.findChild(QTableView)
+        if self._day_view is not None:
+            self._day_view.setMouseTracking(True)
+            self._day_view.viewport().setMouseTracking(True)
+            self._day_view.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if self._day_view is not None and obj is self._day_view.viewport():
+            if event.type() == QEvent.Type.MouseMove:
+                py_date = self._date_from_view_pos(event.pos())
+                self._show_tooltip_for_date(py_date, self._day_view.viewport().mapToGlobal(event.pos()))
+            elif event.type() == QEvent.Type.Leave:
+                self.tooltip_label.hide()
+        return super().eventFilter(obj, event)
+
+    def _date_from_view_pos(self, pos_in_view):
+        """QCalendarWidget has no public dateAt()/similar for this - its day grid
+        is rendered by an internal QTableView whose model is private/undocumented.
+        Resolve the date ourselves from the cell's (row, col) instead: the model's
+        row 0 is a non-clickable weekday-name header (confirmed empirically - its
+        cells are text like "Sun"/"Mon", not day numbers), so the real day grid
+        starts at row 1, which is always firstDayOfWeek()-aligned - walk backward
+        from the 1st of the shown month by however many leading days that needs."""
+        index = self._day_view.indexAt(pos_in_view)
+        if not index.isValid() or index.row() < 1:
+            return None
+        first_of_month = date_cls(self.yearShown(), self.monthShown(), 1)
+        qt_first_day = self.firstDayOfWeek().value  # Qt.Monday=1 .. Qt.Sunday=7
+        first_weekday = first_of_month.isoweekday()  # Python: Monday=1 .. Sunday=7
+        # Qt always shows at least one full leading week from the previous month,
+        # even when the 1st already falls exactly on the configured first day of
+        # the week (confirmed empirically: e.g. Feb 2026 starts on a Sunday with
+        # Sunday as the first day of the week, yet row 1 still shows the last week
+        # of January, not Feb 1st) - so this must land in [1, 7], never 0.
+        leading_days = ((first_weekday - qt_first_day - 1) % 7) + 1
+        first_visible_date = first_of_month - timedelta(days=leading_days)
+        cell_offset = (index.row() - 1) * 7 + index.column()
+        return first_visible_date + timedelta(days=cell_offset)
+
+    def set_data(self, visibility_hours=None, weather_scores=None, weather_details=None, session_markers=None):
+        if visibility_hours is not None:
+            self.visibility_hours = visibility_hours
+        if weather_scores is not None:
+            self.weather_scores = weather_scores
+        if weather_details is not None:
+            self.weather_details = weather_details
+        if session_markers is not None:
+            self.session_markers = session_markers
+        self.updateCells()
+        self.update()
+
+    def clear_visibility(self):
+        self.visibility_hours = {}
+        self.updateCells()
+        self.update()
+
+    def paintCell(self, painter, rect, date):
+        from PySide6.QtGui import QPen, QBrush
+        from cosmoscollection.planning.DSOVisibilityCalculator import no_visibility_data_colors, visibility_hours_to_color
+        from cosmoscollection.planning.WeatherForecast import get_rating_color
+
+        if date.month() != self.monthShown() or date.year() != self.yearShown():
+            super().paintCell(painter, rect, date)
+            return
+
+        py_date = date.toPython()
+
+        if py_date in self.visibility_hours:
+            bg_color, fg_color = visibility_hours_to_color(self.visibility_hours[py_date])
+        else:
+            bg_color, fg_color = no_visibility_data_colors()
+
+        painter.fillRect(rect, QBrush(bg_color))
+
+        weather_score = self.weather_scores.get(py_date)
+        if weather_score is not None:
+            stripe_rect = rect.adjusted(0, 0, 0, -(rect.height() - 6))
+            painter.fillRect(stripe_rect, QBrush(QColor(get_rating_color(weather_score))))
+
+        painter.setPen(QPen(fg_color))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(date.day()))
+
+        markers = self.session_markers.get(py_date)
+        if markers:
+            statuses = sorted({status for _, _, status, _, _ in markers})
+            dot_radius = 3
+            spacing = 8
+            start_x = rect.right() - 6 - spacing * (len(statuses) - 1)
+            dot_y = rect.bottom() - 8
+            painter.setPen(Qt.NoPen)
+            for i, status in enumerate(statuses):
+                color_key = self.STATUS_COLOR_KEYS.get(status, "text_disabled")
+                painter.setBrush(QBrush(QColor(COLORS[color_key])))
+                painter.drawEllipse(QPoint(start_x + i * spacing, dot_y), dot_radius, dot_radius)
+
+        if date == self.selectedDate():
+            painter.setPen(QPen(QColor(COLORS['warning']), 2))
+            painter.drawRect(rect.adjusted(1, 1, -1, -1))
+        elif py_date == date_cls.today():
+            painter.setPen(QPen(QColor(COLORS['text']), 1))
+            painter.drawRect(rect.adjusted(1, 1, -1, -1))
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.tooltip_label.hide()
+
+    def _show_tooltip_for_date(self, py_date, global_pos):
+        """py_date is a plain datetime.date (or None); global_pos is the screen
+        position to anchor the tooltip near."""
+        from cosmoscollection.planning.WeatherForecast import get_rating_label
+
+        if py_date is None or py_date.month != self.monthShown() or py_date.year != self.yearShown():
+            self.tooltip_label.hide()
+            return
+
+        lines = []
+        if py_date in self.visibility_hours:
+            lines.append(f"{self.visibility_hours[py_date]:.1f}h visible")
+        if py_date in self.weather_scores:
+            score = self.weather_scores[py_date]
+            weather_line = f"Weather: {score}/100 ({get_rating_label(score)})"
+            detail = self.weather_details.get(py_date)
+            if detail:
+                if detail.get("cloud_cover") is not None:
+                    weather_line += f", {detail['cloud_cover']:.0f}% clouds"
+                if detail.get("seeing"):
+                    weather_line += f", seeing {detail['seeing']}"
+            lines.append(weather_line)
+        for _, dso_name, status, night_seconds, night_filters in self.session_markers.get(py_date, []):
+            marker_line = f"{dso_name} - {status}"
+            if night_seconds:
+                marker_line += f" - {night_seconds / 3600.0:.1f}h"
+            if night_filters:
+                marker_line += f" ({night_filters})"
+            lines.append(marker_line)
+
+        if not lines:
+            self.tooltip_label.hide()
+            return
+
+        self.tooltip_label.setText("\n".join(lines))
+        self.tooltip_label.adjustSize()
+        self.tooltip_label.move(global_pos.x() + 15, global_pos.y() + 15)
+        self.tooltip_label.show()
+        self.tooltip_label.raise_()
+
+
+# Superseded worker threads that are still running. quit() can't interrupt a
+# QThread whose work is in run() (no event loop), and wait()-ing for one froze
+# the UI until it finished - e.g. clicking a second session mid-fetch. So they're
+# abandoned instead: kept referenced here (PySide6 can hard-crash, natively, if a
+# QThread is garbage-collected while its OS thread is still running) with their
+# signals blocked so late results are dropped, and pruned once they've ended.
+_retired_threads = set()
+
+
+def _retire_thread(thread):
+    _retired_threads.difference_update([t for t in _retired_threads if not t.isRunning()])
+    if thread is not None and thread.isRunning():
+        thread.blockSignals(True)
+        _retired_threads.add(thread)
+
+
+class SharedWeatherFetch:
+    """At most one WeatherWorker per location, shared by the calendar's weather
+    stripe and the details panel - selecting a session used to start two
+    identical fetches. A running worker is referenced here until it ends (see
+    _retired_threads for why), and its result is cached before callbacks run."""
+
+    _workers = {}  # (lat, lon) rounded -> running WeatherWorker
+
+    @classmethod
+    def key(cls, lat, lon):
+        return round(float(lat), 2), round(float(lon), 2)
+
+    @classmethod
+    def request(cls, lat, lon, timezone, on_loaded, on_error):
+        from cosmoscollection.planning.WeatherForecast import WeatherCache, WeatherWorker
+        key = cls.key(lat, lon)
+        worker = cls._workers.get(key)
+        is_new = worker is None or not worker.isRunning()
+        if is_new:
+            worker = WeatherWorker(lat, lon, timezone)
+            worker.weather_loaded.connect(lambda data: WeatherCache().set(lat, lon, data))
+            worker.finished.connect(lambda w=worker: cls._workers.pop(key, None) if cls._workers.get(key) is w else None)
+            cls._workers[key] = worker
+        worker.weather_loaded.connect(on_loaded)
+        worker.error_occurred.connect(on_error)
+        if is_new:
+            worker.start()
+
+
+class SessionCalendarWidget(QWidget):
+    """The Session Manager 'Calendar' tab: 1-3 side-by-side SessionMonthCalendar
+    instances kept chronologically chained, with weather/visibility layers that
+    follow the currently selected session. Nothing is fetched until a session
+    is selected."""
+
+    MONTH_COUNT_SETTING = "session_calendar_month_count"
+    SHOW_ALL_SETTING = "session_calendar_show_all_sessions"
+
+    def __init__(self, db_manager, parent=None):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self._current_session = None
+        self.calendars = []
+        self.weather_scores = {}
+        self.weather_details = {}
+        self.visibility_hours = {}
+        self.session_markers = {}
+        self.on_date_with_session_clicked = None
+        self.on_open_visibility_calculator = None
+        self._weather_key = None
+        self._visibility_thread = None
+
+        today = QDate.currentDate()
+        self.anchor_year, self.anchor_month = today.year(), today.month()
+        self.month_count = self._load_month_count()
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(self._build_controls())
+
+        self.calendars_layout = QHBoxLayout()
+        layout.addLayout(self.calendars_layout, 1)
+
+        self._rebuild_calendars()
+
+    def _build_controls(self):
+        row = QHBoxLayout()
+
+        row.addWidget(QLabel("Months:"))
+        self.month_count_combo = QComboBox()
+        self.month_count_combo.addItems(["1 Month", "2 Months", "3 Months"])
+        self.month_count_combo.setCurrentIndex(self.month_count - 1)
+        self.month_count_combo.currentIndexChanged.connect(self._on_month_count_changed)
+        row.addWidget(self.month_count_combo)
+
+        prev_btn = QPushButton("◀ Previous")
+        prev_btn.clicked.connect(self._go_previous)
+        row.addWidget(prev_btn)
+
+        next_btn = QPushButton("Next ▶")
+        next_btn.clicked.connect(self._go_next)
+        row.addWidget(next_btn)
+
+        self.show_all_checkbox = QCheckBox("Show All Sessions")
+        self.show_all_checkbox.setToolTip(
+            "Mark the nights of every session in the months shown,\n"
+            "not just the selected session's.\n\n"
+            "Visibility and weather still follow the selected session."
+        )
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        self.show_all_checkbox.setChecked(settings.value(self.SHOW_ALL_SETTING, False, type=bool))
+        self.show_all_checkbox.toggled.connect(self._on_show_all_toggled)
+        row.addWidget(self.show_all_checkbox)
+
+        self.visibility_calc_btn = QPushButton("Visibility Calculator")
+        self.visibility_calc_btn.setToolTip("Open the DSO Visibility Calculator for the selected session's object.")
+        self.visibility_calc_btn.setEnabled(False)  # until a session is selected
+        self.visibility_calc_btn.clicked.connect(lambda: self._open_visibility_calculator())
+        row.addWidget(self.visibility_calc_btn)
+
+        row.addStretch()
+
+        self.legend_label = QLabel()
+        self._update_legend()
+        row.addWidget(self.legend_label)
+        for label, color_key in (
+            ("Excellent", 'success'), ("Good", 'info'),
+            ("Moderate", 'warning'), ("Poor", 'error'),
+        ):
+            swatch = QLabel()
+            swatch.setFixedSize(12, 12)
+            themed_style(swatch, lambda color_key=color_key: f"background-color: {COLORS[color_key]}; border: 1px solid {COLORS['border']};")
+            row.addWidget(swatch)
+            row.addWidget(QLabel(label))
+
+        return row
+
+    def _load_month_count(self):
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        return max(1, min(3, settings.value(self.MONTH_COUNT_SETTING, 1, type=int)))
+
+    def _save_month_count(self, count):
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue(self.MONTH_COUNT_SETTING, count)
+
+    def _update_legend(self):
+        dots = "all sessions' nights" if self.show_all_checkbox.isChecked() else "selected session's nights"
+        self.legend_label.setText(f"Background: DSO visibility • Top stripe: weather • Dot: {dots}")
+
+    def _on_show_all_toggled(self, checked):
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue(self.SHOW_ALL_SETTING, checked)
+        self._update_legend()
+        self.refresh_session_markers()
+
+    def _on_month_count_changed(self, index):
+        self.month_count = index + 1
+        self._save_month_count(self.month_count)
+        self._rebuild_calendars()
+
+    @staticmethod
+    def _next_month(year, month):
+        return (year + 1, 1) if month == 12 else (year, month + 1)
+
+    @staticmethod
+    def _prev_month(year, month):
+        return (year - 1, 12) if month == 1 else (year, month - 1)
+
+    def _display_range(self):
+        start = date_cls(self.anchor_year, self.anchor_month, 1)
+        last_year, last_month = self.anchor_year, self.anchor_month
+        for _ in range(self.month_count - 1):
+            last_year, last_month = self._next_month(last_year, last_month)
+        last_day = calendar.monthrange(last_year, last_month)[1]
+        end = date_cls(last_year, last_month, last_day)
+        return start, end
+
+    def _rebuild_calendars(self):
+        for cal in self.calendars:
+            cal.setParent(None)
+            cal.deleteLater()
+        self.calendars = []
+
+        while self.calendars_layout.count():
+            self.calendars_layout.takeAt(0)
+
+        year, month = self.anchor_year, self.anchor_month
+        for i in range(self.month_count):
+            cal = SessionMonthCalendar()
+            cal.setCurrentPage(year, month)
+            if i == 0:
+                cal.currentPageChanged.connect(self._on_calendar0_page_changed)
+            else:
+                cal.setNavigationBarVisible(False)
+            cal.clicked.connect(self._on_date_clicked)
+            self.calendars_layout.addWidget(cal)
+            self.calendars.append(cal)
+            year, month = self._next_month(year, month)
+
+        self._trigger_recalculation()
+
+    def _set_anchor(self, year, month):
+        self.anchor_year, self.anchor_month = year, month
+        y, m = year, month
+        for cal in self.calendars:
+            cal.blockSignals(True)
+            cal.setCurrentPage(y, m)
+            cal.blockSignals(False)
+            y, m = self._next_month(y, m)
+        self._trigger_recalculation()
+
+    def _on_calendar0_page_changed(self, year, month):
+        self._set_anchor(year, month)
+
+    def _go_previous(self):
+        year, month = self._prev_month(self.anchor_year, self.anchor_month)
+        self._set_anchor(year, month)
+
+    def _go_next(self):
+        year, month = self._next_month(self.anchor_year, self.anchor_month)
+        self._set_anchor(year, month)
+
+    def _on_date_clicked(self, qdate):
+        py_date = qdate.toPython()
+        markers = self.session_markers.get(py_date)
+        if not markers or not self.on_date_with_session_clicked:
+            return
+
+        # One entry per session - a session can have several observations on a date
+        sessions = {}
+        for session_id, dso_name, status, _, _ in markers:
+            sessions.setdefault(session_id, f"{dso_name} - {status}")
+        if len(sessions) == 1:
+            self.on_date_with_session_clicked(next(iter(sessions)))
+            return
+
+        # Several sessions share this date (Show All Sessions) - let the user pick
+        menu = QMenu(self)
+        for session_id, text in sessions.items():
+            action = menu.addAction(text)
+            action.triggered.connect(
+                lambda _checked=False, sid=session_id: self.on_date_with_session_clicked(sid))
+        menu.exec(QCursor.pos())
+
+    def set_active_session(self, session):
+        self._current_session = session
+        self.visibility_calc_btn.setEnabled(bool(session))
+        self._trigger_recalculation()
+
+    def _open_visibility_calculator(self):
+        if self._current_session and self.on_open_visibility_calculator:
+            self.on_open_visibility_calculator(self._current_session)
+
+    def _trigger_recalculation(self):
+        self.refresh_session_markers()
+        self._refresh_weather_layer()
+        self._refresh_visibility_layer()
+
+    def _refresh_weather_layer(self):
+        # Weather is only fetched for a selected session - opening the Session
+        # Manager doesn't start a download.
+        session = self._current_session
+        lat = session.get("location_lat") if session else None
+        lon = session.get("location_lon") if session else None
+        if lat is None or lon is None:
+            self._weather_key = None
+            self._apply_weather_scores({}, {})
+            return
+
+        from cosmoscollection.planning.WeatherForecast import WeatherCache
+
+        cached = WeatherCache().get(lat, lon)
+        self._weather_key = SharedWeatherFetch.key(lat, lon)
+        if cached:
+            self._apply_weather_list(cached)
+            return
+        key = self._weather_key
+        SharedWeatherFetch.request(
+            lat, lon, session.get("location_timezone"),
+            lambda data: self._on_weather_loaded(data, key),
+            lambda msg: logger.debug(f"Calendar weather fetch failed: {msg}"))
+
+    def _on_weather_loaded(self, data, key):
+        if key != self._weather_key:
+            return  # a different session/location has been selected since
+        try:
+            self._apply_weather_list(data)
+        except RuntimeError:
+            pass  # the window was closed while the fetch ran
+
+    def _apply_weather_list(self, daily_summaries):
+        scores = {}
+        details = {}
+        for summary in daily_summaries:
+            d = summary.date.date()
+            scores[d] = summary.astro_score
+            details[d] = {
+                "cloud_cover": summary.tonight_avg_cloud_cover,
+                "seeing": summary.seeing_estimate,
+            }
+        self._apply_weather_scores(scores, details)
+
+    def _apply_weather_scores(self, scores, details=None):
+        self.weather_scores = scores
+        self.weather_details = details if details is not None else {}
+        for cal in self.calendars:
+            cal.set_data(weather_scores=scores, weather_details=self.weather_details)
+
+    def _refresh_visibility_layer(self):
+        session = self._current_session
+        if not session:
+            self.visibility_hours = {}
+            for cal in self.calendars:
+                cal.clear_visibility()
+            return
+
+        start_date, end_date = self._display_range()
+
+        _retire_thread(self._visibility_thread)
+        self._visibility_thread = SessionMonthlyVisibilityThread(
+            session.get("ra_deg"), session.get("dec_deg"), session.get("dso_name"),
+            session.get("location_lat"), session.get("location_lon"), session.get("location_timezone"),
+            start_date, end_date,
+        )
+        self._visibility_thread.finished_calc.connect(self._on_visibility_calc_finished)
+        self._visibility_thread.error.connect(
+            lambda msg: logger.debug(f"Calendar visibility calc failed: {msg}")
+        )
+        self._visibility_thread.start()
+
+    def _on_visibility_calc_finished(self, hours_by_date):
+        self.visibility_hours = hours_by_date
+        for cal in self.calendars:
+            cal.set_data(visibility_hours=hours_by_date)
+
+    def refresh_session_markers(self):
+        # Dots for every session's nights with Show All Sessions, otherwise only
+        # for the selected session's - none when nothing is selected.
+        start_date, end_date = self._display_range()
+        if self.show_all_checkbox.isChecked():
+            self.session_markers = self._query_session_markers(start_date, end_date)
+        else:
+            session_id = self._current_session.get("id") if self._current_session else None
+            self.session_markers = (self._query_session_markers(start_date, end_date, session_id)
+                                    if session_id is not None else {})
+        for cal in self.calendars:
+            cal.set_data(session_markers=self.session_markers)
+
+    def _query_session_markers(self, start_date, end_date, session_id=None):
+        """Returns date -> [(session_id, dso_name, status, night_integration_seconds,
+        night_filters), ...] for one session (or every session when session_id is
+        None), one entry per observation (observing night). A night that runs
+        past midnight (e.g. Friday 21:00 to Saturday 04:00) is one observation,
+        and its complete counted totals are shown on EVERY calendar date it
+        touches (both Friday and Saturday) rather than split across them. A
+        session with no observations is marked on its session_date."""
+        markers = {}
+        try:
+            # A night starting the evening before start_date can reach into it.
+            padded_start = start_date - timedelta(days=1)
+
+            # Leave the session filter out entirely for all sessions
+            session_filter = "" if session_id is None else "AND s.id = ?"
+            session_params = () if session_id is None else (session_id,)
+
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"""
+                    SELECT o.id, o.session_id, s.status, s.dso_name, o.night_date,
+                           o.start_datetime, o.end_datetime
+                    FROM usersessionobservations o
+                    JOIN usersessions s ON s.id = o.session_id
+                    WHERE o.night_date BETWEEN ? AND ? {session_filter}
+                    ORDER BY o.night_date, s.dso_name
+                """, (padded_start.isoformat(), end_date.isoformat()) + session_params)
+                observations = cursor.fetchall()
+                breakdowns = SessionObservations.load_breakdowns(conn, [row[0] for row in observations])
+
+                for obs_id, obs_session_id, status, dso_name, night_date, start_dt, end_dt in observations:
+                    _subs, seconds, filters = SessionObservations.summarize_breakdown(breakdowns[obs_id])
+                    marker = (obs_session_id, dso_name, status, seconds, ",".join(filters) or None)
+                    try:
+                        night = datetime.strptime(night_date, "%Y-%m-%d").date()
+                    except (ValueError, TypeError):
+                        continue
+                    start = SessionObservations.parse_obs_datetime(start_dt)
+                    end = SessionObservations.parse_obs_datetime(end_dt)
+                    first_day = start.date() if start else night
+                    last_day = end.date() if start and end and end >= start else first_day
+                    day = first_day
+                    while day <= last_day:
+                        if start_date <= day <= end_date:
+                            markers.setdefault(day, []).append(marker)
+                        day += timedelta(days=1)
+
+                cursor.execute(f"""
+                    SELECT s.id, s.session_date, s.status, s.dso_name FROM usersessions s
+                    WHERE s.session_date BETWEEN ? AND ? {session_filter}
+                      AND NOT EXISTS (SELECT 1 FROM usersessionobservations o
+                                      WHERE o.session_id = s.id)
+                    ORDER BY s.dso_name
+                """, (start_date.isoformat(), end_date.isoformat()) + session_params)
+                for row_session_id, session_date, status, dso_name in cursor.fetchall():
+                    try:
+                        day = datetime.strptime(session_date, "%Y-%m-%d").date()
+                    except (ValueError, TypeError):
+                        continue
+                    markers.setdefault(day, []).append((row_session_id, dso_name, status, 0, None))
+        except Exception as e:
+            logger.error(f"Error querying session markers: {e}")
+        return markers
+
+
+class SessionManagerWindow(WindowPositionMixin, QMainWindow):
+    WINDOW_POSITION_KEY = "SessionManager"
+    COLUMNS_SETTING = "session_manager_table_columns_hidden"
+    COLUMN_WIDTHS_SETTING = "session_manager_table_column_widths"
+    """Main window for planning and logging observing sessions"""
+
+    def __init__(self):
+        super().__init__()
+        release_on_close(self)  # Freed once closed (see WindowLifetime)
+        self.setAttribute(Qt.WA_QuitOnClose, False)
+        self.setWindowTitle("Session Manager - Cosmos Collection")
+        self.resize(1200, 800)
+        self.setup_window_position()
+
+        self.db_manager = DatabaseManager()
+        self.sessions_data = []
+        self._current_session = None
+        self._visibility_thread = None
+        self._weather_key = None  # location of the forecast the details panel is waiting for
+        self._init_database()
+        self._init_ui()
+        self._load_sessions()
+
+    def _init_database(self):
+        """Belt-and-suspenders table creation, mirroring DSOTargetListWindow's own
+        _init_database() on top of DatabaseManager's copy."""
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS usersessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        target_id INTEGER REFERENCES usertargetlist(id) ON DELETE SET NULL,
+                        dso_name TEXT NOT NULL,
+                        ra_deg REAL,
+                        dec_deg REAL,
+                        status TEXT NOT NULL DEFAULT 'Planned',
+                        session_date TEXT NOT NULL,
+                        start_time TEXT,
+                        end_time TEXT,
+                        location_lat REAL,
+                        location_lon REAL,
+                        location_name TEXT,
+                        location_timezone TEXT,
+                        location_source TEXT DEFAULT 'active',
+                        telescope_id INTEGER REFERENCES usertelescopes(id) ON DELETE SET NULL,
+                        camera TEXT,
+                        filters_used TEXT,
+                        sub_count INTEGER DEFAULT 0,
+                        integration_seconds REAL DEFAULT 0,
+                        earliest_sub_date TEXT,
+                        latest_sub_date TEXT,
+                        notes TEXT,
+                        created_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                        modified_date TEXT
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS usersessionfiles (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL REFERENCES usersessions(id) ON DELETE CASCADE,
+                        file_path TEXT NOT NULL,
+                        file_type TEXT,
+                        frame_type TEXT,
+                        object_name TEXT,
+                        date_obs TEXT,
+                        exptime_seconds REAL,
+                        filter_name TEXT,
+                        camera TEXT,
+                        telescope TEXT,
+                        gain REAL,
+                        offset_value REAL,
+                        ccd_temp REAL,
+                        xbinning INTEGER,
+                        ybinning INTEGER,
+                        header_json TEXT,
+                        added_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(session_id, file_path)
+                    )
+                """)
+                conn.commit()
+                # Observation tables, then place any not-yet-grouped files on their nights.
+                SessionObservations.migrate(conn)
+                MountDetection.ensure_schema(conn)
+                conn.commit()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error initializing session manager database: {e}")
+
+    def _init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        self.setAcceptDrops(True)
+
+        main_layout = QVBoxLayout(central_widget)
+
+        header_label = QLabel("Session Manager")
+        header_label.setAlignment(Qt.AlignCenter)
+        themed_style(header_label, lambda: f"font-size: {font_px(18)}; font-weight: bold; margin: 10px;")
+        main_layout.addWidget(header_label)
+
+        control_group = QGroupBox("Session Management")
+        control_layout = QVBoxLayout()
+
+        search_row = QHBoxLayout()
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("Search DSO name...")
+        self.search_box.setFixedWidth(280)
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.textChanged.connect(self._filter_sessions)
+        search_row.addWidget(QLabel("Search:"))
+        search_row.addWidget(self.search_box)
+
+        # Telescope and camera filters: the equipment the sessions use
+        self.telescope_filter = QComboBox()
+        self.camera_filter = QComboBox()
+        for label, combo in (("Telescope:", self.telescope_filter), ("Camera:", self.camera_filter)):
+            search_row.addSpacing(12)
+            search_row.addWidget(QLabel(label))
+            combo.addItem("All")
+            combo.setMinimumWidth(140)
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.currentTextChanged.connect(self._filter_sessions)
+            search_row.addWidget(combo)
+        # Equatorial or alt-az: detected from the lights, set by hand, else the telescope's Equipment
+        search_row.addSpacing(12)
+        search_row.addWidget(QLabel("Mount:"))
+        self.mount_filter = QComboBox()
+        self.mount_filter.addItems(["All", MountDetection.EQUATORIAL, MountDetection.ALT_AZ, MountDetection.MIXED,
+                                    "Unknown"])
+        self.mount_filter.setToolTip("Sessions by how the mount tracked: detected from their light frames, "
+                                     "chosen in the session, or else the telescope's Mount in Equipment")
+        self.mount_filter.currentTextChanged.connect(self._filter_sessions)
+        search_row.addWidget(self.mount_filter)
+        search_row.addStretch()
+        control_layout.addLayout(search_row)
+
+        buttons_row = QHBoxLayout()
+        new_planned_btn = QPushButton("New Planned Session")
+        new_planned_btn.clicked.connect(self._new_planned_session)
+        buttons_row.addWidget(new_planned_btn)
+
+        log_past_btn = QPushButton("Log Past Session")
+        log_past_btn.clicked.connect(self._log_past_session)
+        buttons_row.addWidget(log_past_btn)
+
+        self.edit_session_btn = QPushButton("Edit Selected")
+        self.edit_session_btn.clicked.connect(self._edit_selected_session)
+        self.edit_session_btn.setEnabled(False)
+        buttons_row.addWidget(self.edit_session_btn)
+
+        self.duplicate_session_btn = QPushButton("Duplicate")
+        self.duplicate_session_btn.clicked.connect(self._duplicate_selected_session)
+        self.duplicate_session_btn.setEnabled(False)
+        buttons_row.addWidget(self.duplicate_session_btn)
+
+        self.delete_session_btn = QPushButton("Delete Selected")
+        self.delete_session_btn.clicked.connect(self._delete_selected_session)
+        self.delete_session_btn.setEnabled(False)
+        buttons_row.addWidget(self.delete_session_btn)
+
+        buttons_row.addStretch()
+
+        buttons_row.addWidget(QLabel("Status:"))
+        self.status_filter = QComboBox()
+        self.status_filter.addItems(["All", "Planned", "In Progress", "Completed", "Cancelled"])
+        self.status_filter.currentTextChanged.connect(self._filter_sessions)
+        buttons_row.addWidget(self.status_filter)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._load_sessions)
+        buttons_row.addWidget(refresh_btn)
+
+        control_layout.addLayout(buttons_row)
+        control_group.setLayout(control_layout)
+        main_layout.addWidget(control_group)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        self.sessions_table = QTableWidget()
+        # New columns go at the end: hidden columns and widths are saved by position
+        self._column_labels = [
+            "DSO Name", "Status", "Date", "Time", "Location", "Telescope",
+            "Filters", "Subs", "Integration", "Linked Target", "Mount"
+        ]
+        self.sessions_table.setColumnCount(len(self._column_labels))
+        self.sessions_table.setHorizontalHeaderLabels(self._column_labels)
+        # Open sessions first (SortItem's groups), each group newest first
+        self.sessions_table.horizontalHeader().setSortIndicator(2, Qt.DescendingOrder)
+        self.sessions_table.setSortingEnabled(True)
+        self.sessions_table.setItemDelegate(GroupDividerDelegate(self.sessions_table))
+        header = self.sessions_table.horizontalHeader()
+        for col in range(len(self._column_labels)):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._show_column_menu)
+        self.sessions_table.setAlternatingRowColors(True)
+        self.sessions_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.sessions_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.sessions_table.itemDoubleClicked.connect(self._edit_selected_session)
+        self.sessions_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.sessions_table.customContextMenuRequested.connect(self._show_context_menu)
+        # Column widths are remembered (restored before hiding columns, so a hidden
+        # column comes back at its saved width)
+        self._fit_name_column_on_load = not self._apply_saved_column_widths()
+        self._column_width_timer = QTimer(self)
+        self._column_width_timer.setSingleShot(True)
+        self._column_width_timer.setInterval(500)
+        self._column_width_timer.timeout.connect(self._save_column_widths)
+        header.sectionResized.connect(lambda *_: self._column_width_timer.start())
+        self._apply_saved_column_visibility()
+        splitter.addWidget(self.sessions_table)
+
+        self.detail_panel = self._build_detail_panel()
+        splitter.addWidget(self.detail_panel)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+
+        sessions_tab = QWidget()
+        sessions_tab_layout = QVBoxLayout(sessions_tab)
+        sessions_tab_layout.setContentsMargins(0, 0, 0, 0)
+        sessions_tab_layout.addWidget(splitter)
+
+        self.calendar_widget = SessionCalendarWidget(self.db_manager)
+        self.calendar_widget.on_date_with_session_clicked = self._on_calendar_date_clicked
+        self.calendar_widget.on_open_visibility_calculator = self._open_visibility_calculator
+
+        self.tab_widget = QTabWidget()
+        self.tab_widget.addTab(sessions_tab, "Sessions")
+        self.tab_widget.addTab(self.calendar_widget, "Calendar")
+        main_layout.addWidget(self.tab_widget, 1)
+
+        self.sessions_table.selectionModel().selectionChanged.connect(self._on_selection_changed)
+
+        self.status_label = QLabel("Ready")
+        main_layout.addWidget(self.status_label)
+
+    def _build_detail_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        info_group = QGroupBox("Session Info")
+        info_layout = QVBoxLayout()
+        self.detail_info_label = QLabel("Select a session to view details.")
+        self.detail_info_label.setWordWrap(True)
+        info_layout.addWidget(self.detail_info_label)
+        self.detail_equipment_label = QLabel("")
+        self.detail_equipment_label.setWordWrap(True)
+        info_layout.addWidget(self.detail_equipment_label)
+        self.view_target_btn = QPushButton("View in Target List")
+        self.view_target_btn.clicked.connect(self._view_linked_target)
+        self.view_target_btn.setVisible(False)
+        info_layout.addWidget(self.view_target_btn)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        location_group = QGroupBox("Location")
+        location_layout = QVBoxLayout()
+        self.detail_location_label = QLabel("")
+        self.detail_location_label.setWordWrap(True)
+        location_layout.addWidget(self.detail_location_label)
+        location_group.setLayout(location_layout)
+        layout.addWidget(location_group)
+
+        visibility_group = QGroupBox("Visibility")
+        visibility_layout = QVBoxLayout()
+        self.detail_visibility_label = QLabel("")
+        self.detail_visibility_label.setWordWrap(True)
+        visibility_layout.addWidget(self.detail_visibility_label)
+        open_best_dso_btn = QPushButton("Open Best DSO Tonight")
+        open_best_dso_btn.clicked.connect(self._open_best_dso_tonight_for_current)
+        visibility_layout.addWidget(open_best_dso_btn)
+        visibility_group.setLayout(visibility_layout)
+        layout.addWidget(visibility_group)
+
+        weather_group = QGroupBox("Weather Forecast")
+        weather_layout = QVBoxLayout()
+        self.detail_weather_label = QLabel("")
+        self.detail_weather_label.setWordWrap(True)
+        weather_layout.addWidget(self.detail_weather_label)
+        refresh_weather_btn = QPushButton("Refresh Weather")
+        refresh_weather_btn.clicked.connect(self._refresh_weather_clicked)
+        weather_layout.addWidget(refresh_weather_btn)
+        weather_group.setLayout(weather_layout)
+        layout.addWidget(weather_group)
+
+        layout.addStretch()
+
+        return panel
+
+    def _load_sessions(self):
+        try:
+            columns = [
+                "id", "target_id", "dso_name", "ra_deg", "dec_deg", "status",
+                "session_date", "start_time", "end_time",
+                "location_lat", "location_lon", "location_name", "location_timezone", "location_source",
+                "telescope_id", "telescope_name",
+                "camera_id", "camera", "filters_used", "sub_count", "integration_seconds",
+                "earliest_sub_date", "latest_sub_date", "notes",
+                "created_date", "modified_date",
+                "mount_override", "mount_detected", "telescope_mount",
+            ]
+            from cosmoscollection.equipment import EquipmentMapper
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                # camera: its Equipment's name, else the name it was given
+                cursor.execute(f"""
+                    SELECT s.id, s.target_id, s.dso_name, s.ra_deg, s.dec_deg, s.status,
+                           s.session_date, s.start_time, s.end_time,
+                           s.location_lat, s.location_lon, s.location_name, s.location_timezone, s.location_source,
+                           s.telescope_id, tel.name as telescope_name,
+                           s.camera_id, {EquipmentMapper.session_camera_sql('s')},
+                           s.filters_used, s.sub_count, s.integration_seconds,
+                           s.earliest_sub_date, s.latest_sub_date, s.notes,
+                           s.created_date, s.modified_date,
+                           s.mount_override, {MountDetection.detected_sql('s')}, tel.mount_type
+                    FROM usersessions s
+                    LEFT JOIN usertelescopes tel ON s.telescope_id = tel.id
+                    ORDER BY s.session_date DESC, s.id DESC
+                """)
+                self.sessions_data = [dict(zip(columns, row)) for row in cursor.fetchall()]
+            for session in self.sessions_data:
+                session["mount"], session["mount_how"] = MountDetection.summarize(
+                    session["mount_detected"], session["mount_override"], session["telescope_mount"])
+
+            self._populate_table()
+            self._populate_equipment_filters()
+            self._filter_sessions()
+            self.status_label.setText(f"Loaded {len(self.sessions_data)} sessions")
+            self.calendar_widget.refresh_session_markers()
+        except Exception as e:
+            logger.error(f"Error loading sessions: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to load sessions: {e}")
+
+    def _populate_table(self):
+        self.sessions_table.setSortingEnabled(False)
+        self.sessions_table.setRowCount(len(self.sessions_data))
+        fit_name_column = self._fit_name_column_on_load and bool(self.sessions_data)
+
+        for row, session in enumerate(self.sessions_data):
+            group = 0 if session.get("status") in OPEN_STATUSES else 1
+
+            def cell(text, sort_key=None, align=None):
+                return SortItem(text, sort_key, align, group)
+
+            name_item = cell(session.get("dso_name", ""))
+            name_item.setData(Qt.UserRole, session)
+            self.sessions_table.setItem(row, 0, name_item)
+
+            self.sessions_table.setItem(row, 1, cell(session.get("status", "")))
+            self.sessions_table.setItem(row, 2, cell(session.get("session_date", "")))
+
+            start_time = session.get("start_time")
+            end_time = session.get("end_time")
+            if start_time and end_time:
+                time_text = f"{start_time}-{end_time}"
+            else:
+                time_text = start_time or ""
+            self.sessions_table.setItem(row, 3, cell(time_text))
+
+            loc_name = session.get("location_name")
+            lat, lon = session.get("location_lat"), session.get("location_lon")
+            if loc_name:
+                loc_text = loc_name
+            elif lat is not None and lon is not None:
+                loc_text = f"{lat:.2f}, {lon:.2f}"
+            else:
+                loc_text = ""
+            self.sessions_table.setItem(row, 4, cell(loc_text))
+
+            self.sessions_table.setItem(row, 5, cell(session.get("telescope_name") or "Any"))
+            self.sessions_table.setItem(row, 6, cell(session.get("filters_used") or ""))
+
+            sub_count = session.get("sub_count") or 0
+            self.sessions_table.setItem(row, 7, cell(str(sub_count), sub_count, Qt.AlignCenter))
+
+            integration_seconds = session.get("integration_seconds") or 0
+            integration_item = cell(f"{integration_seconds / 3600.0:.1f} h" if integration_seconds else "",
+                                    integration_seconds, Qt.AlignCenter)
+            integration_item.setData(Qt.UserRole, integration_seconds)
+            self.sessions_table.setItem(row, 8, integration_item)
+
+            self.sessions_table.setItem(row, 9, cell("Yes" if session.get("target_id") else "",
+                                                     align=Qt.AlignCenter))
+
+            mount_item = cell(session.get("mount") or "", align=Qt.AlignCenter)
+            if session.get("mount"):
+                mount_item.setToolTip(MountDetection.describe(session["mount"], session["mount_how"]))
+            self.sessions_table.setItem(row, 10, mount_item)
+
+        if fit_name_column:
+            # No remembered widths yet: size the names column to its contents once
+            self._fit_name_column_on_load = False
+            self.sessions_table.resizeColumnToContents(0)
+
+        self.sessions_table.setSortingEnabled(True)
+
+    def _populate_equipment_filters(self):
+        """The telescope and camera filters: the equipment the loaded sessions
+        use - a session with no telescope ("Any") only shows under All."""
+        for combo, key in ((self.telescope_filter, "telescope_name"), (self.camera_filter, "camera")):
+            current = combo.currentText()
+            names = sorted({s[key] for s in self.sessions_data if s.get(key)}, key=str.casefold)
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("All")
+            combo.addItems(names)
+            combo.setCurrentText(current if current in names else "All")
+            combo.blockSignals(False)
+            # Wide enough a dropdown to show the full names
+            combo.view().setMinimumWidth(combo.minimumSizeHint().width())
+
+    def _filter_sessions(self):
+        search_text = self.search_box.text().strip().lower()
+        status_filter = self.status_filter.currentText()
+        equipment = [(key, combo.currentText()) for key, combo in (("telescope_name", self.telescope_filter),
+                                                                   ("camera", self.camera_filter))
+                     if combo.currentText() != "All"]
+        mount_filter = self.mount_filter.currentText()
+        if mount_filter != "All":
+            equipment.append(("mount", None if mount_filter == "Unknown" else mount_filter))
+
+        for row in range(self.sessions_table.rowCount()):
+            show_row = True
+            if status_filter != "All":
+                status_item = self.sessions_table.item(row, 1)
+                if not status_item or status_item.text() != status_filter:
+                    show_row = False
+            if search_text and show_row:
+                name_item = self.sessions_table.item(row, 0)
+                if not name_item or search_text not in name_item.text().lower():
+                    show_row = False
+            if equipment and show_row:
+                name_item = self.sessions_table.item(row, 0)
+                session = name_item.data(Qt.UserRole) if name_item else None
+                if not session or any(session.get(key) != name for key, name in equipment):
+                    show_row = False
+            self.sessions_table.setRowHidden(row, not show_row)
+
+    def _on_selection_changed(self):
+        row = self.sessions_table.currentRow()
+        has_selection = row >= 0
+        self.edit_session_btn.setEnabled(has_selection)
+        self.delete_session_btn.setEnabled(has_selection)
+        self.duplicate_session_btn.setEnabled(has_selection)
+
+        session_data = None
+        if has_selection:
+            name_item = self.sessions_table.item(row, 0)
+            session_data = name_item.data(Qt.UserRole) if name_item else None
+        self._update_detail_panel(session_data)
+
+    def _select_session_by_id(self, session_id):
+        for row in range(self.sessions_table.rowCount()):
+            name_item = self.sessions_table.item(row, 0)
+            if name_item:
+                data = name_item.data(Qt.UserRole)
+                if data and data.get("id") == session_id:
+                    self.sessions_table.selectRow(row)
+                    self.sessions_table.scrollToItem(name_item)
+                    # selectRow() is a no-op if this row index was already the
+                    # current selection (Qt tracks selection by row index, not
+                    # item identity - _populate_table() replaces every row's
+                    # QTableWidgetItem in place via setItem(), so editing a
+                    # session or attaching new files to it doesn't move it to a
+                    # different row and Qt never re-fires selectionChanged, even
+                    # though the underlying data just changed). Refresh the
+                    # detail panel/calendar unconditionally so they never show a
+                    # stale dict from before the reload.
+                    self._on_selection_changed()
+                    return
+
+    def _on_calendar_date_clicked(self, session_id):
+        """Jump to the session in the Sessions tab when a marked calendar date is clicked."""
+        self.tab_widget.setCurrentIndex(0)
+        self._select_session_by_id(session_id)
+
+    def _update_detail_panel(self, session):
+        self._current_session = session
+        if not session:
+            self.detail_info_label.setText("Select a session to view details.")
+            self.detail_location_label.setText("")
+            self.detail_visibility_label.setText("")
+            self.detail_weather_label.setText("")
+            self._weather_key = None
+            self.detail_equipment_label.setText("")
+            self.view_target_btn.setVisible(False)
+            self.calendar_widget.set_active_session(None)
+            return
+
+        info_lines = [
+            f"<b>{session.get('dso_name', '')}</b>",
+            f"Status: {session.get('status', '')}",
+            f"Date: {session.get('session_date', '')}",
+        ]
+        time_text = self._format_time_range(session)
+        if time_text:
+            info_lines.append(f"Time: {time_text}")
+        if session.get("notes"):
+            info_lines.append(f"Notes: {session['notes']}")
+        self.detail_info_label.setText("<br>".join(info_lines))
+
+        loc_name = session.get("location_name")
+        lat, lon, tz = session.get("location_lat"), session.get("location_lon"), session.get("location_timezone")
+        if lat is not None and lon is not None:
+            loc_text = f"{loc_name or ''} ({lat:.4f}, {lon:.4f})"
+            if tz:
+                loc_text += f" — {tz}"
+        else:
+            loc_text = "No location set"
+        self.detail_location_label.setText(loc_text)
+
+        self.view_target_btn.setVisible(bool(session.get("target_id")))
+
+        nights_count = self._count_observation_nights(session["id"])
+        equipment_lines = [
+            f"Telescope: {session.get('telescope_name') or 'Any'}",
+            f"Camera: {session.get('camera') or '(unknown)'}",
+            f"Mount: {MountDetection.describe(session.get('mount'), session.get('mount_how'))}",
+            f"Filters: {session.get('filters_used') or '(none)'}",
+            f"Subs: {session.get('sub_count') or 0}",
+            f"Integration: {(session.get('integration_seconds') or 0) / 3600.0:.2f} h",
+            f"Observation Nights: {nights_count}",
+        ]
+        self.detail_equipment_label.setText("<br>".join(equipment_lines))
+
+        self._refresh_visibility_panel(session)
+        self._refresh_weather_panel(session)
+        self.calendar_widget.set_active_session(session)
+
+    def _format_time_range(self, session):
+        start, end = session.get("start_time"), session.get("end_time")
+        if start and end:
+            return f"{start} - {end}"
+        return start or ""
+
+    def _count_observation_nights(self, session_id):
+        """Number of observations (observing nights - one that runs past midnight
+        is still one night) recorded for this session."""
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM usersessionobservations WHERE session_id = ?", (session_id,))
+                return cursor.fetchone()[0]
+        except Exception as e:
+            logger.error(f"Error counting observation nights: {e}")
+            return 0
+
+    def _refresh_visibility_panel(self, session):
+        ra_deg, dec_deg = session.get("ra_deg"), session.get("dec_deg")
+        dso_name = session.get("dso_name")
+        status = session.get("status")
+
+        # Planned/In Progress sessions aren't tied to one fixed night any more (an
+        # ongoing session may span many nights past its original planned date), so
+        # show tonight's numbers - what matters day-to-day is "how does it look
+        # right now," not the date it was first planned/started. Completed/Cancelled
+        # sessions keep showing their recorded session_date for historical reference.
+        showing_tonight = status in ("Planned", "In Progress")
+        visibility_date = date_cls.today().strftime("%Y-%m-%d") if showing_tonight else session.get("session_date")
+
+        if not visibility_date:
+            self.detail_visibility_label.setText("No date set.")
+            return
+
+        self.detail_visibility_label.setText("Calculating visibility...")
+        header = f"<b>Tonight</b> ({visibility_date}):" if showing_tonight else f"On {visibility_date}:"
+        session_id = session.get("id")
+
+        _retire_thread(self._visibility_thread)
+
+        # Runs off the GUI thread - the first calculation per app run can otherwise
+        # take several seconds (see VisibilityCalcThread) and would freeze the whole
+        # window if done inline here, as selecting a row used to do.
+        self._visibility_thread = VisibilityCalcThread(
+            ra_deg, dec_deg, dso_name,
+            session.get("location_lat"), session.get("location_lon"), session.get("location_timezone"),
+            visibility_date,
+        )
+        self._visibility_thread.result_ready.connect(
+            lambda result: self._on_visibility_result(result, header, session_id)
+        )
+        self._visibility_thread.start()
+
+    def _on_visibility_result(self, result, header, session_id):
+        # Discard a result for a session the user has since navigated away from.
+        if not self._current_session or self._current_session.get("id") != session_id:
+            return
+
+        if result.get("error"):
+            self.detail_visibility_label.setText(result["error"])
+            return
+
+        lines = [header] + result.get("lines", [])
+        self.detail_visibility_label.setText("<br>".join(lines))
+
+    def _refresh_weather_clicked(self):
+        if self._current_session:
+            self._refresh_weather_panel(self._current_session, force=True)
+
+    def _refresh_weather_panel(self, session, force=False):
+        status = session.get("status")
+        lat, lon = session.get("location_lat"), session.get("location_lon")
+
+        # Like the Visibility panel, Planned/In Progress sessions show tonight's
+        # forecast (index 0 of the 7-day array) rather than the session's original
+        # planned date, since an ongoing session isn't tied to one fixed night.
+        if status not in ("Planned", "In Progress") or lat is None or lon is None:
+            self._weather_key = None
+            self.detail_weather_label.setText(
+                "Weather forecast is only shown for planned or ongoing sessions with a location set."
+            )
+            return
+
+        from cosmoscollection.planning.WeatherForecast import WeatherCache
+
+        cached = None if force else WeatherCache().get(lat, lon)
+        self._weather_key = SharedWeatherFetch.key(lat, lon)
+        if cached:
+            self._apply_weather_summary(cached[0])
+            return
+
+        self.detail_weather_label.setText("Loading weather forecast...")
+        key = self._weather_key
+        SharedWeatherFetch.request(
+            lat, lon, session.get("location_timezone"),
+            lambda data: self._on_weather_loaded(data, key),
+            lambda msg: self._on_weather_error(msg, key))
+
+    def _on_weather_loaded(self, data, key):
+        if key != self._weather_key:
+            return  # a different session/location has been selected since
+        try:
+            if data:
+                self._apply_weather_summary(data[0])
+            else:
+                self.detail_weather_label.setText("No forecast data available.")
+        except RuntimeError:
+            pass  # the window was closed while the fetch ran
+
+    def _on_weather_error(self, message, key):
+        if key != self._weather_key:
+            return
+        try:
+            self.detail_weather_label.setText(f"Weather fetch failed: {message}")
+        except RuntimeError:
+            pass
+
+    def _apply_weather_summary(self, day_summary):
+        from cosmoscollection.planning.WeatherForecast import get_rating_label
+        lines = [
+            f"Astro score: {day_summary.astro_score}/100 ({get_rating_label(day_summary.astro_score)})",
+            f"Avg cloud cover tonight: {day_summary.tonight_avg_cloud_cover:.0f}%",
+            f"Seeing estimate: {day_summary.seeing_estimate}",
+        ]
+        if day_summary.moon_phase:
+            lines.append(f"Moon: {day_summary.moon_phase.phase_name} ({day_summary.moon_phase.illumination:.0f}%)")
+        if day_summary.dark_hours_start and day_summary.dark_hours_end:
+            lines.append(
+                f"Dark hours: {format_time(day_summary.dark_hours_start)} - {format_time(day_summary.dark_hours_end)}"
+            )
+        self.detail_weather_label.setText("<br>".join(lines))
+
+    def _open_best_dso_tonight_for_current(self):
+        if not self._current_session:
+            return
+        try:
+            from cosmoscollection.planning.BestDSOTonight import BestDSOTonightWindow
+            self.best_dso_window = BestDSOTonightWindow(use_target_list=bool(self._current_session.get("target_id")))
+            self.best_dso_window.show()
+            self.best_dso_window.raise_()
+            self.best_dso_window.activateWindow()
+        except Exception as e:
+            logger.error(f"Error opening Best DSO Tonight: {e}")
+            QMessageBox.warning(self, "Error", f"Could not open Best DSO Tonight: {e}")
+
+    def _view_linked_target(self):
+        if not self._current_session or not self._current_session.get("target_id"):
+            return
+        try:
+            from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
+            if not window_is_open(getattr(self, "target_list_window", None)):
+                self.target_list_window = DSOTargetListWindow()
+            self.target_list_window.open_and_select_target(self._current_session.get("dso_name"))
+        except Exception as e:
+            logger.error(f"Error opening target list: {e}")
+            QMessageBox.warning(self, "Error", f"Could not open Target List: {e}")
+
+    def _new_planned_session(self):
+        dialog = AddEditSessionDialog(initial_status="Planned", parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            self._load_sessions()
+            if dialog.session_id:
+                self._select_session_by_id(dialog.session_id)
+
+    def _log_past_session(self):
+        dialog = AddEditSessionDialog(initial_status="Completed", parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            self._load_sessions()
+            if dialog.session_id:
+                self._select_session_by_id(dialog.session_id)
+
+    def _edit_selected_session(self, _item=None, start_tab=0, start_add=False):
+        row = self.sessions_table.currentRow()
+        if row < 0:
+            return
+        name_item = self.sessions_table.item(row, 0)
+        session_data = name_item.data(Qt.UserRole)
+        dialog = SessionDetailsDialog(session_data, start_tab=start_tab, start_add=start_add, parent=self)
+        # Attaching/removing files writes immediately, so reload even on Cancel.
+        if dialog.exec() == QDialog.Accepted or dialog.data_changed:
+            self._load_sessions()
+            self._select_session_by_id(session_data["id"])
+            # Compared against the status the dialog opened with, so a change
+            # committed early (attaching files saves pending edits) still counts.
+            updated = next((s for s in self.sessions_data if s["id"] == session_data["id"]), None)
+            if updated and updated["status"] == "Completed" and session_data.get("status") != "Completed":
+                from cosmoscollection.sessions.SessionCompletion import SessionCompletionDialog
+                SessionCompletionDialog(updated, parent=self).exec()
+                self._load_sessions()  # the target list entry may have been marked Completed
+                self._select_session_by_id(session_data["id"])
+
+    def _add_observation_to_selected(self):
+        self._edit_selected_session(start_tab=SessionDetailsDialog.OBSERVATIONS_TAB, start_add=True)
+
+    def _duplicate_selected_session(self):
+        row = self.sessions_table.currentRow()
+        if row < 0:
+            return
+        name_item = self.sessions_table.item(row, 0)
+        session_data = name_item.data(Qt.UserRole)
+        dialog = AddEditSessionDialog(parent=self)
+        dialog.load_as_duplicate(session_data)
+        if dialog.exec() == QDialog.Accepted:
+            self._load_sessions()
+            if dialog.session_id:
+                self._select_session_by_id(dialog.session_id)
+
+    def _delete_selected_session(self):
+        row = self.sessions_table.currentRow()
+        if row < 0:
+            return
+        name_item = self.sessions_table.item(row, 0)
+        session_data = name_item.data(Qt.UserRole)
+
+        reply = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Delete the session for '{session_data.get('dso_name')}' on {session_data.get('session_date')}?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                SessionObservations.delete_session_children(conn, session_data["id"])
+                cursor.execute("DELETE FROM usersessions WHERE id = ?", (session_data["id"],))
+                conn.commit()
+            self._load_sessions()
+        except Exception as e:
+            _rollback(self.db_manager)
+            logger.error(f"Error deleting session: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to delete session: {e}")
+
+    def _show_context_menu(self, position):
+        item = self.sessions_table.itemAt(position)
+        if not item:
+            return
+        self.sessions_table.selectRow(item.row())
+        session_data = self.sessions_table.item(item.row(), 0).data(Qt.UserRole)
+
+        menu = QMenu(self)
+        edit_action = menu.addAction("Session Details...")
+        edit_action.triggered.connect(lambda: self._edit_selected_session())
+        add_obs_action = menu.addAction("Add Observation...")
+        add_obs_action.triggered.connect(self._add_observation_to_selected)
+        duplicate_action = menu.addAction("Duplicate Session")
+        duplicate_action.triggered.connect(self._duplicate_selected_session)
+        menu.addAction("Review Lights Quality...").triggered.connect(
+            lambda: self._review_light_quality(session_data))
+        menu.addSeparator()
+        self._add_target_tool_actions(menu, session_data)
+        menu.addSeparator()
+        if session_data and session_data.get("target_id"):
+            change_link_action = menu.addAction("Change Linked Target...")
+            change_link_action.triggered.connect(self._link_session_to_target)
+            unlink_action = menu.addAction("Unlink Target")
+            unlink_action.triggered.connect(self._unlink_session_target)
+        else:
+            link_action = menu.addAction("Link to Target List...")
+            link_action.triggered.connect(self._link_session_to_target)
+        menu.addSeparator()
+        delete_action = menu.addAction("Delete Session")
+        delete_action.triggered.connect(self._delete_selected_session)
+        menu.exec(self.sessions_table.mapToGlobal(position))
+
+    # ---- Right-click tools (processing, FOV Simulator, DSO Details, NINA) ----
+
+    def _add_target_tool_actions(self, menu, session):
+        from cosmoscollection.sessions import ProcessingHandoff as handoff
+        from cosmoscollection.nina.NINAIntegration import NINAIntegration
+
+        # Processing apps are listed only when enabled under Settings → Integrations.
+        processing_apps = [app for app in (handoff.PIXINSIGHT, handoff.SIRIL)
+                           if QSettings("CosmosCollection", "CosmosCollection")
+                           .value(f"{app}_integration_enabled", False, type=bool)]
+        if processing_apps:
+            processing_menu = menu.addMenu("Processing")
+            for app in processing_apps:
+                action = processing_menu.addAction(f"{handoff.APP_LABELS[app]}...")
+                ready, message = handoff.integration_status(app)
+                if ready:
+                    action.triggered.connect(lambda _=False, a=app: self._process_session(session, a))
+                else:
+                    action.setEnabled(False)
+                    action.setToolTip(message)
+            processing_menu.setToolTipsVisible(True)
+
+        menu.addAction("FOV Simulator").triggered.connect(lambda: self._open_fov_simulator(session))
+        menu.addAction("DSO Details").triggered.connect(lambda: self._open_dso_details(session))
+        menu.addAction("Visibility Calculator").triggered.connect(
+            lambda: self._open_visibility_calculator(session))
+
+        if NINAIntegration.is_enabled():
+            nina_menu = menu.addMenu("NINA")
+            nina_menu.addAction("Send to Framing Assistant").triggered.connect(
+                lambda: self._nina_action(session, NINAIntegration.send_to_framing_assistant))
+            nina_menu.addAction("Slew to Target").triggered.connect(
+                lambda: self._nina_action(session, NINAIntegration.slew_to_coordinates))
+
+    def _review_light_quality(self, session):
+        from cosmoscollection.imaging.LightQualityReview import LightQualityDialog
+        dialog = LightQualityDialog(session, parent=self)
+        dialog.exec()
+        if dialog.files_changed:  # sub counts and integration changed
+            self._load_sessions()
+            self._select_session_by_id(session["id"])
+
+    def _process_session(self, session, app):
+        """Hand the session to Siril/PixInsight from the right-click menu - the
+        same handoff as on completion, without the completion choices."""
+        from cosmoscollection.sessions.SessionCompletion import SessionCompletionDialog
+        dialog = SessionCompletionDialog(session, parent=self, app=app)
+        dialog.exec()
+        if dialog.files_changed:  # Cleaned up there - sub counts may have changed
+            self._load_sessions()
+            self._select_session_by_id(session["id"])
+
+    def _catalog_data(self, session):
+        """Catalogue data for the session's object (for DSO Details / FOV
+        Simulator, and coordinates when the session has none), or None."""
+        from cosmoscollection.planning.DSOTargetList import find_full_dso_data
+        return find_full_dso_data(self.db_manager, session.get("dso_name", ""), session)
+
+    def _session_coordinates(self, session):
+        """(ra_deg, dec_deg) - the session's own, else its object's catalogue position."""
+        if session.get("ra_deg") is not None and session.get("dec_deg") is not None:
+            return session["ra_deg"], session["dec_deg"]
+        data = self._catalog_data(session)
+        return (data["ra_deg"], data["dec_deg"]) if data else (None, None)
+
+    def _open_dso_details(self, session):
+        data = self._catalog_data(session)
+        if not data:
+            QMessageBox.warning(self, "Object Not Found",
+                                f"Could not find {session.get('dso_name', 'this object')} in the DSO catalogue.")
+            return
+        try:
+            from cosmoscollection.catalog.DSODetail import DSODetailWindow
+            DSODetailWindow(data, self).show()
+        except Exception as e:
+            logger.error(f"Error opening DSO details: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open DSO details: {e}")
+
+    def _open_fov_simulator(self, session):
+        data = self._catalog_data(session)
+        if not data:
+            QMessageBox.warning(self, "Object Not Found",
+                                f"Could not find {session.get('dso_name', 'this object')} in the DSO catalogue.")
+            return
+        try:
+            from cosmoscollection.planning.FOVSimulator import AladinLiteWindow, load_session_framing
+            with self.db_manager.get_connection() as conn:
+                framing = load_session_framing(conn, session["id"])
+            AladinLiteWindow(data, self, framing=framing, session_id=session["id"]).show()
+        except Exception as e:
+            logger.error(f"Error opening FOV Simulator: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open FOV Simulator: {e}")
+
+    def _open_visibility_calculator(self, session):
+        """DSO Visibility Calculator for the session's object, opened on tonight (for
+        planning the next night); the session's own nights are a calendar click away."""
+        if not session:
+            return
+        ra_deg, dec_deg = self._session_coordinates(session)
+        if ra_deg is None or dec_deg is None:
+            QMessageBox.warning(self, "No Coordinates",
+                                f"This session has no coordinates and {session.get('dso_name', 'its object')} "
+                                "wasn't found in the DSO catalog.")
+            return
+        try:
+            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityApp
+            window = DSOVisibilityApp()
+            window.dso_input.setText(session.get("dso_name") or "")
+            window.set_dso_coordinates(ra_deg, dec_deg)
+            self._visibility_window = window  # keep a reference so it isn't garbage collected
+            window.show()
+            window.raise_()
+            window.activateWindow()
+            # Same short delay as the other places that open it, so the window is fully up first
+            QTimer.singleShot(500, window.calculate_visibility)
+        except Exception as e:
+            logger.error(f"Error opening Visibility Calculator: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open Visibility Calculator: {e}")
+
+    def _nina_action(self, session, nina_function):
+        ra_deg, dec_deg = self._session_coordinates(session)
+        if ra_deg is None or dec_deg is None:
+            QMessageBox.warning(self, "No Coordinates",
+                                f"This session has no coordinates and {session.get('dso_name', 'its object')} "
+                                "wasn't found in the DSO catalogue.")
+            return
+        nina_function(ra_deg, dec_deg, session.get("dso_name") or "Unknown", self)
+
+    def _link_session_to_target(self):
+        row = self.sessions_table.currentRow()
+        if row < 0:
+            return
+        session_data = self.sessions_table.item(row, 0).data(Qt.UserRole)
+
+        ra_deg, dec_deg = self._session_coordinates(session_data)
+        dialog = LinkTargetDialog(self.db_manager, parent=self, session_name=session_data.get("dso_name"),
+                                  ra_deg=ra_deg, dec_deg=dec_deg,
+                                  current_target_id=session_data.get("target_id"))
+        if dialog.exec() == QDialog.Accepted and dialog.selected_target:
+            target = dialog.selected_target
+            try:
+                with self.db_manager.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE usersessions SET target_id = ? WHERE id = ?",
+                                   (target["id"], session_data["id"]))
+                    conn.commit()
+                self._load_sessions()
+                self._select_session_by_id(session_data["id"])
+            except Exception as e:
+                logger.error(f"Error linking session to target: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to link target: {e}")
+
+    def _unlink_session_target(self):
+        row = self.sessions_table.currentRow()
+        if row < 0:
+            return
+        session_data = self.sessions_table.item(row, 0).data(Qt.UserRole)
+
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE usersessions SET target_id = NULL WHERE id = ?", (session_data["id"],))
+                conn.commit()
+            self._load_sessions()
+            self._select_session_by_id(session_data["id"])
+        except Exception as e:
+            logger.error(f"Error unlinking target: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to unlink target: {e}")
+
+    def _show_column_menu(self, position):
+        """Right-click menu on the sessions table's header - toggle which columns
+        are shown. Selection is persisted via QSettings and restored on next launch."""
+        header = self.sessions_table.horizontalHeader()
+        menu = QMenu(self)
+        for col, label in enumerate(self._column_labels):
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(not self.sessions_table.isColumnHidden(col))
+            action.toggled.connect(lambda checked, c=col: self._toggle_column_visibility(c, checked))
+        menu.exec(header.mapToGlobal(position))
+
+    def _toggle_column_visibility(self, col, visible):
+        self.sessions_table.setColumnHidden(col, not visible)
+        self._save_column_visibility()
+
+    def _save_column_visibility(self):
+        hidden = [str(col) for col in range(self.sessions_table.columnCount())
+                  if self.sessions_table.isColumnHidden(col)]
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings.setValue(self.COLUMNS_SETTING, ",".join(hidden))
+
+    def _save_column_widths(self):
+        """Remember the column widths (a hidden column keeps its last saved width)."""
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        saved = self._saved_column_widths()
+        widths = []
+        for col in range(self.sessions_table.columnCount()):
+            if self.sessions_table.isColumnHidden(col):
+                widths.append(saved[col] if col < len(saved) else 0)
+            else:
+                widths.append(self.sessions_table.columnWidth(col))
+        settings.setValue(self.COLUMN_WIDTHS_SETTING, ",".join(str(w) for w in widths))
+
+    def _saved_column_widths(self):
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        saved = settings.value(self.COLUMN_WIDTHS_SETTING, "", type=str)
+        return [int(part) if part.strip().isdigit() else 0 for part in saved.split(",")] if saved else []
+
+    def _apply_saved_column_widths(self):
+        """Restore remembered column widths; False if none were saved."""
+        widths = self._saved_column_widths()
+        for col, width in enumerate(widths[:self.sessions_table.columnCount()]):
+            if width > 0:
+                self.sessions_table.setColumnWidth(col, width)
+        return any(width > 0 for width in widths)
+
+    def _apply_saved_column_visibility(self):
+        settings = QSettings("CosmosCollection", "CosmosCollection")
+        saved = settings.value(self.COLUMNS_SETTING, "", type=str)
+        if not saved:
+            return
+        for part in saved.split(","):
+            part = part.strip()
+            if part.isdigit():
+                col = int(part)
+                if 0 <= col < self.sessions_table.columnCount():
+                    self.sessions_table.setColumnHidden(col, True)
+
+    def create_session_from_dso(self, dso_data):
+        """Public entry point: open a pre-filled planned session for a Target List DSO."""
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        self.activateWindow()
+        dialog = AddEditSessionDialog(target_data=dso_data, initial_status="Planned", parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            self._load_sessions()
+            if dialog.session_id:
+                self._select_session_by_id(dialog.session_id)
+
+    def open_and_select_session(self, session_id):
+        """Public entry point: show/raise the window and select a session by id."""
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        self.activateWindow()
+        self._load_sessions()
+        self._select_session_by_id(session_id)
+
+    def dragEnterEvent(self, event):
+        if dropped_sub_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        dropped_paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
+        event.acceptProposedAction()
+        if dropped_paths:
+            self._start_scan(dropped_paths)
+
+    def _start_scan(self, paths):
+        self._progress_dialog = QProgressDialog("Scanning files...", "Cancel", 0, 0, self)
+        self._progress_dialog.setWindowTitle("Session Manager")
+        self._progress_dialog.setWindowModality(Qt.WindowModal)
+        self._progress_dialog.setMinimumDuration(0)
+        self._progress_dialog.show()
+
+        self._scan_thread = SessionScanThread(paths, _active_site(self.db_manager), parent=self)
+        self._scan_thread.progress.connect(self._on_scan_progress)
+        self._scan_thread.status.connect(self._progress_dialog.setLabelText)
+        self._scan_thread.scan_finished.connect(self._on_scan_finished)
+        self._scan_thread.scan_error.connect(self._on_scan_error)
+        self._progress_dialog.canceled.connect(self._scan_thread.stop)
+        self._scan_thread.start()
+
+    def _on_scan_progress(self, current, total):
+        if total > 0:
+            self._progress_dialog.setMaximum(total)
+            self._progress_dialog.setValue(current)
+
+    def _on_scan_finished(self, files, mounts):
+        self._progress_dialog.close()
+        if not files:
+            QMessageBox.information(self, "No Files Found", "No supported FITS/XISF files were found.")
+            return
+        summary = SessionFileScanner.summarize_files(files)
+        dialog = DropMatchDialog(summary, self.db_manager, mounts=mounts, parent=self)
+        if dialog.exec() == QDialog.Accepted and dialog.result_session_id:
+            self._load_sessions()
+            self._select_session_by_id(dialog.result_session_id)
+
+    def _on_scan_error(self, message):
+        self._progress_dialog.close()
+        QMessageBox.critical(self, "Scan Error", f"Failed to scan dropped files: {message}")

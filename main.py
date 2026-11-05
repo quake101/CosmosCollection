@@ -51,7 +51,7 @@ if getattr(sys, 'frozen', False):
 #     some Mesa builds (e.g. CachyOS, especially under Wayland) draw web views as garbled or
 #     solid black. These keep drawing on the CPU (WebGL is unaffected). Elsewhere they'd only
 #     cost frame rate.
-from ResourceManager import ResourceManager as _ResourceManager
+from cosmoscollection.core.ResourceManager import ResourceManager as _ResourceManager
 _chromium_log_path = os.path.join(str(_ResourceManager.get_data_dir()), 'chromium_debug.log')
 _gpu_workarounds = ('--disable-gpu-compositing --disable-gpu-rasterization --disable-zero-copy '
                     if sys.platform.startswith('linux') else '')
@@ -89,22 +89,24 @@ from PySide6.QtWidgets import (
 )
 
 # Local imports (always needed)
-from DatabaseManager import DatabaseManager
-from WindowPositionManager import WindowPositionManager, WindowPositionMixin
-from WindowLifetime import keep_when_closed, window_is_open
-from ResourceManager import ResourceManager
-from CollageBuilder import open_collage_builder
-from Theme import (
+from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.ui.WindowPositionManager import WindowPositionManager, WindowPositionMixin
+from cosmoscollection.ui.WindowLifetime import keep_when_closed, window_is_open
+from cosmoscollection.core.ResourceManager import ResourceManager
+from cosmoscollection.imaging.CollageBuilder import open_collage_builder
+from cosmoscollection.ui.Theme import (
     COLORS, apply_theme, font_size, load_settings as load_theme_settings,
     save_settings as save_theme_settings, theme_manager, themed_style, tint,
 )
-from ThemeTab import ThemeSettingsTab
-from ImageViewer import ImageViewerWindow
-from DSODetail import DSODetailWindow
-from FOVSimulator import AladinLiteWindow
-from NINAIntegration import NINAIntegration
-from SystemTrayManager import SystemTrayManager
-from StartupLoadingDialog import StartupLoadingDialog
+from cosmoscollection.ui.ThemeTab import ThemeSettingsTab
+from cosmoscollection.imaging.ImageViewer import ImageViewerWindow
+from cosmoscollection.catalog.DSODetail import DSODetailWindow
+from cosmoscollection.planning.FOVSimulator import AladinLiteWindow
+from cosmoscollection.nina.NINAIntegration import NINAIntegration
+from cosmoscollection.app.SystemTrayManager import SystemTrayManager
+from cosmoscollection.app.StartupLoadingDialog import StartupLoadingDialog
+from cosmoscollection.catalog.SimbadWorker import SimbadLoadingDialog, SimbadQueryWorker
+from cosmoscollection.ui.MapLocationPicker import MapLocationPickerDialog
 
 # Import astroquery at module level so PyInstaller detects it
 try:
@@ -126,8 +128,6 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO if getattr(sys, 'frozen', False) else logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Get the application directory
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Log SSL configuration status and configure astroquery
 if getattr(sys, 'frozen', False):
@@ -149,7 +149,7 @@ else:
 
 # Check for optional DSO Visibility Calculator availability
 try:
-    import DSOVisibilityCalculator
+    from cosmoscollection.planning import DSOVisibilityCalculator
     VISIBILITY_AVAILABLE = True
 except ImportError:
     VISIBILITY_AVAILABLE = False
@@ -265,7 +265,7 @@ class InitialDataLoadWorker(QThread):
         conn = None
         try:
             import sqlite3
-            from ResourceManager import attach_update_catalogs
+            from cosmoscollection.core.ResourceManager import attach_update_catalogs
 
             conn = sqlite3.connect(str(ResourceManager.get_database_path()))
             attach_update_catalogs(conn)
@@ -610,196 +610,6 @@ class DSOTableModel(QAbstractTableModel):
             self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1),
                                   [Qt.ItemDataRole.BackgroundRole])
 
-
-# --- SIMBAD Query Worker Thread ---
-class SimbadQueryWorker(QThread):
-    """Worker thread for querying SIMBAD and adding object to database"""
-    object_found = Signal(dict)  # Signal with object data
-    object_not_found = Signal()  # Signal when object not found
-    error_occurred = Signal(str)  # Signal with error message
-
-    def __init__(self, search_term, parent=None):
-        super().__init__(parent)
-        self.search_term = search_term
-
-    def run(self):
-        """Query SIMBAD in background thread"""
-        from SimbadQuery import SimbadUnavailable
-        try:
-            from SimbadQuery import query
-            from astropy.coordinates import SkyCoord
-            import astropy.units as u
-
-            logger.debug(f"Querying SIMBAD for: {self.search_term}")
-
-            # Query by identifier, with comprehensive data
-            result = query(lambda simbad: simbad.query_object(self.search_term),
-                           fields=(
-                               'otype',  # Object type
-                               'dimensions',  # Dimensions
-                               'V',  # V magnitude
-                               'B',  # B magnitude
-                           ))
-
-            if result is None or len(result) == 0:
-                logger.debug(f"No SIMBAD data found for {self.search_term}")
-                self.object_not_found.emit()
-                return
-
-            # Parse the first result
-            row = result[0]
-
-            # Debug: print column names
-            logger.debug(f"SIMBAD columns: {result.colnames}")
-
-            # Extract coordinates - try different column name variations
-            ra_str = None
-            dec_str = None
-
-            # Try common RA/DEC column names
-            for ra_col in ['RA', 'ra', 'RA_d', 'ra_d', 'RA_ICRS', 'ra_icrs']:
-                if ra_col in row.colnames:
-                    ra_str = row[ra_col]
-                    logger.debug(f"Found RA in column: {ra_col} = {ra_str}")
-                    break
-
-            for dec_col in ['DEC', 'dec', 'DEC_d', 'dec_d', 'DEC_ICRS', 'dec_icrs']:
-                if dec_col in row.colnames:
-                    dec_str = row[dec_col]
-                    logger.debug(f"Found DEC in column: {dec_col} = {dec_str}")
-                    break
-
-            if ra_str is None or dec_str is None:
-                logger.error(f"Could not find RA/DEC in SIMBAD result. Available columns: {result.colnames}")
-                self.error_occurred.emit(f"Could not extract coordinates from SIMBAD result")
-                return
-
-            # Extract coordinates - SIMBAD returns RA/DEC in degrees
-            coords = SkyCoord(
-                ra=ra_str,
-                dec=dec_str,
-                unit=(u.deg, u.deg),
-                frame='icrs'
-            )
-
-            ra_deg = coords.ra.degree
-            dec_deg = coords.dec.degree
-
-            # Extract other fields - use lowercase column names
-            main_id = str(row['main_id']) if 'main_id' in row.colnames else str(row.get('MAIN_ID', 'Unknown'))
-            obj_type = str(row['otype']) if 'otype' in row.colnames else (str(row['OTYPE']) if 'OTYPE' in row.colnames else None)
-
-            # Get magnitude - try V magnitude first, then B
-            magnitude = None
-            for mag_col in ['V', 'v', 'B', 'b', 'FLUX_V', 'flux_V', 'FLUX_B', 'flux_B']:
-                if mag_col in row.colnames and row[mag_col] is not None:
-                    try:
-                        magnitude = float(row[mag_col])
-                        logger.debug(f"Found magnitude in column {mag_col}: {magnitude}")
-                        break
-                    except (ValueError, TypeError):
-                        pass
-
-            # Get dimensions (in arcminutes)
-            size_maj = None
-            size_min = None
-            for maj_col in ['galdim_majaxis', 'GALDIM_MAJAXIS']:
-                if maj_col in row.colnames and row[maj_col] is not None:
-                    try:
-                        size_maj = float(row[maj_col])
-                        logger.debug(f"Found major axis in column {maj_col}: {size_maj}")
-                        break
-                    except (ValueError, TypeError):
-                        pass
-
-            for min_col in ['galdim_minaxis', 'GALDIM_MINAXIS']:
-                if min_col in row.colnames and row[min_col] is not None:
-                    try:
-                        size_min = float(row[min_col])
-                        logger.debug(f"Found minor axis in column {min_col}: {size_min}")
-                        break
-                    except (ValueError, TypeError):
-                        pass
-
-            # Map SIMBAD object type to DSO type
-            dso_type = self._map_simbad_type(obj_type)
-
-            logger.debug(f"SIMBAD found: {main_id} at RA={ra_deg}, Dec={dec_deg}, Type={obj_type}")
-
-            # Create object data dictionary
-            object_data = {
-                'main_id': main_id,
-                'ra_deg': ra_deg,
-                'dec_deg': dec_deg,
-                'magnitude': magnitude,
-                'size_maj': size_maj,
-                'size_min': size_min,
-                'dso_type': dso_type,
-                'obj_type': obj_type
-            }
-
-            self.object_found.emit(object_data)
-
-        except SimbadUnavailable as e:
-            self.error_occurred.emit(str(e))
-        except Exception as e:
-            logger.error(f"Error querying SIMBAD: {str(e)}", exc_info=True)
-            self.error_occurred.emit(f"Error querying SIMBAD:\n\n{str(e)}")
-
-    # SIMBAD object type codes (current short codes and legacy long forms) -> DSO type
-    _SIMBAD_TYPE_MAP = {
-        **dict.fromkeys(['g', 'gig', 'gic', 'bic', 'gip', 'hzg', 'agn', 'syg', 'sy1', 'sy2', 'lin',
-                         'liner', 'seyfert', 'qso', 'bla', 'bll', 'rg', 'h2g', 'lsb', 'emg', 'sbg',
-                         'bcg', 'ig', 'pag', 'galaxy'], 'GALXY'),
-        **dict.fromkeys(['clg', 'grg', 'cgg', 'scg', 'pcg'], 'GALCL'),
-        **dict.fromkeys(['pn', 'plnnb'], 'PLNNB'),
-        **dict.fromkeys(['snr', 'snrem'], 'SNREM'),
-        **dict.fromkeys(['hii', 'gne', 'brtnb', 'emobj'], 'BRTNB'),
-        **dict.fromkeys(['rne', 'refnb'], 'REFNB'),
-        **dict.fromkeys(['dne', 'drknb'], 'DRKNB'),
-        **dict.fromkeys(['opc', 'opcl', 'cl*', 'opncl'], 'OPNCL'),
-        **dict.fromkeys(['glc', 'glcl', 'globc', 'glocl'], 'GLOCL'),
-        **dict.fromkeys(['as*', 'assoc', 'assc'], 'ASSC'),
-    }
-
-    def _map_simbad_type(self, simbad_type):
-        """Map SIMBAD object type to DSO type used in database.
-
-        Matches whole type codes: substring checks misfire on SIMBAD's short
-        codes (e.g. 'G' would match GlC globular clusters and GNe nebulae)."""
-        if not simbad_type:
-            return None
-
-        # Candidates are suffixed with '?' (e.g. "PN?")
-        code = simbad_type.strip().rstrip('?').lower()
-        dso_type = self._SIMBAD_TYPE_MAP.get(code)
-        if dso_type is None and 'neb' in code and 'cl' in code:
-            dso_type = 'CL+NB'
-        return dso_type
-
-
-# --- Loading Dialog ---
-class SimbadLoadingDialog(QDialog):
-    """Simple loading dialog to show while querying SIMBAD"""
-
-    def __init__(self, search_term, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Searching SIMBAD")
-        self.setModal(True)
-        self.setFixedSize(400, 100)
-
-        # Remove close button
-        self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
-
-        layout = QVBoxLayout()
-
-        # Message label
-        message = QLabel(f"Searching for '{search_term}' in SIMBAD database...\n\nPlease wait...")
-        message.setAlignment(Qt.AlignCenter)
-        themed_style(message, lambda: f"font-size: {font_size(12)};")
-        layout.addWidget(message)
-
-        self.setLayout(layout)
 
 
 # --- Custom Visibility Window Class ---
@@ -1366,7 +1176,7 @@ class SettingsDialog(QDialog):
         self.integrations_stack.addWidget(nina_page)
 
         # Plate solving page - which solvers are tried, in what order
-        from PlateSolver import SOLVER_ORDERS
+        from cosmoscollection.solving.PlateSolver import SOLVER_ORDERS
         solving_page = QWidget()
         solving_page_layout = QVBoxLayout(solving_page)
 
@@ -1793,13 +1603,13 @@ class SettingsDialog(QDialog):
         self.setLayout(layout)
         
     def _update_reminder_status(self):
-        from AppUpdater import update_reminder_status
+        from cosmoscollection.core.AppUpdater import update_reminder_status
         status = update_reminder_status()
         self.update_reminder_label.setText(status or "")
         self.update_reminder_row.setVisible(bool(status))
 
     def _reset_update_reminders(self):
-        from AppUpdater import reset_update_reminders
+        from cosmoscollection.core.AppUpdater import reset_update_reminders
         reset_update_reminders()
         self._update_reminder_status()
 
@@ -1816,7 +1626,7 @@ class SettingsDialog(QDialog):
         # Load UI preferences from QSettings
         try:
             settings = QSettings("CosmosCollection", "CosmosCollection")
-            from OnlineLimits import OFFLINE_SETTING
+            from cosmoscollection.core.OnlineLimits import OFFLINE_SETTING
             offline_mode = settings.value(OFFLINE_SETTING, False, type=bool)
             self.offline_mode_checkbox.setChecked(offline_mode)
             self._on_offline_mode_toggled(offline_mode)
@@ -1869,7 +1679,7 @@ class SettingsDialog(QDialog):
                 self.precip_unit_combo.setCurrentIndex(index)
 
             # Load plate solving settings
-            from PlateSolver import solver_order
+            from cosmoscollection.solving.PlateSolver import solver_order
             order_index = self.solver_order_combo.findData(",".join(solver_order()))
             self.solver_order_combo.setCurrentIndex(max(0, order_index))
             astap_path = settings.value("astap_path", "", type=str)
@@ -1982,7 +1792,7 @@ class SettingsDialog(QDialog):
                     lat, lon, name, tz, is_active, horizon_points, horizon_name = row
                     self.pending_horizon = None
                     try:
-                        from HorizonProfile import HorizonProfile
+                        from cosmoscollection.planning.HorizonProfile import HorizonProfile
                         self._show_horizon_status(HorizonProfile.from_json(horizon_points, name=horizon_name))
                     except (ValueError, TypeError) as e:
                         logger.warning(f"Ignoring unreadable custom horizon for location {loc_id}: {e}")
@@ -2039,7 +1849,7 @@ class SettingsDialog(QDialog):
 
         An existing location is updated immediately; a new location keeps the
         horizon until Save Location."""
-        from HorizonProfile import HorizonParseError, parse_horizon_file
+        from cosmoscollection.planning.HorizonProfile import HorizonParseError, parse_horizon_file
 
         settings = QSettings("CosmosCollection", "CosmosCollection")
         start_dir = settings.value("last_horizon_dir", "", type=str)
@@ -2239,7 +2049,7 @@ class SettingsDialog(QDialog):
         # our bundled LD_LIBRARY_PATH, which makes it fail to launch the file
         # manager. UrlOpener retries with gio/xdg-open under a cleaned
         # environment first (same fix already used for opening web links).
-        from UrlOpener import open_url
+        from cosmoscollection.core.UrlOpener import open_url
         log_dir = ResourceManager.get_data_dir()
         if not open_url(QUrl.fromLocalFile(str(log_dir))):
             logger.warning(f"Failed to open log folder: {log_dir}")
@@ -2252,7 +2062,7 @@ class SettingsDialog(QDialog):
         """Save application settings (QSettings only - locations are saved separately)"""
         try:
             settings = QSettings("CosmosCollection", "CosmosCollection")
-            from OnlineLimits import OFFLINE_SETTING
+            from cosmoscollection.core.OnlineLimits import OFFLINE_SETTING
             settings.setValue(OFFLINE_SETTING, self.offline_mode_checkbox.isChecked())
             settings.setValue("show_observer_location", self.show_observer_location_checkbox.isChecked())
             settings.setValue("check_updates_on_startup", self.check_updates_checkbox.isChecked())
@@ -2310,7 +2120,7 @@ class SettingsDialog(QDialog):
 
     def _open_map_picker(self):
         """Open map dialog to select location coordinates"""
-        from OnlineLimits import is_offline, notify_offline
+        from cosmoscollection.core.OnlineLimits import is_offline, notify_offline
         if is_offline():
             notify_offline(self, "The map")
             return
@@ -2431,7 +2241,7 @@ class SettingsDialog(QDialog):
             workspace_input.setText(os.path.normpath(folder))
 
     def _test_processing_app(self, app, label):
-        import ProcessingHandoff
+        from cosmoscollection.sessions import ProcessingHandoff
         configured = self.processing_app_widgets[app]["path"].text().strip()
         if app == "siril":
             exe = ProcessingHandoff.find_siril_cli(configured)
@@ -2511,7 +2321,7 @@ class SettingsDialog(QDialog):
             self.astrometry_test_btn.setText("Testing...")
             QApplication.processEvents()
 
-            from PlateSolver import test_astrometry_key
+            from cosmoscollection.solving.PlateSolver import test_astrometry_key
             success, message = test_astrometry_key(api_key)
 
             if success:
@@ -2532,7 +2342,7 @@ class SettingsDialog(QDialog):
             self.openweather_test_btn.setText("Testing...")
             QApplication.processEvents()
 
-            from WeatherForecast import test_openweather_key
+            from cosmoscollection.planning.WeatherForecast import test_openweather_key
             success, message = test_openweather_key(api_key)
 
             if success:
@@ -2553,7 +2363,7 @@ class SettingsDialog(QDialog):
             self.visualcrossing_test_btn.setText("Testing...")
             QApplication.processEvents()
 
-            from WeatherForecast import test_visualcrossing_key
+            from cosmoscollection.planning.WeatherForecast import test_visualcrossing_key
             success, message = test_visualcrossing_key(api_key)
 
             if success:
@@ -2574,7 +2384,7 @@ class SettingsDialog(QDialog):
             self.weatherapi_test_btn.setText("Testing...")
             QApplication.processEvents()
 
-            from WeatherForecast import test_weatherapi_key
+            from cosmoscollection.planning.WeatherForecast import test_weatherapi_key
             success, message = test_weatherapi_key(api_key)
 
             if success:
@@ -3087,7 +2897,7 @@ class RestoreImageFixupDialog(QDialog):
             start_dir = last_known_dir if os.path.isdir(last_known_dir) else ''
 
         try:
-            from DSOGallery import SUPPORTED_IMAGE_EXTENSIONS
+            from cosmoscollection.imaging.DSOGallery import SUPPORTED_IMAGE_EXTENSIONS
             ext_filter = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_IMAGE_EXTENSIONS))
             name_filter = f"Image Files ({ext_filter});;All Files (*.*)"
         except ImportError:
@@ -3165,626 +2975,6 @@ class RestoreImageFixupDialog(QDialog):
                     self._apply_fix(proposal['row'], proposal['new_path'], write_db=False)
 
 
-# --- Map Location Picker Dialog ---
-class MapBridge(QObject):
-    """Bridge object for Qt-JavaScript communication in map picker"""
-
-    searchCompleted = Signal(str)  # Signal to send search results back to JavaScript
-    geocodeCompleted = Signal(str)  # Signal to send geocode results back to JavaScript
-
-    def __init__(self, dialog):
-        super().__init__()
-        self.dialog = dialog
-
-    @Slot(float, float, str)
-    def selectLocation(self, lat, lon, location_name):
-        """Called from JavaScript when user selects a location on the map"""
-        logger.debug(f"MapBridge.selectLocation called: lat={lat}, lon={lon}, name={location_name}")
-        self.dialog._on_location_selected(lat, lon, location_name)
-
-    @Slot(str)
-    def searchLocationFromPython(self, query):
-        """Search for location using Python (to avoid CORS issues)"""
-        logger.debug(f"MapBridge.searchLocationFromPython called: query={query}")
-        self._run_in_background(self.searchCompleted, self.dialog._search_location_python, query)
-
-    @Slot(float, float)
-    def reverseGeocodeFromPython(self, lat, lon):
-        """Reverse geocode using Python (to avoid CORS issues)"""
-        logger.debug(f"MapBridge.reverseGeocodeFromPython called: lat={lat}, lon={lon}")
-        self._run_in_background(self.geocodeCompleted, self.dialog._reverse_geocode_python, lat, lon)
-
-    @staticmethod
-    def _run_in_background(result_signal, lookup, *args):
-        """Run a Nominatim lookup off the UI thread (it can take up to its 10s timeout);
-        the result signal is delivered back to the web channel on the UI thread."""
-        def worker():
-            result = lookup(*args)
-            logger.debug(f"Emitting lookup result: {result}")
-            try:
-                result_signal.emit(result)
-            except RuntimeError:
-                pass  # Dialog closed while the lookup was running
-
-        threading.Thread(target=worker, daemon=True).start()
-
-
-class MapLocationPickerDialog(QDialog):
-    """Dialog for selecting location coordinates from an interactive map"""
-
-    def __init__(self, initial_lat=40.7128, initial_lon=-74.0060, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Select Location from Map - Cosmos Collection")
-        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
-        self.setModal(True)
-        self.resize(900, 700)
-
-        # Store initial coordinates
-        self.initial_lat = initial_lat
-        self.initial_lon = initial_lon
-
-        # Selected coordinates (initialize with initial values so user can accept without clicking)
-        self.selected_lat = initial_lat
-        self.selected_lon = initial_lon
-        self.selected_location_name = ""
-
-        # Web view and bridge
-        self.web_view = None
-        self.bridge = None
-        self.channel = None
-        self._renderer_crashed = False  # Set by _on_render_process_terminated; suppresses the generic load-failed message
-        self._init_failed = False  # Set when the map can't be created at all; exec() then returns immediately
-
-        self._setup_ui()
-
-        # Update coordinates display with initial position
-        lat_str = f"{abs(initial_lat):.6f}°{'N' if initial_lat >= 0 else 'S'}"
-        lon_str = f"{abs(initial_lon):.6f}°{'W' if initial_lon < 0 else 'E'}"
-        self.coords_label.setText(f"Current position: {lat_str}, {lon_str}\nClick on the map to change location")
-
-        # Create web view immediately instead of deferring
-        self._load_map()
-
-    def _setup_ui(self):
-        """Set up the dialog UI"""
-        layout = QVBoxLayout()
-
-        # Search section
-        search_layout = QHBoxLayout()
-        search_label = QLabel("Search:")
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Enter city name, address, or landmark...")
-        self.search_input.returnPressed.connect(self._on_search_clicked)
-        self.search_button = QPushButton("Search")
-        self.search_button.clicked.connect(self._on_search_clicked)
-
-        search_layout.addWidget(search_label)
-        search_layout.addWidget(self.search_input, 1)
-        search_layout.addWidget(self.search_button)
-        layout.addLayout(search_layout)
-
-        # Placeholder for map (will be replaced by web view in _load_map)
-        self.map_container = QWidget()
-        self.map_container.setMinimumSize(800, 500)
-        self.map_layout = QVBoxLayout(self.map_container)
-        self.map_layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.map_container, 1)
-
-        # Coordinates display
-        self.coords_label = QLabel("Click on the map to select a location")
-        self.coords_label.setAlignment(Qt.AlignCenter)
-        themed_style(self.coords_label, lambda: f"QLabel {{ font-size: {font_size(12)}; padding: 10px; }}")
-        layout.addWidget(self.coords_label)
-
-        # Help text
-        help_text = QLabel("Tip: You can pan, zoom, and search for locations. Click anywhere on the map to select coordinates.")
-        help_text.setWordWrap(True)
-        themed_style(help_text, lambda: f"QLabel {{ color: {COLORS['text_disabled']}; font-size: {font_size(9)}; padding: 5px; }}")
-        help_text.setAlignment(Qt.AlignCenter)
-        layout.addWidget(help_text)
-
-        # Buttons
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-
-        self.select_button = QPushButton("Select Location")
-        self.select_button.clicked.connect(self._on_select_clicked)
-        self.select_button.setEnabled(True)  # Enabled since we have initial coordinates
-        # Don't set as default to prevent event propagation to parent dialog
-        # self.select_button.setDefault(True)
-
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.clicked.connect(self._on_cancel_clicked)
-
-        button_layout.addWidget(self.select_button)
-        button_layout.addWidget(self.cancel_button)
-        layout.addLayout(button_layout)
-
-        self.setLayout(layout)
-
-    def _create_map_html(self, lat, lon, zoom=10):
-        """Create HTML with Leaflet map and JavaScript bridge"""
-        html_template = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Location Picker</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://cdn.jsdelivr.net/npm/qwebchannel@6.2.0/qwebchannel.min.js"></script>
-    <style>
-        body {{ margin: 0; padding: 0; }}
-        #map {{ width: 100%; height: 100vh; }}
-        .info-box {{
-            position: absolute;
-            bottom: 10px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(0, 0, 0, 0.8);
-            color: white;
-            padding: 10px 20px;
-            border-radius: 5px;
-            font-family: Arial, sans-serif;
-            font-size: 12px;
-            z-index: 1000;
-            max-width: 500px;
-            text-align: center;
-        }}
-    </style>
-</head>
-<body>
-    <div id="map"></div>
-    <div class="info-box" id="infoBox">Click on the map to select a location</div>
-
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script>
-        var qt_bridge = null;
-        var map = null;
-        var marker = null;
-        var searchTimeout = null;
-        var bridgeReady = false;
-        var currentGeocodeLat = null;
-        var currentGeocodeLon = null;
-
-        // Initialize QWebChannel for Qt-JavaScript communication
-        new QWebChannel(qt.webChannelTransport, function(channel) {{
-            qt_bridge = channel.objects.qt_bridge;
-            bridgeReady = true;
-            console.log("Qt bridge initialized successfully");
-
-            // Connect to search results signal
-            qt_bridge.searchCompleted.connect(function(resultJson) {{
-                console.log("Received search results:", resultJson);
-                handleSearchResults(resultJson);
-            }});
-
-            // Connect to geocode results signal
-            qt_bridge.geocodeCompleted.connect(function(resultJson) {{
-                console.log("Received geocode results:", resultJson);
-                handleGeocodeResults(resultJson);
-            }});
-        }});
-
-        // Initialize Leaflet map
-        try {{
-            map = L.map('map').setView([{lat}, {lon}], {zoom});
-
-            // Add OpenStreetMap tiles
-            L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-                maxZoom: 19
-            }}).addTo(map);
-
-            // Add initial marker at starting position
-            marker = L.marker([{lat}, {lon}], {{
-                draggable: true
-            }}).addTo(map);
-
-            // Handle marker drag
-            marker.on('dragend', function(e) {{
-                var latlng = e.target.getLatLng();
-                onLocationSelected(latlng.lat, latlng.lng);
-            }});
-
-            // Handle map clicks
-            map.on('click', function(e) {{
-                var lat = e.latlng.lat;
-                var lon = e.latlng.lng;
-
-                // Update or create marker
-                if (marker) {{
-                    marker.setLatLng(e.latlng);
-                }} else {{
-                    marker = L.marker(e.latlng, {{
-                        draggable: true
-                    }}).addTo(map);
-
-                    marker.on('dragend', function(e) {{
-                        var latlng = e.target.getLatLng();
-                        onLocationSelected(latlng.lat, latlng.lng);
-                    }});
-                }}
-
-                onLocationSelected(lat, lon);
-            }});
-
-            document.getElementById('infoBox').innerHTML = 'Map loaded successfully - Click to select location';
-        }} catch (e) {{
-            console.error("Failed to initialize map:", e);
-            document.getElementById('infoBox').innerHTML = 'Error loading map: ' + e.message;
-        }}
-
-        function onLocationSelected(lat, lon) {{
-            // Update info box
-            document.getElementById('infoBox').innerHTML =
-                'Selected: ' + lat.toFixed(6) + '°, ' + lon.toFixed(6) + '° - Getting location name...';
-
-            // Reverse geocode to get location name
-            reverseGeocode(lat, lon);
-
-            // Also send coordinates immediately to Qt (in case reverse geocode fails)
-            sendToQt(lat, lon, "");
-        }}
-
-        function sendToQt(lat, lon, locationName) {{
-            if (bridgeReady && qt_bridge) {{
-                try {{
-                    qt_bridge.selectLocation(lat, lon, locationName);
-                    console.log("Sent to Qt: " + lat + ", " + lon);
-                }} catch(e) {{
-                    console.error("Error calling Qt bridge:", e);
-                }}
-            }} else {{
-                console.warn("Qt bridge not ready yet, retrying in 100ms...");
-                setTimeout(function() {{
-                    sendToQt(lat, lon, locationName);
-                }}, 100);
-            }}
-        }}
-
-        function reverseGeocode(lat, lon) {{
-            // Store current coordinates for when we receive the result
-            currentGeocodeLat = lat;
-            currentGeocodeLon = lon;
-
-            // Use Python bridge to reverse geocode (avoids CORS issues)
-            if (bridgeReady && qt_bridge && qt_bridge.reverseGeocodeFromPython) {{
-                qt_bridge.reverseGeocodeFromPython(lat, lon);
-            }} else {{
-                console.warn('Bridge not ready or reverseGeocodeFromPython not available');
-                document.getElementById('infoBox').innerHTML =
-                    'Selected: ' + lat.toFixed(6) + '°, ' + lon.toFixed(6) + '°';
-                // Send coordinates without name
-                sendToQt(lat, lon, "");
-            }}
-        }}
-
-        function handleGeocodeResults(resultJson) {{
-            try {{
-                var data = JSON.parse(resultJson);
-                var lat = currentGeocodeLat;
-                var lon = currentGeocodeLon;
-                var locationName = data.display_name || "";
-
-                // Update info box
-                document.getElementById('infoBox').innerHTML =
-                    'Selected: ' + lat.toFixed(6) + '°, ' + lon.toFixed(6) + '°<br>' +
-                    '<small>' + locationName + '</small>';
-
-                // Send to Qt with location name
-                sendToQt(lat, lon, locationName);
-            }} catch(error) {{
-                console.error('Error handling geocode results:', error);
-                document.getElementById('infoBox').innerHTML =
-                    'Selected: ' + currentGeocodeLat.toFixed(6) + '°, ' + currentGeocodeLon.toFixed(6) + '°';
-                sendToQt(currentGeocodeLat, currentGeocodeLon, "");
-            }}
-        }}
-
-        // Search function (called from Qt)
-        function searchLocation(query) {{
-            if (!query || query.trim() === '') {{
-                return;
-            }}
-
-            document.getElementById('infoBox').innerHTML = 'Searching for: ' + query + '...';
-
-            // Use Python bridge to search (avoids CORS issues)
-            if (bridgeReady && qt_bridge && qt_bridge.searchLocationFromPython) {{
-                qt_bridge.searchLocationFromPython(query);
-            }} else {{
-                console.error('Bridge not ready or searchLocationFromPython not available');
-                document.getElementById('infoBox').innerHTML = 'Search unavailable. Please try again in a moment.';
-            }}
-        }}
-
-        function handleSearchResults(resultJson) {{
-            try {{
-                var data = JSON.parse(resultJson);
-
-                if (data && data.length > 0) {{
-                    var result = data[0];
-                    var lat = parseFloat(result.lat);
-                    var lon = parseFloat(result.lon);
-
-                    // Pan to location
-                    map.setView([lat, lon], 13);
-
-                    // Update marker
-                    if (marker) {{
-                        marker.setLatLng([lat, lon]);
-                    }} else {{
-                        marker = L.marker([lat, lon], {{
-                            draggable: true
-                        }}).addTo(map);
-
-                        marker.on('dragend', function(e) {{
-                            var latlng = e.target.getLatLng();
-                            onLocationSelected(latlng.lat, latlng.lng);
-                        }});
-                    }}
-
-                    // Select this location
-                    onLocationSelected(lat, lon);
-                }} else {{
-                    document.getElementById('infoBox').innerHTML = 'No results found';
-                }}
-            }} catch(error) {{
-                console.error('Error handling search results:', error);
-                document.getElementById('infoBox').innerHTML = 'Search failed. Please try again.';
-            }}
-        }}
-    </script>
-</body>
-</html>"""
-        return html_template
-
-    def _load_map(self):
-        """Create and load the web view with the map"""
-        try:
-            # Import QtWebEngine components
-            try:
-                from PySide6.QtWebEngineWidgets import QWebEngineView
-                from PySide6.QtWebEngineCore import QWebEngineSettings
-                from PySide6.QtWebChannel import QWebChannel
-            except ImportError as ie:
-                QMessageBox.warning(self, "Feature Unavailable",
-                    "Map picker requires QtWebEngine which is not available.\n\n"
-                    "You can still enter coordinates manually.")
-                logger.error(f"QtWebEngine not available: {ie}")
-                self._init_failed = True
-                return
-
-            # Create web view
-            self.web_view = QWebEngineView()
-            self.web_view.setMinimumSize(800, 500)
-            self.web_view.setContextMenuPolicy(Qt.DefaultContextMenu)
-
-            # Configure web settings
-            settings = self.web_view.settings()
-            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
-
-            # Enable developer tools for debugging (optional - don't fail if unavailable)
-            try:
-                settings.setAttribute(QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled, True)
-                logger.debug("Developer tools enabled for map picker")
-            except AttributeError:
-                logger.debug("DeveloperExtrasEnabled not available in this Qt version")
-            except Exception as e:
-                logger.debug(f"Could not enable developer tools: {e}")
-
-            # Set up QWebChannel for Qt-JavaScript bridge BEFORE loading HTML
-            self.bridge = MapBridge(self)
-            self.channel = QWebChannel()
-            self.channel.registerObject("qt_bridge", self.bridge)
-            self.web_view.page().setWebChannel(self.channel)
-
-            # Generate and load HTML
-            html = self._create_map_html(self.initial_lat, self.initial_lon)
-            self.web_view.setHtml(html)
-
-            # Add load finished handler to check if everything loaded
-            self.web_view.loadFinished.connect(self._on_map_loaded)
-
-            # Catch GPU/renderer process crashes (see FOVSimulator's AladinLiteWindow for the
-            # same pattern) so a crash shows a clear message instead of a silently dead dialog.
-            self._renderer_crashed = False
-            self.web_view.page().renderProcessTerminated.connect(self._on_render_process_terminated)
-
-            # Add web view to map container
-            self.map_layout.addWidget(self.web_view)
-
-            logger.debug("Map view created successfully")
-            logger.debug("_load_map() completed successfully - dialog should still be open")
-
-        except Exception as e:
-            logger.error(f"Failed to create map view: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error",
-                f"Failed to load map picker: {str(e)}\n\n"
-                "Please enter coordinates manually.")
-            self._init_failed = True
-
-    def exec(self):
-        # _load_map runs from __init__, before the caller's exec(); reject() there
-        # would be undone by exec() showing the dialog anyway
-        if self._init_failed:
-            return QDialog.Rejected
-        return super().exec()
-
-    def _on_map_loaded(self, success):
-        """Called when the map page finishes loading"""
-        if success:
-            logger.debug("Map page loaded successfully")
-
-            # Test basic JavaScript execution
-            self.web_view.page().runJavaScript(
-                "1 + 1",
-                lambda result: logger.debug(f"JavaScript execution test (1+1): {result}")
-            )
-
-            # Check if QWebChannel is available
-            self.web_view.page().runJavaScript(
-                "typeof QWebChannel !== 'undefined'",
-                lambda result: logger.debug(f"QWebChannel available: {result}")
-            )
-
-            # Check if qt object is available
-            self.web_view.page().runJavaScript(
-                "typeof qt !== 'undefined'",
-                lambda result: logger.debug(f"qt object available: {result}")
-            )
-
-            # Check bridge status after a delay (give it time to initialize)
-            QTimer.singleShot(2000, self._check_bridge_status)
-        else:
-            # If the renderer already crashed, _on_render_process_terminated has already shown
-            # a more accurate message -- don't stomp it with the generic one.
-            if not self._renderer_crashed:
-                logger.error("Map page failed to load")
-                QMessageBox.warning(self, "Map Failed to Load",
-                    "The map failed to load, possibly due to a network issue.\n\n"
-                    "You can still enter coordinates manually.")
-                self.reject()
-
-    def _on_render_process_terminated(self, termination_status, exit_code):
-        """Handle GPU/renderer process crash without crashing the whole app or leaving a dead dialog"""
-        if self._renderer_crashed:
-            # Chromium can fire this signal again (e.g. an automatic reload attempt) before
-            # reject() below has actually torn the dialog down. Only handle the first one.
-            return
-        from PySide6.QtWebEngineCore import QWebEnginePage
-        status_names = {
-            QWebEnginePage.RenderProcessTerminationStatus.NormalTerminationStatus: "Normal",
-            QWebEnginePage.RenderProcessTerminationStatus.AbnormalTerminationStatus: "Abnormal",
-            QWebEnginePage.RenderProcessTerminationStatus.CrashedTerminationStatus: "Crashed",
-            QWebEnginePage.RenderProcessTerminationStatus.KilledTerminationStatus: "Killed",
-        }
-        status_name = status_names.get(termination_status, f"Unknown({termination_status})")
-        logger.error(f"Map picker renderer process terminated: {status_name}, exit code: {exit_code}")
-        self._renderer_crashed = True
-
-        QMessageBox.warning(self, "Map Renderer Crashed",
-            "The map's renderer process crashed (usually a GPU driver issue).\n\n"
-            "You can still enter coordinates manually.")
-        self.reject()
-
-    def _check_bridge_status(self):
-        """Check if the JavaScript bridge is ready"""
-        def log_bridge_status(result):
-            logger.debug(f"Bridge ready status: {result}")
-            if not result:
-                logger.error("Bridge failed to initialize! Trying to manually trigger...")
-                # Try to manually test the bridge by calling selectLocation
-                self.web_view.page().runJavaScript(
-                    "if (qt_bridge && qt_bridge.selectLocation) { qt_bridge.selectLocation(40.7128, -74.0060, 'Test Location'); } else { console.log('Bridge not available'); }",
-                    lambda r: logger.debug(f"Manual bridge test result: {r}")
-                )
-
-        self.web_view.page().runJavaScript("bridgeReady", log_bridge_status)
-
-    def _on_location_selected(self, lat, lon, location_name=""):
-        """Called when user selects a location (from JavaScript bridge)"""
-        logger.debug(f"_on_location_selected called: lat={lat}, lon={lon}, name={location_name}")
-        self.selected_lat = lat
-        self.selected_lon = lon
-        self.selected_location_name = location_name
-
-        # Update display
-        lat_str = f"{abs(lat):.6f}°{'N' if lat >= 0 else 'S'}"
-        lon_str = f"{abs(lon):.6f}°{'W' if lon < 0 else 'E'}"
-
-        if location_name:
-            # Truncate long location names
-            display_name = location_name if len(location_name) <= 60 else location_name[:57] + "..."
-            self.coords_label.setText(f"Selected: {lat_str}, {lon_str}\n{display_name}")
-        else:
-            self.coords_label.setText(f"Selected: {lat_str}, {lon_str}")
-
-        # Enable select button
-        self.select_button.setEnabled(True)
-
-        logger.debug(f"Location selected: {lat}, {lon} - {location_name}")
-
-    def _search_location_python(self, query):
-        """Search for location using Python's urllib to avoid CORS issues"""
-        import urllib.request
-        import urllib.parse
-        import json
-        from OnlineLimits import is_offline
-
-        if is_offline():
-            return json.dumps([])
-        try:
-            # URL encode the query
-            encoded_query = urllib.parse.quote(query)
-            url = f"https://nominatim.openstreetmap.org/search?format=json&q={encoded_query}&limit=1"
-
-            # Create request with User-Agent header (required by Nominatim)
-            request = urllib.request.Request(
-                url,
-                headers={'User-Agent': 'CosmosCollection/1.0'}
-            )
-
-            # Make the request
-            with urllib.request.urlopen(request, timeout=10) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                logger.debug(f"Search results: {data}")
-                return json.dumps(data)  # Return as JSON string
-
-        except Exception as e:
-            logger.error(f"Error searching location: {e}")
-            return json.dumps([])  # Return empty array on error
-
-    def _reverse_geocode_python(self, lat, lon):
-        """Reverse geocode using Python's urllib to avoid CORS issues"""
-        import urllib.request
-        import json
-        from OnlineLimits import is_offline
-
-        if is_offline():
-            return json.dumps({})
-        try:
-            url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}"
-
-            # Create request with User-Agent header (required by Nominatim)
-            request = urllib.request.Request(
-                url,
-                headers={'User-Agent': 'CosmosCollection/1.0'}
-            )
-
-            # Make the request
-            with urllib.request.urlopen(request, timeout=10) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                logger.debug(f"Reverse geocode result: {data}")
-                return json.dumps(data)  # Return as JSON string
-
-        except Exception as e:
-            logger.error(f"Error reverse geocoding: {e}")
-            return json.dumps({})  # Return empty object on error
-
-    def _on_search_clicked(self):
-        """Handle search button click"""
-        query = self.search_input.text().strip()
-        if query and self.web_view:
-            # Call JavaScript function which will call back to Python for the actual search
-            self.web_view.page().runJavaScript(f"searchLocation({json.dumps(query)})")
-
-    def _on_select_clicked(self):
-        """Handle Select Location button click"""
-        self.accept()
-
-    def _on_cancel_clicked(self):
-        """Handle Cancel button click"""
-        self.reject()
-
-    def get_selected_coordinates(self):
-        """Get the selected coordinates"""
-        if self.selected_lat is not None and self.selected_lon is not None:
-            return (self.selected_lat, self.selected_lon, self.selected_location_name)
-        return None
-
 
 # --- Bulk Add to Target List Dialog ---
 class BulkAddToTargetDialog(QDialog):
@@ -3797,7 +2987,7 @@ class BulkAddToTargetDialog(QDialog):
         self.setModal(True)
         self.resize(700, 500)
 
-        from DSONames import display_name
+        from cosmoscollection.catalog.DSONames import display_name
         # Each entry under the name it'll be added as, "M 31 (Andromeda Galaxy)"
         self.dso_list = sorted(
             ({**e, 'name': display_name(e.get('name', ''), designations=e.get('designations'))}
@@ -3947,7 +3137,7 @@ def run_update_check(owner, on_result, refresh=False):
     """Check GitHub for a newer release on a background thread, then call
     on_result(version_info) on the UI thread - unless owner (a QObject) has
     been closed and deleted by then. refresh=True skips the cached answer."""
-    from AppUpdater import UpdateChecker
+    from cosmoscollection.core.AppUpdater import UpdateChecker
     checker = UpdateChecker(owner)
     checker.checked.connect(on_result)
     checker.checked.connect(checker.deleteLater)
@@ -3964,8 +3154,8 @@ def offer_update_and_apply(parent, version_info):
     the matching asset), falls back to the original "visit the download
     page" behavior.
     """
-    from AppUpdater import update_manager
-    from OnlineLimits import is_offline, notify_offline
+    from cosmoscollection.core.AppUpdater import update_manager
+    from cosmoscollection.core.OnlineLimits import is_offline, notify_offline
 
     if is_offline():
         notify_offline(parent, "Updating")
@@ -3990,7 +3180,7 @@ class UpdateAvailableDialog(QDialog):
     def __init__(self, parent, version_info, action, note=None):
         """action: "install", "page" (open the download page) or None."""
         super().__init__(parent)
-        from AppUpdater import REMIND_CHOICES, remind_choice_index
+        from cosmoscollection.core.AppUpdater import REMIND_CHOICES, remind_choice_index
 
         self.setWindowTitle("Update Available")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
@@ -4053,21 +3243,21 @@ class UpdateAvailableDialog(QDialog):
         self._update_later_button()
 
     def _update_later_button(self):
-        from AppUpdater import REMIND_CHOICES
+        from cosmoscollection.core.AppUpdater import REMIND_CHOICES
         skip = REMIND_CHOICES[self.remind_combo.currentIndex()][1] is None
         self.later_button.setText("Skip This Version" if skip else "Remind Me Later")
 
     def _remind_later(self):
-        from AppUpdater import remind_later
+        from cosmoscollection.core.AppUpdater import remind_later
         remind_later(self.version, self.remind_combo.currentIndex())
         self.reject()
 
     def _open_release_notes(self):
-        from UrlOpener import open_url
+        from cosmoscollection.core.UrlOpener import open_url
         open_url(self.github_url)  # The dialog stays open to decide afterwards
 
     def _open_download_page(self):
-        from UrlOpener import open_url
+        from cosmoscollection.core.UrlOpener import open_url
         open_url(self.github_url)
         self.reject()
 
@@ -4077,7 +3267,7 @@ def _download_and_install_update(parent, zip_asset, sha256_asset):
     then restarts the app. Any failure is reported and simply leaves the
     running app untouched - nothing here modifies the install directory
     directly (that only happens in the separate updater helper process)."""
-    from AppUpdater import update_manager, UpdateError
+    from cosmoscollection.core.AppUpdater import update_manager, UpdateError
 
     progress = QProgressDialog("Downloading update...", "Cancel", 0, 100, parent)
     progress.setWindowTitle("Updating Cosmos Collection")
@@ -4159,7 +3349,7 @@ class AboutDialog(QDialog):
 
         # Version information - the local version now, the latest release once GitHub answers
         try:
-            from version import version_manager
+            from cosmoscollection.version import version_manager
             version_text = f"Local Version: {version_manager.get_local_version()}\nChecking for the latest release…"
             run_update_check(self, self._show_version_details)
         except ImportError:
@@ -4209,7 +3399,7 @@ class AboutDialog(QDialog):
 
         # Check for updates button
         try:
-            from version import check_for_updates
+            from cosmoscollection.version import check_for_updates
             self.update_button = QPushButton("Check for Updates")
             self.update_button.setFixedSize(130, 30)
             self.update_button.clicked.connect(self._check_updates)
@@ -4228,12 +3418,12 @@ class AboutDialog(QDialog):
         About_layout.addLayout(button_layout)
 
     def _show_version_details(self, version_info):
-        from version import version_manager
+        from cosmoscollection.version import version_manager
         self.version_label.setText(version_manager.get_detailed_version_info(version_info))
 
     def _check_updates(self):
         """Ask GitHub again (in the background) and show the result"""
-        from OnlineLimits import is_offline, notify_offline
+        from cosmoscollection.core.OnlineLimits import is_offline, notify_offline
         if is_offline():
             notify_offline(self, "Checking for updates")
             return
@@ -4285,7 +3475,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         # Set window title with version - the local version now, plus
         # "(Latest)" / "(Update available: ...)" once GitHub answers
         try:
-            from version import version_manager
+            from cosmoscollection.version import version_manager
             self.setWindowTitle(f"Cosmos Collection - v{version_manager.get_local_version()}")
             run_update_check(self, self._show_version_in_title)
         except ImportError:
@@ -4599,7 +3789,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _show_telescopes(self):
         """Show the Equipment window"""
-        from EquipmentManager import open_equipment_window
+        from cosmoscollection.equipment.EquipmentManager import open_equipment_window
         open_equipment_window(self)
 
     def _show_about(self):
@@ -4610,7 +3800,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _show_dso_visibility(self):
         """Show the DSO Visibility Calculator window"""
         try:
-            from DSOVisibilityCalculator import DSOVisibilityApp
+            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityApp
             if not window_is_open(getattr(self, 'dso_visibility_window', None)):
                 self.dso_visibility_window = DSOVisibilityApp()
             self.dso_visibility_window.show()
@@ -4624,7 +3814,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _show_weather_forecast(self):
         """Show the Weather Forecast window"""
         try:
-            from WeatherForecast import WeatherForecastWindow
+            from cosmoscollection.planning.WeatherForecast import WeatherForecastWindow
             if not window_is_open(getattr(self, 'weather_forecast_window', None)):
                 self.weather_forecast_window = WeatherForecastWindow()
             self.weather_forecast_window.show()
@@ -4637,7 +3827,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _show_nina_dashboard(self):
         """Show the NINA Dashboard window"""
-        from NINAIntegration import NINAIntegration
+        from cosmoscollection.nina.NINAIntegration import NINAIntegration
         if not NINAIntegration.is_enabled():
             QMessageBox.information(
                 self, "NINA Integration",
@@ -4647,7 +3837,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             return
 
         try:
-            from NINADashboard import NINADashboardWindow
+            from cosmoscollection.nina.NINADashboard import NINADashboardWindow
             if not window_is_open(getattr(self, 'nina_dashboard_window', None)):
                 self.nina_dashboard_window = NINADashboardWindow()
             self.nina_dashboard_window.show()
@@ -4661,7 +3851,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _show_best_dso_tonight(self):
         """Show the Best DSO Tonight window"""
         try:
-            from BestDSOTonight import BestDSOTonightWindow
+            from cosmoscollection.planning.BestDSOTonight import BestDSOTonightWindow
             # Reuse the existing window (even if it was closed/hidden) rather than
             # rebuilding it from scratch each time - reconstruction re-runs the
             # catalog load and twilight calculation, which is expensive.
@@ -4694,7 +3884,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _show_target_list(self):
         """Show the DSO Target List window"""
         try:
-            from DSOTargetList import DSOTargetListWindow
+            from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
             if not window_is_open(getattr(self, 'target_list_window', None)):
                 self.target_list_window = DSOTargetListWindow()
             self.target_list_window.show()
@@ -4708,7 +3898,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _show_session_manager(self):
         """Show the Session Manager window"""
         try:
-            from SessionManager import SessionManagerWindow
+            from cosmoscollection.sessions.SessionManager import SessionManagerWindow
             if not window_is_open(getattr(self, 'session_manager_window', None)):
                 self.session_manager_window = SessionManagerWindow()
             self.session_manager_window.show()
@@ -4721,7 +3911,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _show_import_wizard(self):
         """Show the Import Wizard window"""
-        from ImportWizard import open_import_wizard
+        from cosmoscollection.sessions.ImportWizard import open_import_wizard
         self.import_wizard_window = open_import_wizard(self)
 
     def _show_collage_builder(self):
@@ -4744,7 +3934,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _show_dso_gallery(self):
         """Show the DSO Image Gallery window"""
         try:
-            from DSOGallery import DSOGalleryWindow
+            from cosmoscollection.imaging.DSOGallery import DSOGalleryWindow
             if not window_is_open(getattr(self, 'gallery_window', None)):
                 self.gallery_window = DSOGalleryWindow()
             self.gallery_window.show()
@@ -4883,7 +4073,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         # 2. No results found in local database
         # 3. No other filters are active (catalog/type filters should be "All")
         # 4. SIMBAD lookup on search failure is enabled in settings (and not offline)
-        from OnlineLimits import is_offline
+        from cosmoscollection.core.OnlineLimits import is_offline
         if (text and
             QSettings("CosmosCollection", "CosmosCollection").value(
                 "simbad_lookup_on_search_failure", True, type=bool) and
@@ -4981,7 +4171,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             self.status_label.setText(f"Showing all {total} objects")
         else:
             self.status_label.setText(f"Showing {filtered} of {total} objects")
-        from OnlineLimits import is_offline
+        from cosmoscollection.core.OnlineLimits import is_offline
         if is_offline():
             self.status_label.setText(self.status_label.text() + " · Offline mode")
 
@@ -4991,7 +4181,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         it does filesystem work, and is unconditional (unlike the update
         check itself) since it's just housekeeping."""
         try:
-            from AppUpdater import update_manager
+            from cosmoscollection.core.AppUpdater import update_manager
             update_manager.cleanup_stale_staged_dirs_async()
         except Exception as e:
             logger.debug(f"Could not start staged-update cleanup: {e}")
@@ -5002,7 +4192,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             # Surface a prior failed/incomplete update once, regardless of
             # whether startup checking is enabled - this reports on an
             # action the user already took, not a new check.
-            from AppUpdater import update_manager
+            from cosmoscollection.core.AppUpdater import update_manager
             failure_message = update_manager.check_previous_update_failure()
             if failure_message:
                 from PySide6.QtWidgets import QMessageBox
@@ -5015,7 +4205,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             if not check_updates:
                 logger.debug("Update check on startup is disabled")
                 return
-            from OnlineLimits import is_offline
+            from cosmoscollection.core.OnlineLimits import is_offline
             if is_offline():
                 logger.debug("Update check on startup skipped - offline mode")
                 return
@@ -5032,7 +4222,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         run_update_check(self, on_result)
 
     def _show_version_in_title(self, version_info):
-        from version import version_manager
+        from cosmoscollection.version import version_manager
         self.setWindowTitle(f"Cosmos Collection - {version_manager.get_version_display_string(version_info)}")
 
     def _automatic_update_due(self, version_info):
@@ -5040,7 +4230,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         the user has snoozed it or skipped this version, and at most once a day."""
         if not (version_info.get('github_available') and version_info.get('update_available')):
             return False
-        from AppUpdater import update_notice_due, record_update_notice
+        from cosmoscollection.core.AppUpdater import update_notice_due, record_update_notice
         version = version_info.get('github_version') or ""
         if not update_notice_due(version):
             logger.debug(f"Update {version} available, but reminders are snoozed or it was skipped")
@@ -5418,8 +4608,8 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         name = entry.get('name', '')
         ra_deg, dec_deg = entry.get('ra_deg'), entry.get('dec_deg')
         try:
-            from DSOTargetList import find_existing_target
-            from FOVSimulator import sessions_for_object
+            from cosmoscollection.planning.DSOTargetList import find_existing_target
+            from cosmoscollection.planning.FOVSimulator import sessions_for_object
             with self.db_manager.get_connection() as conn:
                 return (find_existing_target(conn, name, ra_deg, dec_deg),
                         sessions_for_object(conn, name, ra_deg, dec_deg, entry.get('dsodetailid')))
@@ -5430,7 +4620,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _context_open_in_target_list(self, target_entry):
         """Open the Target List with this object's entry selected"""
         try:
-            from DSOTargetList import DSOTargetListWindow
+            from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
             if not window_is_open(getattr(self, 'target_list_window', None)):
                 self.target_list_window = DSOTargetListWindow()
             if not self.target_list_window.open_and_select_target(target_entry['name']):
@@ -5442,7 +4632,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _context_open_session(self, session_id):
         """Open the Session Manager with this session selected"""
         try:
-            from SessionManager import SessionManagerWindow
+            from cosmoscollection.sessions.SessionManager import SessionManagerWindow
             if not window_is_open(getattr(self, 'session_manager_window', None)):
                 self.session_manager_window = SessionManagerWindow()
             self.session_manager_window.open_and_select_session(session_id)
@@ -5462,7 +4652,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 'dec_deg': entry.get('dec_deg'),
                 'designations': entry.get('designations', '')
             }
-            from SessionManager import SessionManagerWindow
+            from cosmoscollection.sessions.SessionManager import SessionManagerWindow
             if not window_is_open(getattr(self, 'session_manager_window', None)):
                 self.session_manager_window = SessionManagerWindow()
             self.session_manager_window.create_session_from_dso(dso_data)
@@ -5491,7 +4681,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             logger.debug(f"Opening DSO Visibility Calculator for: {dso_name} at RA {ra_deg}° Dec {dec_deg}°")
 
             # Import and open DSO Visibility Calculator
-            from DSOVisibilityCalculator import DSOVisibilityApp
+            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityApp
 
             # Store reference to prevent garbage collection
             self.visibility_window = DSOVisibilityApp()
@@ -5575,7 +4765,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             }
 
             # Import and open Target List window, then add the DSO
-            from DSOTargetList import DSOTargetListWindow
+            from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
             if not window_is_open(getattr(self, 'target_list_window', None)):
                 self.target_list_window = DSOTargetListWindow()
 
@@ -5599,7 +4789,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         missing = [e for e in self.model.dso_data if e.get('image_count', 0) == 0]
 
         try:
-            from DSOTargetList import TargetListIndex
+            from cosmoscollection.planning.DSOTargetList import TargetListIndex
             with self.db_manager.get_connection() as conn:
                 # Same rules as everywhere else: an object listed under another
                 # spelling or designation ("M17" / "M 17", "IC 4725" / "M 25") counts
@@ -5672,7 +4862,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             if len(urls) == 1 and urls[0].isLocalFile():
-                from DSOGallery import SUPPORTED_IMAGE_EXTENSIONS
+                from cosmoscollection.imaging.DSOGallery import SUPPORTED_IMAGE_EXTENSIONS
                 ext = os.path.splitext(urls[0].toLocalFile())[1].lower()
                 if ext in SUPPORTED_IMAGE_EXTENSIONS:
                     event.acceptProposedAction()
@@ -5681,14 +4871,14 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def dropEvent(self, event):
         """Open the Add Image dialog with the dropped file pre-filled"""
-        from DSOGallery import SUPPORTED_IMAGE_EXTENSIONS
+        from cosmoscollection.imaging.DSOGallery import SUPPORTED_IMAGE_EXTENSIONS
         urls = event.mimeData().urls()
         if urls and urls[0].isLocalFile():
             file_path = urls[0].toLocalFile()
             ext = os.path.splitext(file_path)[1].lower()
             if ext in SUPPORTED_IMAGE_EXTENSIONS:
                 event.acceptProposedAction()
-                from DSOGallery import import_image
+                from cosmoscollection.imaging.DSOGallery import import_image
                 # Deferred: a dialog shown inside dropEvent keeps the source app's drag (e.g. Explorer) blocked
                 QTimer.singleShot(0, lambda: import_image(self, file_path))
 
@@ -5705,7 +4895,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             app_icon = QApplication.instance().windowIcon()
             if app_icon.isNull():
                 # Fallback to loading icon directly
-                icon_path = os.path.join(APP_DIR, 'images', 'CosmosCollection.png')
+                icon_path = str(ResourceManager.get_icon_path())
                 app_icon = QIcon(icon_path)
 
             if self._tray_manager.setup(app_icon):
@@ -5729,7 +4919,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _register_weather_callback(self):
         """Register callback to update tray tooltip when weather data changes"""
         try:
-            from WeatherForecast import WeatherCache
+            from cosmoscollection.planning.WeatherForecast import WeatherCache
             cache = WeatherCache()
             cache.add_update_callback(self._on_weather_updated)
 
@@ -5757,7 +4947,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             # Start hourly update check
             self._start_tray_update_check()
             logger.debug("Window minimized to tray")
-            from Diagnostics import log_memory
+            from cosmoscollection.core.Diagnostics import log_memory
             log_memory("minimized to tray")
 
     def _restore_from_tray(self):
@@ -5777,7 +4967,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.raise_()
         self.activateWindow()
         logger.debug("Window restored from tray")
-        from Diagnostics import log_memory
+        from cosmoscollection.core.Diagnostics import log_memory
         log_memory("restored from tray")
 
     def _start_tray_weather_refresh(self):
@@ -5838,7 +5028,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _check_updates_for_tray(self):
         """Check for updates in the background; a tray notification follows if one is available"""
-        from OnlineLimits import is_offline
+        from cosmoscollection.core.OnlineLimits import is_offline
         if is_offline():
             logger.debug("Tray update check skipped - offline mode")
             return
@@ -5879,12 +5069,12 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _fetch_weather_for_tray(self):
         """Fetch weather data in background for tray tooltip"""
-        from OnlineLimits import is_offline
+        from cosmoscollection.core.OnlineLimits import is_offline
         if is_offline():
             logger.debug("Tray weather refresh skipped - offline mode")
             return
         try:
-            from WeatherForecast import WeatherCache, WeatherWorker
+            from cosmoscollection.planning.WeatherForecast import WeatherCache, WeatherWorker
 
             # Get user location
             with self.db_manager.get_connection() as conn:
@@ -5923,7 +5113,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _on_tray_weather_loaded(self, weather_data):
         """Handle weather data loaded for tray"""
         try:
-            from WeatherForecast import WeatherCache
+            from cosmoscollection.planning.WeatherForecast import WeatherCache
 
             # Get location to store in cache
             with self.db_manager.get_connection() as conn:
@@ -6149,9 +5339,9 @@ def add_image_cli(args) -> bool:
             cursor = conn.cursor()
 
             # "telescope, camera" - linked to the user's Equipment where it names it
-            import EquipmentMapper
-            import LibraryScanner
-            from DatabaseManager import add_user_image_row
+            from cosmoscollection.equipment import EquipmentMapper
+            from cosmoscollection.sessions import LibraryScanner
+            from cosmoscollection.core.DatabaseManager import add_user_image_row
             telescope_id, telescope_name, camera_id, camera_name = EquipmentMapper.parse_equipment_text(
                 args.equipment, LibraryScanner.load_equipment_info(conn))
             image_id = add_user_image_row(cursor, dso['id'], image_path, args.integration, args.date, args.notes,
@@ -6344,7 +5534,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
 
     # Set application icon
-    icon_path = os.path.join(APP_DIR, 'images', 'CosmosCollection.png')
+    icon_path = str(ResourceManager.get_icon_path())
     app_icon = QIcon(icon_path)
     app.setWindowIcon(app_icon)
 
@@ -6453,7 +5643,7 @@ if __name__ == "__main__":
     try:
         from astropy.utils.iers import IERS_Auto
         IERS_Auto.open()
-        from WeatherForecast import calculate_sun_altitudes, calculate_moon_phase
+        from cosmoscollection.planning.WeatherForecast import calculate_sun_altitudes, calculate_moon_phase
         import datetime as _dt
         _now = _dt.datetime.utcnow()
         calculate_sun_altitudes(0.0, 0.0, [_now])
@@ -6466,7 +5656,7 @@ if __name__ == "__main__":
         # exercising it here, in this same single-threaded pre-warm block, means
         # that cost (observed at ~8s cold) is paid once at startup instead of
         # freezing whichever of those windows the user happens to open first.
-        from DSOVisibilityCalculator import DSOVisibilityCalculator
+        from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityCalculator
         from astropy.coordinates import SkyCoord
         import astropy.units as _u
         _calc = DSOVisibilityCalculator(location_lat=0.0, location_lon=0.0, timezone="UTC")
@@ -6519,7 +5709,7 @@ if __name__ == "__main__":
 
     try:
         # Check if catalogs directory exists, create if needed
-        catalogs_dir = os.path.join(APP_DIR, 'catalogs')
+        catalogs_dir = str(ResourceManager.get_resource_path('catalogs'))
         if not os.path.exists(catalogs_dir):
             os.makedirs(catalogs_dir)
 
@@ -6531,7 +5721,7 @@ if __name__ == "__main__":
         initial_loader.start()
 
         # Freezes, slow memory cleanups and memory use go to the log file
-        from Diagnostics import start_diagnostics
+        from cosmoscollection.core.Diagnostics import start_diagnostics
         start_diagnostics(app)
 
         sys.exit(app.exec())
