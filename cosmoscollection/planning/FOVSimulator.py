@@ -1499,6 +1499,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self.setCentralWidget(central_widget)
 
         self.fallback_button = None  # Track fallback button to avoid duplicates
+        self._gpu_reset_bar = None   # Shown when the sky view broke after a graphics reset
         self._renderer_crashed = False  # Set by _on_render_process_terminated; suppresses the generic load-failed message
 
         # Add loading timeout
@@ -2764,6 +2765,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             self._page_error = True
             logger.error(f"Sky viewer: {report['error']}")
             self._add_browser_fallback_button()
+            self._check_gpu_reset()
         if report.get("survey") not in (None, self._sky_source):
             self._on_sky_source(report["survey"])
         if report.get("rotateSeq") not in (None, self._rotate_seq):
@@ -2899,6 +2901,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['error']}; font-size: {font_px(12)}; }}")
             self.web_placeholder.show()
         self._add_browser_fallback_button()
+        self._check_gpu_reset()
         # Stop any in-progress load to break the automatic crash-and-retry cycle
         try:
             if self.web_view:
@@ -2972,6 +2975,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                 else:
                     logger.error(f"WebGL is NOT available: {webgl_info.get('error', 'Unknown error')}")
                     logger.error("Aladin Lite will not render properly without WebGL support")
+                    self._check_gpu_reset()
             except Exception as e:
                 logger.error(f"Failed to parse WebGL info: {e}, result: {result}")
 
@@ -2987,6 +2991,38 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             self.web_placeholder.setText("Loading timed out\nAladin Lite may be slow to respond\n\nClick below to open in browser instead.")
             themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['warning']}; font-size: {font_px(12)}; }}")
         self._add_browser_fallback_button()
+
+    def _check_gpu_reset(self):
+        """The sky view failed: if the graphics card was reset since the app started,
+        say so and offer Try Again / Restart App (see core/GpuReset.py)."""
+        from cosmoscollection.core.GpuReset import was_reset
+        if getattr(self, "_closing", False) or not was_reset():
+            return
+        if self._gpu_reset_bar is None:
+            from cosmoscollection.ui.GpuResetBar import GpuResetBar
+            reopen = {"tool": "fov", "data": self.data, "session_id": self.session_id}
+            self._gpu_reset_bar = GpuResetBar("the sky view", self._retry_after_gpu_reset, reopen=reopen)
+            central_widget = self.centralWidget()
+            if central_widget and central_widget.layout():
+                central_widget.layout().insertWidget(0, self._gpu_reset_bar)
+        self._gpu_reset_bar.show()
+
+    def _retry_after_gpu_reset(self):
+        """Try Again on the graphics reset bar: load the sky view again."""
+        if self.web_view is None:
+            self._create_web_view_safely()
+            return
+        central_widget = self.centralWidget()
+        layout = central_widget.layout() if central_widget else None
+        if self.web_placeholder and layout is not None and layout.indexOf(self.web_view) >= 0:
+            # A renderer crash put a placeholder back beside the web view - drop it
+            layout.removeWidget(self.web_placeholder)
+            self.web_placeholder.deleteLater()
+            self.web_placeholder = None
+            self.web_view.show()
+        self._page_error = False
+        self._renderer_crashed = False
+        self._load_viewer_page()
 
     def _ensure_web_view_visible(self):
         """Ensure the web view is visible and replace placeholder if needed"""

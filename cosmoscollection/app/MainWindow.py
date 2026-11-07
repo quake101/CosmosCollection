@@ -345,6 +345,21 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self.nina_dashboard_action.setVisible(NINAIntegration.is_enabled())
         self._update_status()  # Shows whether offline mode is on
 
+    def _reopen_after_restart(self):
+        """After Restart App on a view broken by a graphics reset: open that tool again
+        (see core/GpuReset.py)."""
+        from cosmoscollection.core.GpuReset import take_reopen
+        note = take_reopen()
+        if not note:
+            return
+        try:
+            if note.get("tool") == "fov" and isinstance(note.get("data"), dict):
+                logger.debug(f"Reopening the FOV Simulator after a restart: {note['data'].get('name')}")
+                self.aladin_window = AladinLiteWindow(note["data"], self, session_id=note.get("session_id"))
+                self.aladin_window.show()
+        except Exception as e:
+            logger.error(f"Could not reopen {note.get('tool')} after the restart: {e}", exc_info=True)
+
     def _check_location_on_startup(self):
         """Check if user has configured their location and prompt if not"""
         try:

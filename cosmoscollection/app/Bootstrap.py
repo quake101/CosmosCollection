@@ -6,6 +6,12 @@ import logging
 import os
 import sys
 
+# Started again by Restart App: wait for the old app to finish exiting first, so the two
+# don't share the database or the web views' storage (see core/GpuReset.py)
+if os.environ.get('COSMOS_RESTART_WAIT_PID'):
+    from cosmoscollection.core.GpuReset import wait_for_previous_app
+    wait_for_previous_app()
+
 
 # numpy's math library (OpenBLAS) reserves a buffer for every CPU thread when numpy is
 # first imported: about 750 MB on a 32-thread PC, held for as long as the app runs. The
@@ -54,6 +60,14 @@ os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
     f'--no-sandbox {_gpu_workarounds}'
     f'--enable-logging --log-level=1'
 )
+
+# Windows: no Qt vsync helper thread (QDxgiVSyncService). When the graphics device is reset
+# while the app runs (Auto HDR switching on for a game, an HDR toggle, a driver reset), it was
+# being torn down when the app aborted on opening the FOV Simulator (2026-11-06,
+# "QDxgiVSyncService not destroyed in time" then "Fatal Python error: Aborted"). Without it Qt
+# paces window updates with a timer instead. A value already in the environment wins.
+if sys.platform == 'win32':
+    os.environ.setdefault('QT_D3D_NO_VBLANK_THREAD', '1')
 
 # The packaged app (and pythonw) has no console, so Chromium's stderr went nowhere. Point the
 # process's stderr at chromium_debug.log; Chromium's GPU and renderer processes inherit it.

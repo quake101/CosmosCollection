@@ -89,6 +89,7 @@ class MapLocationPickerDialog(QDialog):
         self.bridge = None
         self.channel = None
         self._renderer_crashed = False  # Set by _on_render_process_terminated; suppresses the generic load-failed message
+        self._gpu_reset_bar = None   # Shown when the map broke after a graphics reset
         self._init_failed = False  # Set when the map can't be created at all; exec() then returns immediately
 
         self._setup_ui()
@@ -494,6 +495,14 @@ class MapLocationPickerDialog(QDialog):
 
             # Check bridge status after a delay (give it time to initialize)
             QTimer.singleShot(2000, self._check_bridge_status)
+
+            # No WebGL here usually means the web views' graphics are broken - after a
+            # graphics reset, the map may not draw either
+            self.web_view.page().runJavaScript(
+                "(function () { var c = document.createElement('canvas');"
+                " return !!(c.getContext('webgl2') || c.getContext('webgl')); })()",
+                lambda ok: None if ok else self._check_gpu_reset()
+            )
         else:
             # If the renderer already crashed, _on_render_process_terminated has already shown
             # a more accurate message -- don't stomp it with the generic one.
@@ -520,11 +529,34 @@ class MapLocationPickerDialog(QDialog):
         status_name = status_names.get(termination_status, f"Unknown({termination_status})")
         logger.error(f"Map picker renderer process terminated: {status_name}, exit code: {exit_code}")
         self._renderer_crashed = True
+        if self._check_gpu_reset():
+            return  # The bar offers Try Again / Restart App instead of closing the map
 
         QMessageBox.warning(self, "Map Renderer Crashed",
             "The map's renderer process crashed (usually a GPU driver issue).\n\n"
             "You can still enter coordinates manually.")
         self.reject()
+
+    def _check_gpu_reset(self):
+        """The map failed: if the graphics card was reset since the app started, say so
+        and offer Try Again / Restart App (see core/GpuReset.py). True if shown."""
+        from cosmoscollection.core.GpuReset import was_reset
+        if not was_reset():
+            return False
+        if self._gpu_reset_bar is None:
+            from cosmoscollection.ui.GpuResetBar import GpuResetBar
+            self._gpu_reset_bar = GpuResetBar("the map", self._retry_after_gpu_reset,
+                                              before_restart=self.reject)
+            self.layout().insertWidget(1, self._gpu_reset_bar)  # Below the search row
+        self._gpu_reset_bar.show()
+        return True
+
+    def _retry_after_gpu_reset(self):
+        """Try Again on the graphics reset bar: load the map again where it was."""
+        if self.web_view is None:
+            return
+        self._renderer_crashed = False
+        self.web_view.setHtml(self._create_map_html(self.selected_lat, self.selected_lon))
 
     def _check_bridge_status(self):
         """Check if the JavaScript bridge is ready"""

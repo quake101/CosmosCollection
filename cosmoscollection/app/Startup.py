@@ -239,6 +239,8 @@ def main():
 
             # Check if location is configured after window is shown
             QTimer.singleShot(500, window._check_location_on_startup)
+            # Restarted from a broken view (Restart App): open that tool again
+            QTimer.singleShot(800, window._reopen_after_restart)
 
         except Exception as e:
             logger.error(f"Error creating main window: {e}", exc_info=True)
@@ -273,7 +275,13 @@ def main():
         from cosmoscollection.core.Diagnostics import start_diagnostics
         start_diagnostics(app)
 
-        sys.exit(app.exec())
+        # Notices a graphics reset, for web views that break afterward (Restart App)
+        from cosmoscollection.core import GpuReset
+        GpuReset.start_watch()
+
+        exit_code = app.exec()
+        GpuReset.relaunch_if_requested()
+        sys.exit(exit_code)
 
     except Exception as e:
         logger.error(f"Error initializing application: {str(e)}", exc_info=True)
