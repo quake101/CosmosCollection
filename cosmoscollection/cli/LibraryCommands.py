@@ -193,16 +193,9 @@ def _decide_equipment(ctx, rows, mode):
         else:
             if info is None:
                 info = _current_equipment(ctx)
-            items = info.items(kind)
-            measured = LibraryScanner.equipment_from_header(kind, row["header"])
-            detail = (f" ({measured['focal_length']:g} mm)" if kind == LibraryScanner.TELESCOPE and
-                      measured.get("focal_length") else
-                      f" ({measured['pixel_size']:g} µm pixels)" if measured.get("pixel_size") else "")
-            options = [("keep", "Not matched - keep the name from the files")]
-            options += [(item_id, item["name"] + ("" if item["is_active"] else " (disabled)"))
-                        for item_id, item in sorted(items.items(), key=lambda i: (not i[1]["is_active"],
-                                                                                    (i[1]["name"] or "").lower()))]
-            options.append(("add", f"Add as a new {kind}{detail}"))
+            options = [("keep", LibraryScanner.KEEP_NAME_CHOICE)]
+            options += LibraryScanner.equipment_choices(info, kind)
+            options.append(("add", LibraryScanner.add_equipment_choice(kind, row["header"])))
             why = f" - suggested: {row['suggested_name']} ({row['why']})" if row["suggested"] is not None else ""
             print(f"\n{kind.capitalize()} '{value}' in {count_text(row['subs'], 'sub')}{why}")
             choice = choose(ctx, "Match it to:", options,

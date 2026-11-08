@@ -33,7 +33,6 @@ from cosmoscollection.core.Paths import path_key
 from cosmoscollection.core.Formatting import count_text, format_duration, natural_key
 from cosmoscollection.sessions import MountDetection
 from cosmoscollection.sessions.LibraryScanner import ScanRules, scan_and_build, ScanIndex
-from cosmoscollection.catalog.DSONames import SESSION_COMMON_NAMES_SETTING
 from cosmoscollection.ui.Theme import COLORS, font_size, themed_style
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 
@@ -59,7 +58,8 @@ FINAL_TYPES = {1: "Finished image", 2: "Stack", 3: "Possible image"}
 
 # Shared with the command line's 'library scan' (ImportSettings.py)
 from cosmoscollection.sessions.ImportSettings import (  # noqa: E402,F401
-    SETTINGS_PREFIX, _split_words, load_rules, save_folders, saved_folders)
+    SETTINGS_PREFIX, common_names_for_new_sessions, load_rules, save_folders, save_rules, saved_folders,
+    set_common_names_for_new_sessions)
 
 
 # ---------------------------------------------------------------------------
@@ -340,15 +340,7 @@ class FoldersPage(QWidget):
         self.reread_check.setChecked(False)
 
     def _save_advanced(self):
-        settings = app_settings()
-        defaults = ScanRules()
-        settings.setValue(f"{SETTINGS_PREFIX}/session_gap_days", self.gap_spin.value())
-        finals, work = _split_words(self.final_words.text()), _split_words(self.work_folders.text())
-        # Stored only when changed, so improved defaults reach everyone else
-        settings.setValue(f"{SETTINGS_PREFIX}/final_keywords",
-                          "" if finals == defaults.final_keywords else ", ".join(finals))
-        settings.setValue(f"{SETTINGS_PREFIX}/work_folders",
-                          "" if work == defaults.work_folders else ", ".join(work))
+        save_rules(self.gap_spin.value(), self.final_words.text(), self.work_folders.text())
 
     def _scan(self):
         if not self.folders():
@@ -566,18 +558,10 @@ class EquipmentPage(QWidget):
             table.setItem(row, column, cell)
 
         combo = QComboBox()
-        combo.addItem("Not matched - keep the name from the files", NOT_MATCHED)
-        items = info.items(kind)
-        for item_id in sorted(items, key=lambda i: (not items[i]["is_active"], (items[i]["name"] or "").lower())):
-            item = items[item_id]
-            combo.addItem(item["name"] + ("" if item["is_active"] else " (disabled)"), _matched(item_id))
-        measured = LibraryScanner.equipment_from_header(kind, entry["header"])
-        if kind == LibraryScanner.TELESCOPE:
-            detail = f" ({measured['focal_length']:g} mm)" if measured["focal_length"] else ""
-            combo.addItem(f"Add as a new telescope{detail}", ADD_NEW)
-        else:
-            detail = f" ({measured['pixel_size']:g} µm pixels)" if measured["pixel_size"] else ""
-            combo.addItem(f"Add as a new camera{detail}", ADD_NEW)
+        combo.addItem(LibraryScanner.KEEP_NAME_CHOICE, NOT_MATCHED)
+        for item_id, name in LibraryScanner.equipment_choices(info, kind):
+            combo.addItem(name, _matched(item_id))
+        combo.addItem(LibraryScanner.add_equipment_choice(kind, entry["header"]), ADD_NEW)
 
         if info.decided(kind, value):
             chosen = info.aliases[(kind, LibraryScanner.alias_key(value))]
@@ -732,9 +716,8 @@ class ReviewPage(QWidget):
         self.common_names_check = QCheckBox("Add common names to session names")
         self.common_names_check.setToolTip('New sessions are named like "M 31 (Andromeda Galaxy)" rather than '
                                            '"M 31". Sessions already in the Session Manager keep their names.')
-        self.common_names_check.setChecked(app_settings().value(SESSION_COMMON_NAMES_SETTING, True, type=bool))
-        self.common_names_check.toggled.connect(
-            lambda checked: app_settings().setValue(SESSION_COMMON_NAMES_SETTING, checked))
+        self.common_names_check.setChecked(common_names_for_new_sessions())
+        self.common_names_check.toggled.connect(set_common_names_for_new_sessions)
         bottom.addWidget(self.common_names_check)
         self.selection_label = QLabel("")
         bottom.addWidget(self.selection_label)

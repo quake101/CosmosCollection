@@ -306,10 +306,11 @@ def _folder_lights(ctx, paths, progress):
 
 
 def _frame_json(path, light, metrics, grade):
+    from cosmoscollection.imaging.LightQuality import RANKED_GRADES
     ok = metrics is not None and metrics.ok
     return {
         "path": path, "grade": grade.grade if grade else None,
-        "score": round(grade.score, 1) if grade and grade.grade in _ranked() else None,
+        "score": round(grade.score, 1) if grade and grade.grade in RANKED_GRADES else None,
         "night": light["night_date"], "filter": light["filter_name"] or "No filter",
         "exposure_seconds": light["exptime_seconds"], "binning": light["xbinning"] or 1,
         "stars": metrics.stars if ok else None,
@@ -322,11 +323,6 @@ def _frame_json(path, light, metrics, grade):
         "issues": list(grade.flags) if grade else [],
         "error": metrics.error if metrics is not None and not metrics.ok else None,
     }
-
-
-def _ranked():
-    from cosmoscollection.imaging import FrameQuality as fq
-    return (fq.GRADE_GOOD, fq.GRADE_MARGINAL, fq.GRADE_REJECT)
 
 
 def run_quality(ctx):
@@ -441,7 +437,7 @@ def run_quality(ctx):
         if not 1 <= percent <= 100:
             raise CliError("--keep-top takes a percentage from 1 to 100.", EXIT_USAGE)
         keep = lq.top_percent_lights(lights, grades, percent)
-        selected = [p for p in shown if p in grades and grades[p].grade in _ranked() and p not in keep]
+        selected = [p for p in shown if p in grades and grades[p].grade in lq.RANKED_GRADES and p not in keep]
         selection = f"outside the top {percent}%"
         describe = lambda n: f"{count_text(n, 'frame')} outside the top {percent}%"  # noqa: E731
     else:
@@ -564,7 +560,7 @@ def _print_quality(ctx, session, lights, shown, metrics, grades, by_grade, night
 
         print_table(listed, [
             Column("Grade", lambda p: grades[p].grade if p in grades else "Not analyzed"),
-            Column("Score", lambda p: f"{grades[p].score:.0f}" if p in grades and grades[p].grade in _ranked()
+            Column("Score", lambda p: f"{grades[p].score:.0f}" if p in grades and grades[p].grade in lq.RANKED_GRADES
                    else "", ">"),
             Column("File", lambda p: os.path.basename(p), flex=True),
             Column("Night", lambda p: lights[p]["night_date"] or ""),
@@ -672,10 +668,7 @@ def _act(ctx, session, lights, selected, describe, integration):
     if finished:
         with ctx.connection() as conn:
             try:
-                if session:
-                    lq.record_removed(conn, session["id"], lights, finished, mode, extra, others)
-                else:
-                    _record_loose(conn, finished, mode, others)
+                lq.record_removed(conn, session["id"] if session else None, lights, finished, mode, extra, others)
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -706,19 +699,3 @@ def _act(ctx, session, lights, selected, describe, integration):
             "moved_to": {p: new for p, new in finished.items()} if mode == lq.MOVE else None,
             "failed": failed}
 
-
-def _record_loose(conn, changed, mode, others):
-    """Files graded from folders, moved or deleted: sessions they're attached to
-    follow a move, and lose a deleted file; the saved measurements follow."""
-    from cosmoscollection.sessions import SessionObservations as so
-    if mode == "move":
-        for old, new in changed.items():
-            conn.execute("UPDATE usersessionfiles SET file_path = ? WHERE file_path = ?", (new, old))
-            conn.execute("UPDATE OR REPLACE framequality SET file_path = ? WHERE file_path = ?", (new, old))
-        return
-    for session_id, (_label, ids) in others.items():
-        so.remove_files(conn, session_id, ids)
-    paths = list(changed)
-    for i in range(0, len(paths), 500):
-        chunk = paths[i:i + 500]
-        conn.execute(f"DELETE FROM framequality WHERE file_path IN ({','.join('?' * len(chunk))})", chunk)

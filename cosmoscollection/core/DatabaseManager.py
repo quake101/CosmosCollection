@@ -12,6 +12,15 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 
+def set_favorite_image(cursor, image_id, favorite=True):
+    """Make an image its object's favorite - one per object, so the object's
+    others stop being it - or stop it being one. Does not commit."""
+    if favorite:
+        cursor.execute("UPDATE userimages SET is_favorite = 0 WHERE id != ? AND dsodetailid = "
+                       "(SELECT dsodetailid FROM userimages WHERE id = ?)", (image_id, image_id))
+    cursor.execute("UPDATE userimages SET is_favorite = ? WHERE id = ?", (1 if favorite else 0, image_id))
+
+
 def add_user_image_row(cursor, dsodetailid, image_path, integration_time="", date_taken="", notes="",
                        session_id=None, equipment=None):
     """Insert one userimages row (the gallery's image of a DSO); its id. Does not commit.

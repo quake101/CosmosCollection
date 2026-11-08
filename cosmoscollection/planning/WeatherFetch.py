@@ -865,13 +865,8 @@ class WeatherFetch:
             avg_precip = sum(precip_probs) / len(precip_probs)
 
             # Build "tonight" hours: evening dark hours of this day + morning dark hours of next day
-            evening_dark = [h for h in hours if h.time.hour >= 12 and sun_alt_map.get(h.time, 0) < -12]
-            morning_dark = []
-            if date_idx + 1 < len(sorted_dates):
-                next_date = sorted_dates[date_idx + 1]
-                next_hours = daily_data[next_date]
-                morning_dark = [h for h in next_hours if h.time.hour < 12 and sun_alt_map.get(h.time, 0) < -12]
-            tonight_hours = evening_dark + morning_dark
+            next_hours = daily_data[sorted_dates[date_idx + 1]] if date_idx + 1 < len(sorted_dates) else None
+            tonight_hours = [h for h in night_hours(hours, next_hours) if sun_alt_map.get(h.time, 0) < -12]
 
             # Determine dark hours start and end times
             dark_start = tonight_hours[0].time if tonight_hours else None
@@ -1170,6 +1165,33 @@ def get_rating_label(score: int) -> str:
         return "Moderate"
     else:
         return "Poor"
+
+
+def weather_units():
+    """(temperature, wind) units from Settings > Weather Units: "Celsius" or
+    "Fahrenheit", "km/h", "mph" or "m/s"."""
+    settings = app_settings()
+    return (settings.value("temperature_unit", "Celsius", type=str),
+            settings.value("wind_speed_unit", "km/h", type=str))
+
+
+def convert_temperature(celsius, unit):
+    """A forecast temperature (Celsius) in the unit weather_units() gives."""
+    return celsius * 9 / 5 + 32 if unit == "Fahrenheit" else celsius
+
+
+def convert_wind(kmh, unit):
+    """A forecast wind speed (km/h) in the unit weather_units() gives."""
+    if unit == "mph":
+        return kmh * 0.621371
+    if unit == "m/s":
+        return kmh / 3.6
+    return kmh
+
+
+def night_hours(day_hours, next_day_hours=None):
+    """A night's forecast hours: noon of its day to noon the next."""
+    return [h for h in day_hours if h.time.hour >= 12] + [h for h in next_day_hours or () if h.time.hour < 12]
 
 
 def calculate_sun_altitudes(lat: float, lon: float, times: List[datetime], timezone: str = None) -> List[float]:

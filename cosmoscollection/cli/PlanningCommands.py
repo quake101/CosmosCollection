@@ -11,7 +11,6 @@ from datetime import date, datetime, timedelta
 
 from cosmoscollection.cli.Output import (EXIT_USAGE, CliError, Column, note, print_fields, print_json,
                                          print_table)
-from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import count_text
 
 # Best DSO Tonight's defaults (BestTonightEngine's DEFAULT_*), here so --help doesn't load astropy
@@ -479,23 +478,14 @@ def run_visibility(ctx):
 
 # ================================================================ weather
 
-def _units():
-    """(temperature, wind) units from Settings > Weather Units."""
-    settings = app_settings()
-    return (settings.value("temperature_unit", "Celsius", type=str),
-            settings.value("wind_speed_unit", "km/h", type=str))
-
-
 def _temperature(celsius, unit):
-    return f"{celsius * 9 / 5 + 32:.0f}°F" if unit == "Fahrenheit" else f"{celsius:.0f}°C"
+    from cosmoscollection.planning.WeatherFetch import convert_temperature
+    return f"{convert_temperature(celsius, unit):.0f}°{'F' if unit == 'Fahrenheit' else 'C'}"
 
 
 def _wind(kmh, unit):
-    if unit == "mph":
-        return f"{kmh * 0.621371:.0f} mph"
-    if unit == "m/s":
-        return f"{kmh / 3.6:.0f} m/s"
-    return f"{kmh:.0f} km/h"
+    from cosmoscollection.planning.WeatherFetch import convert_wind
+    return f"{convert_wind(kmh, unit):.0f} {unit}"
 
 
 SOURCE_NAMES = {"openmeteo": "Open-Meteo", "openweather": "OpenWeather", "visualcrossing": "VisualCrossing",
@@ -516,18 +506,10 @@ def _hour_score(hour):
                                  hour.visibility, hour.wind_gusts)
 
 
-def _night_hours(summaries, index):
-    """The hours from noon of night index's date to noon the next day."""
-    hours = [h for h in summaries[index].hourly_data if h.time.hour >= 12]
-    if index + 1 < len(summaries):
-        hours += [h for h in summaries[index + 1].hourly_data if h.time.hour < 12]
-    return hours
-
-
 def run_weather(ctx):
     from cosmoscollection.cli.LibraryCommands import Progress
     from cosmoscollection.planning.WeatherFetch import (WeatherFetch, WeatherUnavailable, calculate_sun_altitudes,
-                                                        get_rating_label)
+                                                        get_rating_label, night_hours, weather_units)
 
     args = ctx.args
     if args.days < 1:
@@ -545,7 +527,7 @@ def run_weather(ctx):
 
     errors = {name: getattr(fetcher, f"{name}_error") for name in SOURCE_NAMES if getattr(fetcher, f"{name}_error")}
     sources = _sources(fetcher, summaries)
-    temp_unit, wind_unit = _units()
+    temp_unit, wind_unit = weather_units()
 
     hourly_index = None
     if args.hourly is not None:
@@ -572,7 +554,9 @@ def run_weather(ctx):
             "moon": {"phase": moon.phase_name, "illumination": round(moon.illumination)} if moon else None,
         }
 
-    hours = _night_hours(summaries, hourly_index) if hourly_index is not None else []
+    hours = night_hours(summaries[hourly_index].hourly_data,
+                        summaries[hourly_index + 1].hourly_data if hourly_index + 1 < len(summaries) else None) \
+        if hourly_index is not None else []
     sun = calculate_sun_altitudes(site.lat, site.lon, [h.time for h in hours], site.timezone) if hours else []
 
     if ctx.json:

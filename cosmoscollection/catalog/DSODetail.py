@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 from cosmoscollection.equipment import EquipmentMapper
 from cosmoscollection.sessions.SessionFileScanner import SUPPORTED_EXTENSIONS
 from cosmoscollection.planning.Observer import active_site
-from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.core.DatabaseManager import DatabaseManager, set_favorite_image
 from cosmoscollection.ui.WindowPositionManager import WindowPositionManager
 from cosmoscollection.ui.WindowLifetime import release_on_close, window_is_open
 from cosmoscollection.ui.Theme import COLORS, adapt_color, font_size, themed_style, themed_text
@@ -1670,24 +1670,8 @@ class DSODetailWindow(QDialog):
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
 
-                current_favorite = current_image.get('is_favorite', 0)
-                new_favorite = 1 if not current_favorite else 0
-
-                if new_favorite == 1:
-                    dsodetailid = current_image.get('dsodetailid')
-                    if not dsodetailid:
-                        cursor.execute("SELECT dsodetailid FROM userimages WHERE id = ?", (image_id,))
-                        result = cursor.fetchone()
-                        if result:
-                            dsodetailid = result[0]
-
-                    if dsodetailid:
-                        cursor.execute("""
-                            UPDATE userimages SET is_favorite = 0
-                            WHERE dsodetailid = ? AND id != ?
-                        """, (dsodetailid, image_id))
-
-                cursor.execute("UPDATE userimages SET is_favorite = ? WHERE id = ?", (new_favorite, image_id))
+                new_favorite = 0 if current_image.get('is_favorite', 0) else 1
+                set_favorite_image(cursor, image_id, bool(new_favorite))
                 conn.commit()
 
                 current_image['is_favorite'] = new_favorite

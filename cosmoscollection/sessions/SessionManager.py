@@ -31,12 +31,12 @@ from cosmoscollection.planning.Observer import active_site
 from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import format_dec, format_duration, format_exposure, format_ra
-from cosmoscollection.catalog.DSONames import SESSION_COMMON_NAMES_SETTING, display_name, suggestion_names
+from cosmoscollection.catalog.DSONames import display_name, suggestion_names
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close, retire_thread, window_is_open
 from cosmoscollection.ui.TimeFormatHelper import format_time
 from cosmoscollection.ui.Theme import COLORS, font_px, font_size, themed_style
-from cosmoscollection.sessions import MountDetection
+from cosmoscollection.sessions import ImportSettings, MountDetection
 from cosmoscollection.sessions import SessionFileScanner
 from cosmoscollection.sessions import SessionObservations
 
@@ -573,7 +573,7 @@ class SessionFormWidget(QWidget):
     def _on_common_name_toggled(self, checked):
         """Switch the scanned name to/from its common-name form (unless it's been
         retyped) and remember the choice"""
-        app_settings().setValue(SESSION_COMMON_NAMES_SETTING, checked)
+        ImportSettings.set_common_names_for_new_sessions(checked)
         if self._scanned_names and self.name_edit.text().strip() in self._scanned_names:
             self.name_edit.setText(self._scanned_names[1] if checked else self._scanned_names[0])
 
@@ -586,8 +586,7 @@ class SessionFormWidget(QWidget):
                 # Offer the common name, as last chosen
                 self._scanned_names = (dso_name, named)
                 self.common_name_check.blockSignals(True)
-                self.common_name_check.setChecked(app_settings().value(
-                    SESSION_COMMON_NAMES_SETTING, True, type=bool))
+                self.common_name_check.setChecked(ImportSettings.common_names_for_new_sessions())
                 self.common_name_check.blockSignals(False)
                 self.common_name_check.setVisible(True)
                 dso_name = named if self.common_name_check.isChecked() else dso_name
@@ -2015,25 +2014,9 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
 
     def _filter_totals(self):
         """[(display name, subs, seconds, nights)] across the session, counted values."""
-        totals = {}
-        for obs in self._observations:
-            for row in self._breakdown(obs):
-                if not row["counted_subs"]:
-                    continue
-                key = SessionObservations.normalize_filter(row["filter_name"])
-                entry = totals.setdefault(key, {"name": row["filter_name"] or "(no filter)",
-                                                "subs": 0, "seconds": 0.0, "nights": set()})
-                entry["subs"] += row["counted_subs"]
-                entry["seconds"] += row["counted_seconds"]
-                entry["nights"].add(obs["night_date"])
-        for f in self._loose_light_files():
-            key = SessionObservations.normalize_filter(f["filter_name"])
-            entry = totals.setdefault(key, {"name": f["filter_name"] or "(no filter)",
-                                            "subs": 0, "seconds": 0.0, "nights": set()})
-            entry["subs"] += 1
-            entry["seconds"] += f["exptime_seconds"] or 0
-        return sorted(((e["name"], e["subs"], e["seconds"], len(e["nights"])) for e in totals.values()),
-                      key=lambda t: t[0].lower())
+        totals = SessionObservations.filter_totals(
+            [(obs["night_date"], self._breakdown(obs)) for obs in self._observations], self._loose_light_files())
+        return [(t["filter"], t["subs"], t["seconds"], t["nights"]) for t in totals]
 
     def _filter_choices(self):
         choices = {f.strip() for f in (self.form.filters_edit.text() or "").split(",") if f.strip()}
@@ -3762,38 +3745,9 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
 
     def _load_sessions(self):
         try:
-            columns = [
-                "id", "target_id", "dso_name", "ra_deg", "dec_deg", "status",
-                "session_date", "start_time", "end_time",
-                "location_lat", "location_lon", "location_name", "location_timezone", "location_source",
-                "telescope_id", "telescope_name",
-                "camera_id", "camera", "filters_used", "sub_count", "integration_seconds",
-                "earliest_sub_date", "latest_sub_date", "notes",
-                "created_date", "modified_date",
-                "mount_override", "mount_detected", "telescope_mount",
-            ]
-            from cosmoscollection.equipment import EquipmentMapper
+            from cosmoscollection.sessions import SessionRows
             with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                # camera: its Equipment's name, else the name it was given
-                cursor.execute(f"""
-                    SELECT s.id, s.target_id, s.dso_name, s.ra_deg, s.dec_deg, s.status,
-                           s.session_date, s.start_time, s.end_time,
-                           s.location_lat, s.location_lon, s.location_name, s.location_timezone, s.location_source,
-                           s.telescope_id, tel.name as telescope_name,
-                           s.camera_id, {EquipmentMapper.session_camera_sql('s')},
-                           s.filters_used, s.sub_count, s.integration_seconds,
-                           s.earliest_sub_date, s.latest_sub_date, s.notes,
-                           s.created_date, s.modified_date,
-                           s.mount_override, {MountDetection.detected_sql('s')}, tel.mount_type
-                    FROM usersessions s
-                    LEFT JOIN usertelescopes tel ON s.telescope_id = tel.id
-                    ORDER BY s.session_date DESC, s.id DESC
-                """)
-                self.sessions_data = [dict(zip(columns, row)) for row in cursor.fetchall()]
-            for session in self.sessions_data:
-                session["mount"], session["mount_how"] = MountDetection.summarize(
-                    session["mount_detected"], session["mount_override"], session["telescope_mount"])
+                self.sessions_data = SessionRows.load_sessions(conn)
 
             self._populate_table()
             self._populate_equipment_filters()

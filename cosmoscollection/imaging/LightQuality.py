@@ -218,7 +218,7 @@ KEEP_GRADES = {
 }
 TOP_PERCENT_SETTING = SETTINGS_PREFIX + "top_percent"
 DEFAULT_TOP_PERCENT = 75
-_RANKED_GRADES = (FrameQuality.GRADE_GOOD, FrameQuality.GRADE_MARGINAL, FrameQuality.GRADE_REJECT)
+RANKED_GRADES = (FrameQuality.GRADE_GOOD, FrameQuality.GRADE_MARGINAL, FrameQuality.GRADE_REJECT)
 
 
 def light_choice_label(choice, percent):
@@ -246,7 +246,7 @@ def top_percent_lights(lights, grades, percent):
             continue
         if g.grade == FrameQuality.GRADE_UNGRADED:
             keep.add(path)
-        elif g.grade in _RANKED_GRADES:
+        elif g.grade in RANKED_GRADES:
             ranked.setdefault(group_key(lights[path]), []).append((g.score, path))
     for members in ranked.values():
         members.sort(reverse=True)
@@ -396,16 +396,18 @@ def record_removed(conn, session_id, lights, changed, mode, extra_ids=(), others
     deleted one is removed from them too. lights: {path: file dict} (the
     session's). extra_ids: other session files to detach too (a night's
     calibration frames). others: other_sessions() for a delete, if already
-    looked up. Does not commit."""
-    SessionObservations.remove_files(conn, session_id, [lights[p]["id"] for p in changed] + list(extra_ids))
+    looked up. session_id None: frames graded from folders, in no session of
+    their own (lights unused). Does not commit."""
+    if session_id is not None:
+        SessionObservations.remove_files(conn, session_id, [lights[p]["id"] for p in changed] + list(extra_ids))
     if mode == MOVE:
         for old, new in changed.items():
-            conn.execute("UPDATE usersessionfiles SET file_path = ? WHERE file_path = ? AND session_id != ?",
+            conn.execute("UPDATE usersessionfiles SET file_path = ? WHERE file_path = ? AND session_id IS NOT ?",
                          (new, old, session_id))
             conn.execute("UPDATE OR REPLACE framequality SET file_path = ? WHERE file_path = ?", (new, old))
     elif mode == DELETE:
         if others is None:
-            others = other_sessions(conn, session_id, changed)
+            others = other_sessions(conn, session_id if session_id is not None else -1, changed)
         for other_id, (_label, ids) in others.items():
             SessionObservations.remove_files(conn, other_id, ids)
         paths = list(changed)

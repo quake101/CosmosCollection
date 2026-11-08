@@ -51,7 +51,7 @@ from cosmoscollection.imaging import LightQuality  # noqa: E402
 from cosmoscollection.imaging.LightQuality import (  # noqa: E402,F401
     DEFAULT_TOP_PERCENT, KEEP_GRADES, LIGHT_CHOICE_LABELS, LIGHTS_ALL, LIGHTS_GOOD, LIGHTS_GOOD_MARGINAL,
     LIGHTS_PICKED, LIGHTS_TOP, READ_AHEAD_BYTES, READ_THREADS, SETTINGS_PREFIX, THRESHOLDS, TOP_PERCENT_SETTING,
-    _RANKED_GRADES, _unused_path, analysis_workers, ensure_cache_table, grade_lights, grade_session_lights,
+    RANKED_GRADES, _unused_path, analysis_workers, ensure_cache_table, grade_lights, grade_session_lights,
     group_key, light_choice_label, load_cached, save_cached, save_top_percent, saved_grade_settings,
     saved_top_percent, session_light_files, top_percent_lights)
 
@@ -339,7 +339,6 @@ CHART_GRADE_STYLES = [
     (FrameQuality.GRADE_REJECT, 'error', 'X', "Reject"),
     (FrameQuality.GRADE_UNGRADED, 'text_secondary', 'o', "Not graded"),
 ]
-CHART_RANKED = (FrameQuality.GRADE_GOOD, FrameQuality.GRADE_MARGINAL, FrameQuality.GRADE_REJECT)
 CHART_MARKER_SIZE = 38     # points^2 - an 8 px marker at typical screen dpi
 CHART_HIGHLIGHT_SIZE = 150
 CHART_CHECKED_SIZE = 95
@@ -1430,7 +1429,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             value = self._chart_value(key, m, g)
             tooltip = [self._local_time(f["date_obs"]), os.path.basename(path)]
             if g:
-                tooltip.insert(1, f"{g.grade}" + (f" · score {g.score:.0f}" if g.grade in CHART_RANKED else ""))
+                tooltip.insert(1, f"{g.grade}" + (f" · score {g.score:.0f}" if g.grade in RANKED_GRADES else ""))
             if value is not None and key != "score":
                 tooltip.insert(2, f"{axis}: {value:.2f}" if abs(value) < 10 else f"{axis}: {value:,.0f}")
             points.append(ChartPoint(path=path, night=night_label(f["night_date"]), value=value,
@@ -1502,7 +1501,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             return None
         relative = grade.relative if grade else {}
         if key == "score":
-            return grade.score if grade and grade.grade in CHART_RANKED else None
+            return grade.score if grade and grade.grade in RANKED_GRADES else None
         if key == "fwhm":
             return metrics.fwhm_px
         if key == "eccentricity":

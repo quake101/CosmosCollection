@@ -219,6 +219,28 @@ def display_name(name, dsodetailid=None, designations=None, conn=None):
         return name
 
 
+def main_designations(conn, dsodetailids):
+    """{dsodetailid: its best-known designation ('M 31')} (preferred_designation)."""
+    ids = list(dict.fromkeys(str(i) for i in dsodetailids if i))
+    pairs = {}
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        for dso, catalogue, designation in conn.execute(
+                f"SELECT dsodetailid, catalogue, designation FROM cataloguenr WHERE catalogue <> 'NAME' "
+                f"AND dsodetailid IN ({','.join('?' * len(chunk))})", chunk):
+            if catalogue and designation:
+                pairs.setdefault(str(dso), []).append((catalogue, str(designation)))
+    return {dso: preferred_designation(p) for dso, p in pairs.items()}
+
+
+def object_labels(conn, dsodetailids):
+    """{dsodetailid: 'M 31 (Andromeda Galaxy)'} - each object's best-known
+    designation with its common name."""
+    ids = list(dict.fromkeys(str(i) for i in dsodetailids if i))
+    mains, commons = main_designations(conn, ids), load_common_names(conn, ids)
+    return {dso: with_common_name(mains.get(dso) or commons.get(dso) or dso, commons.get(dso)) for dso in ids}
+
+
 def suggestion_names(conn, rows, typed=""):
     """Names for catalog search results, in order: [(label, dsodetailid)] from
     [(dsodetailid, catalogue, designation)] rows.
@@ -229,15 +251,7 @@ def suggestion_names(conn, rows, typed=""):
     since a completer that filters on it would hide the others."""
     ids = list(dict.fromkeys(str(row[0]) for row in rows))
     commons = load_common_names(conn, ids)
-    main_names = {}
-    for start in range(0, len(ids), 500):
-        chunk = ids[start:start + 500]
-        pairs = {}
-        for dso, catalogue, designation in conn.execute(
-                f"SELECT dsodetailid, catalogue, designation FROM cataloguenr WHERE catalogue <> 'NAME' "
-                f"AND dsodetailid IN ({','.join('?' * len(chunk))})", chunk):
-            pairs.setdefault(str(dso), []).append((catalogue, str(designation)))
-        main_names.update({dso: preferred_designation(p) for dso, p in pairs.items()})
+    main_names = main_designations(conn, ids)
     # The aliases each object matched by, for one entry per object
     matched = {}
     for dso, catalogue, designation in rows:

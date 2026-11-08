@@ -390,9 +390,8 @@ def _mean_coordinates(coords):
 def angular_separation_deg(ra1, dec1, ra2, dec2):
     """Great-circle separation in degrees between two RA/Dec points (degrees)."""
     ra1, dec1, ra2, dec2 = map(math.radians, (ra1, dec1, ra2, dec2))
-    cos_sep = (math.sin(dec1) * math.sin(dec2)
-               + math.cos(dec1) * math.cos(dec2) * math.cos(ra1 - ra2))
-    return math.degrees(math.acos(max(-1.0, min(1.0, cos_sep))))
+    h = math.sin((dec2 - dec1) / 2) ** 2 + math.cos(dec1) * math.cos(dec2) * math.sin((ra2 - ra1) / 2) ** 2
+    return math.degrees(2 * math.asin(min(1.0, math.sqrt(h))))
 
 
 def summarize_files(file_dicts):

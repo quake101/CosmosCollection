@@ -23,7 +23,7 @@ from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.planning.Observer import active_site, local_zone
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import format_dec, format_ra
-from cosmoscollection.catalog.DSONames import NOT_DSO_TYPES, display_name
+from cosmoscollection.catalog.DSONames import display_name
 from cosmoscollection.planning.HorizonProfile import load_active_horizon
 from cosmoscollection.core.ResourceManager import ResourceManager
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
@@ -32,6 +32,8 @@ from cosmoscollection.ui.Theme import COLORS, contrast_text, font_px, font_size,
 from cosmoscollection.core.UrlOpener import open_url
 from cosmoscollection.ui.TimeFormatHelper import format_time, get_time_format_24h
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
+from cosmoscollection.sessions import SessionRows
+from cosmoscollection.sessions.SessionFileScanner import angular_separation_deg
 
 logger = logging.getLogger(__name__)
 
@@ -426,75 +428,6 @@ def sky_tint(sun_alt):
     return max(0.0, min(1.0, (sun_alt - ASTRONOMICAL_DARK_ALT) / 24.0)) * 0.55
 
 
-def angular_distance(ra1, dec1, ra2, dec2):
-    """Angle between two sky positions, in degrees."""
-    ra1, dec1, ra2, dec2 = map(math.radians, (ra1, dec1, ra2, dec2))
-    h = math.sin((dec2 - dec1) / 2) ** 2 + math.cos(dec1) * math.cos(dec2) * math.sin((ra2 - ra1) / 2) ** 2
-    return math.degrees(2 * math.asin(min(1.0, math.sqrt(h))))
-
-
-# A session made from dropped subs stores where they were pointed, which can be
-# off the catalog center by the framing - this far still counts as the object
-POINTED_NEAR_DEG = 5 / 60
-
-
-def sessions_for_object(conn, name, ra=None, dec=None, dsodetailid=None):
-    """An object's Session Manager sessions, newest first: [(id, name, date, status,
-    has framing)]. A session is the object's when it's linked to the object's Target
-    List entry or named as it (any designation: "M 42 (Orion Nebula)", "NGC 1976"),
-    is at its exact position, or was pointed within POINTED_NEAR_DEG of it with no
-    other catalog object closer (so M 43's sessions aren't M 42's)."""
-    from cosmoscollection.planning.DSOTargetList import SAME_POSITION_DEG, catalog_object_ids, has_position, name_key
-    cursor = conn.cursor()
-    name = (name or "").strip()
-    position = (float(ra), float(dec)) if has_position({"ra_deg": ra, "dec_deg": dec}) else None
-
-    # The catalog objects the name designates, and every designation of them
-    objects = set(catalog_object_ids(cursor, name)) if name else set()
-    if dsodetailid:
-        objects.add(dsodetailid)
-    keys = {name_key(name)} if name else set()
-    if objects:
-        cursor.execute(f"SELECT catalogue || ' ' || designation FROM cataloguenr WHERE dsodetailid IN "
-                       f"({','.join('?' * len(objects))})", list(objects))
-        keys.update(name_key(row[0]) for row in cursor.fetchall())
-    keys.discard("")
-
-    def exact_position(s_ra, s_dec):
-        return (position is not None and has_position({"ra_deg": s_ra, "dec_deg": s_dec})
-                and abs(s_ra - position[0]) < SAME_POSITION_DEG and abs(s_dec - position[1]) < SAME_POSITION_DEG)
-
-    # Its Target List entries (by any designation or the same position, as find_existing_target
-    # matches them - without its whole-list catalog lookup)
-    entries = {target_id for target_id, target_name, t_ra, t_dec in cursor.execute(
-        "SELECT id, name, ra_deg, dec_deg FROM usertargetlist").fetchall()
-        if name_key(target_name or "") in keys or exact_position(t_ra, t_dec)}
-
-    found = []
-    for session_id, session_name, date, status, s_ra, s_dec, target_id, framing in conn.execute(
-            "SELECT id, dso_name, session_date, status, ra_deg, dec_deg, target_id, framing FROM usersessions "
-            "ORDER BY session_date DESC, id DESC").fetchall():
-        same = target_id in entries or name_key(session_name or "") in keys
-        if not same and position and has_position({"ra_deg": s_ra, "dec_deg": s_dec}):
-            distance = angular_distance(position[0], position[1], s_ra, s_dec)
-            same = exact_position(s_ra, s_dec) or (
-                distance < POINTED_NEAR_DEG and not _other_object_closer(cursor, s_ra, s_dec, distance, objects))
-        if same:
-            found.append((session_id, session_name, date, status, bool(framing)))
-    return found
-
-
-def _other_object_closer(cursor, ra, dec, distance, objects):
-    """Whether a catalog object other than objects is within distance of (ra, dec)."""
-    cursor.execute(f"""
-        SELECT id, ra, dec FROM dsodetail
-        WHERE dec BETWEEN ? AND ? AND COALESCE(dsotype, '') NOT IN ({','.join('?' * len(NOT_DSO_TYPES))})
-    """, (dec - distance, dec + distance, *NOT_DSO_TYPES))
-    return any(obj not in objects and o_ra is not None and o_dec is not None
-               and angular_distance(ra, dec, float(o_ra), float(o_dec)) < distance
-               for obj, o_ra, o_dec in cursor.fetchall())
-
-
 # --- A framing saved to a session ---
 # One per session, in usersessions.framing as JSON: {"version": 1, "ra", "dec"
 # (the frame or mosaic center), "rotation", "columns", "rows", "overlap" (0-1),
@@ -545,7 +478,7 @@ def match_panels(framing, subs):
         if len(panels) == 1:
             number = 1
         elif sub.get("ra") is not None and sub.get("dec") is not None:
-            distance, nearest = min((angular_distance(sub["ra"], sub["dec"], p["ra"], p["dec"]), p["number"])
+            distance, nearest = min((angular_separation_deg(sub["ra"], sub["dec"], p["ra"], p["dec"]), p["number"])
                                     for p in panels)
             if distance <= reach:
                 number = nearest
@@ -2316,7 +2249,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             return
         target_ra, target_dec = self._target_position()
         # Back on the target when it's (nearly) there
-        near = target_ra is not None and angular_distance(ra, dec, target_ra, target_dec) < 1 / 3600
+        near = target_ra is not None and angular_separation_deg(ra, dec, target_ra, target_dec) < 1 / 3600
         self.frame_center = None if near else (ra, dec)
         self._push_frames()
 
@@ -2383,7 +2316,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         ra, dec = framing.get("ra"), framing.get("dec")
         target_ra, target_dec = self._target_position()
         if ra is not None and dec is not None and (
-                target_ra is None or angular_distance(ra, dec, target_ra, target_dec) > 1 / 3600):
+                target_ra is None or angular_separation_deg(ra, dec, target_ra, target_dec) > 1 / 3600):
             self.frame_center = (ra, dec)
         self.framing_note = (f"Saved with {' and '.join(missing)}, which "
                              f"{'are' if len(missing) > 1 else 'is'}n't in your equipment now" if missing else None)
@@ -2391,7 +2324,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
     def _sessions_for_object(self, conn):
         """This object's sessions, newest first: [(id, name, date, status, has framing)]."""
         ra, dec = self._target_position()
-        return sessions_for_object(conn, self.data.get('name'), ra, dec, self.data.get('dsodetailid'))
+        return SessionRows.sessions_for_object(conn, self.data.get('name'), ra, dec, self.data.get('dsodetailid'))
 
     def _save_to_session(self):
         """Keep the frame or mosaic with one of this object's sessions (or a new planned one)."""
@@ -2809,7 +2742,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         if self.frame_center is not None:
             target_ra, target_dec = self._target_position()
             if target_ra is not None:
-                offset = angular_distance(*self.frame_center, target_ra, target_dec)
+                offset = angular_separation_deg(*self.frame_center, target_ra, target_dec)
                 info_parts.append(f"Frame moved {offset:.2f}° from {self.data.get('name', 'the target')}")
         if self.framing_note:
             info_parts.append(self.framing_note)

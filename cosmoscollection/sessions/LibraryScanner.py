@@ -1295,6 +1295,28 @@ def equipment_from_header(kind, header):
             "sensor_height": round(height * pixel / 1000, 2) if height and pixel else None}
 
 
+KEEP_NAME_CHOICE = "Not matched - keep the name from the files"
+
+
+def equipment_choices(info, kind):
+    """[(id, name)] to match a name from the files to: the kind's Equipment,
+    enabled entries first, by name (disabled ones say so)."""
+    items = info.items(kind)
+    return [(item_id, items[item_id]["name"] + ("" if items[item_id]["is_active"] else " (disabled)"))
+            for item_id in sorted(items, key=lambda i: (not items[i]["is_active"], (items[i]["name"] or "").lower()))]
+
+
+def add_equipment_choice(kind, header):
+    """'Add as a new telescope (61 mm)' / 'Add as a new camera (3.76 µm pixels)'
+    - with what the files' header measures."""
+    measured = equipment_from_header(kind, header)
+    if kind == TELESCOPE:
+        detail = f" ({measured['focal_length']:g} mm)" if measured["focal_length"] else ""
+    else:
+        detail = f" ({measured['pixel_size']:g} µm pixels)" if measured["pixel_size"] else ""
+    return f"Add as a new {kind}{detail}"
+
+
 def suggest_equipment(kind, value, header, info):
     """(equipment id, why) for a name in the files nobody has matched yet - by
     name ('ZWO ASI2600MC Pro' ~ 'ASI2600MC Pro'), else by focal length or pixel

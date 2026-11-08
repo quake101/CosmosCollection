@@ -1170,7 +1170,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         ra_deg, dec_deg = entry.get('ra_deg'), entry.get('dec_deg')
         try:
             from cosmoscollection.planning.DSOTargetList import find_existing_target
-            from cosmoscollection.planning.FOVSimulator import sessions_for_object
+            from cosmoscollection.sessions.SessionRows import sessions_for_object
             with self.db_manager.get_connection() as conn:
                 return (find_existing_target(conn, name, ra_deg, dec_deg),
                         sessions_for_object(conn, name, ra_deg, dec_deg, entry.get('dsodetailid')))

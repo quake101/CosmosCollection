@@ -404,8 +404,8 @@ def in_library(conn, image_path):
 def session_choices(conn, image_path):
     """(linked session id or None, [(id, name, date, status)]) - the sessions the
     image could be linked to: those of the objects it's in the gallery under
-    (FOVSimulator.sessions_for_object), newest first, with the linked one among them."""
-    from cosmoscollection.planning.FOVSimulator import sessions_for_object
+    (SessionRows.sessions_for_object), newest first, with the linked one among them."""
+    from cosmoscollection.sessions.SessionRows import sessions_for_object
     rows = _library_rows(conn, image_path)
     linked = next((row["session_id"] for row in rows if row["session_id"]), None)
     found = {}
@@ -474,19 +474,8 @@ def link_session(conn, image_path, session_id, nights=None):
 
 def _object_names(conn, dsodetailids):
     """'M 81 (Bode's Galaxy) & M 82 (Cigar Galaxy)' for the objects."""
-    from cosmoscollection.catalog.DSONames import load_common_names, preferred_designation, with_common_name
-    ids = list(dict.fromkeys(i for i in dsodetailids if i))
-    if not ids:
-        return ""
-    common = load_common_names(conn, ids)
-    names = []
-    for dso in ids:
-        designations = [(c, d) for c, d in conn.execute(
-            "SELECT catalogue, designation FROM cataloguenr WHERE dsodetailid = ? AND catalogue != 'NAME'",
-            (dso,)).fetchall() if c and d]
-        name = preferred_designation(designations) or common.get(str(dso)) or ""
-        names.append(with_common_name(name, common.get(str(dso))))
-    return " & ".join(name for name in names if name)
+    from cosmoscollection.catalog.DSONames import object_labels
+    return " & ".join(object_labels(conn, dsodetailids).values())
 
 
 def _mode(values):

@@ -192,22 +192,6 @@ def resolve_dso(conn, name):
                    hint=f"Did you mean: {suggestions}?" if suggestions else "Try 'dso search' with part of the name.")
 
 
-def object_labels(conn, dsodetailids):
-    """{dsodetailid: 'M 31 (Andromeda Galaxy)'} - each object's best-known
-    designation with its common name."""
-    from cosmoscollection.catalog.DSONames import load_common_names, preferred_designation, with_common_name
-    ids = list(dict.fromkeys(str(i) for i in dsodetailids if i))
-    pairs = {}
-    for start in range(0, len(ids), 500):
-        chunk = ids[start:start + 500]
-        for dso, catalogue, designation in conn.execute(
-                f"SELECT dsodetailid, catalogue, designation FROM cataloguenr WHERE catalogue <> 'NAME' "
-                f"AND dsodetailid IN ({','.join('?' * len(chunk))})", chunk):
-            pairs.setdefault(str(dso), []).append((catalogue, str(designation)))
-    commons = load_common_names(conn, ids)
-    return {dso: with_common_name(preferred_designation(pairs.get(dso)) or dso, commons.get(dso)) for dso in ids}
-
-
 def _dso_json(dso):
     from cosmoscollection.core.Formatting import format_dec, format_ra
     from cosmoscollection.catalog.DSONames import (common_name_from_designations, constellation_name,
@@ -337,20 +321,11 @@ def run_dso_list(ctx):
 
 
 def _sessions_for_dso(conn, dso):
-    """Sessions of the object - their name is one of its designations, or they're
-    linked to a Target List entry that is."""
-    from cosmoscollection.planning.TargetRows import catalog_object_ids_many
-    rows = _load_sessions(conn)
-    ids = catalog_object_ids_many(conn.cursor(), [s["dso_name"] for s in rows])
-    target_names = dict(conn.execute("SELECT id, name FROM usertargetlist").fetchall())
-    target_ids = catalog_object_ids_many(conn.cursor(), list(target_names.values()))
-    wanted = dso["dsodetailid"]
-    found = []
-    for session in rows:
-        target = target_names.get(session["target_id"])
-        if wanted in ids[session["dso_name"]] or (target and wanted in target_ids[target]):
-            found.append(session)
-    return found
+    """The object's sessions, as the app finds them (SessionRows.sessions_for_object)."""
+    from cosmoscollection.sessions import SessionRows
+    ids = {row[0] for row in SessionRows.sessions_for_object(conn, dso["name"], dso["ra_deg"], dso["dec_deg"],
+                                                             dso["dsodetailid"])}
+    return [s for s in SessionRows.load_sessions(conn) if s["id"] in ids]
 
 
 def run_dso_show(ctx):
@@ -420,6 +395,7 @@ def _load_images(conn, dsodetailid=None, session_id=None):
     keys = ("id", "dsodetailid", "path", "integration", "date_taken", "notes", "favorite", "session_id",
             "telescope", "camera", "added")
     images = [dict(zip(keys, tuple(row))) for row in conn.execute(sql, params).fetchall()]
+    from cosmoscollection.catalog.DSONames import object_labels
     labels = object_labels(conn, [i["dsodetailid"] for i in images])
     for image in images:
         image["favorite"] = bool(image["favorite"])
@@ -470,7 +446,7 @@ def _integration_text(value):
 
 def run_images_add(ctx):
     from datetime import datetime
-    from cosmoscollection.core.DatabaseManager import add_user_image_row
+    from cosmoscollection.core.DatabaseManager import add_user_image_row, set_favorite_image
     from cosmoscollection.equipment import EquipmentMapper
     from cosmoscollection.sessions import LibraryScanner
 
@@ -501,10 +477,7 @@ def run_images_add(ctx):
                                           equipment={"telescope_id": telescope_id, "telescope_name": telescope_name,
                                                      "camera_id": camera_id, "camera_name": camera_name})
             if args.favorite:
-                # One favorite per object, as the object's detail window does it
-                cursor.execute("UPDATE userimages SET is_favorite = 0 WHERE dsodetailid = ? AND id != ?",
-                               (dso["dsodetailid"], image_id))
-                cursor.execute("UPDATE userimages SET is_favorite = 1 WHERE id = ?", (image_id,))
+                set_favorite_image(cursor, image_id)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -524,25 +497,9 @@ def run_images_add(ctx):
 
 # ================================================================ sessions
 
-_SESSION_KEYS = ("id", "dso_name", "status", "session_date", "telescope_id", "telescope", "camera", "filters",
-                 "sub_count", "integration_seconds", "location_name", "earliest_sub", "latest_sub", "target_id",
-                 "notes", "nights")
-
-
 def _load_sessions(conn, session_id=None):
-    sql = """
-        SELECT s.id, s.dso_name, s.status, s.session_date, s.telescope_id, t.name, s.camera, s.filters_used,
-               s.sub_count, s.integration_seconds, s.location_name, s.earliest_sub_date, s.latest_sub_date,
-               s.target_id, s.notes,
-               (SELECT COUNT(*) FROM usersessionobservations o WHERE o.session_id = s.id)
-        FROM usersessions s LEFT JOIN usertelescopes t ON t.id = s.telescope_id
-    """
-    params = ()
-    if session_id is not None:
-        sql += " WHERE s.id = ?"
-        params = (session_id,)
-    sql += " ORDER BY s.session_date DESC, s.id DESC"
-    return [dict(zip(_SESSION_KEYS, tuple(row))) for row in conn.execute(sql, params).fetchall()]
+    from cosmoscollection.sessions import SessionRows
+    return SessionRows.load_sessions(conn, session_id)
 
 
 def _session_columns(with_name=True):
@@ -556,8 +513,8 @@ def _session_columns(with_name=True):
         Column("Subs", lambda s: s["sub_count"] or 0, ">"),
         Column("Integration", lambda s: format_duration(s["integration_seconds"]) if s["integration_seconds"] else "",
                ">"),
-        Column("Filters", lambda s: s["filters"] or "", flex=True),
-        Column("Telescope", lambda s: s["telescope"] or "", flex=True),
+        Column("Filters", lambda s: s["filters_used"] or "", flex=True),
+        Column("Telescope", lambda s: s["telescope_name"] or "", flex=True),
     ]
     return columns
 
@@ -576,7 +533,7 @@ def run_sessions_list(ctx):
     if args.until:
         sessions = [s for s in sessions if (s["session_date"] or "") <= args.until]
     if args.telescope:
-        sessions = [s for s in sessions if args.telescope.lower() in (s["telescope"] or "").lower()]
+        sessions = [s for s in sessions if args.telescope.lower() in (s["telescope_name"] or "").lower()]
     if args.camera:
         sessions = [s for s in sessions if args.camera.lower() in (s["camera"] or "").lower()]
     shown = sessions[:args.limit] if args.limit > 0 else sessions
@@ -602,8 +559,10 @@ def run_sessions_show(ctx):
         observations = so.load_observations(conn, session["id"])
         breakdowns = so.load_breakdowns(conn, [o["id"] for o in observations])
         images = _load_images(conn, session_id=session["id"])
+        loose = [f for f in so.load_session_files(conn, session["id"])
+                 if f["observation_id"] is None and f["frame_type"] == "Light"]
 
-    nights, by_filter = [], {}
+    nights = []
     for obs in observations:
         breakdown = breakdowns.get(obs["id"], [])
         subs, seconds, filters = so.summarize_breakdown(breakdown)
@@ -611,15 +570,9 @@ def run_sessions_show(ctx):
                        "span": so.format_night_span(obs["night_date"], obs["start_datetime"], obs["end_datetime"]),
                        "subs": subs, "seconds": seconds, "filters": filters, "files": obs["file_count"],
                        "notes": obs["notes"], "breakdown": breakdown})
-        for row in breakdown:
-            if not row["counted_subs"]:
-                continue
-            key = (so.normalize_filter(row["filter_name"]), so.exposure_bucket(row["exposure_seconds"]))
-            entry = by_filter.setdefault(key, {"filter": row["filter_name"] or "(none)",
-                                               "exposure_seconds": row["exposure_seconds"], "subs": 0, "seconds": 0.0})
-            entry["subs"] += row["counted_subs"]
-            entry["seconds"] += row["counted_seconds"]
-    filters = sorted(by_filter.values(), key=lambda f: (f["filter"].lower(), f["exposure_seconds"] or 0))
+    # As the Session Manager counts them: lights not in a night yet too
+    filters = so.filter_totals([(o["night_date"], breakdowns.get(o["id"], [])) for o in observations], loose,
+                               by_exposure=True)
 
     if ctx.json:
         print_json(dict(session, nights_detail=nights, filters_detail=filters, images=images))
@@ -629,7 +582,7 @@ def run_sessions_show(ctx):
     print()
     print_fields([
         ("Status", session["status"]), ("Date", session["session_date"]),
-        ("Telescope", session["telescope"]), ("Camera", session["camera"]), ("Location", session["location_name"]),
+        ("Telescope", session["telescope_name"]), ("Camera", session["camera"]), ("Location", session["location_name"]),
         ("Subs", f"{session['sub_count'] or 0} lights, {format_duration(session['integration_seconds'])}"),
         ("Notes", (session["notes"] or "").strip() or None),
     ])
@@ -778,7 +731,7 @@ def run_stats(ctx):
         observations = conn.execute("SELECT id, night_date FROM usersessionobservations").fetchall()
         breakdowns = so.load_breakdowns(conn, [row[0] for row in observations])
 
-    by_year, by_filter, total_seconds, total_subs, nights = {}, {}, 0.0, 0, 0
+    by_year, total_seconds, total_subs, nights = {}, 0.0, 0, 0
     for obs_id, night in observations:
         subs, seconds, _ = so.summarize_breakdown(breakdowns.get(obs_id, []))
         if subs:
@@ -787,17 +740,13 @@ def run_stats(ctx):
         total_seconds += seconds
         year = str(night or "")[:4] or "?"
         by_year[year] = by_year.get(year, 0.0) + seconds
-        for row in breakdowns.get(obs_id, []):
-            if row["counted_subs"]:
-                name = so.normalize_filter(row["filter_name"]) or "(none)"
-                entry = by_filter.setdefault(name, {"filter": row["filter_name"] or "(none)", "seconds": 0.0})
-                entry["seconds"] += row["counted_seconds"]
+    by_filter = so.filter_totals([(night, breakdowns.get(obs_id, [])) for obs_id, night in observations])
 
     data = {"objects_imaged": objects_imaged, "images": images, "sessions": sessions, "nights": nights,
             "subs": total_subs, "integration_seconds": total_seconds,
             "integration_by_year": dict(sorted(by_year.items())),
             "integration_by_filter": {f["filter"]: f["seconds"] for f in
-                                      sorted(by_filter.values(), key=lambda f: -f["seconds"])},
+                                      sorted(by_filter, key=lambda f: -f["seconds"])},
             "targets_by_status": statuses}
     if ctx.json:
         print_json(data)

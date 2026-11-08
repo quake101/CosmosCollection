@@ -397,6 +397,38 @@ def combine_breakdown(file_groups, logged_rows):
     return result
 
 
+NO_FILTER = "(no filter)"
+
+
+def filter_totals(nights, loose_lights=(), by_exposure=False):
+    """Counted subs per filter (per filter and exposure with by_exposure):
+    [{"filter", "exposure_seconds", "subs", "seconds", "nights"}], by filter
+    name then exposure. nights: [(night_date, breakdown rows)]; loose_lights:
+    Light file dicts not in a night yet (counted, in no night)."""
+    totals = {}
+
+    def add(name, exposure, subs, seconds, night):
+        key = (normalize_filter(name), exposure_bucket(exposure) if by_exposure else None)
+        entry = totals.setdefault(key, {"filter": name or NO_FILTER,
+                                        "exposure_seconds": exposure if by_exposure else None,
+                                        "subs": 0, "seconds": 0.0, "nights": set()})
+        entry["subs"] += subs
+        entry["seconds"] += seconds
+        if night:
+            entry["nights"].add(night)
+
+    for night, rows in nights:
+        for row in rows:
+            if row["counted_subs"]:
+                add(row["filter_name"], row["exposure_seconds"], row["counted_subs"], row["counted_seconds"], night)
+    for f in loose_lights:
+        add(f["filter_name"], f["exptime_seconds"], 1, f["exptime_seconds"] or 0, None)
+    result = sorted(totals.values(), key=lambda e: (e["filter"].lower(), e["exposure_seconds"] or 0))
+    for entry in result:
+        entry["nights"] = len(entry["nights"])
+    return result
+
+
 def summarize_breakdown(rows):
     """(counted_subs, counted_seconds, sorted display filter names) for a breakdown."""
     subs = sum(r["counted_subs"] for r in rows)

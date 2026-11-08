@@ -40,8 +40,25 @@ def load_rules():
     return rules
 
 
+def save_rules(session_gap_days, final_keywords, work_folders):
+    """Save the Advanced scan rules (the word lists as typed, comma separated).
+    The lists are stored only when changed, so improved defaults reach everyone else."""
+    settings = app_settings()
+    defaults = ScanRules()
+    settings.setValue(f"{SETTINGS_PREFIX}/session_gap_days", session_gap_days)
+    finals, work = _split_words(final_keywords), _split_words(work_folders)
+    settings.setValue(f"{SETTINGS_PREFIX}/final_keywords",
+                      "" if finals == defaults.final_keywords else ", ".join(finals))
+    settings.setValue(f"{SETTINGS_PREFIX}/work_folders", "" if work == defaults.work_folders else ", ".join(work))
+
+
 def common_names_for_new_sessions():
     """Whether new sessions are named "M 31 (Andromeda Galaxy)" rather than "M 31"
     (the review's checkbox, shared with the Session Manager)."""
     from cosmoscollection.catalog.DSONames import SESSION_COMMON_NAMES_SETTING
     return app_settings().value(SESSION_COMMON_NAMES_SETTING, True, type=bool)
+
+
+def set_common_names_for_new_sessions(on):
+    from cosmoscollection.catalog.DSONames import SESSION_COMMON_NAMES_SETTING
+    app_settings().setValue(SESSION_COMMON_NAMES_SETTING, bool(on))

@@ -56,8 +56,9 @@ CACHE_MAX_AGE_MINUTES = 15
 from cosmoscollection.planning.WeatherFetch import (  # noqa: E402,F401
     DailyWeatherSummary, HourlyWeatherData, MoonPhaseData, WeatherFetch, WeatherUnavailable,
     _get_moon_phase_name, _get_openweather_signature, _get_visualcrossing_signature, _get_weatherapi_signature,
-    calculate_astro_score, calculate_moon_phase, calculate_sun_altitudes, estimate_seeing, get_rating_label,
-    test_openweather_key, test_visualcrossing_key, test_weatherapi_key)
+    calculate_astro_score, calculate_moon_phase, calculate_sun_altitudes, convert_temperature, convert_wind,
+    estimate_seeing, get_rating_label, night_hours, test_openweather_key, test_visualcrossing_key,
+    test_weatherapi_key, weather_units)
 
 
 class WeatherCache:
@@ -561,10 +562,8 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
         self.setup_window_position()
 
         # Get unit preferences
-        settings = app_settings()
-        self.temp_unit = settings.value("temperature_unit", "Celsius", type=str)
-        self.wind_unit = settings.value("wind_speed_unit", "km/h", type=str)
-        self.precip_unit = settings.value("precip_visibility_unit", "Metric (mm, km)", type=str)
+        self.temp_unit, self.wind_unit = weather_units()
+        self.precip_unit = app_settings().value("precip_visibility_unit", "Metric (mm, km)", type=str)
 
         self._setup_ui()
         # The table's cell colors are item data, so refill it when the theme
@@ -582,23 +581,9 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
         times = [h.time for h in hours]
         return calculate_sun_altitudes(self.lat, self.lon, times, self.timezone)
 
-    def _convert_temp(self, celsius: float) -> float:
-        """Convert temperature based on user preference"""
-        if self.temp_unit == "Fahrenheit":
-            return celsius * 9 / 5 + 32
-        return celsius
-
     def _temp_suffix(self) -> str:
         """Get temperature unit suffix"""
         return "F" if self.temp_unit == "Fahrenheit" else "C"
-
-    def _convert_wind(self, kmh: float) -> float:
-        """Convert wind speed from km/h based on user preference"""
-        if self.wind_unit == "mph":
-            return kmh * 0.621371
-        elif self.wind_unit == "m/s":
-            return kmh / 3.6
-        return kmh
 
     def _wind_suffix(self) -> str:
         """Get wind speed unit suffix"""
@@ -761,9 +746,7 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
         """Get the hourly data to display based on current view mode"""
         if self.midnight_view_checkbox.isChecked() and self.next_day_summary:
             # Get evening hours from current day and morning hours from next day
-            evening_hours = [h for h in self.summary.hourly_data if h.time.hour >= 12]
-            morning_hours = [h for h in self.next_day_summary.hourly_data if h.time.hour < 12]
-            all_night_hours = evening_hours + morning_hours
+            all_night_hours = night_hours(self.summary.hourly_data, self.next_day_summary.hourly_data)
 
             # Filter to only include actual dark hours (sun altitude < -12°)
             if self.lat is not None and self.lon is not None:
@@ -793,14 +776,14 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
 
         # Temperature stats
         temps = [h.temperature for h in display_hours]
-        min_temp = self._convert_temp(min(temps))
-        max_temp = self._convert_temp(max(temps))
+        min_temp = convert_temperature(min(temps), self.temp_unit)
+        max_temp = convert_temperature(max(temps), self.temp_unit)
         self.temp_label.setText(f"Temperature: {min_temp:.1f} - {max_temp:.1f}{self._temp_suffix()}")
 
         # Wind stats
         winds = [h.wind_speed for h in display_hours]
-        avg_wind = self._convert_wind(sum(winds) / len(winds))
-        max_wind = self._convert_wind(max(winds))
+        avg_wind = convert_wind(sum(winds) / len(winds), self.wind_unit)
+        max_wind = convert_wind(max(winds), self.wind_unit)
         self.wind_label.setText(f"Wind: avg {avg_wind:.1f} {self._wind_suffix()}, max {max_wind:.1f} {self._wind_suffix()}")
 
         # Humidity stats
@@ -853,14 +836,14 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
                 self.table.setItem(row, col, item)
 
             # Temperature
-            temp_item = QTableWidgetItem(f"{self._convert_temp(hour_data.temperature):.1f}")
+            temp_item = QTableWidgetItem(f"{convert_temperature(hour_data.temperature, self.temp_unit):.1f}")
             temp_item.setTextAlignment(Qt.AlignCenter)
             if is_night:
                 temp_item.setBackground(QColor(COLORS['background_lighter']))
             self.table.setItem(row, 5, temp_item)
 
             # Dew point
-            dew_item = QTableWidgetItem(f"{self._convert_temp(hour_data.dew_point):.1f}")
+            dew_item = QTableWidgetItem(f"{convert_temperature(hour_data.dew_point, self.temp_unit):.1f}")
             dew_item.setTextAlignment(Qt.AlignCenter)
             if is_night:
                 dew_item.setBackground(QColor(COLORS['background_lighter']))
@@ -884,7 +867,7 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
             self.table.setItem(row, 7, humid_item)
 
             # Wind speed (convert for display, but use original km/h for color thresholds)
-            wind_converted = self._convert_wind(hour_data.wind_speed)
+            wind_converted = convert_wind(hour_data.wind_speed, self.wind_unit)
             wind_item = QTableWidgetItem(f"{wind_converted:.1f}")
             wind_item.setTextAlignment(Qt.AlignCenter)
             if is_night:
@@ -896,7 +879,7 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
             self.table.setItem(row, 8, wind_item)
 
             # Wind gusts
-            gusts_converted = self._convert_wind(hour_data.wind_gusts)
+            gusts_converted = convert_wind(hour_data.wind_gusts, self.wind_unit)
             gusts_item = QTableWidgetItem(f"{gusts_converted:.1f}")
             gusts_item.setTextAlignment(Qt.AlignCenter)
             if is_night:
@@ -975,10 +958,6 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self.worker = None
         self.daily_summaries: List[DailyWeatherSummary] = []
         self.day_cards: List[DayWeatherCard] = []
-
-        # Get temperature unit preference
-        settings = app_settings()
-        self.temp_unit = settings.value("temperature_unit", "Celsius", type=str)
 
         # Auto-refresh timer
         self.auto_refresh_timer = QTimer(self)
