@@ -7,7 +7,7 @@ Some features need online data, so the app contacts these services:
 | Service | What for | What it receives |
 |---|---|---|
 | GitHub | Checking for and downloading updates | A request for the latest release |
-| CDS Strasbourg (SIMBAD, VizieR, Aladin), with Harvard and ESA Sky as backups | Object details, sky images in the FOV Simulator, star catalogs for plate solving | Object names and sky coordinates |
+| CDS Strasbourg (SIMBAD, VizieR, Aladin), with Harvard and ESA Sky as backups, and VizieR's mirrors (Harvard, IDIA South Africa, NAOJ Japan, IUCAA India) when VizieR doesn't answer | Object details, sky images in the FOV Simulator, star catalogs for plate solving | Object names and sky coordinates |
 | Your weather provider (Open-Meteo, OpenWeatherMap, Visual Crossing or WeatherAPI) | Weather forecasts | Your observing location's coordinates, and your API key if the provider needs one |
 | OpenStreetMap | Finding your location on the map in Settings | The place you search for or the point you pick, and the map area shown |
 | unpkg.com, jsDelivr | The map's code | A request for the map's code |

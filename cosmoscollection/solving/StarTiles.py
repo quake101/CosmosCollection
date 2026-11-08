@@ -8,7 +8,8 @@ size touches a manageable number of them. A tile holds every catalog star in
 it brighter than its magnitude limit, so the brightest stars of any cone can
 be put together from the tiles it touches - the answer VizieR would give -
 whichever earlier solves fetched them. Tiles that are missing, or don't reach
-faint enough, are fetched from VizieR in one request per cone.
+faint enough, are fetched from VizieR in one request per cone (from one of
+its mirrors when CDS doesn't answer).
 
     stars = cone_stars("gaia", ra, dec, radius, count)   # (n, 3) ra, dec, mag
 
@@ -28,7 +29,17 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-VIZIER_URL = "https://vizier.cds.unistra.fr/viz-bin/asu-tsv"
+VIZIER_MIRRORS = (    # CDS first, then its official mirrors - each serves the same catalogs
+    "vizier.cds.unistra.fr",    # Strasbourg
+    "vizier.cfa.harvard.edu",   # USA (Tycho-2 only - its Gaia DR3 table is empty)
+    "vizier.idia.ac.za",        # South Africa
+    "vizier.nao.ac.jp",         # Japan
+    "vizier.iucaa.in",          # India
+)
+VIZIER_PATH = "/viz-bin/asu-tsv"
+CONNECT_TIMEOUT = 10    # Seconds to wait for a server to answer at all
+READ_TIMEOUT = 120      # Seconds to wait for a big answer
+SKIP_FOR = 120          # Seconds a server that failed is passed over (the next fields and images don't wait on it)
 CATALOGS = {  # VizieR table, then its ra, dec and magnitude columns
     "tycho2": ("I/259/tyc2", ("RAmdeg", "DEmdeg", "VTmag")),
     "gaia": ("I/355/gaiadr3", ("RA_ICRS", "DE_ICRS", "Gmag")),
@@ -44,7 +55,8 @@ FILE_NAME = "star_tiles.sqlite"
 
 
 class CatalogUnavailable(Exception):
-    """VizieR couldn't be reached for stars the cache doesn't have."""
+    """VizieR (and its mirrors) couldn't be reached for stars the cache
+    doesn't have."""
 
 
 # ---- Tiles -------------------------------------------------------------------
@@ -221,10 +233,62 @@ def _store(catalog, level, fetched):
 
 # ---- VizieR ------------------------------------------------------------------
 
+_servers_lock = threading.Lock()
+_failed_at = {}     # server -> time.monotonic() it last couldn't be reached
+_no_table = set()   # (server, catalog) that last answered without a table
+_last_good = {}     # catalog -> the server that last sent a table
+
+
+def _servers(catalog):
+    """The VizieR servers to ask for catalog, in order: the one that last
+    sent its stars, the others, then those that last sent no table - leaving
+    out servers that couldn't be reached in the last SKIP_FOR seconds."""
+    now = time.monotonic()
+    with _servers_lock:
+        good = _last_good.get(catalog)
+        order = sorted(VIZIER_MIRRORS, key=lambda server: (server != good, (server, catalog) in _no_table))
+        return [server for server in order if now - _failed_at.get(server, -math.inf) >= SKIP_FOR]
+
+
+def _server_answered(server, catalog, outcome):
+    """Note how server answered a query for catalog: "table", "no table"
+    (no stars there, or a mirror without the catalog's data), or "failed"
+    (not reached, or an error)."""
+    with _servers_lock:
+        if outcome == "failed":
+            _failed_at[server] = time.monotonic()
+        else:
+            _failed_at.pop(server, None)
+        if outcome == "table":
+            _last_good[catalog] = server
+            _no_table.discard((server, catalog))
+        else:
+            if outcome == "no table":
+                _no_table.add((server, catalog))
+            if _last_good.get(catalog) == server:
+                del _last_good[catalog]
+
+
+def _table_lines(text):
+    """The data lines of a VizieR TSV answer - None if it has no table: no
+    stars matched, an error page, or a mirror without the catalog's data
+    (all look the same)."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("--"):  # The dashes under the column names
+            return lines[i + 1:]
+    return None
+
+
 def _vizier(catalog, ra, dec, radius, count, brighter_than=None):
     """The `count` brightest stars of catalog within radius of ra, dec (only
     those brighter than brighter_than, if given), from VizieR: ((n, 3) array
     of ra, dec, magnitude, brightest first; whether VizieR stopped at count).
+
+    Asks CDS, then its mirrors, until one sends a table; none from every
+    server that answers means there are no stars there. A server that
+    can't be reached is passed over for a couple of minutes, so a solve
+    that tries several fields (or images) doesn't wait on it each time.
 
     When VizieR stops at count it can leave out a few stars brighter than the
     last it sends, even bright ones - stars brighter than a magnitude are all
@@ -238,21 +302,30 @@ def _vizier(catalog, ra, dec, radius, count, brighter_than=None):
               "-out": ",".join(columns), "-sort": columns[2], "-out.max": str(count)}
     if brighter_than is not None:
         params[columns[2]] = f"<{brighter_than:.3f}"
-    for attempt in range(2):
+    servers = _servers(catalog)
+    if not servers:
+        raise CatalogUnavailable("VizieR and its mirrors didn't answer in the last few minutes")
+    lines, answered, problems = None, False, []
+    for server in servers:
         try:
             with online_request("vizier"):
-                response = requests.get(VIZIER_URL, params=params, timeout=(15, 120))
+                response = requests.get(f"https://{server}{VIZIER_PATH}", params=params,
+                                        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             response.raise_for_status()
-            break
         except requests.RequestException as e:
-            if attempt:
-                raise CatalogUnavailable(str(e))
-            logger.info(f"Star catalog query failed, trying again: {e}")
-    rows, sent, table = [], 0, False
-    for line in response.text.splitlines():
-        if not table:
-            table = line.startswith("--")  # The dashes under the column names
+            _server_answered(server, catalog, "failed")
+            problems.append(f"{server}: {type(e).__name__}")
+            logger.info(f"Star catalog query to {server} failed: {e}")
             continue
+        answered = True
+        lines = _table_lines(response.text)
+        _server_answered(server, catalog, "no table" if lines is None else "table")
+        if lines is not None:
+            break
+    if not answered:
+        raise CatalogUnavailable("VizieR and its mirrors didn't answer (" + ", ".join(problems) + ")")
+    rows, sent = [], 0
+    for line in lines or ():
         if not line.strip() or line.startswith("#"):
             continue
         sent += 1  # Every row counts toward count, even one without a position or magnitude
