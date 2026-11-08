@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 
 from PySide6.QtCore import QObject, Signal, QThread
+from cosmoscollection.core.Settings import app_settings
 
 logger = logging.getLogger(__name__)
 
@@ -147,12 +148,112 @@ def describe_solving():
 def solver_order():
     """The solvers to try, in order: some of "builtin", "astap", "astrometry"."""
     try:
-        from PySide6.QtCore import QSettings
-        value = QSettings("CosmosCollection", "CosmosCollection").value("plate_solver_order", "", type=str)
+        value = app_settings().value("plate_solver_order", "", type=str)
     except Exception:
         value = ""
     order = [name for name in value.split(",") if name in SOLVER_NAMES]
     return order or list(DEFAULT_SOLVER_ORDER)
+
+
+def _save_solution(image_path, result, fresh):
+    """Save a solution next to the image (.wcs) if the solver didn't (ASTAP
+    does; the others don't), so every window finds it next time."""
+    if not (result.success and result.wcs_header) or result.solver_used == 'ASTAP':
+        return
+    from cosmoscollection.imaging.WCS import read_wcs_header, write_wcs_file
+    try:
+        if fresh or read_wcs_header(image_path) is None:
+            write_wcs_file(image_path, result.wcs_header)
+    except OSError as e:
+        logger.warning(f"Could not save the plate solve for {image_path}: {e}")
+
+
+def _solve_builtin(image_path, hints, say, cancelled):
+    """The built-in solver's result - None if it can't be used (no position hint)."""
+    if hints.get('ra') is None or hints.get('dec') is None:
+        return None
+    result = PlateSolveResult()
+    result.solver_used = 'Built-in'
+    from cosmoscollection.solving.NativePlateSolver import solve, SolveFailed
+    say("Solving with the built-in solver...")
+    try:
+        header, info = solve(image_path, hints['ra'], hints['dec'], scale=hints.get('scale'),
+                             progress=lambda message: say(f"Built-in solver: {message}"),
+                             cancelled=cancelled)
+    except SolveFailed as e:
+        result.error_message = str(e)
+        return result
+    except Exception as e:
+        logger.exception("Built-in plate solve failed")
+        result.error_message = f"Unexpected error: {e}"
+        return result
+    result.success = True
+    result.wcs_header = header
+    result.ra_center, result.dec_center = header['CRVAL1'], header['CRVAL2']
+    result.pixel_scale = info['scale']
+    return result
+
+
+def solve_image(image_path: str, hints: Dict[str, Any] = None, fresh: bool = False, order=None,
+                progress=None, cancelled=None) -> PlateSolveResult:
+    """Plate solve an image, trying each solver in turn (order: some of
+    "builtin", "astap", "astrometry"; default solver_order()) until one solves
+    it, and save the solution next to the image (.wcs).
+
+    hints: {"ra", "dec"} (degrees) of the image's object - the built-in solver
+    needs them - plus optional "radius" (degrees, ASTAP's search) and "scale"
+    (arcsec/pixel). fresh: solve again even if the image has a saved solution,
+    and replace it. progress(message) as it goes; cancelled() to stop between
+    solvers (and inside the built-in one).
+
+    Returns the solving result, or a failed one whose error_message says what
+    each solver tried said."""
+    hints = hints or {}
+    say = progress or (lambda message: None)
+    cancelled = cancelled or (lambda: False)
+    solver = PlateSolver()
+    errors = []
+    result = None
+    for name in order or solver_order():
+        if cancelled():
+            errors.append("Cancelled")
+            break
+        try:
+            if name == "builtin":
+                result = _solve_builtin(image_path, hints, say, cancelled)
+                if result is None:
+                    errors.append("Built-in: needs the image's object (its position) to search near")
+                    continue
+            elif name == "astap":
+                if not solver.is_astap_available():
+                    errors.append("ASTAP: not installed or not found")
+                    continue
+                say("Solving with ASTAP...")
+                result = solver.solve_with_astap(image_path, hints, use_saved=not fresh)
+            else:
+                # Online - only with a usable API key
+                key_problem = solver.astrometry_key_problem()
+                if key_problem:
+                    logger.info(f"Skipping astrometry.net: {key_problem}")
+                    errors.append(f"Astrometry.net: {key_problem}")
+                    continue
+                say("Solving with Astrometry.net (this may take a few minutes)...")
+                result = solver.solve_with_astrometry_net(image_path, hints)
+        except Exception as e:
+            # One solver failing unexpectedly doesn't stop the others
+            logger.exception(f"{SOLVER_NAMES[name]} plate solve of {image_path} failed")
+            result = PlateSolveResult()
+            result.error_message = f"Unexpected error: {e}"
+        if result.success:
+            _save_solution(image_path, result, fresh)
+            return result
+        errors.append(f"{SOLVER_NAMES[name]}: {result.error_message or 'No solution'}")
+        say(f"{SOLVER_NAMES[name]} failed: {result.error_message or 'no solution'}")
+
+    failed = PlateSolveResult()
+    failed.solver_used = result.solver_used if result is not None else None
+    failed.error_message = "\n\n".join(errors) or "No plate solver is available"
+    return failed
 
 
 class PlateSolverWorker(QThread):
@@ -176,100 +277,17 @@ class PlateSolverWorker(QThread):
     def cancel(self):
         self._cancelled = True
 
-    def _save_solution(self, result):
-        """Save a solution next to the image (.wcs) if the solver didn't (ASTAP
-        does; the others don't), so every window finds it next time."""
-        if not (result.success and result.wcs_header) or result.solver_used == 'ASTAP':
-            return
-        from cosmoscollection.imaging.AnnotationOverlay import read_wcs_header, write_wcs_file
-        try:
-            if self.fresh or read_wcs_header(self.image_path) is None:
-                write_wcs_file(self.image_path, result.wcs_header)
-        except OSError as e:
-            logger.warning(f"Could not save the plate solve for {self.image_path}: {e}")
-
-    def _solve_builtin(self):
-        """The built-in solver's result - None if it can't be used (no position hint)."""
-        if self.hints.get('ra') is None or self.hints.get('dec') is None:
-            return None
-        result = PlateSolveResult()
-        result.solver_used = 'Built-in'
-        from cosmoscollection.solving.NativePlateSolver import solve, SolveFailed
-        self.progress.emit("Solving with the built-in solver...")
-        try:
-            header, info = solve(self.image_path, self.hints['ra'], self.hints['dec'],
-                                 scale=self.hints.get('scale'),
-                                 progress=lambda message: self.progress.emit(f"Built-in solver: {message}"),
-                                 cancelled=lambda: self._cancelled)
-        except SolveFailed as e:
-            result.error_message = str(e)
-            return result
-        except Exception as e:
-            logger.exception("Built-in plate solve failed")
-            result.error_message = f"Unexpected error: {e}"
-            return result
-        result.success = True
-        result.wcs_header = header
-        result.ra_center, result.dec_center = header['CRVAL1'], header['CRVAL2']
-        result.pixel_scale = info['scale']
-        return result
-
     def run(self):
         """Run plate solving in background. Always reports a result - the
         plate solve queue waits for it before solving the next image."""
         try:
-            self._run_solvers()
+            result = solve_image(self.image_path, self.hints, self.fresh, progress=self.progress.emit,
+                                 cancelled=lambda: self._cancelled)
         except Exception as e:
             logger.exception(f"Plate solving {self.image_path} failed")
-            failed = PlateSolveResult()
-            failed.error_message = f"Unexpected error: {e}"
-            self.solve_finished.emit(failed)
-
-    def _run_solvers(self):
-        solver = PlateSolver()
-        errors = []
-        result = None
-        for name in solver_order():
-            if self._cancelled:
-                errors.append("Cancelled")
-                break
-            try:
-                if name == "builtin":
-                    result = self._solve_builtin()
-                    if result is None:
-                        errors.append("Built-in: needs the image's object (its position) to search near")
-                        continue
-                elif name == "astap":
-                    if not solver.is_astap_available():
-                        errors.append("ASTAP: not installed or not found")
-                        continue
-                    self.progress.emit("Solving with ASTAP...")
-                    result = solver.solve_with_astap(self.image_path, self.hints, use_saved=not self.fresh)
-                else:
-                    # Online - only with a usable API key
-                    key_problem = solver.astrometry_key_problem()
-                    if key_problem:
-                        logger.info(f"Skipping astrometry.net: {key_problem}")
-                        errors.append(f"Astrometry.net: {key_problem}")
-                        continue
-                    self.progress.emit("Solving with Astrometry.net (this may take a few minutes)...")
-                    result = solver.solve_with_astrometry_net(self.image_path, self.hints)
-            except Exception as e:
-                # One solver failing unexpectedly doesn't stop the others
-                logger.exception(f"{SOLVER_NAMES[name]} plate solve of {self.image_path} failed")
-                result = PlateSolveResult()
-                result.error_message = f"Unexpected error: {e}"
-            if result.success:
-                self._save_solution(result)
-                self.solve_finished.emit(result)
-                return
-            errors.append(f"{SOLVER_NAMES[name]}: {result.error_message or 'No solution'}")
-            self.progress.emit(f"{SOLVER_NAMES[name]} failed: {result.error_message or 'no solution'}")
-
-        failed = PlateSolveResult()
-        failed.solver_used = result.solver_used if result is not None else None
-        failed.error_message = "\n\n".join(errors) or "No plate solver is available"
-        self.solve_finished.emit(failed)
+            result = PlateSolveResult()
+            result.error_message = f"Unexpected error: {e}"
+        self.solve_finished.emit(result)
 
 
 class PlateSolver:
@@ -290,8 +308,7 @@ class PlateSolver:
     def _get_astrometry_api_key(self) -> str:
         """Get astrometry.net API key from settings"""
         try:
-            from PySide6.QtCore import QSettings
-            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings = app_settings()
             return settings.value("astrometry_api_key", "", type=str).strip()
         except Exception:
             return ""
@@ -304,8 +321,7 @@ class PlateSolver:
             return ("No API key set. Register free at nova.astrometry.net "
                     "and add your key in Settings to use the online solver.")
         try:
-            from PySide6.QtCore import QSettings
-            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings = app_settings()
             if settings.value("astrometry_invalid_api_key", "", type=str) == self.astrometry_api_key:
                 return ("Your API key was rejected by astrometry.net. "
                         "Check the key in Settings.")
@@ -317,8 +333,7 @@ class PlateSolver:
         """Record that astrometry.net rejected the current key, so it isn't
         retried until the key is changed in Settings"""
         try:
-            from PySide6.QtCore import QSettings
-            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings = app_settings()
             settings.setValue("astrometry_invalid_api_key", self.astrometry_api_key)
         except Exception:
             pass
@@ -327,8 +342,7 @@ class PlateSolver:
         """Find ASTAP executable"""
         # First check user settings for custom path
         try:
-            from PySide6.QtCore import QSettings
-            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings = app_settings()
             custom_path = settings.value("astap_path", "", type=str)
             if custom_path and os.path.isfile(custom_path):
                 # If user specified astap.exe, check if astap_cli.exe exists in same directory

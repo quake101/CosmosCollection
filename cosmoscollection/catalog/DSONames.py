@@ -35,6 +35,44 @@ CONSTELLATIONS = {
     "VUL": "Vulpecula",
 }
 
+# Object type codes (dsodetail.dsotype) and their readable names, most common first
+# (the main window's Type filter)
+DSO_TYPES = (
+    ("GALXY", "Galaxy"), ("DRKNB", "Dark Nebula"), ("OPNCL", "Open Cluster"), ("PLNNB", "Planetary Nebula"),
+    ("BRTNB", "Bright Nebula"), ("SNREM", "Supernova Remnant"), ("GALCL", "Galaxy Cluster"),
+    ("GLOCL", "Globular Cluster"), ("ASTER", "Asterism"), ("2STAR", "Double Star"), ("CL+NB", "Cluster + Nebula"),
+    ("GX+DN", "Galaxy + Dark Nebula"), ("3STAR", "Triple Star"), ("4STAR", "Quadruple Star"),
+    ("1STAR", "Single Star"), ("LMCOC", "LMC Open Cluster"), ("LMCCN", "LMC Cluster/Nebula"),
+    ("LMCGC", "LMC Globular Cluster"), ("LMCDN", "LMC Dark Nebula"), ("SMCGC", "SMC Globular Cluster"),
+    ("SMCCN", "SMC Cluster/Nebula"), ("SMCOC", "SMC Open Cluster"), ("SMCDN", "SMC Dark Nebula"),
+    ("QUASR", "Quasar"), ("NONEX", "Non-existent"),
+)
+
+
+# Star types: not deep-sky objects, left out of annotations and object matching
+NOT_DSO_TYPES = {"1STAR", "2STAR", "3STAR", "4STAR", "NONEX"}
+
+
+def type_name(code):
+    """'Galaxy' for 'GALXY'; the code itself when it isn't a known one."""
+    return dict(DSO_TYPES).get(code, code or "")
+
+
+def type_code(text):
+    """The type code for a code or readable name, any case ('galaxy', 'GALXY',
+    'open cluster'), or None."""
+    wanted = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    for code, name in DSO_TYPES:
+        if wanted in (code.lower(), name.lower()):
+            return code
+    return None
+
+
+def constellation_name(abbreviation):
+    """'Andromeda' for 'AND' (any case); the text itself when it isn't one."""
+    return CONSTELLATIONS.get(str(abbreviation or "").upper(), abbreviation or "")
+
+
 # Better-known catalogs first, for an object's main designation ("M 31", not "NGC 224")
 CATALOG_RANK = {"M": 0, "NGC": 1, "IC": 2, "Sh2": 3, "Barnard": 3, "LDN": 3, "vdB": 3, "LBN": 4,
                 "Caldwell": 5, "Abell": 5, "Arp": 5, "Collinder": 5, "Melotte": 5, "Ced": 5}

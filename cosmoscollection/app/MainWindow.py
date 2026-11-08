@@ -4,7 +4,7 @@ import logging
 import os
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QSettings, QTimer, Qt
+from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
 )
 
 from cosmoscollection.app.SystemTrayManager import SystemTrayManager
+from cosmoscollection.catalog.DSONames import DSO_TYPES
+from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.catalog.DSODetail import DSODetailWindow
 from cosmoscollection.catalog.SimbadWorker import SimbadLoadingDialog, SimbadQueryWorker
 from cosmoscollection.core.DatabaseManager import DatabaseManager
@@ -38,7 +40,8 @@ from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 
 from cosmoscollection.app.AboutDialog import AboutDialog
 from cosmoscollection.app.BulkAddToTargetDialog import BulkAddToTargetDialog
-from cosmoscollection.app.DSOData import DSO_QUERY, dso_row_to_dict, format_dec, format_ra, load_all_dso_data
+from cosmoscollection.app.DSOData import DSO_QUERY, dso_row_to_dict, load_all_dso_data
+from cosmoscollection.core.Formatting import format_dec, format_ra
 from cosmoscollection.app.DSOTableModel import DSOTableModel
 from cosmoscollection.app.SettingsDialog import SettingsDialog
 from cosmoscollection.app.UpdateDialogs import offer_update_and_apply, run_update_check
@@ -105,35 +108,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         type_label = QLabel("Type:")
         self.type_combo = QComboBox()
         self.type_combo.addItem("All Types")
-        # Add common DSO types with readable names (ordered by frequency/popularity)
-        dso_types = [
-            ("GALXY", "Galaxy"),
-            ("DRKNB", "Dark Nebula"),
-            ("OPNCL", "Open Cluster"),
-            ("PLNNB", "Planetary Nebula"),
-            ("BRTNB", "Bright Nebula"),
-            ("SNREM", "Supernova Remnant"),
-            ("GALCL", "Galaxy Cluster"),
-            ("GLOCL", "Globular Cluster"),
-            ("ASTER", "Asterism"),
-            ("2STAR", "Double Star"),
-            ("CL+NB", "Cluster + Nebula"),
-            ("GX+DN", "Galaxy + Dark Nebula"),
-            ("3STAR", "Triple Star"),
-            ("4STAR", "Quadruple Star"),
-            ("1STAR", "Single Star"),
-            ("LMCOC", "LMC Open Cluster"),
-            ("LMCCN", "LMC Cluster/Nebula"),
-            ("LMCGC", "LMC Globular Cluster"),
-            ("LMCDN", "LMC Dark Nebula"),
-            ("SMCGC", "SMC Globular Cluster"),
-            ("SMCCN", "SMC Cluster/Nebula"),
-            ("SMCOC", "SMC Open Cluster"),
-            ("SMCDN", "SMC Dark Nebula"),
-            ("QUASR", "Quasar"),
-            ("NONEX", "Non-existent")
-        ]
-        for code, name in dso_types:
+        for code, name in DSO_TYPES:
             self.type_combo.addItem(name, code)
         self.type_combo.currentTextChanged.connect(self._on_type_changed)
         type_layout.addWidget(type_label)
@@ -681,7 +656,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         # 4. SIMBAD lookup on search failure is enabled in settings (and not offline)
         from cosmoscollection.core.OnlineLimits import is_offline
         if (text and
-            QSettings("CosmosCollection", "CosmosCollection").value(
+            app_settings().value(
                 "simbad_lookup_on_search_failure", True, type=bool) and
             not is_offline() and
             len(self.model.filtered_data) == 0 and
@@ -805,7 +780,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                 QMessageBox.warning(self, "Update Did Not Complete", failure_message)
 
             # Check if the setting is enabled
-            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings = app_settings()
             check_updates = settings.value("check_updates_on_startup", True, type=bool)
 
             if not check_updates:
@@ -1436,7 +1411,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close event"""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
 
         # If minimize to tray is enabled, minimize instead of closing
         if settings.value("minimize_to_tray", True, type=bool):
@@ -1455,7 +1430,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def changeEvent(self, event):
         """Handle window state changes (minimize, etc.)"""
         if event.type() == QEvent.WindowStateChange:
-            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings = app_settings()
             if settings.value("minimize_to_tray", True, type=bool):
                 if self.windowState() & Qt.WindowMinimized:
                     if self._tray_manager and self._tray_manager.is_available:
@@ -1490,7 +1465,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _setup_system_tray_if_enabled(self):
         """Initialize system tray if the setting is enabled"""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         if not settings.value("minimize_to_tray", True, type=bool):
             return
 
@@ -1578,7 +1553,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _start_tray_weather_refresh(self):
         """Start background weather refresh timer when in tray"""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
 
         # Check if auto-refresh is enabled in weather settings
         if not settings.value("weather_auto_refresh_enabled", False, type=bool):
@@ -1608,7 +1583,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
     def _start_tray_update_check(self):
         """Start hourly update check timer when in tray"""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
 
         # Only check if update checking is enabled
         if not settings.value("check_updates_on_startup", True, type=bool):

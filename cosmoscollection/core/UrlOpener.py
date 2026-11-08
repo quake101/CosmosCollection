@@ -55,6 +55,25 @@ def open_url(url):
         return False
 
 
+def show_in_folder(path, select=True):
+    """Open the file manager at path: for a file, its folder with the file selected
+    (Windows and macOS; select=False just opens the folder), for a folder, the
+    folder itself. False if it doesn't exist or couldn't be opened."""
+    path = os.path.normpath(str(path))
+    if select and os.path.isfile(path) and sys.platform in ("win32", "darwin"):
+        command = ["explorer", "/select,", path] if sys.platform == "win32" else ["open", "-R", path]
+        try:
+            subprocess.Popen(command, env=clean_subprocess_env())
+            return True
+        except Exception as e:
+            logger.warning(f"Could not show {path} in its folder: {e}")
+    folder = path if os.path.isdir(path) else os.path.dirname(path)
+    if not os.path.isdir(folder):
+        logger.warning(f"Folder not found: {folder}")
+        return False
+    return open_url(QUrl.fromLocalFile(folder))
+
+
 def clean_subprocess_env():
     """
     Environment for launching external programs, without the variables this

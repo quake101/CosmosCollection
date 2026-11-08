@@ -1,6 +1,9 @@
-"""Process setup that must happen before numpy, Qt or any network module loads.
+"""The app's process setup, which must happen before numpy, Qt or any network
+module loads.
 
-Imported first by main.py; importing it does the setup."""
+Imported first by main.py when it starts the app (not the command line);
+importing it does the setup. The part the command line shares is in
+core/ProcessSetup.py."""
 
 import logging
 import os
@@ -12,32 +15,8 @@ if os.environ.get('COSMOS_RESTART_WAIT_PID'):
     from cosmoscollection.core.GpuReset import wait_for_previous_app
     wait_for_previous_app()
 
-
-# numpy's math library (OpenBLAS) reserves a buffer for every CPU thread when numpy is
-# first imported: about 750 MB on a 32-thread PC, held for as long as the app runs. The
-# app's numpy work is small matrices and per-pixel math, which doesn't use more than a
-# few threads, so cap it at 8 (about 240 MB). Set before anything imports numpy; a value
-# already in the environment wins.
-if (os.cpu_count() or 1) > 8:
-    os.environ.setdefault('OPENBLAS_NUM_THREADS', '8')
-
-# Configure SSL certificates BEFORE any network imports (CRITICAL for PyInstaller)
-if getattr(sys, 'frozen', False):
-    # Running in a PyInstaller bundle - configure SSL first
-    try:
-        import certifi
-        cert_path = os.path.join(sys._MEIPASS, 'certifi', 'cacert.pem')
-        if os.path.exists(cert_path):
-            os.environ['SSL_CERT_FILE'] = cert_path
-            os.environ['REQUESTS_CA_BUNDLE'] = cert_path
-            os.environ['CURL_CA_BUNDLE'] = cert_path
-        else:
-            # Fallback to certifi's default path
-            os.environ['SSL_CERT_FILE'] = certifi.where()
-            os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
-            os.environ['CURL_CA_BUNDLE'] = certifi.where()
-    except Exception as e:
-        print(f"Warning: Could not configure SSL certificates: {e}")
+# OpenBLAS thread cap, SSL certificates and astroquery's cache folder
+import cosmoscollection.core.ProcessSetup  # noqa: E402,F401
 
 # QtWebEngine (Chromium) flags. Set here, before Qt starts, and nowhere else: a later
 # update once overwrote these and brought the crashes back.
@@ -91,20 +70,9 @@ logging.basicConfig(level=logging.INFO if getattr(sys, 'frozen', False) else log
 logger = logging.getLogger(__name__)
 
 
-# Log SSL configuration status and configure astroquery
+# Log the SSL and astroquery cache setup (ProcessSetup.py)
 if getattr(sys, 'frozen', False):
     logger.info(f"Running in PyInstaller bundle. SSL_CERT_FILE={os.environ.get('SSL_CERT_FILE')}")
-
-    # Configure astroquery cache directory for PyInstaller
-    try:
-        from astropy.config.paths import set_temp_cache
-        import tempfile
-        cache_dir = os.path.join(tempfile.gettempdir(), 'astroquery_cache')
-        os.makedirs(cache_dir, exist_ok=True)
-        # Set astroquery to use this cache directory
-        os.environ['XDG_CACHE_HOME'] = cache_dir
-        logger.info(f"Astroquery cache directory set to: {cache_dir}")
-    except Exception as e:
-        logger.warning(f"Could not configure astroquery cache: {e}")
+    logger.info(f"Astroquery cache directory set to: {os.environ.get('XDG_CACHE_HOME')}")
 else:
     logger.debug("Running in normal Python environment")

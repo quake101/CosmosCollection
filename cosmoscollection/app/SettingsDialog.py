@@ -7,7 +7,7 @@ import sys
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-from PySide6.QtCore import QPointF, QRectF, QSettings, QSize, QThread, QUrl, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, QThread, QUrl, Qt, Signal
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -37,6 +37,8 @@ from PySide6.QtWidgets import (
 )
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.planning.NightTimes import compass_direction
+from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.ResourceManager import ResourceManager
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
 from cosmoscollection.ui.MapLocationPicker import MapLocationPickerDialog
@@ -152,11 +154,8 @@ class HorizonPreview(QWidget):
             QToolTip.hideText()
             return
         az = round((pos.x() - rect.left()) / rect.width() * 360.0) % 360
-        directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
-                      'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
-        direction = directions[int((az + 11.25) / 22.5) % 16]
         QToolTip.showText(event.globalPosition().toPoint(),
-                          f"Azimuth {az}° ({direction}): horizon {self._altitudes[az]:.1f}°", self)
+                          f"Azimuth {az}° ({compass_direction(az)}): horizon {self._altitudes[az]:.1f}°", self)
 
 
 # --- Settings Dialog ---
@@ -1067,7 +1066,7 @@ class SettingsDialog(QDialog):
 
         # Load UI preferences from QSettings
         try:
-            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings = app_settings()
             from cosmoscollection.core.OnlineLimits import OFFLINE_SETTING
             offline_mode = settings.value(OFFLINE_SETTING, False, type=bool)
             self.offline_mode_checkbox.setChecked(offline_mode)
@@ -1293,7 +1292,7 @@ class SettingsDialog(QDialog):
         horizon until Save Location."""
         from cosmoscollection.planning.HorizonProfile import HorizonParseError, parse_horizon_file
 
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         start_dir = settings.value("last_horizon_dir", "", type=str)
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -1503,7 +1502,7 @@ class SettingsDialog(QDialog):
     def _save_settings(self):
         """Save application settings (QSettings only - locations are saved separately)"""
         try:
-            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings = app_settings()
             from cosmoscollection.core.OnlineLimits import OFFLINE_SETTING
             settings.setValue(OFFLINE_SETTING, self.offline_mode_checkbox.isChecked())
             settings.setValue("show_observer_location", self.show_observer_location_checkbox.isChecked())
@@ -1877,7 +1876,7 @@ class SettingsDialog(QDialog):
                     }
 
             # Backup QSettings (only JSON-serializable values)
-            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings = app_settings()
             qsettings_data = {}
             for key in settings.allKeys():
                 value = settings.value(key)
@@ -1965,7 +1964,7 @@ class SettingsDialog(QDialog):
 
             # Restore QSettings if present
             if 'qsettings' in backup_data:
-                settings = QSettings("CosmosCollection", "CosmosCollection")
+                settings = app_settings()
                 for key, value in backup_data['qsettings'].items():
                     settings.setValue(key, value)
 
@@ -2365,7 +2364,7 @@ class RestoreImageFixupDialog(QDialog):
 
         # Match the user's configured worker-thread count (Settings > max_threads),
         # the same setting used for parallel data loading elsewhere in the app.
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         default_threads = max(1, (os.cpu_count() or 4) - 2)
         max_threads = max(1, min(settings.value("max_threads", default_threads, type=int), 128))
 

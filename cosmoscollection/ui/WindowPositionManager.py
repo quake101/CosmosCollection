@@ -2,17 +2,13 @@
 Window Position Manager
 Manages saving and restoring window positions using QSettings
 """
-from PySide6.QtCore import QSettings, QPoint, QRect
+from PySide6.QtCore import QPoint, QRect
+from cosmoscollection.core.Settings import app_settings
 from PySide6.QtWidgets import QApplication
 
 
 class WindowPositionManager:
     """Manages window position persistence using QSettings"""
-
-    @staticmethod
-    def get_settings():
-        """Get QSettings instance for the application"""
-        return QSettings("CosmosCollection", "CosmosCollection")
 
     @staticmethod
     def save_window_position(window, window_key):
@@ -23,7 +19,7 @@ class WindowPositionManager:
             window: QMainWindow or QDialog instance
             window_key: Unique key to identify this window type (e.g., 'DSOTargetList')
         """
-        settings = WindowPositionManager.get_settings()
+        settings = app_settings()
         settings.setValue(f"{window_key}/geometry", window.saveGeometry())
         settings.setValue(f"{window_key}/pos", window.pos())
         settings.setValue(f"{window_key}/size", window.size())
@@ -40,7 +36,7 @@ class WindowPositionManager:
         Returns:
             bool: True if position was restored, False if centered (first time)
         """
-        settings = WindowPositionManager.get_settings()
+        settings = app_settings()
 
         # Try to restore saved geometry first
         geometry = settings.value(f"{window_key}/geometry")

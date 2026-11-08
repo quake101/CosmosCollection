@@ -45,10 +45,15 @@ class ResourceManager:
         return self._base_path.joinpath(*path_parts)
     
     def get_data_dir(self):
-        """Get the user data directory based on platform"""
+        """Get the user data directory based on platform. The COSMOS_DATA_DIR
+        environment variable overrides it (the database and logs go there) - for
+        tests, or a second collection from the command line."""
         app_name = "CosmosCollection"
-        
-        if platform.system() == "Windows":
+
+        override = os.environ.get('COSMOS_DATA_DIR')
+        if override:
+            data_dir = Path(os.path.abspath(os.path.expanduser(override)))
+        elif platform.system() == "Windows":
             # Windows: Use AppData/Roaming
             data_dir = Path(os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming')) / app_name
         elif platform.system() == "Darwin":
@@ -90,8 +95,12 @@ class ResourceManager:
 
     def get_cache_dir(self, *path_parts):
         """The platform's cache folder (or a folder in it) - disposable data, kept out
-        of the Windows roaming profile and out of backups of ~/Library/Application Support."""
-        if sys.platform == "win32":
+        of the Windows roaming profile and out of backups of ~/Library/Application Support.
+        With COSMOS_DATA_DIR set, a "cache" folder in it instead, so a test copy of
+        the data doesn't share caches (e.g. the library scan index) with the real one."""
+        if os.environ.get('COSMOS_DATA_DIR'):
+            base = self.get_data_dir() / "cache"
+        elif sys.platform == "win32":
             base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "CosmosCollection" / "cache"
         elif sys.platform == "darwin":
             base = Path.home() / "Library" / "Caches" / "CosmosCollection"
@@ -101,44 +110,6 @@ class ResourceManager:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def open_file_manager(self, path):
-        """Open the system file manager at the specified path"""
-        try:
-            path = Path(path)
-            if not path.exists():
-                logger.error(f"Path does not exist: {path}")
-                return False
-                
-            # Use the directory if path is a file
-            if path.is_file():
-                path = path.parent
-                
-            system = platform.system()
-            
-            if system == "Windows":
-                os.startfile(str(path))
-            elif system == "Darwin":  # macOS
-                import subprocess
-                subprocess.run(["open", str(path)], check=True)
-            else:  # Linux and other Unix-like systems
-                import subprocess
-                # Try common Linux file managers
-                for cmd in ["xdg-open", "nautilus", "dolphin", "thunar", "pcmanfm"]:
-                    try:
-                        subprocess.run([cmd, str(path)], check=True)
-                        break
-                    except (subprocess.CalledProcessError, FileNotFoundError):
-                        continue
-                else:
-                    logger.warning(f"Could not find a suitable file manager to open {path}")
-                    return False
-                    
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error opening file manager: {e}")
-            return False
-    
     def get_database_path(self):
         """Get the user database path, copying from catalogs folder if needed"""
         # Always use user data directory for the user's database

@@ -25,13 +25,16 @@ import statistics
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
-from PySide6.QtCore import Qt, QObject, QRectF, QRunnable, QSettings, Signal
+from PySide6.QtCore import Qt, QObject, QRectF, QRunnable, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QWidget, QLabel, QPushButton,
                                QComboBox, QCheckBox, QLineEdit, QListWidget, QListWidgetItem, QAbstractItemView,
                                QToolButton, QSlider, QFontComboBox, QColorDialog, QInputDialog, QMessageBox)
 
-from cosmoscollection.ui.Theme import COLORS, contrast_text, font_size, themed_style
+from cosmoscollection.ui.Theme import COLORS, contrast_text, font_size, show_color_on_button, themed_style
+from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Paths import path_key
+from cosmoscollection.core.Formatting import count_text, format_duration, format_exposure, trim_number
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 
 logger = logging.getLogger(__name__)
@@ -138,24 +141,24 @@ def _json_value(text):
 
 
 def load_style():
-    settings = QSettings("CosmosCollection", "CosmosCollection")
+    settings = app_settings()
     return normalize_style(_json_value(settings.value(STYLE_SETTING, "", type=str)))
 
 
 def save_style(style):
-    QSettings("CosmosCollection", "CosmosCollection").setValue(STYLE_SETTING, json.dumps(style))
+    app_settings().setValue(STYLE_SETTING, json.dumps(style))
 
 
 def load_presets():
     """{name: style} - each without "enabled" (a preset is a look, not on/off)."""
-    value = _json_value(QSettings("CosmosCollection", "CosmosCollection").value(PRESETS_SETTING, "", type=str))
+    value = _json_value(app_settings().value(PRESETS_SETTING, "", type=str))
     if not isinstance(value, dict):
         return {}
     return {str(name): normalize_style(style) for name, style in value.items() if isinstance(style, dict)}
 
 
 def save_presets(presets):
-    QSettings("CosmosCollection", "CosmosCollection").setValue(PRESETS_SETTING, json.dumps(presets))
+    app_settings().setValue(PRESETS_SETTING, json.dumps(presets))
 
 
 def is_banner(style):
@@ -165,31 +168,6 @@ def is_banner(style):
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
-
-def _num(value, decimals):
-    """A number with up to `decimals` places, without trailing zeros."""
-    return f"{value:.{decimals}f}".rstrip('0').rstrip('.')
-
-
-def format_total(seconds):
-    """'12h 30m', '45m', '30s' - an integration time."""
-    seconds = float(seconds or 0)
-    if seconds < 60:
-        return f"{_num(seconds, 1)}s"
-    hours, minutes = divmod(round(seconds / 60.0), 60)
-    if hours and minutes:
-        return f"{hours}h {minutes}m"
-    return f"{hours}h" if hours else f"{minutes}m"
-
-
-def format_exposure(seconds):
-    """'300s', '0.5s' - one sub's exposure."""
-    return f"{_num(float(seconds or 0), 2)}s"
-
-
-def _subs(count):
-    return f"{count} sub{'s' if count != 1 else ''}"
-
 
 def format_dates(dates):
     """'Oct 4, 2025', 'Oct 4 – 12, 2025 (5 nights)', 'Dec 30, 2024 – Jan 2, 2025 (3 nights)'."""
@@ -239,11 +217,11 @@ def format_optics(focal_length, aperture=None, focal_ratio=None):
     """'400 mm f/5'."""
     if not focal_length:
         return ""
-    text = f"{_num(focal_length, 1)} mm"
+    text = f"{trim_number(focal_length, 1)} mm"
     if not focal_ratio and aperture:
         focal_ratio = focal_length / aperture
     if focal_ratio:
-        text += f" f/{_num(focal_ratio, 1)}"
+        text += f" f/{trim_number(focal_ratio, 1)}"
     return text
 
 
@@ -251,11 +229,11 @@ def format_camera_settings(gain=None, offset=None, temperature=None, binning=Non
     """'Gain 100, Offset 50, -10 °C, Bin 2x2' - what's known of them."""
     parts = []
     if gain is not None:
-        parts.append(f"Gain {_num(gain, 2)}")
+        parts.append(f"Gain {trim_number(gain, 2)}")
     if offset is not None:
-        parts.append(f"Offset {_num(offset, 2)}")
+        parts.append(f"Offset {trim_number(offset, 2)}")
     if temperature is not None:
-        parts.append(f"{_num(round(temperature, 1), 1)} °C")
+        parts.append(f"{trim_number(round(temperature, 1), 1)} °C")
     if binning and binning > 1:
         parts.append(f"Bin {binning:.0f}x{binning:.0f}")
     return ", ".join(parts)
@@ -276,7 +254,7 @@ def format_filter_breakdown(groups):
     parts = []
     for name, exposures, seconds in filters.values():
         counts = " + ".join(f"{subs}×{format_exposure(exposure)}" for subs, exposure in exposures)
-        parts.append(f"{name} {counts} ({format_total(seconds)})")
+        parts.append(f"{name} {counts} ({format_duration(seconds)})")
     return SEPARATOR.join(parts)
 
 
@@ -286,10 +264,6 @@ def format_filter_breakdown(groups):
 
 # The night key of a session's Light files that couldn't be put on a night
 NO_NIGHT = "none"
-
-def path_key(path):
-    """How a file path is matched: case and separators as Windows treats them."""
-    return os.path.normcase(os.path.normpath(path or ""))
 
 
 def _like_escape(text):
@@ -459,10 +433,16 @@ def _linked_total_texts(conn, session_id, stored):
     nights = session_nights(conn, session_id)
     totals = {nights_total(nights, chosen_nights(nights, stored))[1],
               nights_total(nights, chosen_nights(nights, None))[1]}
-    texts = {format_total(seconds) for seconds in totals if seconds > 0}
     row = conn.execute("SELECT integration_seconds FROM usersessions WHERE id = ?", (session_id,)).fetchone()
     if row and row[0]:
-        texts.add(format_total(row[0]))
+        totals.add(row[0])
+    texts = set()
+    for seconds in totals:
+        if seconds > 0:
+            texts.add(format_duration(seconds))
+            if seconds < 60:
+                # Earlier versions filled totals under a minute in as '0m' or '1m'
+                texts.add(f"{round(seconds / 60.0)}m")
     return texts
 
 
@@ -480,7 +460,7 @@ def link_session(conn, image_path, session_id, nights=None):
     if session_id:
         available = session_nights(conn, session_id)
         seconds = nights_total(available, chosen_nights(available, nights))[1]
-        new_text = format_total(seconds) if seconds > 0 else ""
+        new_text = format_duration(seconds) if seconds > 0 else ""
     stored = ",".join(nights) if session_id and nights else None
     for row in rows:
         integration = row["integration_time"]
@@ -578,8 +558,8 @@ def _session_details(conn, session_id, details, numbers, nights=None):
     if nights:
         details["dates"] = format_dates(nights)
     if integration_seconds:
-        details["integration"] = f"{format_total(integration_seconds)} ({_subs(sub_count or 0)})" \
-            if sub_count else format_total(integration_seconds)
+        details["integration"] = f"{format_duration(integration_seconds)} ({count_text(sub_count or 0, 'sub')})" \
+            if sub_count else format_duration(integration_seconds)
     breakdown = format_filter_breakdown(ordered)
     if breakdown:
         details["integration_filters"] = breakdown
@@ -658,9 +638,9 @@ def _header_details(header, details, numbers):
     live_time = _to_float(kw.get('LIVETIME'))
     exposure = _to_float(_first_value(kw, 'EXPTIME', 'EXPOSURE'))
     if live_time:
-        fill("integration", format_total(live_time) + (f" ({_subs(int(frames))})" if frames and frames > 1 else ""))
+        fill("integration", format_duration(live_time) + (f" ({count_text(int(frames), 'sub')})" if frames and frames > 1 else ""))
     elif frames and frames > 1:
-        fill("integration", _subs(int(frames)))
+        fill("integration", count_text(int(frames), 'sub'))
     elif exposure:
         fill("integration", format_exposure(exposure))
     fill("filters", kw.get('FILTER'))
@@ -1109,7 +1089,7 @@ def night_name(key):
 
 
 def _night_amount(subs, seconds):
-    return f"{_subs(subs)}, {format_total(seconds)}" if subs else "no subs"
+    return f"{count_text(subs, 'sub')}, {format_duration(seconds)}" if subs else "no subs"
 
 
 class SessionNightsDialog(QDialog):
@@ -1355,8 +1335,8 @@ class ImageDetailsDialog(WindowPositionMixin, QDialog):
                 self.font_combo.setCurrentFont(QFont(style["font_family"]))
             else:
                 self.font_combo.setCurrentFont(QFont())
-            self._color_button(self.text_color_button, style["text_color"])
-            self._color_button(self.background_button, style["background_color"])
+            show_color_on_button(self.text_color_button, style["text_color"])
+            show_color_on_button(self.background_button, style["background_color"])
             self.opacity_slider.setValue(style["background_opacity"])
             self.title_check.setChecked(style["title_emphasis"])
             self.labels_check.setChecked(style["labels"])
@@ -1480,11 +1460,6 @@ class ImageDetailsDialog(WindowPositionMixin, QDialog):
             self.style[key] = color.name()
             self._show_style()
             self._emit_style()
-
-    @staticmethod
-    def _color_button(button, color):
-        button.setText(color.upper())
-        button.setStyleSheet(f"QPushButton {{ background-color: {color}; color: {contrast_text(color)}; }}")
 
     def _on_item_changed(self, item):
         if self._updating:

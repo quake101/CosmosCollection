@@ -5,7 +5,8 @@ from PySide6.QtGui import QBrush, QColor
 
 from cosmoscollection.ui.Theme import COLORS, theme_manager
 
-from cosmoscollection.app.DSOData import SEARCH_RANK_EXACT, SEARCH_RANK_SUBSTRING, _natural_key, _rank_search_key, designation_in_catalog, format_dec, format_ra, normalize_search_text, prepare_search_query
+from cosmoscollection.app.DSOData import SEARCH_RANK_EXACT, DSOSearch
+from cosmoscollection.core.Formatting import format_dec, format_ra, natural_key
 
 
 # --- Model for displaying DSO data in table ---
@@ -22,7 +23,7 @@ class DSOTableModel(QAbstractTableModel):
         self._sort_column = None
         self._sort_order = Qt.AscendingOrder
         self._cached_formatted_data = {}  # (row, col) -> display text
-        self._search_key_cache = {}  # designations string -> [(designation, normalized)]
+        self._search = DSOSearch()  # Filters and search ranking, shared with the command line
         # Row colors come from the theme (alternating rows on the view); only the
         # "no images" highlight is painted here, so rebuild it when the theme changes.
         self._brush_no_images = None
@@ -65,17 +66,7 @@ class DSOTableModel(QAbstractTableModel):
     def _display_designation(self, entry):
         """(catalog, designation) shown for an entry: the search match if any, else
         its designation in the selected catalog, else its primary designation"""
-        matched_designation = entry.get("matched_designation")
-        if matched_designation:
-            catalog, sep, designation = matched_designation.partition(" ")
-            return catalog, designation if sep else matched_designation
-
-        if self.selected_catalog:
-            for designation, _ in self._search_keys(entry["designations"]):
-                if designation_in_catalog(designation, self.selected_catalog):
-                    return self.selected_catalog, designation.split(" ", 1)[1]
-            return self.selected_catalog, entry["id"]
-        return entry["catalogue"], entry["id"]
+        return self._search.display_designation(entry, self.selected_catalog)
 
     def _format_cell_data(self, entry, col):
         """Format cell data for display"""
@@ -120,7 +111,7 @@ class DSOTableModel(QAbstractTableModel):
             # Sort on what's displayed, so a catalog filter sorts by that catalog's numbers
             def key(entry):
                 catalog, designation = self._display_designation(entry)
-                keys = (_natural_key(catalog), _natural_key(designation))
+                keys = (natural_key(catalog), natural_key(designation))
                 return keys if column == 0 else keys[::-1]
         elif column in (2, 3):
             field = "ra_deg" if column == 2 else "dec_deg"
@@ -169,88 +160,12 @@ class DSOTableModel(QAbstractTableModel):
     def _build_filtered_data(self, search_text, selected_catalog=None, show_images_only=False,
                              selected_type=None, show_no_images_only=False):
         """Apply all filters to the data, tagging search matches with their rank"""
-        catalog = selected_catalog if selected_catalog and selected_catalog != "All Catalogs" else None
-        type_code = selected_type if selected_type and selected_type != "All Types" else None
-        query = prepare_search_query(search_text, catalog)
-
-        if not (query or catalog or type_code or show_images_only or show_no_images_only):
-            return self.dso_data.copy()
-
-        matches = []
-        for item in self.dso_data:
-            if catalog and not any(designation_in_catalog(designation, catalog)
-                                   for designation, _ in self._search_keys(item["designations"])):
-                continue
-
-            if type_code and item.get("dso_type", "") != type_code:
-                continue
-
-            if show_images_only and item["image_count"] == 0:
-                continue
-
-            if show_no_images_only and item["image_count"] > 0:
-                continue
-
-            if query is None:
-                matches.append(item)
-                continue
-
-            match = self._match_item(item, query)
-            if match is None:
-                continue
-
-            rank, matched_designation = match
-            item_copy = item.copy()
-            item_copy["search_rank"] = rank
-            if matched_designation:
-                item_copy["matched_designation"] = matched_designation
-            matches.append(item_copy)
-
-        return matches
+        return self._search.filter(self.dso_data, search_text, selected_catalog, show_images_only,
+                                   selected_type, show_no_images_only)
 
     def _search_keys(self, designations):
         """Return [(designation, normalized designation)], cached by designations string"""
-        keys = self._search_key_cache.get(designations)
-        if keys is None:
-            keys = [(designation, normalize_search_text(designation))
-                    for designation in designations.split(", ")]
-            self._search_key_cache[designations] = keys
-        return keys
-
-    def _match_item(self, item, query):
-        """Match an item against a prepared search query.
-
-        Returns (rank, matched_designation) or None. On equal rank, a designation
-        from the selected catalog is preferred so it is the one displayed.
-        """
-        best = None  # (rank, outside_catalog, designation)
-        for designation, key in self._search_keys(item["designations"]):
-            in_catalog = bool(query["catalog_prefix"]) and designation.lower().startswith(query["catalog_prefix"])
-
-            ranks = []
-            if query["norm"]:
-                ranks.append(_rank_search_key(key, query["norm"]))
-            if in_catalog:
-                ranks.append(_rank_search_key(key, query["catalog_norm"]))
-            ranks = [rank for rank in ranks if rank is not None]
-            if not ranks:
-                continue
-
-            candidate = (min(ranks), not in_catalog, designation)
-            if best is None or candidate[:2] < best[:2]:
-                best = candidate
-
-        if best is not None:
-            return best[0], best[2]
-
-        # Coordinate search: typed fragment of an RA/Dec, or a pasted full RA/Dec string
-        if query["is_coordinate"] and item.get("ra_deg") is not None and item.get("dec_deg") is not None:
-            raw = query["raw"]
-            for formatted in (format_ra(item["ra_deg"]).lower(), format_dec(item["dec_deg"]).lower()):
-                if raw in formatted or formatted in raw:
-                    return SEARCH_RANK_SUBSTRING, None
-
-        return None
+        return self._search.search_keys(designations)
 
     def has_exact_search_match(self):
         """Whether the current search found an exact designation match"""

@@ -20,11 +20,13 @@ from astropy import units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 from cosmoscollection.core.DatabaseManager import DatabaseManager
-from cosmoscollection.catalog.DSONames import display_name
+from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Formatting import format_dec, format_ra
+from cosmoscollection.catalog.DSONames import NOT_DSO_TYPES, display_name
 from cosmoscollection.planning.HorizonProfile import load_active_horizon
 from cosmoscollection.core.ResourceManager import ResourceManager
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
-from cosmoscollection.ui.WindowLifetime import release_on_close, window_is_open
+from cosmoscollection.ui.WindowLifetime import refresh_open, release_on_close, window_is_open
 from cosmoscollection.ui.Theme import COLORS, contrast_text, font_px, font_size, themed_style, theme_manager
 from cosmoscollection.core.UrlOpener import open_url
 from cosmoscollection.ui.TimeFormatHelper import format_time, get_time_format_24h
@@ -483,7 +485,6 @@ def sessions_for_object(conn, name, ra=None, dec=None, dsodetailid=None):
 
 def _other_object_closer(cursor, ra, dec, distance, objects):
     """Whether a catalog object other than objects is within distance of (ra, dec)."""
-    from cosmoscollection.imaging.AnnotationOverlay import NOT_DSO_TYPES  # Already loaded with the main window
     cursor.execute(f"""
         SELECT id, ra, dec FROM dsodetail
         WHERE dec BETWEEN ? AND ? AND COALESCE(dsotype, '') NOT IN ({','.join('?' * len(NOT_DSO_TYPES))})
@@ -557,23 +558,6 @@ def match_panels(framing, subs):
         counts[number]["subs"] += 1
         counts[number]["seconds"] += sub.get("seconds") or 0.0
     return counts, unmatched
-
-
-def format_ra(ra):
-    """'00h 42m 44.3s'"""
-    total = (ra % 360.0) / 15.0 * 3600.0
-    hours, rest = divmod(round(total, 1), 3600)
-    minutes, seconds = divmod(rest, 60)
-    return f"{int(hours) % 24:02d}h {int(minutes):02d}m {seconds:04.1f}s"
-
-
-def format_dec(dec):
-    """'+41° 16' 08"'"""
-    sign = "-" if dec < 0 else "+"
-    total = round(abs(dec) * 3600.0)
-    degrees, rest = divmod(total, 3600)
-    minutes, seconds = divmod(rest, 60)
-    return f"{sign}{int(degrees):02d}° {int(minutes):02d}' {int(seconds):02d}\""
 
 
 def load_session_framing(conn, session_id):
@@ -2438,7 +2422,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             QMessageBox.critical(self, "Error", f"Couldn't save the framing: {e}")
             return
         self.session_id = session_id
-        _refresh_session_manager()
+        refresh_open("SessionManagerWindow", "_load_sessions")
         QMessageBox.information(
             self, "Framing Saved",
             f"Saved to the {row[0]} session on {row[1]}.\n\n"
@@ -3276,7 +3260,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
                                     f"{text} isn't in the catalogs.\n\nLooking it up on SIMBAD needs the internet. "
                                     f"{OFFLINE_NOTE}")
             return
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         if not settings.value("simbad_lookup_on_search_failure", True, type=bool):
             QMessageBox.information(self, "Not Found",
                                     f"{text} isn't in the catalogs.\n\nLooking it up on SIMBAD is turned off "
@@ -3361,17 +3345,6 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             self.current_fov = self._fit_fov()
             self._go_to_target(self.current_fov)
             self._push_sky()
-
-
-def _refresh_session_manager():
-    """Reload an open Session Manager's list (a new session, or a framing saved)."""
-    from PySide6.QtWidgets import QApplication
-    for widget in QApplication.topLevelWidgets():
-        if type(widget).__name__ == "SessionManagerWindow" and hasattr(widget, "_load_sessions"):
-            try:
-                widget._load_sessions()
-            except Exception as e:
-                logger.debug(f"Could not refresh the Session Manager: {e}")
 
 
 class SaveFramingDialog(QDialog):

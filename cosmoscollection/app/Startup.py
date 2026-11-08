@@ -1,4 +1,5 @@
-"""App startup: command-line mode or the GUI (splash, crash log, pre-warm, main window)."""
+"""App startup: splash, crash log, pre-warm, main window. (The command line
+doesn't come here - main.py sends it to cosmoscollection/cli.)"""
 
 import faulthandler
 import logging
@@ -6,20 +7,48 @@ import os
 import sys
 import threading
 
-from PySide6.QtCore import QCoreApplication, QSettings, QTimer, Qt
+from PySide6.QtCore import QCoreApplication, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from cosmoscollection.app.StartupLoadingDialog import StartupLoadingDialog
+from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.core.ResourceManager import ResourceManager
 from cosmoscollection.ui.Theme import apply_theme
 
-from cosmoscollection.app.CommandLine import parse_cli_arguments, run_cli_command
-from cosmoscollection.app.DSOData import InitialDataLoadWorker
+from cosmoscollection.app.DSOData import load_all_dso_data
 from cosmoscollection.app.MainWindow import MainWindow
 
 logger = logging.getLogger(__name__)
+
+
+class InitialDataLoadWorker(QThread):
+    """Loads the whole DSO catalog on startup without blocking the UI.
+
+    A single query takes well under a second for the full catalog, so everything
+    is loaded up front and filtering/sorting happen in memory."""
+    data_loaded = Signal(list, list)  # dso_data, catalogs
+    load_failed = Signal(str)  # error message
+
+    def run(self):
+        conn = None
+        try:
+            import sqlite3
+            from cosmoscollection.core.ResourceManager import attach_update_catalogs
+
+            conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+            attach_update_catalogs(conn)
+            dso_data, catalogs = load_all_dso_data(conn)
+            logger.debug(f"Loaded {len(dso_data)} DSOs in background thread")
+            self.data_loaded.emit(dso_data, catalogs)
+
+        except Exception as e:
+            logger.error(f"Error loading initial data in background: {e}", exc_info=True)
+            self.load_failed.emit(str(e))
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 # Import astroquery at module level so PyInstaller detects it
@@ -42,17 +71,7 @@ except ImportError:
 
 
 def main():
-    """Start the app: run a command-line command if one was given, otherwise the GUI."""
-    # Parse CLI arguments first
-    cli_args, remaining_args = parse_cli_arguments()
-
-    # Check if a CLI command was requested
-    cli_result = run_cli_command(cli_args)
-    if cli_result is not None:
-        # A CLI command was run, exit with appropriate code
-        sys.exit(0 if cli_result else 1)
-
-    # No CLI command - continue with GUI startup
+    """Start the app."""
     # (QTWEBENGINE_CHROMIUM_FLAGS is already set by Bootstrap.py, imported first.)
 
     # Initialize QtWebEngine BEFORE QApplication: it needs shared OpenGL contexts, which
@@ -128,7 +147,7 @@ def main():
 
     # Configure file logging if enabled (must be after QApplication for QSettings to work on Windows)
     try:
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         if settings.value("enable_logfile", False, type=bool):
             from logging.handlers import RotatingFileHandler
             log_dir = ResourceManager.get_data_dir()

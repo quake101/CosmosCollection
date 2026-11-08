@@ -26,7 +26,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings, QByteArray, QPointF, QRectF, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QByteArray, QPointF, QRectF, QSize
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QLabel, QGroupBox, QProgressBar, QComboBox, QFrame,
@@ -38,10 +38,12 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QIcon, QColor
 
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
+from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Formatting import format_duration
 from cosmoscollection.imaging.AnnotationOverlay import (AnnotationData, WCSTransform, paint_annotations, saved_annotation_layers,
                                screen_name_px, stars_in_view)
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
-from cosmoscollection.ui.WindowLifetime import release_on_close
+from cosmoscollection.ui.WindowLifetime import keep_alive_until_finished, release_on_close
 from cosmoscollection.ui.Theme import (
     COLORS, adapt_color, chart_background, chart_color, chart_font_size, font_px, theme_manager,
     themed_style,
@@ -50,16 +52,6 @@ from cosmoscollection.ui.TimeFormatHelper import format_time
 
 # Set up logging
 logger = logging.getLogger(__name__)
-
-# Threads that have to outlive a stop request or their window. Dropping the last
-# reference to a running QThread destroys it mid-run, which aborts the whole app.
-_running_threads = set()
-
-
-def keep_alive_until_finished(thread):
-    """Hold a reference to a running QThread until it finishes."""
-    _running_threads.add(thread)
-    thread.finished.connect(lambda: _running_threads.discard(thread))
 
 
 def skip_zero_quality(spin):
@@ -159,13 +151,6 @@ def _format_timespan(text):
     return f"{sign or ''}{hours}:{minutes}:{seconds}"
 
 
-def _format_hours(hours):
-    """Turn fractional hours into '2h 35m'."""
-    total_minutes = max(0, round(hours * 60))
-    h, m = divmod(total_minutes, 60)
-    return f"{h}h {m}m" if h else f"{m}m"
-
-
 def _format_number(value):
     """Drop a trailing .0 so 300.0 reads as 300."""
     return f"{value:g}" if isinstance(value, float) else str(value)
@@ -188,7 +173,7 @@ def sequence_entry_details(entry, kind):
     elif kind == 'trigger':
         time_to_flip = entry.get('TimeToFlip')
         if isinstance(time_to_flip, (int, float)):
-            parts.append(f"Flip in {_format_hours(time_to_flip)}" if time_to_flip > 0 else "Flip due")
+            parts.append(f"Flip in {format_duration(max(0.0, time_to_flip) * 3600)}" if time_to_flip > 0 else "Flip due")
         if isinstance(entry.get('TargetDrift'), (int, float)):
             drift = entry.get('Drift')
             drift_text = f"{drift:.2f}" if isinstance(drift, (int, float)) else "--"
@@ -1419,7 +1404,7 @@ class CaptureSettingsDialog(QDialog):
 
     def _load_settings(self):
         """Load saved capture settings."""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         self.duration_spinbox.setValue(settings.value("capture_duration", 1.0, type=float))
         self.gain_spinbox.setValue(settings.value("capture_gain", -1, type=int))
         self.image_type_combo.setCurrentText(settings.value("capture_image_type", "SNAPSHOT", type=str))
@@ -1427,7 +1412,7 @@ class CaptureSettingsDialog(QDialog):
 
     def _save_settings(self):
         """Save capture settings."""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         settings.setValue("capture_duration", self.duration_spinbox.value())
         settings.setValue("capture_gain", self.gain_spinbox.value())
         settings.setValue("capture_image_type", self.image_type_combo.currentText())
@@ -1546,7 +1531,7 @@ class SlewDialog(QDialog):
 
     def _load_settings(self):
         """Load saved slew coordinates."""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         self.ra_h_spinbox.setValue(settings.value("slew_ra_h", 0, type=int))
         self.ra_m_spinbox.setValue(settings.value("slew_ra_m", 0, type=int))
         self.ra_s_spinbox.setValue(settings.value("slew_ra_s", 0.0, type=float))
@@ -1557,7 +1542,7 @@ class SlewDialog(QDialog):
 
     def _save_settings(self):
         """Save slew coordinates."""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         settings.setValue("slew_ra_h", self.ra_h_spinbox.value())
         settings.setValue("slew_ra_m", self.ra_m_spinbox.value())
         settings.setValue("slew_ra_s", self.ra_s_spinbox.value())
@@ -2713,7 +2698,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
     def _restore_settings(self):
         """Restore saved dock layout, refresh rate, and image quality settings."""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
 
         # Restore image quality/size settings (suppress re-fetch during restore)
         self._restoring_settings = True
@@ -2797,7 +2782,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
 
     def _save_settings(self):
         """Save dock layout and refresh rate."""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
 
         # Only save dock state if docks are properly attached to the window
         camera_area = self.dockWidgetArea(self.camera_dock)
@@ -3626,16 +3611,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                         self._total_integration_by_target[(target, filter_name)] = status['calculated_integration']
                     total_secs = self._total_integration_by_target.get((target, filter_name))
                     if total_secs:
-                        if total_secs >= 3600:
-                            h = int(total_secs // 3600)
-                            m = int((total_secs % 3600) // 60)
-                            info_text += f" | Int: {h}h {m}m"
-                        elif total_secs >= 60:
-                            m = int(total_secs // 60)
-                            s = int(total_secs % 60)
-                            info_text += f" | Int: {m}m {s}s"
-                        else:
-                            info_text += f" | Int: {int(total_secs)}s"
+                        info_text += f" | Int: {format_duration(total_secs)}"
                 self.livestack_info_label.setText(info_text)
             elif not self._current_livestack_pixmap:
                 self.livestack_info_label.setText("Live stack active")

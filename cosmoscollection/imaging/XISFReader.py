@@ -95,7 +95,7 @@ def read_xisf_pixels(file_path, progress=None):
     the file's sampleFormat and values in their native (unnormalized) range -
     the same shape/range convention ImageLoader.stretch_array_to_qimage()
     already expects from the existing FITS decode path. progress: called as
-    the pixel data is read (see ImageLoader.read_file_bytes).
+    the pixel data is read (see ImageArrays.read_file_bytes).
     """
     root, image_el, ns = read_xisf_xml(file_path)
     if image_el is None:
@@ -135,7 +135,7 @@ def read_xisf_pixels(file_path, progress=None):
     bytes_per_sample = np.dtype(dtype).itemsize
     expected_size = width * height * channels * bytes_per_sample
 
-    from cosmoscollection.imaging.ImageLoader import read_file_bytes
+    from cosmoscollection.imaging.ImageArrays import read_file_bytes
     raw = read_file_bytes(file_path, progress, offset, block_size)
 
     raw = _decompress(raw, compression, expected_size)

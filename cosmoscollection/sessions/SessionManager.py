@@ -12,9 +12,9 @@ import threading
 from collections import Counter
 from datetime import datetime, date as date_cls, timedelta
 
-from PySide6.QtCore import (Qt, QDate, QDateTime, QEvent, QTime, QTimer, QPoint, QSettings, Signal, QThread,
-                            QStringListModel, QUrl)
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QPen
+from PySide6.QtCore import (Qt, QDate, QDateTime, QEvent, QTime, QTimer, QPoint, Signal, QThread,
+                            QStringListModel)
+from PySide6.QtGui import QColor, QCursor, QFont, QPen
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
@@ -27,9 +27,12 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QStyledItemDelegate)
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.core.UrlOpener import show_in_folder
+from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Formatting import format_dec, format_duration, format_exposure, format_ra
 from cosmoscollection.catalog.DSONames import SESSION_COMMON_NAMES_SETTING, display_name, suggestion_names
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
-from cosmoscollection.ui.WindowLifetime import release_on_close, window_is_open
+from cosmoscollection.ui.WindowLifetime import release_on_close, retire_thread, window_is_open
 from cosmoscollection.ui.TimeFormatHelper import format_time
 from cosmoscollection.ui.Theme import COLORS, font_px, font_size, themed_style
 from cosmoscollection.sessions import MountDetection
@@ -569,7 +572,7 @@ class SessionFormWidget(QWidget):
     def _on_common_name_toggled(self, checked):
         """Switch the scanned name to/from its common-name form (unless it's been
         retyped) and remember the choice"""
-        QSettings("CosmosCollection", "CosmosCollection").setValue(SESSION_COMMON_NAMES_SETTING, checked)
+        app_settings().setValue(SESSION_COMMON_NAMES_SETTING, checked)
         if self._scanned_names and self.name_edit.text().strip() in self._scanned_names:
             self.name_edit.setText(self._scanned_names[1] if checked else self._scanned_names[0])
 
@@ -582,7 +585,7 @@ class SessionFormWidget(QWidget):
                 # Offer the common name, as last chosen
                 self._scanned_names = (dso_name, named)
                 self.common_name_check.blockSignals(True)
-                self.common_name_check.setChecked(QSettings("CosmosCollection", "CosmosCollection").value(
+                self.common_name_check.setChecked(app_settings().value(
                     SESSION_COMMON_NAMES_SETTING, True, type=bool))
                 self.common_name_check.blockSignals(False)
                 self.common_name_check.setVisible(True)
@@ -1238,20 +1241,6 @@ class LinkTargetDialog(WindowPositionMixin, QDialog):
         self.accept()
 
 
-def format_duration(seconds):
-    """'2h 05m', '45m', '30s' - integration times read better than decimal hours."""
-    seconds = float(seconds or 0)
-    if seconds < 60:
-        return f"{seconds:.0f}s"
-    total_minutes = int(round(seconds / 60.0))
-    hours, minutes = divmod(total_minutes, 60)
-    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
-
-
-def format_exposure(exposure_seconds):
-    return f"{float(exposure_seconds or 0):g}s"
-
-
 def dropped_sub_paths(mime_data):
     """Local folders and FITS/XISF files in a drag's mime data (empty if none)."""
     if not mime_data.hasUrls():
@@ -1815,7 +1804,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
 
     def _refresh_framing(self):
         """The saved framing, its panels and how many subs each has."""
-        from cosmoscollection.planning.FOVSimulator import framing_summary, load_session_framing, match_panels, format_ra, format_dec
+        from cosmoscollection.planning.FOVSimulator import framing_summary, load_session_framing, match_panels
         import json
         subs = []
         try:
@@ -1888,7 +1877,6 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
 
     def _panels_text(self, separator):
         lines = [separator.join(("Panel", "Name", "RA (deg)", "Dec (deg)", "RA", "Dec", "Rotation (deg)"))]
-        from cosmoscollection.planning.FOVSimulator import format_ra, format_dec
         for panel in self._framing_panels():
             lines.append(separator.join((str(panel["number"]), panel["name"], f"{panel['ra']:.6f}",
                                          f"{panel['dec']:.6f}", format_ra(panel["ra"]), format_dec(panel["dec"]),
@@ -1998,7 +1986,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         from cosmoscollection.sessions.SessionFileCheck import FileCheckWorker
         if self._file_check is not None:
             self._file_check.stop()
-            _retire_thread(self._file_check)
+            retire_thread(self._file_check)
         if not self._files:
             return
         # No parent: a check still running when the dialog closes is retired, not destroyed
@@ -2554,7 +2542,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
             self._scan_thread.wait(30000)
         if self._file_check is not None:
             self._file_check.stop()
-            _retire_thread(self._file_check)
+            retire_thread(self._file_check)
         super().done(result)
 
     def _on_scan_finished(self, files, mounts):
@@ -2611,11 +2599,8 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
         menu.exec(self.files_table.viewport().mapToGlobal(position))
 
     def _open_folder(self, path):
-        folder = os.path.dirname(path)
-        if not os.path.isdir(folder):
-            QMessageBox.warning(self, "Folder Not Found", f"The folder no longer exists:\n{folder}")
-            return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        if not show_in_folder(path):
+            QMessageBox.warning(self, "Folder Not Found", f"The folder no longer exists:\n{os.path.dirname(path)}")
 
     def _review_light_quality(self):
         if not self._save_pending_before("Removing, moving or deleting frames in the review"):
@@ -3160,27 +3145,11 @@ class SessionMonthCalendar(QCalendarWidget):
         self.tooltip_label.raise_()
 
 
-# Superseded worker threads that are still running. quit() can't interrupt a
-# QThread whose work is in run() (no event loop), and wait()-ing for one froze
-# the UI until it finished - e.g. clicking a second session mid-fetch. So they're
-# abandoned instead: kept referenced here (PySide6 can hard-crash, natively, if a
-# QThread is garbage-collected while its OS thread is still running) with their
-# signals blocked so late results are dropped, and pruned once they've ended.
-_retired_threads = set()
-
-
-def _retire_thread(thread):
-    _retired_threads.difference_update([t for t in _retired_threads if not t.isRunning()])
-    if thread is not None and thread.isRunning():
-        thread.blockSignals(True)
-        _retired_threads.add(thread)
-
-
 class SharedWeatherFetch:
     """At most one WeatherWorker per location, shared by the calendar's weather
     stripe and the details panel - selecting a session used to start two
     identical fetches. A running worker is referenced here until it ends (see
-    _retired_threads for why), and its result is cached before callbacks run."""
+    WindowLifetime.retire_thread for why), and its result is cached before callbacks run."""
 
     _workers = {}  # (lat, lon) rounded -> running WeatherWorker
 
@@ -3264,7 +3233,7 @@ class SessionCalendarWidget(QWidget):
             "not just the selected session's.\n\n"
             "Visibility and weather still follow the selected session."
         )
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         self.show_all_checkbox.setChecked(settings.value(self.SHOW_ALL_SETTING, False, type=bool))
         self.show_all_checkbox.toggled.connect(self._on_show_all_toggled)
         row.addWidget(self.show_all_checkbox)
@@ -3293,11 +3262,11 @@ class SessionCalendarWidget(QWidget):
         return row
 
     def _load_month_count(self):
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         return max(1, min(3, settings.value(self.MONTH_COUNT_SETTING, 1, type=int)))
 
     def _save_month_count(self, count):
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         settings.setValue(self.MONTH_COUNT_SETTING, count)
 
     def _update_legend(self):
@@ -3305,7 +3274,7 @@ class SessionCalendarWidget(QWidget):
         self.legend_label.setText(f"Background: DSO visibility • Top stripe: weather • Dot: {dots}")
 
     def _on_show_all_toggled(self, checked):
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         settings.setValue(self.SHOW_ALL_SETTING, checked)
         self._update_legend()
         self.refresh_session_markers()
@@ -3473,7 +3442,7 @@ class SessionCalendarWidget(QWidget):
 
         start_date, end_date = self._display_range()
 
-        _retire_thread(self._visibility_thread)
+        retire_thread(self._visibility_thread)
         self._visibility_thread = SessionMonthlyVisibilityThread(
             session.get("ra_deg"), session.get("dec_deg"), session.get("dso_name"),
             session.get("location_lat"), session.get("location_lon"), session.get("location_timezone"),
@@ -4137,7 +4106,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         header = f"<b>Tonight</b> ({visibility_date}):" if showing_tonight else f"On {visibility_date}:"
         session_id = session.get("id")
 
-        _retire_thread(self._visibility_thread)
+        retire_thread(self._visibility_thread)
 
         # Runs off the GUI thread - the first calculation per app run can otherwise
         # take several seconds (see VisibilityCalcThread) and would freeze the whole
@@ -4373,7 +4342,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
 
         # Processing apps are listed only when enabled under Settings → Integrations.
         processing_apps = [app for app in (handoff.PIXINSIGHT, handoff.SIRIL)
-                           if QSettings("CosmosCollection", "CosmosCollection")
+                           if app_settings()
                            .value(f"{app}_integration_enabled", False, type=bool)]
         if processing_apps:
             processing_menu = menu.addMenu("Processing")
@@ -4553,12 +4522,12 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
     def _save_column_visibility(self):
         hidden = [str(col) for col in range(self.sessions_table.columnCount())
                   if self.sessions_table.isColumnHidden(col)]
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         settings.setValue(self.COLUMNS_SETTING, ",".join(hidden))
 
     def _save_column_widths(self):
         """Remember the column widths (a hidden column keeps its last saved width)."""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         saved = self._saved_column_widths()
         widths = []
         for col in range(self.sessions_table.columnCount()):
@@ -4569,7 +4538,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         settings.setValue(self.COLUMN_WIDTHS_SETTING, ",".join(str(w) for w in widths))
 
     def _saved_column_widths(self):
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         saved = settings.value(self.COLUMN_WIDTHS_SETTING, "", type=str)
         return [int(part) if part.strip().isdigit() else 0 for part in saved.split(",")] if saved else []
 
@@ -4582,7 +4551,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         return any(width > 0 for width in widths)
 
     def _apply_saved_column_visibility(self):
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         saved = settings.value(self.COLUMNS_SETTING, "", type=str)
         if not saved:
             return

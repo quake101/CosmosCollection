@@ -70,6 +70,17 @@ def _coerce_fits_value(raw):
         return raw
 
 
+def to_float(value):
+    """A header value as a float, or None (missing, text, NaN or infinite)."""
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
 def _clean_str(value):
     if value is None:
         return None

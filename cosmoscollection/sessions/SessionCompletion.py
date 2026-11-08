@@ -13,7 +13,7 @@ import logging
 from collections import Counter
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QThread, Signal, QProcess, QProcessEnvironment, QUrl, QTimer, QSettings
+from PySide6.QtCore import Qt, QThread, Signal, QProcess, QProcessEnvironment, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QRadioButton, QButtonGroup, QGroupBox, QCheckBox, QLineEdit, QComboBox, QSpinBox,
@@ -21,12 +21,16 @@ from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, 
                                QListWidgetItem, QProgressDialog, QGridLayout, QWidget, QAbstractItemView)
 
 from cosmoscollection.sessions import ProcessingHandoff as handoff
+from cosmoscollection.core.UrlOpener import show_in_folder
+from cosmoscollection.ui.WindowLifetime import retire_thread
+from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.imaging import LightQualityReview
 from cosmoscollection.sessions import SessionObservations
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.Theme import COLORS, font_size, themed_style
-from cosmoscollection.sessions.SessionManager import format_duration, _rollback, _retire_thread
+from cosmoscollection.sessions.SessionManager import _rollback
+from cosmoscollection.core.Formatting import format_duration
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +48,6 @@ def _format_clock(seconds):
     hours, rest = divmod(seconds, 3600)
     minutes, secs = divmod(rest, 60)
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
-
-
-def _open_folder(path):
-    from cosmoscollection.core.UrlOpener import open_url
-    open_url(QUrl.fromLocalFile(path))
 
 
 class StageWorker(QThread):
@@ -344,7 +343,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         frames added from folders in this dialog (those aren't in the session)."""
         old = self.frames
         if self._frame_check is not None:
-            _retire_thread(self._frame_check)
+            retire_thread(self._frame_check)
             self._frame_check = None
         self._missing = set()
         self.missing_label.hide()
@@ -365,7 +364,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
     def done(self, result):
         # Never let the frame-check thread be garbage-collected mid-run with the dialog.
         if self._frame_check is not None:
-            _retire_thread(self._frame_check)
+            retire_thread(self._frame_check)
         super().done(result)
 
     def _summary_text(self):
@@ -508,7 +507,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
         if self.lights_combo.count():
             wanted = self.lights_combo.currentData()
         else:
-            saved = QSettings("CosmosCollection", "CosmosCollection").value(
+            saved = app_settings().value(
                 self.LIGHT_CHOICE_SETTING, LQR.LIGHTS_ALL, type=str)
             wanted = self._requested_light_choice or saved
         every = {p for paths in self._all_lights.values() for p in paths} - self._missing
@@ -585,7 +584,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
     def _add_calibration_folder(self, kind):
         # Calibration frames usually live in a library folder, so start where the
         # last folder of this kind was picked (e.g. .../_Darks/300s).
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         setting_key = f"last_calibration_folder_{kind.lower()}"
         last_folder = settings.value(setting_key, "", type=str)
         start = last_folder if last_folder and os.path.isdir(last_folder) else os.path.expanduser("~")
@@ -614,7 +613,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
                     CHOICE_GALLERY: "gallery", CHOICE_NOTHING: "nothing"}
 
     def _restore_choices(self):
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         if self._fixed_app:
             choice = next(c for c, a in self._app_for_choice.items() if a == self._fixed_app)
             self.choice_group.button(choice).setChecked(True)
@@ -635,7 +634,7 @@ class SessionCompletionDialog(WindowPositionMixin, QDialog):
             self.target_checkbox.setChecked(settings.value(self.MARK_TARGET_SETTING, True, type=bool))
 
     def _save_choices(self):
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         if not self._fixed_app:  # a menu's Processing action isn't a completion choice
             settings.setValue(self.CHOICE_SETTING, self.CHOICE_NAMES[self.choice_group.checkedId()])
         settings.setValue(self.RUN_NOW_SETTING, self.run_now_checkbox.isChecked())
@@ -985,7 +984,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
         layout.addWidget(self.stages_list, 1)
 
         self.output_checkbox = QCheckBox("Show Siril output")
-        self.output_checkbox.setChecked(QSettings("CosmosCollection", "CosmosCollection")
+        self.output_checkbox.setChecked(app_settings()
                                         .value(self.SHOW_OUTPUT_SETTING, False, type=bool))
         self.output_checkbox.toggled.connect(self._on_output_toggled)
         layout.addWidget(self.output_checkbox)
@@ -1018,7 +1017,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
 
         buttons = QHBoxLayout()
         folder_btn = QPushButton("Open Workspace Folder")
-        folder_btn.clicked.connect(lambda: _open_folder(self.workdir))
+        folder_btn.clicked.connect(lambda: show_in_folder(self.workdir))
         buttons.addWidget(folder_btn)
         buttons.addStretch()
         self.stop_btn = QPushButton("Stop")
@@ -1066,7 +1065,7 @@ class SirilRunDialog(WindowPositionMixin, QDialog):
 
     def _on_output_toggled(self, checked):
         self.log_view.setVisible(checked)
-        QSettings("CosmosCollection", "CosmosCollection").setValue(self.SHOW_OUTPUT_SETTING, checked)
+        app_settings().setValue(self.SHOW_OUTPUT_SETTING, checked)
 
     def _append(self, text):
         self.log_view.appendPlainText(text.rstrip("\n"))

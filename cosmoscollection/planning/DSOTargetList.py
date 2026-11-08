@@ -10,7 +10,7 @@ import re
 import calendar
 from dataclasses import dataclass, field
 from datetime import datetime
-from PySide6.QtCore import Qt, QTimer, Signal, QStringListModel, QSettings, QThread, QTime
+from PySide6.QtCore import Qt, QTimer, Signal, QStringListModel, QThread, QTime
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
@@ -21,12 +21,23 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
 from PySide6.QtGui import QFont, QColor
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
-from cosmoscollection.catalog.DSONames import designation_candidates, display_name, suggestion_names
+from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Formatting import format_dec, format_ra
+from cosmoscollection.catalog.DSONames import (designation_candidates, display_name, preferred_designation,
+                                              suggestion_names, type_code,
+                                              type_name)
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close, window_is_open
 from cosmoscollection.ui.Theme import COLORS, font_px, theme_manager, themed_style, themed_text
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
 from cosmoscollection.sessions import SessionFileScanner
+# The Target List's rows (moved to TargetRows.py, which has no UI imports; kept
+# importable from here)
+from cosmoscollection.planning.TargetRows import (  # noqa: F401
+    SAME_POSITION_DEG, TARGET_COLUMNS, TARGET_PRIORITIES, TARGET_STATUSES, TargetListIndex,
+    _standard_name, catalog_object_ids, catalog_object_ids_many, delete_target,
+    find_existing_target, has_position, load_target_rows, name_key)
+from cosmoscollection.planning.Observer import load_observer, local_zone  # noqa: F401
 import logging
 
 # Set up logging
@@ -252,7 +263,7 @@ class AddTargetDialog(QDialog):
         # (editing puts the saved name back afterwards)
         self.name_edit.setText(display_name(self.dso_data.get("name", ""), self.dso_data.get("dsodetailid"),
                                             self.dso_data.get("designations")))
-        self.type_edit.setText(self.dso_data.get("dso_type", ""))
+        self.type_edit.setText(type_name(self.dso_data.get("dso_type")))
         self.constellation_edit.setText(self.dso_data.get("constellation", ""))
 
         # Handle numeric fields - only set if value is not None
@@ -375,20 +386,7 @@ class AddTargetDialog(QDialog):
         if not data:
             return
 
-        # Type mapping (same as DSOTargetListWindow._get_friendly_type_name)
-        type_mapping = {
-            "GALXY": "Galaxy", "DRKNB": "Dark Nebula", "OPNCL": "Open Cluster",
-            "PLNNB": "Planetary Nebula", "BRTNB": "Bright Nebula",
-            "SNREM": "Supernova Remnant", "GALCL": "Galaxy Cluster",
-            "GLOCL": "Globular Cluster", "CL+NB": "Cluster + Nebula",
-            "GX+DN": "Galaxy + Dark Nebula", "ASTER": "Asterism",
-            "2STAR": "Double Star", "3STAR": "Triple Star",
-            "4STAR": "Quadruple Star", "1STAR": "Single Star",
-            "QUASR": "Quasar", "NONEX": "Non-existent",
-        }
-
-        dsotype = data.get("dsotype", "")
-        self.type_edit.setText(type_mapping.get(dsotype, dsotype or ""))
+        self.type_edit.setText(type_name(data.get("dsotype")))
         self.constellation_edit.setText(data.get("constellation") or "")
 
         ra = data.get("ra")
@@ -431,7 +429,7 @@ class AddTargetDialog(QDialog):
             # Create target data
             target_data = {
                 "name": self.name_edit.text().strip(),
-                "dso_type": self.type_edit.text().strip(),
+                "dso_type": type_code(self.type_edit.text()) or self.type_edit.text().strip(),
                 "constellation": self.constellation_edit.text().strip(),
                 "ra_deg": safe_float(self.ra_edit.text()),
                 "dec_deg": safe_float(self.dec_edit.text()),
@@ -606,8 +604,8 @@ def _process_dso_query_result(result, target_data):
 
         return {
             "name": primary_designation,
-            "ra": _format_ra_for_display(ra),
-            "dec": _format_dec_for_display(dec),
+            "ra": format_ra(ra),
+            "dec": format_dec(dec),
             "ra_deg": ra,
             "dec_deg": dec,
             "magnitude": magnitude,
@@ -633,27 +631,6 @@ def _process_dso_query_result(result, target_data):
         return None
 
 
-def _format_ra_for_display(ra_deg):
-    """Format RA in degrees to HMS format for display"""
-    ra_hours = ra_deg / 15.0
-    ra_h = int(ra_hours)
-    ra_remaining = (ra_hours - ra_h) * 60
-    ra_m = int(ra_remaining)
-    ra_s = (ra_remaining - ra_m) * 60
-    return f"{ra_h:02d}h{ra_m:02d}m{ra_s:05.2f}s"
-
-
-def _format_dec_for_display(dec_deg):
-    """Format Dec in degrees to DMS format for display"""
-    dec_sign = '-' if dec_deg < 0 else '+'
-    dec_abs = abs(dec_deg)
-    dec_d = int(dec_abs)
-    dec_remaining = (dec_abs - dec_d) * 60
-    dec_m = int(dec_remaining)
-    dec_s = (dec_remaining - dec_m) * 60
-    return f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
-
-
 # ---- Duplicate entries --------------------------------------------------------
 # Finds Target List entries that are probably the same object, suggests how to
 # merge them, and performs merges/deletes (moving linked sessions along). Also
@@ -668,16 +645,8 @@ def _format_dec_for_display(dec_deg):
 #   are genuinely separate objects (NGC 2244 inside the Rosette), so a possible
 #   group can be dismissed; it's flagged again only if another entry joins it.
 
-# Order from least to most advanced / important (merges keep the highest)
-TARGET_STATUSES = ["Not Observed", "Observed", "Imaged", "Completed"]
-TARGET_PRIORITIES = ["Low", "Medium", "High", "Urgent"]
-
 POSSIBLE_MAX_SEPARATION_ARCMIN = 2.0
 DISMISSED_SETTING = "target_duplicates_dismissed"
-
-TARGET_COLUMNS = ("id", "name", "dso_type", "constellation", "ra_deg", "dec_deg", "magnitude",
-                  "size_info", "priority", "status", "best_months", "notes", "date_added",
-                  "date_observed", "created_date", "telescope_id")
 
 
 @dataclass
@@ -689,88 +658,6 @@ class DuplicateGroup:
     @property
     def ids(self):
         return frozenset(t["id"] for t in self.targets)
-
-
-# ---------------------------------------------------------------- name rules
-
-def name_key(name):
-    """Comparable key for a target name: spacing, punctuation and parenthetical
-    common names ignored ('M 17', 'M17', 'm-17 (Omega)' all give 'M17')."""
-    return SessionFileScanner.normalize_object_name(name)
-
-
-_ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-
-def catalog_object_ids(cursor, name):
-    """The catalog objects (dsodetail ids) a target name designates; empty if
-    the name isn't a known designation."""
-    return catalog_object_ids_many(cursor, [name])[name]
-
-
-def catalog_object_ids_many(cursor, names):
-    """{name: catalog_object_ids(name)} for many names in one pass over the
-    catalog - cataloguenr is a view over the update catalogs that no index
-    serves case-insensitively, so each lookup scans it all."""
-    def fold(text):  # Case folded as COLLATE NOCASE does it (ASCII letters only)
-        return (text or "").translate(_ASCII_UPPER)
-
-    wanted = {}  # (CATALOGUE, DESIGNATION) -> the names that could be it
-    for name in names:
-        for catalogue, designation in designation_candidates(name):
-            wanted.setdefault((fold(catalogue), fold(designation)), set()).add(name)
-    ids = {name: set() for name in names}
-    designations = list({designation for _, designation in wanted})
-    try:
-        for start in range(0, len(designations), 500):
-            chunk = designations[start:start + 500]
-            cursor.execute(f"""
-                SELECT dsodetailid, catalogue, designation FROM cataloguenr
-                WHERE designation COLLATE NOCASE IN ({",".join("?" * len(chunk))})
-            """, chunk)
-            for obj, catalogue, designation in cursor.fetchall():
-                for name in wanted.get((fold(catalogue), fold(designation)), ()):
-                    ids[name].add(obj)
-    except Exception as e:
-        logger.debug(f"Catalog lookup failed for {len(names)} names: {e}")
-    return {name: frozenset(found) for name, found in ids.items()}
-
-
-def _standard_name(cursor, name):
-    """The catalog's own spelling of a target's designation ('M17' -> 'M 17'), or None."""
-    for catalogue, designation in designation_candidates(name):
-        cursor.execute("""
-            SELECT catalogue || ' ' || designation FROM cataloguenr
-            WHERE catalogue = ? COLLATE NOCASE AND designation = ? COLLATE NOCASE LIMIT 1
-        """, (catalogue, designation))
-        row = cursor.fetchone()
-        if row:
-            return row[0]
-    return None
-
-
-# ---------------------------------------------------------------- loading
-
-def load_target_rows(conn):
-    """All Target List rows as dicts (oldest first) and their linked session counts."""
-    cursor = conn.cursor()
-    cursor.execute(f"SELECT {', '.join(TARGET_COLUMNS)} FROM usertargetlist ORDER BY id")
-    targets = [dict(zip(TARGET_COLUMNS, row)) for row in cursor.fetchall()]
-    session_counts = {}
-    try:
-        cursor.execute("SELECT target_id, COUNT(*) FROM usersessions WHERE target_id IS NOT NULL GROUP BY target_id")
-        session_counts = dict(cursor.fetchall())
-    except Exception as e:
-        logger.debug(f"Couldn't count linked sessions: {e}")  # No sessions table yet
-    for target in targets:
-        target["session_count"] = session_counts.get(target["id"], 0)
-    return targets
-
-
-def has_position(target):
-    """Whether a target has real coordinates (the add dialog stores blanks as 0, 0)."""
-    ra, dec = target.get("ra_deg"), target.get("dec_deg")
-    return ra is not None and dec is not None and not (ra == 0 and dec == 0)
 
 
 # ---------------------------------------------------------------- detection
@@ -861,7 +748,7 @@ def find_duplicate_groups(conn, targets=None, dismissed=None):
 
 def load_dismissed():
     """Dismissed 'possible' groups, as frozensets of target ids."""
-    settings = QSettings("CosmosCollection", "CosmosCollection")
+    settings = app_settings()
     saved = settings.value(DISMISSED_SETTING, "", type=str) or ""
     dismissed = []
     for part in saved.split(";"):
@@ -875,7 +762,7 @@ def dismiss_group(group):
     """Remember that a group's entries are different objects."""
     dismissed = load_dismissed()
     dismissed.append(group.ids)
-    settings = QSettings("CosmosCollection", "CosmosCollection")
+    settings = app_settings()
     settings.setValue(DISMISSED_SETTING, ";".join(",".join(str(i) for i in sorted(d)) for d in dismissed))
 
 
@@ -971,91 +858,6 @@ def merge_targets(conn, keep_id, other_ids, merged):
     except Exception:
         conn.rollback()
         raise
-
-
-def delete_target(conn, target_id, move_sessions_to=None):
-    """Delete one entry; its linked sessions move to move_sessions_to (or are
-    unlinked). Returns the number of sessions moved."""
-    cursor = conn.cursor()
-    try:
-        moved = 0
-        try:
-            # Done here rather than left to ON DELETE SET NULL, which SQLite only
-            # enforces when foreign keys are switched on for the connection
-            cursor.execute("UPDATE usersessions SET target_id = ? WHERE target_id = ?",
-                           (move_sessions_to, target_id))
-            moved = cursor.rowcount if move_sessions_to is not None else 0
-        except Exception as e:
-            if "no such table" not in str(e):
-                raise
-        cursor.execute("DELETE FROM usertargetlist WHERE id = ?", (target_id,))
-        conn.commit()
-        return moved
-    except Exception:
-        conn.rollback()
-        raise
-
-
-# ---------------------------------------------------------------- prevention
-
-# A target within this of a catalog object's position is that object (an entry
-# added from the catalog keeps its coordinates), matching DSODetail's old check
-SAME_POSITION_DEG = 0.001
-
-
-class TargetListIndex:
-    """The Target List indexed for "is this object already on the list?"
-    checks - same name (ignoring case, spacing, punctuation and parenthetical
-    common names), another designation of the same catalog object, or
-    (optionally) the same position. Build once to check many objects."""
-
-    def __init__(self, conn, exclude_id=None):
-        self._cursor = conn.cursor()
-        self._cursor.execute("SELECT id, name, ra_deg, dec_deg FROM usertargetlist ORDER BY id")
-        self.entries = [{"id": row[0], "name": row[1], "ra_deg": row[2], "dec_deg": row[3]}
-                        for row in self._cursor.fetchall() if row[0] != exclude_id and row[1]]
-        self._exact, self._keys = {}, {}
-        objects = {}
-        entry_objects = catalog_object_ids_many(self._cursor, [entry["name"] for entry in self.entries])
-        for entry in self.entries:
-            self._exact.setdefault(entry["name"].strip().upper(), entry)
-            self._keys.setdefault(name_key(entry["name"]), entry)
-            for obj in entry_objects[entry["name"]]:
-                objects.setdefault(obj, entry)
-        # Every catalog designation of the listed objects ("NGC 6618" for M 17), so
-        # checking a name is a lookup rather than a catalog query per name
-        self._designations = {}
-        object_ids = list(objects)
-        for start in range(0, len(object_ids), 500):
-            chunk = object_ids[start:start + 500]
-            self._cursor.execute(f"""
-                SELECT dsodetailid, catalogue || ' ' || designation FROM cataloguenr
-                WHERE dsodetailid IN ({",".join("?" * len(chunk))})
-            """, chunk)
-            for obj, designation in self._cursor.fetchall():
-                self._designations.setdefault(name_key(designation), objects[obj])
-
-    def match(self, name, ra_deg=None, dec_deg=None):
-        """The entry that's the same object as name (and, if given, position), or None."""
-        name = (name or "").strip()
-        if name:
-            key = name_key(name)
-            entry = self._exact.get(name.upper()) or self._keys.get(key) or self._designations.get(key)
-            if entry:
-                return entry
-        if ra_deg is not None and dec_deg is not None and not (ra_deg == 0 and dec_deg == 0):
-            for entry in self.entries:
-                if (has_position(entry) and abs(entry["ra_deg"] - ra_deg) < SAME_POSITION_DEG
-                        and abs(entry["dec_deg"] - dec_deg) < SAME_POSITION_DEG):
-                    return entry
-        return None
-
-
-def find_existing_target(conn, name, ra_deg=None, dec_deg=None, exclude_id=None):
-    """The Target List entry that's the same object as name (or at the same
-    position, if given), as {'id', 'name', 'ra_deg', 'dec_deg'}; None if it isn't
-    on the list. exclude_id leaves out the entry being edited."""
-    return TargetListIndex(conn, exclude_id).match(name, ra_deg, dec_deg)
 
 
 # ================================================================ review dialog
@@ -1426,33 +1228,17 @@ class DuplicateReviewDialog(WindowPositionMixin, QDialog):
 # the column fills in. Targets below the location's custom horizon (or 0°) are
 # marked.
 
-# (key, label) for the "Direction at:" dropdown
-DIRECTION_MODES = (
-    ("now", "Now"),
-    ("dusk", "Dusk"),
-    ("midnight", "Midnight"),
-    ("dawn", "Dawn"),
-    ("night", "Tonight (dusk → dawn)"),
-    ("time", "Custom time"),
-    ("frame", "Custom time frame"),
-)
+from cosmoscollection.planning.NightTimes import (  # noqa: E402,F401
+    ASTRONOMICAL_TWILIGHT_DEG, DIRECTION_MODES, _twilight, compass_direction, compute_directions,
+    direction_cells, resolve_direction_times)
 DIRECTION_SETTING = "target_list_direction"  # "mode|at|from|to", times as HH:MM
 DIRECTION_DEFAULT = ("midnight", "22:00", "21:00", "01:00")
-ASTRONOMICAL_TWILIGHT_DEG = -18.0
 NOW_REFRESH_MS = 5 * 60 * 1000  # "Now" mode recalculates every 5 minutes
-
-_COMPASS_POINTS = ('N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
-                   'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW')
-
-
-def compass_direction(az):
-    """'NE' etc. for an azimuth in degrees."""
-    return _COMPASS_POINTS[int((az + 11.25) / 22.5) % 16]
 
 
 def load_direction_setting():
     """(mode, at, start, end) as saved for the Direction column."""
-    settings = QSettings("CosmosCollection", "CosmosCollection")
+    settings = app_settings()
     parts = (settings.value(DIRECTION_SETTING, "", type=str) or "").split("|")
     if len(parts) != 4 or parts[0] not in dict(DIRECTION_MODES):
         return DIRECTION_DEFAULT
@@ -1460,157 +1246,8 @@ def load_direction_setting():
 
 
 def save_direction_setting(mode, at, start, end):
-    settings = QSettings("CosmosCollection", "CosmosCollection")
+    settings = app_settings()
     settings.setValue(DIRECTION_SETTING, "|".join((mode, at, start, end)))
-
-
-def load_observer(conn):
-    """(lat, lon, timezone name or None) of the active location, or None."""
-    cursor = conn.cursor()
-    cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
-    row = cursor.fetchone()
-    if not row:
-        cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-        row = cursor.fetchone()
-    if not row or row[0] is None or row[1] is None:
-        return None
-    return row[0], row[1], row[2]
-
-
-def local_zone(tz_name):
-    """tzinfo for the location (zoneinfo, which unlike pytz doesn't scan every
-    zone file on first use); this computer's zone if unknown."""
-    from datetime import timezone as dt_timezone
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo(tz_name) if tz_name else datetime.now().astimezone().tzinfo
-    except Exception:
-        return datetime.now().astimezone().tzinfo or dt_timezone.utc
-
-
-def _twilight(location, noon_local, tz):
-    """(dusk, dawn) local datetimes of astronomical twilight in the night
-    following noon_local, and whether it gets that dark at all (if not, both
-    are the darkest moment)."""
-    import numpy as np
-    import astropy.units as u
-    from astropy.coordinates import AltAz, get_sun
-    from astropy.time import Time
-
-    times = Time(noon_local) + np.arange(0, 24 * 12 + 1) * 5 * u.min  # every 5 minutes
-    sun_alt = get_sun(times).transform_to(AltAz(obstime=times, location=location)).alt.deg
-    dark = sun_alt < ASTRONOMICAL_TWILIGHT_DEG
-    if dark.any():
-        first = int(np.argmax(dark))
-        last = len(dark) - 1 - int(np.argmax(dark[::-1]))
-        reaches_dark = True
-    else:
-        first = last = int(np.argmin(sun_alt))
-        reaches_dark = False
-    to_local = lambda t: t.to_datetime(timezone=tz)
-    return to_local(times[first]), to_local(times[last]), reaches_dark
-
-
-def resolve_direction_times(mode, at, start, end, location, tz, now=None):
-    """[(label, local datetime)] the Direction column is for - one time, or a
-    frame's start and end - and a note (e.g. no astronomical darkness).
-
-    "Tonight" is the current night until its dawn, then the coming one, so
-    during the day the presets plan ahead and after midnight they still mean
-    the night you're in.
-    """
-    from datetime import timedelta
-    now = now or datetime.now(tz)
-    if mode == "now":
-        return [("Now", now)], ""
-
-    today_noon = now.replace(hour=12, minute=0, second=0, microsecond=0)
-    noon = today_noon
-    if now < today_noon:
-        previous = today_noon - timedelta(days=1)
-        _dusk, dawn, _dark = _twilight(location, previous, tz)
-        if now < dawn:
-            noon = previous  # Still in last night (before its dawn)
-
-    def on_night(hhmm):
-        hours, minutes = (int(x) for x in hhmm.split(":"))
-        when = noon.replace(hour=hours, minute=minutes)
-        return when if when >= noon else when + timedelta(days=1)
-
-    note = ""
-    if mode in ("dusk", "dawn", "night"):
-        dusk, dawn, dark = _twilight(location, noon, tz)
-        if not dark:
-            note = "the sky doesn't get astronomically dark tonight - using the darkest moment"
-        if mode == "dusk":
-            return [("Dusk", dusk)], note
-        if mode == "dawn":
-            return [("Dawn", dawn)], note
-        return [("Dusk", dusk), ("Dawn", dawn)], note
-    if mode == "midnight":
-        return [("Midnight", noon + timedelta(hours=12))], ""
-    if mode == "time":
-        return [("At", on_night(at))], ""
-    first, last = on_night(start), on_night(end)
-    if last <= first:
-        last += timedelta(days=1)
-    return [("From", first), ("To", last)], ""
-
-
-def direction_cells(coords, times, location, horizon):
-    """Direction column (text, tooltip, below_throughout) for each of coords
-    (a SkyCoord array) at times [(label, local datetime)] - one time, or a
-    frame's start and end ("E → SE"). Shared with Best DSO Tonight.
-    """
-    from astropy.coordinates import AltAz
-    from astropy.time import Time
-
-    positions = []  # per time: (az array, alt array)
-    for _label, when in times:
-        altaz = coords.transform_to(AltAz(obstime=Time(when), location=location))
-        positions.append((altaz.az.deg, altaz.alt.deg))
-
-    horizon_word = "your horizon" if horizon is not None else "the horizon"
-    cells = []
-    for i in range(len(coords)):
-        parts, tips, below_flags = [], [], []
-        for (label, when), (az, alt) in zip(times, positions):
-            limit = float(horizon.altitude_at(az[i])) if horizon is not None else 0.0
-            below = alt[i] < limit
-            below_flags.append(below)
-            direction = compass_direction(az[i])
-            parts.append(f"{direction} (below)" if below else direction)
-            tip = f"{label} ({when:%H:%M}): {direction}, azimuth {az[i]:.0f}°, altitude {alt[i]:.0f}°"
-            tips.append(tip + (f" - below {horizon_word}" if below else ""))
-        if len(parts) > 1 and all(below_flags):
-            # Below throughout: say so once ("E → ESE (below)")
-            parts = [compass_direction(az[i]) for az, _alt in positions]
-            parts[-1] += " (below)"
-        cells.append((" → ".join(parts), "\n".join(tips), all(below_flags)))
-    return cells
-
-
-def compute_directions(targets, lat, lon, tz_name, horizon, mode, at, start, end):
-    """Direction column contents for every target.
-
-    targets: [(id, ra_deg, dec_deg)] with real coordinates.
-    Returns {'times': [(label, local datetime)], 'note': str,
-             'cells': {id: (text, tooltip, below_throughout)}}.
-    """
-    import numpy as np
-    import astropy.units as u
-    from astropy.coordinates import EarthLocation, SkyCoord
-
-    tz = local_zone(tz_name)
-    location = EarthLocation(lat=lat * u.deg, lon=lon * u.deg)
-    times, note = resolve_direction_times(mode, at, start, end, location, tz)
-    if not targets:
-        return {"times": times, "note": note, "cells": {}}
-
-    coords = SkyCoord(ra=np.array([t[1] for t in targets]) * u.deg,
-                      dec=np.array([t[2] for t in targets]) * u.deg)
-    cells = direction_cells(coords, times, location, horizon)
-    return {"times": times, "note": note, "cells": {t[0]: cell for t, cell in zip(targets, cells)}}
 
 
 class DirectionWorker(QThread):
@@ -2027,7 +1664,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         
         # Pre-populate with target data
         dialog.name_edit.setText(target_data.get("name", ""))
-        dialog.type_edit.setText(target_data.get("dso_type", ""))
+        dialog.type_edit.setText(type_name(target_data.get("dso_type")))
         dialog.constellation_edit.setText(target_data.get("constellation", ""))
 
         # Handle numeric fields - only set if value is not None
@@ -2303,7 +1940,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
 
             # Type - use friendly name
             dso_type = target.get("dso_type", "")
-            friendly_type = self._get_friendly_type_name(dso_type)
+            friendly_type = type_name(dso_type)
             self.targets_table.setItem(row, 1, QTableWidgetItem(friendly_type))
 
             # Constellation
@@ -2560,71 +2197,6 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         
         return ", ".join(ranges)
 
-    def _get_preferred_catalog_name(self, designations):
-        """Extract the most common/preferred catalog name from designations string
-
-        Priority: M > NGC > IC > others
-
-        Args:
-            designations: String of catalog designations (e.g., "M 42, NGC 1976, LBN 974")
-
-        Returns:
-            The preferred catalog name (e.g., "M 42")
-        """
-        if not designations:
-            return ""
-
-        # Split designations by comma
-        designation_list = [d.strip() for d in designations.split(',')]
-
-        # Priority order for catalogs
-        priority_catalogs = ['M', 'NGC', 'IC']
-
-        # Search for each priority catalog in order
-        for catalog in priority_catalogs:
-            for designation in designation_list:
-                # Check if this designation starts with the catalog name
-                if designation.startswith(catalog + ' '):
-                    return designation
-
-        # If no priority catalog found, return the first designation
-        return designation_list[0] if designation_list else ""
-
-    def _get_friendly_type_name(self, dso_type):
-        """Convert DSO type code to user-friendly name"""
-        type_mapping = {
-            "GALXY": "Galaxy",
-            "DRKNB": "Dark Nebula",
-            "OPNCL": "Open Cluster",
-            "PLNNB": "Planetary Nebula",
-            "BRTNB": "Bright Nebula",
-            "SNREM": "Supernova Remnant",
-            "GALCL": "Galaxy Cluster",
-            "GLOCL": "Globular Cluster",
-            "CL+NB": "Cluster + Nebula",
-            "GX+DN": "Galaxy + Dark Nebula",
-            "ASTER": "Asterism",
-            "2STAR": "Double Star",
-            "3STAR": "Triple Star",
-            "4STAR": "Quadruple Star",
-            "1STAR": "Single Star",
-            "QUASR": "Quasar",
-            "NONEX": "Non-existent",
-            "LMCCN": "LMC Cluster/Nebula",
-            "LMCDN": "LMC Dark Nebula",
-            "LMCGC": "LMC Globular Cluster",
-            "LMCOC": "LMC Open Cluster",
-            "SMCCN": "SMC Cluster/Nebula",
-            "SMCDN": "SMC Dark Nebula",
-            "SMCGC": "SMC Globular Cluster",
-            "SMCOC": "SMC Open Cluster"
-        }
-        return type_mapping.get(dso_type, dso_type)  # Return original if not found
-
-    def azimuth_to_direction(self, az):
-        """Convert azimuth to cardinal direction"""
-        return compass_direction(az)
-
     def _show_context_menu(self, position):
         """Show context menu when right-clicking on the table"""
         # Get the item at the clicked position
@@ -2815,7 +2387,8 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         """Add a target from DSO data (called from DSODetailWindow)"""
         # If designations are available, use the preferred catalog name
         if "designations" in dso_data and dso_data["designations"]:
-            preferred_name = self._get_preferred_catalog_name(dso_data["designations"])
+            preferred_name = preferred_designation(
+                [d.strip().split(" ", 1) for d in dso_data["designations"].split(",") if " " in d.strip()])
             if preferred_name:
                 dso_data["name"] = preferred_name
 
@@ -2896,7 +2469,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
 
             # Pre-populate with target data
             dialog.name_edit.setText(target_data.get("name", ""))
-            dialog.type_edit.setText(target_data.get("dso_type", ""))
+            dialog.type_edit.setText(type_name(target_data.get("dso_type")))
             dialog.constellation_edit.setText(target_data.get("constellation", ""))
 
             # Handle numeric fields - only set if value is not None

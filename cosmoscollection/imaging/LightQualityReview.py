@@ -9,14 +9,10 @@ modification time), so reopening the review only analyzes new or changed subs.
 """
 
 import os
-import json
 import math
 import time
-import queue
-import shutil
 import logging
-from collections import Counter, OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -27,9 +23,9 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.transforms import blended_transform_factory
 from matplotlib.widgets import SpanSelector
-from PySide6.QtCore import (Qt, QItemSelection, QItemSelectionModel, QPointF, QSettings, QThread, QTimer, QUrl,
+from PySide6.QtCore import (Qt, QItemSelection, QItemSelectionModel, QPointF, QThread, QTimer,
                             Signal)
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QGuiApplication, QImage, QPainter, QPixmap, QTransform
+from PySide6.QtGui import QColor, QCursor, QGuiApplication, QImage, QPainter, QPixmap, QTransform
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QWidget, QLabel,
                                QPushButton, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QSplitter, QGroupBox, QDoubleSpinBox, QProgressBar,
@@ -38,27 +34,28 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, Q
                                QToolTip, QFrame)
 
 from cosmoscollection.imaging import FrameQuality
+from cosmoscollection.core.UrlOpener import show_in_folder
+from cosmoscollection.ui.WindowLifetime import retire_thread
+from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.sessions import SessionFileScanner
-from cosmoscollection.sessions import SessionObservations
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.Theme import (COLORS, chart_background, chart_color, chart_font_size, font_size, themed_style,
                    theme_manager, tint)
-from cosmoscollection.sessions.SessionManager import format_duration, format_exposure, _retire_thread, _rollback
+from cosmoscollection.sessions.SessionManager import _rollback
+from cosmoscollection.core.Formatting import count_text, format_duration, format_exposure
+
+# Analyzing, the cache, grading, the stacking choices and moving/deleting frames
+# (moved to LightQuality.py, which has no window imports; kept importable from here)
+from cosmoscollection.imaging import LightQuality  # noqa: E402
+from cosmoscollection.imaging.LightQuality import (  # noqa: E402,F401
+    DEFAULT_TOP_PERCENT, KEEP_GRADES, LIGHT_CHOICE_LABELS, LIGHTS_ALL, LIGHTS_GOOD, LIGHTS_GOOD_MARGINAL,
+    LIGHTS_PICKED, LIGHTS_TOP, READ_AHEAD_BYTES, READ_THREADS, SETTINGS_PREFIX, THRESHOLDS, TOP_PERCENT_SETTING,
+    _RANKED_GRADES, _unused_path, analysis_workers, ensure_cache_table, grade_lights, grade_session_lights,
+    group_key, light_choice_label, load_cached, save_cached, save_top_percent, saved_grade_settings,
+    saved_top_percent, session_light_files, top_percent_lights)
 
 logger = logging.getLogger(__name__)
-
-def analysis_workers():
-    """Parallel file reads + analyses: Settings → Maximum Threads, the same
-    setting used for parallel work elsewhere in the app."""
-    settings = QSettings("CosmosCollection", "CosmosCollection")
-    default_threads = max(1, (os.cpu_count() or 4) - 2)
-    return max(1, min(settings.value("max_threads", default_threads, type=int), 128))
-
-READ_THREADS = 16                    # files read at once - waiting on a disk or network, not the CPU
-READ_AHEAD_BYTES = 512 * 1024 * 1024  # most file bytes held waiting for an analysis thread
-
-SETTINGS_PREFIX = "light_quality/"
 
 GRADE_COLOR_KEYS = {
     FrameQuality.GRADE_GOOD: 'success',
@@ -70,172 +67,6 @@ GRADE_COLOR_KEYS = {
 GRADE_SORT = {FrameQuality.GRADE_GOOD: 0, FrameQuality.GRADE_MARGINAL: 1, FrameQuality.GRADE_REJECT: 2,
               FrameQuality.GRADE_UNGRADED: 3, FrameQuality.GRADE_ERROR: 4}
 WAITING = "Waiting"
-
-# GradeSettings field, label, spin box prefix/suffix, range, step, decimals
-THRESHOLDS = [
-    ("flux_drop_pct", "Dimmer stars (clouds, haze)", "-", "%", 5, 95, 1, 0),
-    ("star_drop_pct", "Fewer stars (obstruction)", "-", "%", 10, 95, 1, 0),
-    ("fwhm_rise_pct", "Bigger stars (seeing, focus)", "+", "%", 5, 300, 1, 0),
-    ("eccentricity_rise", "More elongated (trailing, guiding)", "+", "", 0.02, 0.5, 0.01, 2),
-    ("outside_rise_pct", "Light outside star cores (guiding jumps, halos)", "+", "%", 10, 300, 5, 0),
-    ("background_rise_pct", "Brighter sky (moon, dawn)", "+", "%", 10, 500, 5, 0),
-    ("signal_drop_pct", "Less signal (moon, dawn, haze; 0 = off)", "-", "%", 0, 95, 1, 0),
-    ("trail_count", "Satellite trails in one frame (Marginal at, 0 = off)", "", "", 0, 50, 1, 0),
-]
-
-
-# ---- Cache ----------------------------------------------------------------------
-
-def ensure_cache_table(conn):
-    """Measurements are keyed by file path, so a sub attached to several sessions
-    is only analyzed once."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS framequality (
-            file_path TEXT PRIMARY KEY,
-            file_size INTEGER,
-            file_mtime_ns INTEGER,
-            version INTEGER,
-            metrics_json TEXT,
-            analyzed_date TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-
-def load_cached(conn, paths):
-    """{path: (size, mtime_ns, version, FrameMetrics)} for the paths with stored measurements."""
-    cached = {}
-    paths = list(paths)
-    for i in range(0, len(paths), 500):
-        chunk = paths[i:i + 500]
-        rows = conn.execute(
-            f"SELECT file_path, file_size, file_mtime_ns, version, metrics_json FROM framequality "
-            f"WHERE file_path IN ({','.join('?' * len(chunk))})", chunk).fetchall()
-        for path, size, mtime_ns, version, metrics_json in rows:
-            try:
-                # The path is the row's only: older saves also kept one in the JSON,
-                # stale once a folder was renamed or moved (relinked)
-                metrics = FrameQuality.FrameMetrics.from_dict({**json.loads(metrics_json), "path": path})
-            except (TypeError, ValueError):
-                continue
-            cached[path] = (size, mtime_ns, version, metrics)
-    return cached
-
-
-def save_cached(conn, entries):
-    """entries: [(FrameMetrics, size, mtime_ns)]. The path is stored only as the
-    row's key, so moving a file is one update. Does not commit."""
-    conn.executemany(
-        "INSERT OR REPLACE INTO framequality (file_path, file_size, file_mtime_ns, version, metrics_json) "
-        "VALUES (?, ?, ?, ?, ?)",
-        [(m.path, size, mtime_ns, m.version, json.dumps({k: v for k, v in m.to_dict().items() if k != "path"}))
-         for m, size, mtime_ns in entries])
-
-
-# ---- Grading a session from saved measurements -------------------------------------
-
-# Which lights a stacking handoff takes (SessionCompletionDialog's Lights choice)
-LIGHTS_ALL, LIGHTS_GOOD, LIGHTS_GOOD_MARGINAL, LIGHTS_TOP, LIGHTS_PICKED = (
-    "all", "good", "good_marginal", "top", "picked")
-LIGHT_CHOICE_LABELS = {
-    LIGHTS_ALL: "All lights",
-    LIGHTS_GOOD: "Good only",
-    LIGHTS_GOOD_MARGINAL: "Good + Marginal",
-    LIGHTS_TOP: "Top {percent}% of each filter",
-    LIGHTS_PICKED: "Picked in the quality review",
-}
-# Frames in a group too small to compare can't be judged, so they're kept
-KEEP_GRADES = {
-    LIGHTS_GOOD: {FrameQuality.GRADE_GOOD, FrameQuality.GRADE_UNGRADED},
-    LIGHTS_GOOD_MARGINAL: {FrameQuality.GRADE_GOOD, FrameQuality.GRADE_MARGINAL, FrameQuality.GRADE_UNGRADED},
-}
-TOP_PERCENT_SETTING = SETTINGS_PREFIX + "top_percent"
-DEFAULT_TOP_PERCENT = 75
-_RANKED_GRADES = (FrameQuality.GRADE_GOOD, FrameQuality.GRADE_MARGINAL, FrameQuality.GRADE_REJECT)
-
-
-def light_choice_label(choice, percent):
-    return LIGHT_CHOICE_LABELS[choice].format(percent=percent)
-
-
-def saved_top_percent():
-    value = QSettings("CosmosCollection", "CosmosCollection").value(TOP_PERCENT_SETTING, DEFAULT_TOP_PERCENT, type=int)
-    return min(max(value, 1), 100)
-
-
-def save_top_percent(percent):
-    QSettings("CosmosCollection", "CosmosCollection").setValue(TOP_PERCENT_SETTING, int(percent))
-
-
-def top_percent_lights(lights, grades, percent):
-    """The best `percent` of each group's graded lights by score - always at
-    least one. Per group, as scores only compare frames of the same filter,
-    exposure and binning (which also keeps the stack's filter balance). Frames
-    in groups too small to grade are kept; missing or unanalyzed ones aren't.
-    lights: {path: file dict}, grades: {path: FrameGrade}."""
-    keep, ranked = set(), {}
-    for path, g in grades.items():
-        if path not in lights:
-            continue
-        if g.grade == FrameQuality.GRADE_UNGRADED:
-            keep.add(path)
-        elif g.grade in _RANKED_GRADES:
-            ranked.setdefault(group_key(lights[path]), []).append((g.score, path))
-    for members in ranked.values():
-        members.sort(reverse=True)
-        keep.update(path for _score, path in members[:max(1, math.ceil(len(members) * percent / 100))])
-    return keep
-
-
-def session_light_files(conn, session_id):
-    """{path: file dict} for a session's lights, oldest first. Same rule as the
-    stacking handoff: untyped files are lights only when the session has no typed lights."""
-    files = SessionObservations.load_session_files(conn, session_id)
-    has_typed = any(f["frame_type"] == "Light" for f in files)
-    lights = {}
-    for f in files:
-        path = f["file_path"]
-        if path and path not in lights and (f["frame_type"] == "Light"
-                                            or (f["frame_type"] == "Unknown" and not has_typed)):
-            lights[path] = f
-    return lights
-
-
-def group_key(light):
-    """Frames are grouped by filter, exposure and binning - and graded within
-    that by night (FrameQuality.grade_frames)."""
-    return (light["filter_name"] or "No filter", light["exptime_seconds"], light["xbinning"] or 1)
-
-
-def saved_grade_settings():
-    """The thresholds last set in the review dialog."""
-    settings = QSettings("CosmosCollection", "CosmosCollection")
-    defaults = FrameQuality.GradeSettings()
-    return FrameQuality.GradeSettings(**{
-        name: settings.value(SETTINGS_PREFIX + name, getattr(defaults, name), type=float)
-        for name, *_rest in THRESHOLDS})
-
-
-def grade_session_lights(conn, session_id):
-    """(lights, {path: FrameGrade}) for a session from its saved measurements and
-    the saved thresholds. Lights never analyzed have no grade; the grades are
-    empty when none has been analyzed."""
-    lights = session_light_files(conn, session_id)
-    ensure_cache_table(conn)
-    metrics = {path: m for path, (_size, _mtime, version, m) in load_cached(conn, lights).items()
-               if version == FrameQuality.ANALYSIS_VERSION}
-    if not metrics:
-        return lights, {}
-    return lights, grade_lights(lights, metrics, saved_grade_settings())
-
-
-def grade_lights(lights, metrics, settings):
-    """{path: FrameGrade} for the measured lights. lights: {path: file dict},
-    metrics: {path: FrameMetrics} (paths not in lights are left out)."""
-    paths = [p for p in metrics if p in lights]
-    return FrameQuality.grade_frames(((group_key(lights[p]), metrics[p]) for p in paths), settings,
-                                     gains={p: lights[p]["gain"] for p in paths},
-                                     nights={p: lights[p]["night_date"] for p in paths})
-
 
 # ---- Workers --------------------------------------------------------------------
 
@@ -260,92 +91,10 @@ class AnalysisWorker(QThread):
     def cancelled(self):
         return self._cancelled
 
-    @staticmethod
-    def _stat(path):
-        try:
-            return os.stat(path)
-        except OSError:
-            return None
-
-    @staticmethod
-    def _read(path):
-        try:
-            return FrameQuality.read_file(path)
-        except Exception:
-            return None  # analyze_file reads it again and reports why
-
     def run(self):
-        # Files are read on threads of their own, ahead of the analyses: from a
-        # network share a frame spends most of its time waiting for its bytes,
-        # and with one pool doing both the reads were never hidden behind the
-        # analyses (on a NAS, 8 threads analyzed about half as fast as the network).
-        read_threads = max(READ_THREADS, self.workers)
-        readers = ThreadPoolExecutor(max_workers=read_threads)
-        analyzers = ThreadPoolExecutor(max_workers=self.workers)
-        results = queue.Queue()  # (analysis future or None, (size, mtime_ns)) - one per frame started
-
-        def read_then_analyze(path, stamp):
-            if self._cancelled:
-                results.put((None, stamp))
-                return
-            raw = self._read(path)
-            try:
-                analysis = analyzers.submit(FrameQuality.analyze_file, path, raw)
-            except RuntimeError:  # stopped - the analyzers are shut down
-                results.put((None, stamp))
-                return
-            analysis.add_done_callback(lambda future: results.put((future, stamp)))
-
-        try:
-            # A few ms each on a network share - thousands of subs one at a time
-            # would be a long wait before the first analysis starts
-            todo = deque()
-            for path, stat in zip(self.paths, readers.map(self._stat, self.paths)):
-                if self._cancelled:
-                    return
-                if stat is None:
-                    self.frame_ready.emit(FrameQuality.FrameMetrics(path=path, error="File not found"), None)
-                    continue
-                hit = None if self.force else self.cached.get(path)
-                if (hit and hit[0] == stat.st_size and hit[1] == stat.st_mtime_ns
-                        and hit[2] == FrameQuality.ANALYSIS_VERSION):
-                    continue  # already showing the cached measurements
-                todo.append((path, stat.st_size, stat.st_mtime_ns))
-
-            self.checked.emit(len(todo))
-            # Frames read or being read but not analyzed yet, kept to a few per
-            # thread and to READ_AHEAD_BYTES so big subs can't fill memory
-            max_frames = read_threads + 2 * self.workers
-            started = started_bytes = 0
-            stopping = False
-            while True:
-                if self._cancelled and not stopping:
-                    stopping = True
-                    analyzers.shutdown(wait=False, cancel_futures=True)
-                while (todo and not stopping and started < max_frames
-                       and (not started or started_bytes + todo[0][1] <= READ_AHEAD_BYTES)):
-                    path, size, mtime_ns = todo.popleft()
-                    readers.submit(read_then_analyze, path, (size, mtime_ns))
-                    started += 1
-                    started_bytes += size
-                if not started:
-                    break
-                try:
-                    analysis, stamp = results.get(timeout=0.2)
-                except queue.Empty:
-                    continue
-                started -= 1
-                started_bytes -= stamp[0]
-                # Frames already being analyzed when stopped still finish - keep them too
-                if analysis is not None and not analysis.cancelled():
-                    self._emit(analysis, stamp)
-        finally:
-            readers.shutdown(wait=True, cancel_futures=True)
-            analyzers.shutdown(wait=True, cancel_futures=True)
-
-    def _emit(self, future, stamp):
-        metrics = future.result()
-        self.frame_ready.emit(metrics, stamp if metrics.ok else None)
+        LightQuality.analyze(self.paths, self.cached, self.force, self.workers,
+                             on_checked=self.checked.emit, on_frame=self.frame_ready.emit,
+                             cancelled=lambda: self._cancelled)
 
 
 def _gray_image(values):
@@ -355,21 +104,10 @@ def _gray_image(values):
     return QImage(pixels.data, width, height, width, QImage.Format_Grayscale8).copy()
 
 
-def _unused_path(path):
-    """path, or 'name (2).fits' etc. if something's already there."""
-    if not os.path.exists(path):
-        return path
-    stem, ext = os.path.splitext(path)
-    number = 2
-    while os.path.exists(f"{stem} ({number}){ext}"):
-        number += 1
-    return f"{stem} ({number}){ext}"
-
-
 class FileOperationWorker(QThread):
     """Moves or permanently deletes files one at a time, off the UI thread (a
     move to another drive copies). Only files that succeed are reported done."""
-    MOVE, DELETE = "move", "delete"
+    MOVE, DELETE = LightQuality.MOVE, LightQuality.DELETE
     progress = Signal(int, int)
     done = Signal(object, object)  # {path: new path, or None when deleted}, {path: error text}
 
@@ -384,30 +122,8 @@ class FileOperationWorker(QThread):
         self._cancelled = True
 
     def run(self):
-        finished, failed = {}, {}
-        for i, path in enumerate(self.paths, 1):
-            if self._cancelled:
-                break
-            try:
-                if self.mode == self.DELETE:
-                    try:
-                        os.remove(path)
-                    except FileNotFoundError:
-                        pass  # already gone - still detach it
-                    finished[path] = None
-                else:
-                    folder = self.destination or os.path.join(os.path.dirname(path),
-                                                              SessionFileScanner.REJECTED_FOLDER)
-                    if os.path.normcase(os.path.abspath(folder)) == os.path.normcase(os.path.dirname(os.path.abspath(path))):
-                        failed[path] = "Already in that folder"
-                    else:
-                        os.makedirs(folder, exist_ok=True)
-                        target = _unused_path(os.path.join(folder, os.path.basename(path)))
-                        shutil.move(path, target)
-                        finished[path] = target
-            except OSError as e:
-                failed[path] = e.strerror or str(e)
-            self.progress.emit(i, len(self.paths))
+        finished, failed = LightQuality.move_or_delete(self.mode, self.paths, self.destination,
+                                                       progress=self.progress.emit, cancelled=lambda: self._cancelled)
         self.done.emit(finished, failed)
 
 
@@ -1115,7 +831,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self.list_splitter.addWidget(self._build_table())
         self.list_splitter.setCollapsible(0, False)  # hidden with the Graph button instead
         self.list_splitter.setStretchFactor(1, 1)
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         if not self.list_splitter.restoreState(settings.value(GRAPH_SPLITTER_SETTING, b"")):
             self.list_splitter.setSizes([220, 600])
         self.list_splitter.splitterMoved.connect(self._save_graph_layout)
@@ -1184,16 +900,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         nights graded down as a whole (FrameQuality._check_nights) - Reject when
         any filter's was. Frames that hold up against a typical night on their
         own keep their grade."""
-        nights = {}
-        for path, g in self._grades.items():
-            if g.night_grade:
-                night = self._lights[path]["night_date"] or ""
-                grade, issue, count, grades = nights.get(night, (g.night_grade, g.night_issue, 0, Counter()))
-                if g.night_grade == FrameQuality.GRADE_REJECT:
-                    grade = FrameQuality.GRADE_REJECT
-                grades[g.grade] += 1
-                nights[night] = (grade, issue, count + 1, grades)
-        return nights
+        return LightQuality.bad_nights(self._lights, self._grades)
 
     def _refresh_night_notice(self):
         if self._analyzing:
@@ -1289,7 +996,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
 
     def _saved_hidden_columns(self):
         """Hidden columns, saved by name so new columns don't shift anyone's choice."""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         if not settings.contains(HIDDEN_COLUMNS_SETTING):
             return set(self.DEFAULT_HIDDEN_COLUMNS)
         names = [n for n in str(settings.value(HIDDEN_COLUMNS_SETTING, "") or "").split("|") if n]
@@ -1302,7 +1009,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             if was_hidden and col not in hidden and self.table.columnWidth(col) < 20:
                 self.table.resizeColumnToContents(col)  # hidden since opening, so never sized
         if save:
-            QSettings("CosmosCollection", "CosmosCollection").setValue(
+            app_settings().setValue(
                 HIDDEN_COLUMNS_SETTING, "|".join(self.COLUMNS[col] for col in sorted(hidden)))
 
     def _show_header_menu(self, position):
@@ -1332,7 +1039,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self.chart_metric_combo = QComboBox()
         for key, label, _axis in CHART_METRICS:
             self.chart_metric_combo.addItem(label, key)
-        saved = QSettings("CosmosCollection", "CosmosCollection").value(GRAPH_METRIC_SETTING, "score", type=str)
+        saved = app_settings().value(GRAPH_METRIC_SETTING, "score", type=str)
         self.chart_metric_combo.setCurrentIndex(max(self.chart_metric_combo.findData(saved), 0))
         self.chart_metric_combo.setToolTip("Stars, Star Brightness and Sky are shown as % of their filter's median, "
                                            "so filters can share the graph")
@@ -1448,7 +1155,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         themed_style(note, lambda: f"color: {COLORS['text_secondary']}; font-size: {font_size(8)};")
         grid.addWidget(note, 0, 0, 1, 2)
 
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         defaults = FrameQuality.GradeSettings()
         self.threshold_spins = {}
         for row, (name, label, prefix, suffix, low, high, step, decimals) in enumerate(THRESHOLDS, 1):
@@ -1573,7 +1280,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
     # ---- Grading and the table ------------------------------------------
 
     def _on_threshold_changed(self, name, value):
-        QSettings("CosmosCollection", "CosmosCollection").setValue(SETTINGS_PREFIX + name, value)
+        app_settings().setValue(SETTINGS_PREFIX + name, value)
         self._regrade()
 
     def _reset_thresholds(self):
@@ -1837,7 +1544,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         return moment.strftime("%b %d %H:%M UTC")
 
     def _on_chart_metric_changed(self):
-        QSettings("CosmosCollection", "CosmosCollection").setValue(GRAPH_METRIC_SETTING,
+        app_settings().setValue(GRAPH_METRIC_SETTING,
                                                                    self.chart_metric_combo.currentData())
         self._refresh_chart()
 
@@ -1849,7 +1556,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             self._sync_chart_selection()
 
     def _save_graph_layout(self, *_):
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         settings.setValue(GRAPH_VISIBLE_SETTING, self.graph_btn.isChecked())
         if self.chart_strip.isVisible():
             settings.setValue(GRAPH_SPLITTER_SETTING, self.list_splitter.saveState())
@@ -1906,7 +1613,6 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             return
         grades = {p: self._grades[p] for p in self._lights if p in self._grades}
         of = lambda grade: [p for p, g in grades.items() if g.grade == grade]
-        plural = lambda n, word: f"{n} {word}{'' if n == 1 else 's'}"
         rejects = of(FrameQuality.GRADE_REJECT)
         errors = of(FrameQuality.GRADE_ERROR)
         missing = [p for p in errors if self._metrics.get(p) and self._metrics[p].error == "File not found"]
@@ -1917,10 +1623,10 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         parts = []
         waiting = len(self._lights) - len(grades)  # analysis was stopped part way
         if waiting:
-            parts.append(f"<b>{plural(waiting, 'frame')} {'isn' if waiting == 1 else 'aren'}'t analyzed yet</b> "
+            parts.append(f"<b>{count_text(waiting, 'frame')} {'isn' if waiting == 1 else 'aren'}'t analyzed yet</b> "
                          "- reopen the review to finish them.")
         if rejects:
-            lead = f"<b>{plural(len(rejects), 'frame')} {'has' if len(rejects) == 1 else 'have'} problems</b>"
+            lead = f"<b>{count_text(len(rejects), 'frame')} {'has' if len(rejects) == 1 else 'have'} problems</b>"
             if all(p in self._checked for p in rejects):
                 parts.append(f"{lead} and {'is' if len(rejects) == 1 else 'are'} checked - "
                              "Remove from Session or Move them, then stack.")
@@ -1929,21 +1635,21 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         elif grades:
             parts.append("<b>No problem frames</b> - ready to stack.")
         if missing:
-            parts.append(f"{plural(len(missing), 'file')} {'is' if len(missing) == 1 else 'are'} missing "
+            parts.append(f"{count_text(len(missing), 'file')} {'is' if len(missing) == 1 else 'are'} missing "
                          "on disk - remove them from the session.")
         if unreadable:
-            parts.append(f"{plural(unreadable, 'frame')} couldn't be analyzed - see Issues.")
+            parts.append(f"{count_text(unreadable, 'frame')} couldn't be analyzed - see Issues.")
         if ungraded:
-            parts.append(f"{plural(len(ungraded), 'frame')} couldn't be graded - too few in their filter "
+            parts.append(f"{count_text(len(ungraded), 'frame')} couldn't be graded - too few in their filter "
                          "group to compare.")
         if trails:
-            parts.append(f"Satellite trails in {plural(trails, 'frame')} - stacking removes these.")
+            parts.append(f"Satellite trails in {count_text(trails, 'frame')} - stacking removes these.")
 
         # Good + Marginal: Marginal frames are only slightly worse and still add signal
         suggested = self._stack_paths(LIGHTS_GOOD_MARGINAL)
         if suggested:
             parts.append(f"<b>Suggested:</b> <a href='stack' style='color:{COLORS['link']};'>stack "
-                         f"{LIGHT_CHOICE_LABELS[LIGHTS_GOOD_MARGINAL]} ({plural(len(suggested), 'frame')}, "
+                         f"{LIGHT_CHOICE_LABELS[LIGHTS_GOOD_MARGINAL]} ({count_text(len(suggested), 'frame')}, "
                          f"{format_duration(self._integration(suggested))})</a>")
         self.guide_label.setText("  ".join(parts))
         self._refresh_night_notice()
@@ -2011,22 +1717,12 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
 
     def _other_sessions(self, paths):
         """{session_id: (label, [file ids])} for other sessions these files are also attached to."""
-        others = {}
-        paths = list(paths)
         try:
             with self.db_manager.get_connection() as conn:
-                for i in range(0, len(paths), 500):
-                    chunk = paths[i:i + 500]
-                    rows = conn.execute(
-                        f"SELECT f.session_id, f.id, s.dso_name, s.session_date FROM usersessionfiles f "
-                        f"JOIN usersessions s ON s.id = f.session_id "
-                        f"WHERE f.session_id != ? AND f.file_path IN ({','.join('?' * len(chunk))})",
-                        [self.session["id"]] + chunk).fetchall()
-                    for session_id, file_id, name, date in rows:
-                        others.setdefault(session_id, (f"{name} ({date})", []))[1].append(file_id)
+                return LightQuality.other_sessions(conn, self.session["id"], paths)
         except Exception as e:
             logger.error(f"Error checking other sessions for files: {e}")
-        return others
+            return {}
 
     def _other_sessions_note(self, others, moving):
         if not others:
@@ -2154,23 +1850,10 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         too (a night's calibration frames). Returns False if the database update failed."""
         session_id = self.session["id"]
         # Looked up before the transaction, so it only holds the writes
-        others =self._other_sessions(changed) if mode == FileOperationWorker.DELETE else {}
+        others = self._other_sessions(changed) if mode == FileOperationWorker.DELETE else {}
         try:
             with self.db_manager.get_connection() as conn:
-                SessionObservations.remove_files(conn, session_id,
-                                                 [self._lights[p]["id"] for p in changed] + list(extra_ids))
-                if mode == FileOperationWorker.MOVE:
-                    for old, new in changed.items():
-                        conn.execute("UPDATE usersessionfiles SET file_path = ? WHERE file_path = ? AND session_id != ?",
-                                     (new, old, session_id))
-                        conn.execute("UPDATE OR REPLACE framequality SET file_path = ? WHERE file_path = ?", (new, old))
-                elif mode == FileOperationWorker.DELETE:
-                    for other_id, (_label, ids) in others.items():
-                        SessionObservations.remove_files(conn, other_id, ids)
-                    paths = list(changed)
-                    for i in range(0, len(paths), 500):
-                        chunk = paths[i:i + 500]
-                        conn.execute(f"DELETE FROM framequality WHERE file_path IN ({','.join('?' * len(chunk))})", chunk)
+                LightQuality.record_removed(conn, session_id, self._lights, changed, mode, extra_ids, others)
                 conn.commit()
         except Exception as e:
             _rollback(self.db_manager)
@@ -2242,7 +1925,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         from cosmoscollection.sessions import ProcessingHandoff as handoff
         menu = self.stack_btn.menu()
         menu.clear()
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         apps = [app for app in (handoff.SIRIL, handoff.PIXINSIGHT)
                 if settings.value(f"{app}_integration_enabled", False, type=bool) and handoff.integration_status(app)[0]]
         if not apps:
@@ -2343,7 +2026,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             return
         if self._preview is not None and self._preview.isRunning() and self._preview.path == path:
             return
-        _retire_thread(self._preview)
+        retire_thread(self._preview)
         # The previous frame stays up (keeping the zoom) until this one is ready
         self.preview_view.show_loading(True)
         self._preview = InspectionLoader(path)
@@ -2457,11 +2140,8 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         viewer.activateWindow()
 
     def _open_folder(self, path):
-        folder = os.path.dirname(path)
-        if not os.path.isdir(folder):
-            QMessageBox.warning(self, "Folder Not Found", f"The folder no longer exists:\n{folder}")
-            return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        if not show_in_folder(path):
+            QMessageBox.warning(self, "Folder Not Found", f"The folder no longer exists:\n{os.path.dirname(path)}")
 
     # ---- Closing --------------------------------------------------------
 
@@ -2471,6 +2151,6 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         if self._worker is not None:
             self._worker.cancel()
         self._flush_cache()
-        _retire_thread(self._worker)
-        _retire_thread(self._preview)
+        retire_thread(self._worker)
+        retire_thread(self._preview)
         super().done(result)

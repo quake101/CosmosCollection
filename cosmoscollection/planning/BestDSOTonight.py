@@ -9,7 +9,7 @@ import os
 import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMutex, QSettings
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMutex
 from PySide6.QtCore import QTime
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
@@ -29,6 +29,8 @@ warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.catalog.DSONames import type_name
+from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close, window_is_open
 from cosmoscollection.ui.Theme import COLORS, adapt_color, font_px, theme_manager, themed_style, tint
@@ -36,64 +38,9 @@ from cosmoscollection.ui.TimeFormatHelper import format_time, format_datetime
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
 
 
-# The "Time:" choice - same options as the Target List's "Direction at:"
-TIME_SETTING = "BestDSOTonight/time"  # "mode|at|from|to", times as HH:MM
-TIME_DEFAULT = ("night", "22:00", "01:00", "02:00")
-
-
-def load_time_choice():
-    """(mode, at, from, to) saved for the Time dropdown."""
-    from cosmoscollection.planning.DSOTargetList import DIRECTION_MODES
-    settings = QSettings("CosmosCollection", "CosmosCollection")
-    parts = (settings.value(TIME_SETTING, "", type=str) or "").split("|")
-    if len(parts) != 4 or parts[0] not in dict(DIRECTION_MODES):
-        return TIME_DEFAULT
-    return tuple(parts)
-
-
-def resolve_time_window(time_choice, location, timezone_name):
-    """(start, end, note, times) of the chosen time: local datetimes - start ==
-    end for a single moment - and the labeled times the Direction column is for
-    ([("Dusk", ...), ("Dawn", ...)] etc.). Always the coming night (or the
-    current one before dawn)."""
-    from cosmoscollection.planning.DSOTargetList import resolve_direction_times, local_zone
-    mode, at, start, end = time_choice
-    times, note = resolve_direction_times(mode, at, start, end, location, local_zone(timezone_name))
-    return times[0][1], times[-1][1], note, times
-
-
-def describe_time_window(mode, start, end):
-    """'tonight (20:40 \u2192 06:10)', '01:00 \u2192 02:00', 'at midnight'... for status text."""
-    if start == end:
-        names = {"now": f"right now ({start:%H:%M})", "dusk": f"at dusk ({start:%H:%M})",
-                 "midnight": "at midnight", "dawn": f"at dawn ({start:%H:%M})"}
-        return names.get(mode, f"at {start:%H:%M}")
-    span = f"{start:%H:%M} \u2192 {end:%H:%M}"
-    return f"tonight ({span})" if mode == "night" else span
-
-
-def _get_available_catalogs():
-    """Get list of available catalogs from database.
-
-    Standalone helper (no location/timezone lookup) so callers that only
-    need the catalog list - e.g. populating the catalog dropdown - don't
-    have to pay for building a full DSOVisibilityCalculator.
-    """
-    try:
-        from cosmoscollection.core.ResourceManager import ResourceManager, attach_update_catalogs
-        import sqlite3
-
-        db_path = ResourceManager.get_database_path()
-        conn = sqlite3.connect(str(db_path))
-        attach_update_catalogs(conn)
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT catalogue FROM cataloguenr ORDER BY catalogue")
-        catalogs = [row[0] for row in cursor.fetchall()]
-        conn.close()
-        return catalogs
-    except Exception as e:
-        print(f"Error getting catalogs: {e}")
-        return []
+from cosmoscollection.planning.BestTonightEngine import (  # noqa: E402,F401
+    TIME_DEFAULT, TIME_SETTING, BestTonightCalculation, TonightError, _get_available_catalogs,
+    describe_time_window, load_time_choice, resolve_time_window)
 
 
 class NumericTableWidgetItem(QTableWidgetItem):
@@ -116,541 +63,24 @@ class NumericTableWidgetItem(QTableWidgetItem):
             # Fallback to string comparison if conversion fails
             return super().__lt__(other)
 
+
 class DSOCalculationThread(QThread):
-    """
-    Thread for calculating best DSOs for tonight.
-    
-    Uses coordinate-based visibility calculations for reliability and consistency
-    with other tools (avoids object name resolution issues like 'sh2 142' vs 'sh2-142').
-    """
+    """Runs a BestTonightCalculation (see BestTonightEngine) off the UI
+    thread. Its arguments are the calculation's; .calculation has the
+    resolved time window and blocked_by_horizon once it has run."""
     progress = Signal(int)
     result_ready = Signal(object)
     error_occurred = Signal(str)
 
-    # Returned by calculate_tonight_visibility for a DSO that clears Min
-    # Altitude during dark sky but never rises above the custom horizon
-    BLOCKED_BY_HORIZON = object()
-
-    def __init__(self, min_altitude=30, max_magnitude=12.0, selected_catalogs=None, dso_limit=200, selected_dso_types=None, use_target_list=False, time_choice=TIME_DEFAULT, use_horizon=False, hide_completed=False):
+    def __init__(self, *args, **kwargs):
         super().__init__()
-        self.min_altitude = min_altitude
-        self.max_magnitude = max_magnitude
-        self.selected_catalogs = selected_catalogs or []
-        self.selected_dso_types = selected_dso_types or []
-        self.dso_limit = dso_limit
-        self.use_target_list = use_target_list
-        # Skip target list entries whose status is "Completed"
-        self.hide_completed = hide_completed
-        # (mode, at, from, to) - resolved to window_start/window_end in run()
-        self.time_choice = time_choice
-        self.time_mode = time_choice[0]
-        # A custom time frame lists only objects up for the whole frame ("best
-        # viewed from 1am-2am"); Tonight lists anything up at some point
-        self.whole_window = self.time_mode == "frame"
-        self.window_start = self.window_end = None
-        self.window_note = ""
-        self.window_times = []  # [(label, local datetime)] for the Direction column
-        # Number of DSOs that would be visible but are entirely below the
-        # custom horizon - set by run() before result_ready is emitted
-        self.blocked_by_horizon = 0
-
-        # Use centralized calculator
-        try:
-            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityCalculator
-            # Initialize with location info - the calculator will load from database if no params provided
-            self.calculator = DSOVisibilityCalculator()
-            self.location = self.calculator.location
-            self.local_tz = self.calculator.timezone
-            self.horizon = self.calculator.horizon if use_horizon else None
-        except (ImportError, Exception) as e:
-            print(f"Warning: Could not initialize DSOVisibilityCalculator: {e}")
-            self.calculator = None
-            self.location = self.setup_location()
-            self.local_tz = self.setup_timezone()
-            from cosmoscollection.planning.HorizonProfile import load_active_horizon
-            self.horizon = load_active_horizon() if use_horizon else None
-
-    def setup_location(self):
-        """Set up the observer location from database"""
-        try:
-            db_manager = DatabaseManager()
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-                if row:
-                    lat, lon = row
-                    if lat is not None and lon is not None:
-                        lat = lat * u.deg
-                        lon = lon * u.deg
-                        height = 250 * u.m
-                        return EarthLocation(lat=lat, lon=lon, height=height)
-        except Exception:
-            pass
-        return None
-
-    def setup_timezone(self):
-        """Set up the user's timezone from database"""
-        try:
-            db_manager = DatabaseManager()
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-                if row and row[0]:
-                    return pytz.timezone(row[0])
-        except Exception:
-            pass
-        return pytz.UTC
-
-    def _window_sampling(self):
-        """(start Time, duration hours, samples per hour) covering the chosen time.
-
-        A single moment is one sample; frames up to 3 hours are sampled every
-        5 minutes (so "up for the whole of 1am-2am" is checked closely), longer
-        ones every 15 minutes as before.
-        """
-        hours = (self.window_end - self.window_start).total_seconds() / 3600
-        start = Time(self.window_start.astimezone(pytz.UTC).replace(tzinfo=None))
-        if hours <= 0:
-            return start, 0.25, 4  # linspace(0, 0.25, 1) -> just the start
-        return start, hours, 12 if hours <= 3 else 4
-
-    def _qualifies(self, visible):
-        """Whether a per-sample visibility mask passes the time rule."""
-        if not np.any(visible):
-            return False
-        return bool(np.all(visible)) if self.whole_window else True
-
-    def _visibility_result(self, dso_info, dso_coord, time_range, dso_altaz, visible, samples_per_hour):
-        """Result dict for a qualifying DSO: its altitude, time visible, and best time."""
-        altitudes = dso_altaz.alt.deg
-        indices = np.where(visible)[0]
-        if self.time_mode == "night":
-            best_idx = indices[len(indices) // 2]  # Middle of its time up tonight
-        else:
-            best_idx = indices[int(np.argmax(altitudes[indices]))]  # Highest within the chosen time
-        single_moment = len(altitudes) == 1
-        best_time_utc = time_range[best_idx].datetime.replace(tzinfo=pytz.UTC)
-        return {
-            "dso_info": dso_info,
-            "max_altitude": np.max(altitudes[visible]),
-            "visible_hours": None if single_moment else float(np.sum(visible)) / samples_per_hour,
-            "optimal_time": best_time_utc.astimezone(self.local_tz),
-            "optimal_altitude": altitudes[best_idx],
-            "optimal_azimuth": dso_altaz.az.deg[best_idx],
-            "coordinates": dso_coord
-        }
-
-    def calculate_tonight_visibility(self, dso_info):
-        """Calculate visibility for a DSO in the chosen time using the centralized calculator"""
-        try:
-            if self.calculator is None:
-                # Fallback to original method if centralized calculator not available
-                return self._calculate_tonight_visibility_fallback(dso_info)
-
-            # Coordinate-based calculation for reliability (avoids name resolution issues)
-            dso_coord = SkyCoord(ra=dso_info["ra_deg"] * u.deg, dec=dso_info["dec_deg"] * u.deg)
-            start_time, duration, samples_per_hour = self._window_sampling()
-            time_range, dso_altaz, sun_altaz = self.calculator.calculate_altaz_over_time(
-                dso_coord, start_time, duration, samples_per_hour)
-
-            visible = self.calculator.find_optimal_viewing_times(
-                dso_altaz, sun_altaz, self.min_altitude, horizon=self.horizon)
-            if not self._qualifies(visible):
-                # Note DSOs hidden only by the custom horizon, for the status line
-                if self.horizon is not None and self._qualifies(
-                        self.calculator.find_optimal_viewing_times(dso_altaz, sun_altaz, self.min_altitude)):
-                    return self.BLOCKED_BY_HORIZON
-                return None
-            return self._visibility_result(dso_info, dso_coord, time_range, dso_altaz, visible, samples_per_hour)
-
-        except Exception:
-            return None
-
-    def _calculate_tonight_visibility_fallback(self, dso_info):
-        """Fallback method using original calculations if centralized calculator unavailable"""
-        try:
-            start_time, duration, samples_per_hour = self._window_sampling()
-            time_range = start_time + np.linspace(0, duration, int(duration * samples_per_hour)) * u.hour
-
-            # Get DSO coordinates from database data (coordinate-based for reliability)
-            try:
-                dso_coord = SkyCoord(ra=dso_info["ra_deg"] * u.deg, dec=dso_info["dec_deg"] * u.deg)
-            except Exception:
-                return None
-
-            # Calculate altitude/azimuth
-            altaz_frame = AltAz(obstime=time_range, location=self.location)
-            dso_altaz = dso_coord.transform_to(altaz_frame)
-            sun_altaz = get_sun(time_range).transform_to(altaz_frame)
-
-            # Visible when above minimum altitude and custom horizon, and the sun is down
-            threshold = self.min_altitude
-            if self.horizon is not None:
-                threshold = np.maximum(self.min_altitude, self.horizon.altitude_at(dso_altaz.az.deg))
-            dark_sky = sun_altaz.alt.deg < -12
-            visible = (dso_altaz.alt.deg > threshold) & dark_sky
-
-            if not self._qualifies(visible):
-                if self.horizon is not None and self._qualifies((dso_altaz.alt.deg > self.min_altitude) & dark_sky):
-                    return self.BLOCKED_BY_HORIZON
-                return None
-            return self._visibility_result(dso_info, dso_coord, time_range, dso_altaz, visible, samples_per_hour)
-
-        except Exception:
-            return None
-
-    def azimuth_to_direction(self, az):
-        """Convert azimuth to cardinal direction using centralized method"""
-        if self.calculator:
-            return self.calculator.azimuth_to_direction(az)
-        else:
-            # Fallback implementation
-            directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
-                          'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
-            idx = int((az + 11.25) / 22.5) % 16
-            return directions[idx]
-
-    def get_available_catalogs(self):
-        """Get list of available catalogs from database"""
-        return _get_available_catalogs()
-
-    def load_dsos_from_target_list(self):
-        """Load DSOs from the user's target list"""
-        try:
-            from cosmoscollection.core.ResourceManager import ResourceManager
-            import sqlite3
-
-            # Create a new database connection in this thread
-            db_path = ResourceManager.get_database_path()
-            conn = sqlite3.connect(str(db_path))
-            conn.row_factory = sqlite3.Row
-            from cosmoscollection.core.ResourceManager import attach_update_catalogs
-            attach_update_catalogs(conn)
-            cursor = conn.cursor()
-
-            # Query target list entries with telescope information
-            # No magnitude filter - show all target list items since user intentionally added them
-            query = """
-                SELECT t.name, t.dso_type, t.constellation, t.magnitude, t.ra_deg, t.dec_deg,
-                       t.size_info, t.telescope_id, tel.name as telescope_name
-                FROM usertargetlist t
-                LEFT JOIN usertelescopes tel ON t.telescope_id = tel.id
-                WHERE t.ra_deg IS NOT NULL
-                    AND t.dec_deg IS NOT NULL
-            """
-            if self.hide_completed:
-                query += " AND COALESCE(t.status, '') != 'Completed'"
-            query += " ORDER BY t.magnitude ASC"
-
-            cursor.execute(query)
-
-            rows = cursor.fetchall()
-            dsos = []
-            for row in rows:
-                name, dso_type, constellation, magnitude, ra_deg, dec_deg, size_info, telescope_id, telescope_name = row
-                if name and ra_deg is not None and dec_deg is not None:
-                    # Default NULL magnitude to 99.0 sentinel so object is still processed
-                    if magnitude is None:
-                        magnitude = 99.0
-                    # Query designations from main database by matching coordinates
-                    cursor.execute("""
-                        SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-                            CASE c.catalogue
-                                WHEN 'M' THEN 1
-                                WHEN 'NGC' THEN 2
-                                WHEN 'IC' THEN 3
-                                ELSE 4
-                            END, c.designation) as designations
-                        FROM dsodetail d
-                        JOIN cataloguenr c ON d.id = c.dsodetailid
-                        WHERE ABS(d.ra - ?) < 0.001
-                          AND ABS(d.dec - ?) < 0.001
-                        GROUP BY d.id
-                        ORDER BY ABS(d.ra - ?) + ABS(d.dec - ?) ASC
-                        LIMIT 1
-                    """, (ra_deg, dec_deg, ra_deg, dec_deg))
-
-                    desig_row = cursor.fetchone()
-                    designations = desig_row[0] if desig_row and desig_row[0] else name
-
-                    dsos.append({
-                        "name": name,
-                        "type": dso_type or "Unknown",
-                        "constellation": constellation or "Unknown",
-                        "magnitude": float(magnitude),
-                        "surface_brightness": 0.0,
-                        "size_min": 0.0,
-                        "size_max": 0.0,
-                        "dso_class": "Unknown",
-                        "ra_deg": float(ra_deg),
-                        "dec_deg": float(dec_deg),
-                        "designations": designations,
-                        "telescope_name": telescope_name or "Any"
-                    })
-
-            conn.close()
-            return dsos
-
-        except Exception as e:
-            print(f"Error loading DSOs from target list: {e}")
-            return []
-
-    def load_dsos_from_database(self):
-        """Load DSOs from the database with thread-safe connection"""
-        try:
-            # Import here to avoid circular imports and create fresh connection in thread
-            from cosmoscollection.core.ResourceManager import ResourceManager
-            import sqlite3
-            
-            # Create a new database connection in this thread
-            db_path = ResourceManager.get_database_path()
-            conn = sqlite3.connect(str(db_path))
-            conn.row_factory = sqlite3.Row
-            from cosmoscollection.core.ResourceManager import attach_update_catalogs
-            attach_update_catalogs(conn)
-            cursor = conn.cursor()
-
-            # Build the query with catalog filtering if specified
-            base_query = """
-                SELECT
-                    d.id,
-                    (
-                        SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-                            CASE c.catalogue
-                                WHEN 'M' THEN 1
-                                WHEN 'NGC' THEN 2
-                                WHEN 'IC' THEN 3
-                                ELSE 4
-                            END, c.designation)
-                        FROM cataloguenr c
-                        WHERE c.dsodetailid = d.id
-                    ) as name,
-                    d.dsotype as type,
-                    d.constellation,
-                    d.magnitude,
-                    d.surfacebrightness,
-                    CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                    CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                    d.dsoclass,
-                    d.ra as ra_deg,
-                    d.dec as dec_deg,
-                    (
-                        SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-                            CASE c.catalogue
-                                WHEN 'M' THEN 1
-                                WHEN 'NGC' THEN 2
-                                WHEN 'IC' THEN 3
-                                ELSE 4
-                            END, c.designation)
-                        FROM cataloguenr c
-                        WHERE c.dsodetailid = d.id
-                    ) as designations
-                FROM dsodetail d
-                WHERE d.magnitude IS NOT NULL
-                    AND d.magnitude <= ?
-                    AND d.constellation IS NOT NULL
-                    AND d.dsotype IS NOT NULL
-                    AND d.ra IS NOT NULL
-                    AND d.dec IS NOT NULL
-            """
-            
-            params = [self.max_magnitude]
-
-            # Add catalog filtering if catalogs are selected
-            if self.selected_catalogs:
-                catalog_placeholders = ','.join('?' * len(self.selected_catalogs))
-                base_query += f"""
-                    AND d.id IN (
-                        SELECT dsodetailid FROM cataloguenr
-                        WHERE catalogue IN ({catalog_placeholders})
-                    )
-                """
-                params.extend(self.selected_catalogs)
-
-            # Add DSO type filtering if types are selected
-            if self.selected_dso_types:
-                type_placeholders = ','.join('?' * len(self.selected_dso_types))
-                base_query += f" AND d.dsotype IN ({type_placeholders})"
-                params.extend(self.selected_dso_types)
-
-            base_query += f" ORDER BY d.magnitude ASC LIMIT {self.dso_limit}"
-            
-            cursor.execute(base_query, params)
-            
-            rows = cursor.fetchall()
-            dsos = []
-            for row in rows:
-                dso_id, name, dso_type, constellation, magnitude, surface_brightness, size_min, size_max, dso_class, ra_deg, dec_deg, designations = row
-                if name and magnitude is not None and ra_deg is not None and dec_deg is not None:
-                    # Take the first designation as the primary name
-                    primary_name = name.split(',')[0].strip()
-                    dsos.append({
-                        "name": primary_name,
-                        "type": dso_type or "Unknown",
-                        "constellation": constellation or "Unknown",
-                        "magnitude": float(magnitude),
-                        "surface_brightness": float(surface_brightness) if surface_brightness is not None else 0.0,
-                        "size_min": float(size_min) if size_min is not None else 0.0,
-                        "size_max": float(size_max) if size_max is not None else 0.0,
-                        "dso_class": dso_class or "Unknown",
-                        "ra_deg": float(ra_deg),
-                        "dec_deg": float(dec_deg),
-                        "designations": designations or name
-                    })
-            
-            conn.close()
-            return dsos
-            
-        except Exception as e:
-            print(f"Error loading DSOs from database: {e}")
-            return []
-    
-    def calculate_dso_batch(self, dso_batch):
-        """Calculate visibility for a batch of DSOs
-
-        Returns:
-            tuple: (visible DSO results, number blocked by the custom horizon)
-        """
-        batch_results = []
-        blocked = 0
-        for dso_info in dso_batch:
-            result = self.calculate_tonight_visibility(dso_info)
-            if result is self.BLOCKED_BY_HORIZON:
-                blocked += 1
-            elif result:
-                # Replaced by _add_direction_cells() once every batch is done
-                result["direction"] = self.azimuth_to_direction(result["optimal_azimuth"])
-                batch_results.append(result)
-        return batch_results, blocked
-
-    def _add_direction_cells(self, visible_dsos):
-        """The Direction column as the Target List shows it: the direction at
-        the chosen time, or at its start and end ("E → SE", dusk and dawn for
-        Tonight), marked "(below)" where under the horizon. The tooltip gives
-        each time's azimuth and altitude, plus the direction at the Best Time."""
-        if not visible_dsos:
-            return
-        try:
-            from cosmoscollection.planning.DSOTargetList import direction_cells
-            from astropy.coordinates import concatenate
-            coords = concatenate([dso["coordinates"] for dso in visible_dsos])
-            cells = direction_cells(coords, self.window_times, self.location, self.horizon)
-        except Exception as e:
-            logger.error(f"Direction column failed, showing the Best Time direction: {e}")
-            return
-        for dso, (text, tooltip, _below) in zip(visible_dsos, cells):
-            best = (f"Best Time ({dso['optimal_time']:%H:%M}): {dso['direction']}, "
-                    f"azimuth {dso['optimal_azimuth']:.0f}°, altitude {dso['optimal_altitude']:.0f}°")
-            if len(self.window_times) > 1:
-                tooltip += "\n" + best  # A single time is already the Best Time
-            # Not grayed out like the Target List's "below throughout": anything
-            # listed here is up at some point in between
-            dso.update(direction=text, direction_tooltip=tooltip)
+        self.calculation = BestTonightCalculation(*args, **kwargs)
 
     def run(self):
-        """Main calculation thread with parallel processing"""
         try:
-            if self.location is None:
-                self.error_occurred.emit("Observer location not configured")
-                return
-
-            # The chosen time, on the coming night (or the current one before dawn)
-            self.window_start, self.window_end, self.window_note, self.window_times = resolve_time_window(
-                self.time_choice, self.location, getattr(self.local_tz, "zone", None))
-
-            # Load DSOs from database or target list
-            if self.use_target_list:
-                dso_catalog = self.load_dsos_from_target_list()
-            else:
-                dso_catalog = self.load_dsos_from_database()
-
-            if not dso_catalog:
-                if self.use_target_list and self.hide_completed:
-                    self.error_occurred.emit("No targets in your target list that aren't Completed")
-                else:
-                    self.error_occurred.emit("No DSOs found in database")
-                return
-            
-            visible_dsos = []
-            total_dsos = len(dso_catalog)
-
-            # Determine number of threads from user settings
-            from PySide6.QtCore import QSettings
-            import os
-            settings = QSettings("CosmosCollection", "CosmosCollection")
-            default_threads = max(1, (os.cpu_count() or 4) - 2)
-            max_workers = settings.value("max_threads", default_threads, type=int)
-            
-            # Split DSOs into batches for parallel processing
-            batch_size = max(1, len(dso_catalog) // max_workers)
-            dso_batches = [dso_catalog[i:i + batch_size] for i in range(0, len(dso_catalog), batch_size)]
-            
-            completed_count = 0
-            
-            # Use ThreadPoolExecutor for parallel processing
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all batches
-                future_to_batch = {executor.submit(self.calculate_dso_batch, batch): batch for batch in dso_batches}
-                
-                # Collect results as they complete
-                for future in as_completed(future_to_batch):
-                    try:
-                        batch_results, blocked = future.result()
-                        visible_dsos.extend(batch_results)
-                        self.blocked_by_horizon += blocked
-                        
-                        # Update progress based on completed batches
-                        completed_count += len(future_to_batch[future])
-                        progress = int((completed_count * 100) / total_dsos)
-                        self.progress.emit(min(progress, 100))  # Ensure we don't exceed 100%
-                        
-                    except Exception as e:
-                        print(f"Error processing batch: {e}")
-                        continue
-            
-            # Sort by combination of altitude and magnitude (lower magnitude is better)
-            visible_dsos.sort(key=lambda x: (-x["max_altitude"] + x["dso_info"]["magnitude"]), reverse=False)
-
-            self._add_direction_cells(visible_dsos)
-
-            # Moon proximity annotation — runs once after parallel phase completes
-            try:
-                from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityCalculator as _Calc
-                import pytz as _pytz
-
-                # Moon phase in the middle of the chosen time (it changes ~12% a day)
-                _middle = self.window_start + (self.window_end - self.window_start) / 2
-                moon_illumination = _Calc.get_moon_illumination(
-                    Time(_middle.astimezone(_pytz.UTC).replace(tzinfo=None)))
-
-                for dso_data in visible_dsos:
-                    dso_data["moon_illumination"] = moon_illumination
-                    moon_sep = None
-                    try:
-                        coord = dso_data.get("coordinates")
-                        optimal_time = dso_data.get("optimal_time")
-                        if coord is not None and optimal_time is not None:
-                            opt_utc = optimal_time.astimezone(_pytz.UTC).replace(tzinfo=None)
-                            moon_sep = _Calc.get_moon_separation(coord, Time(opt_utc))
-                    except Exception:
-                        pass
-                    dso_data["moon_separation"] = moon_sep  # float degrees or None
-            except Exception as e:
-                print(f"Moon annotation failed: {e}")
-                for dso_data in visible_dsos:
-                    dso_data.setdefault("moon_illumination", 0.5)
-                    dso_data.setdefault("moon_separation", None)
-
-            self.result_ready.emit(visible_dsos)
-            
+            self.result_ready.emit(self.calculation.calculate(progress=self.progress.emit))
+        except TonightError as e:
+            self.error_occurred.emit(str(e))
         except Exception as e:
             self.error_occurred.emit(f"Calculation error: {str(e)}")
 
@@ -672,7 +102,7 @@ class TimeWindowThread(QThread):
             # Own connection: the DatabaseManager singleton's is bound to the GUI thread
             conn = sqlite3.connect(str(ResourceManager.get_database_path()))
             try:
-                from cosmoscollection.planning.DSOTargetList import load_observer
+                from cosmoscollection.planning.Observer import load_observer
                 observer = load_observer(conn)
             finally:
                 conn.close()
@@ -777,7 +207,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
     def _needs_auto_calculate(self):
         """Return True if Auto Calculate should run because the last calculation
         wasn't performed today (or has never been performed)."""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         last_calculated_date = settings.value("BestDSOTonight/last_calculated_date", "", type=str)
         today_str = datetime.now().strftime("%Y-%m-%d")
         return last_calculated_date != today_str
@@ -861,7 +291,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         settings_row2.addWidget(self.dso_limit_spin)
 
         # Time: when the objects should be up (the night, a moment, or a time frame)
-        from cosmoscollection.planning.DSOTargetList import DIRECTION_MODES
+        from cosmoscollection.planning.NightTimes import DIRECTION_MODES
         mode, at, start, end = load_time_choice()
         settings_row2.addWidget(QLabel("Time:"))
         self.time_mode_combo = QComboBox()
@@ -923,7 +353,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         # Don't Show Completed checkbox - only applies to the target list, so
         # it's enabled by _on_target_list_checkbox_changed() alongside it
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         self.hide_completed_checkbox = QCheckBox("Don't Show Completed")
         self.hide_completed_checkbox.setToolTip(
             "Skip target list entries whose status is \"Completed\".\n\n"
@@ -1041,7 +471,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
     def _on_time_choice_changed(self):
         self._show_time_edits()
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         settings.setValue(TIME_SETTING, "|".join(self._time_choice()))
         self._resolve_time_note()
 
@@ -1076,8 +506,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self._refresh_horizon_state()
 
         # Check if observer location should be shown
-        from PySide6.QtCore import QSettings
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         show_location = settings.value("show_observer_location", True, type=bool)
 
         # The location is only shown (in the settings title) when the setting is on
@@ -1140,17 +569,8 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
     def load_dso_type_options(self):
         """Load curated list of common DSO types for astrophotography"""
         # Curated list of common types for astrophotography planning
-        common_types = [
-            ("GALXY", "Galaxy"),
-            ("BRTNB", "Bright Nebula"),
-            ("DRKNB", "Dark Nebula"),
-            ("PLNNB", "Planetary Nebula"),
-            ("SNREM", "Supernova Remnant"),
-            ("CL+NB", "Cluster + Nebula"),
-            ("OPNCL", "Open Cluster"),
-            ("GLOCL", "Globular Cluster"),
-            ("GALCL", "Galaxy Cluster"),
-        ]
+        common_types = [(code, type_name(code)) for code in
+                        ("GALXY", "BRTNB", "DRKNB", "PLNNB", "SNREM", "CL+NB", "OPNCL", "GLOCL", "GALCL")]
 
         # Add "All Types" option first
         self.dso_type_combo.addItem("All Types")
@@ -1167,7 +587,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
     def closeEvent(self, event):
         """Save settings and window position when closing"""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         settings.setValue("BestDSOTonight/use_target_list", self.use_target_list_checkbox.isChecked())
         settings.setValue("BestDSOTonight/hide_completed", self.hide_completed_checkbox.isChecked())
         settings.setValue("BestDSOTonight/auto_calculate", self.auto_calculate_checkbox.isChecked())
@@ -1312,12 +732,12 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         # Persist the date of this calculation so Auto Calculate knows not to
         # re-run again today
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         settings.setValue("BestDSOTonight/last_calculated_date", now.strftime("%Y-%m-%d"))
 
-        blocked = self.calc_thread.blocked_by_horizon if self.calc_thread else 0
+        thread = self.calc_thread.calculation if self.calc_thread else None
+        blocked = thread.blocked_by_horizon if thread else 0
         blocked_text = f" ({blocked} blocked by custom horizon)" if blocked else ""
-        thread = self.calc_thread
         when = "tonight"
         if thread is not None and thread.window_start is not None:
             when = describe_time_window(thread.time_mode, thread.window_start, thread.window_end)
@@ -1382,7 +802,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self.results_table.setItem(row, 0, name_item)
             
             # Type - use friendly name
-            friendly_type = self._get_friendly_type_name(dso_info["type"])
+            friendly_type = type_name(dso_info["type"])
             self.results_table.setItem(row, 1, QTableWidgetItem(friendly_type))
             
             # Constellation
@@ -1543,37 +963,6 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             QMessageBox.warning(self, "Import Error", f"Could not load DSODetailWindow: {e}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not open object details: {e}")
-
-    def _get_friendly_type_name(self, dso_type):
-        """Convert DSO type code to user-friendly name"""
-        type_mapping = {
-            "GALXY": "Galaxy",
-            "DRKNB": "Dark Nebula",
-            "OPNCL": "Open Cluster",
-            "PLNNB": "Planetary Nebula",
-            "BRTNB": "Bright Nebula",
-            "SNREM": "Supernova Remnant",
-            "GALCL": "Galaxy Cluster",
-            "GLOCL": "Globular Cluster",
-            "CL+NB": "Cluster + Nebula",
-            "GX+DN": "Galaxy + Dark Nebula",
-            "ASTER": "Asterism",
-            "2STAR": "Double Star",
-            "3STAR": "Triple Star",
-            "4STAR": "Quadruple Star",
-            "1STAR": "Single Star",
-            "QUASR": "Quasar",
-            "NONEX": "Non-existent",
-            "LMCCN": "LMC Cluster/Nebula",
-            "LMCDN": "LMC Dark Nebula",
-            "LMCGC": "LMC Globular Cluster",
-            "LMCOC": "LMC Open Cluster",
-            "SMCCN": "SMC Cluster/Nebula",
-            "SMCDN": "SMC Dark Nebula",
-            "SMCGC": "SMC Globular Cluster",
-            "SMCOC": "SMC Open Cluster"
-        }
-        return type_mapping.get(dso_type, dso_type)  # Return original if not found
 
     def handle_error(self, error_msg):
         """Handle calculation errors"""

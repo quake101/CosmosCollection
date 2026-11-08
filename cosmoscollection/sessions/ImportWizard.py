@@ -10,13 +10,12 @@ Pages: Choose folders -> Scanning -> Review.
 """
 
 import os
-import re
 import logging
 import threading
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import Qt, QEvent, QObject, QSettings, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QEvent, QObject, QThread, QTimer, Signal
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout,
@@ -27,6 +26,11 @@ from PySide6.QtWidgets import (
 )
 
 from cosmoscollection.sessions import LibraryScanner
+from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.UrlOpener import show_in_folder
+from cosmoscollection.ui.WindowLifetime import refresh_open
+from cosmoscollection.core.Paths import path_key
+from cosmoscollection.core.Formatting import count_text, format_duration, natural_key
 from cosmoscollection.sessions import MountDetection
 from cosmoscollection.sessions.LibraryScanner import ScanRules, scan_and_build, ScanIndex
 from cosmoscollection.catalog.DSONames import SESSION_COMMON_NAMES_SETTING
@@ -35,7 +39,6 @@ from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 
 logger = logging.getLogger(__name__)
 
-SETTINGS_PREFIX = "import_wizard"
 THUMBNAIL_SIZE = 480
 
 # Tree columns
@@ -54,45 +57,14 @@ FINAL_TYPES = {1: "Finished image", 2: "Stack", 3: "Possible image"}
 # Settings
 # ---------------------------------------------------------------------------
 
-def _settings():
-    return QSettings("CosmosCollection", "CosmosCollection")
-
-
-def saved_folders():
-    folders = _settings().value(f"{SETTINGS_PREFIX}/folders", [], type=list)
-    return [f for f in folders if f]
-
-
-def save_folders(folders):
-    _settings().setValue(f"{SETTINGS_PREFIX}/folders", list(folders))
-
-
-def _split_words(text):
-    return tuple(w.strip() for w in re.split(r"[,;]", text or "") if w.strip())
-
-
-def load_rules():
-    """The scan rules, with the user's Advanced changes."""
-    settings = _settings()
-    rules = ScanRules()
-    rules.session_gap_days = settings.value(f"{SETTINGS_PREFIX}/session_gap_days", rules.session_gap_days, type=int)
-    finals = _split_words(settings.value(f"{SETTINGS_PREFIX}/final_keywords", "", type=str))
-    work = _split_words(settings.value(f"{SETTINGS_PREFIX}/work_folders", "", type=str))
-    if finals:
-        rules.final_keywords = finals
-    if work:
-        rules.work_folders = work
-    return rules
+# Shared with the command line's 'library scan' (ImportSettings.py)
+from cosmoscollection.sessions.ImportSettings import (  # noqa: E402,F401
+    SETTINGS_PREFIX, _split_words, load_rules, save_folders, saved_folders)
 
 
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
-
-def format_duration(seconds):
-    from cosmoscollection.sessions.SessionManager import format_duration as session_format_duration
-    return session_format_duration(seconds)
-
 
 def format_night_range(nights):
     """'Sep 19, 2024', 'Sep 19 – Oct 4, 2024', 'Dec 28, 2024 – Jan 3, 2025'."""
@@ -104,17 +76,6 @@ def format_night_range(nights):
     if first.year == last.year:
         return f"{first:%b} {first.day} – {last:%b} {last.day}, {last.year}"
     return f"{first:%b} {first.day}, {first.year} – {last:%b} {last.day}, {last.year}"
-
-
-def _count(n, word, bold=False):
-    """'1 session', '3 sessions' - with the number in bold for rich text."""
-    number = f"<b>{n:,}</b>" if bold else f"{n:,}"
-    return f"{number} {word}{'' if n == 1 else 's'}"
-
-
-def natural_key(text):
-    """'M 2' before 'M 13'."""
-    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text or "")]
 
 
 def _common_folder(folders):
@@ -343,7 +304,7 @@ class FoldersPage(QWidget):
         return [self.folder_list.topLevelItem(i).text(0) for i in range(self.folder_list.topLevelItemCount())]
 
     def add_folders(self, paths):
-        existing = {os.path.normcase(os.path.normpath(f)) for f in self.folders()}
+        existing = {path_key(f) for f in self.folders()}
         for path in paths:
             path = os.path.normpath(path)
             if os.path.isdir(path) and os.path.normcase(path) not in existing:
@@ -382,7 +343,7 @@ class FoldersPage(QWidget):
         self.reread_check.setChecked(False)
 
     def _save_advanced(self):
-        settings = _settings()
+        settings = app_settings()
         defaults = ScanRules()
         settings.setValue(f"{SETTINGS_PREFIX}/session_gap_days", self.gap_spin.value())
         finals, work = _split_words(self.final_words.text()), _split_words(self.work_folders.text())
@@ -622,7 +583,7 @@ class EquipmentPage(QWidget):
             combo.addItem(f"Add as a new camera{detail}", ADD_NEW)
 
         if info.decided(kind, value):
-            chosen = info.aliases[(kind, LibraryScanner._alias_key(value))]
+            chosen = info.aliases[(kind, LibraryScanner.alias_key(value))]
             why = "Chosen before"
         else:
             chosen, reason = LibraryScanner.suggest_equipment(kind, value, entry["header"], info)
@@ -732,7 +693,7 @@ class ReviewPage(QWidget):
         self.tree.header().setStretchLastSection(True)
         for column, width in enumerate(COLUMN_WIDTHS):
             self.tree.setColumnWidth(column, width)
-        state = _settings().value(f"{SETTINGS_PREFIX}/tree_header")
+        state = app_settings().value(f"{SETTINGS_PREFIX}/tree_header")
         if state is not None:
             self.tree.header().restoreState(state)
         self.tree.itemChanged.connect(self._on_item_changed)
@@ -774,9 +735,9 @@ class ReviewPage(QWidget):
         self.common_names_check = QCheckBox("Add common names to session names")
         self.common_names_check.setToolTip('New sessions are named like "M 31 (Andromeda Galaxy)" rather than '
                                            '"M 31". Sessions already in the Session Manager keep their names.')
-        self.common_names_check.setChecked(_settings().value(SESSION_COMMON_NAMES_SETTING, True, type=bool))
+        self.common_names_check.setChecked(app_settings().value(SESSION_COMMON_NAMES_SETTING, True, type=bool))
         self.common_names_check.toggled.connect(
-            lambda checked: _settings().setValue(SESSION_COMMON_NAMES_SETTING, checked))
+            lambda checked: app_settings().setValue(SESSION_COMMON_NAMES_SETTING, checked))
         bottom.addWidget(self.common_names_check)
         self.selection_label = QLabel("")
         bottom.addWidget(self.selection_label)
@@ -801,7 +762,7 @@ class ReviewPage(QWidget):
             notes.append("The scan was stopped before it finished, so this is only part of your library. "
                          "Scan Again carries on where it stopped.")
         if library.relinked:
-            notes.append(f"{_count(library.relinked, 'session sub')} had moved to a renamed or moved folder - "
+            notes.append(f"{count_text(library.relinked, 'session sub')} had moved to a renamed or moved folder - "
                          f"the Session Manager now points to {'its' if library.relinked == 1 else 'their'} "
                          f"new location.")
         self.banner.setVisible(bool(notes))
@@ -846,7 +807,7 @@ class ReviewPage(QWidget):
                 if item:
                     unknown_items.append(item)
             if unknown_items:
-                header.setText(COL_STATUS, _count(len(unknown_items), "group"))
+                header.setText(COL_STATUS, count_text(len(unknown_items), "group"))
                 self.tree.addTopLevelItem(header)
                 self._restore_expanded(header, "unknown_header")
         if mode == FILTER_ALL:
@@ -895,9 +856,9 @@ class ReviewPage(QWidget):
         self._bold(item)
         parts = []
         if group.sessions:
-            parts.append(_count(len(group.sessions), "session"))
+            parts.append(count_text(len(group.sessions), "session"))
         if group.finals:
-            parts.append(_count(len(group.finals), "image"))
+            parts.append(count_text(len(group.finals), "image"))
         item.setText(COL_STATUS, " · ".join(parts))
         if not importable:
             item.setToolTip(COL_NAME, "Choose an object for these first (right-click > Change Object...), "
@@ -1029,10 +990,10 @@ class ReviewPage(QWidget):
         processing = [p for p, r in scan.skipped_folders if r == "processing"]
         rejected = [p for p, r in scan.skipped_folders if r == "rejected"]
         if processing:
-            rows.append((_count(len(processing), "stacking work folder"),
+            rows.append((count_text(len(processing), "stacking work folder"),
                          "Copies your stacking software made - not looked through", processing))
         if rejected:
-            rows.append((_count(len(rejected), "Rejected folder"), "Subs the light quality review set aside", rejected))
+            rows.append((count_text(len(rejected), "Rejected folder"), "Subs the light quality review set aside", rejected))
         if library.counts.get("duplicate"):
             rows.append((f"{library.counts['duplicate']:,} copies of subs", "The same subs in another folder", []))
         if library.counts.get("preview"):
@@ -1077,7 +1038,7 @@ class ReviewPage(QWidget):
         return False
 
     def save_state(self):
-        _settings().setValue(f"{SETTINGS_PREFIX}/tree_header", self.tree.header().saveState())
+        app_settings().setValue(f"{SETTINGS_PREFIX}/tree_header", self.tree.header().saveState())
 
     # ---- Checks ----
 
@@ -1134,9 +1095,9 @@ class ReviewPage(QWidget):
         new_finals = [f for f in finals if not f.imported]
         parts = []
         if new_sessions:
-            parts.append(f"{sum(s.checked for s in new_sessions):,} of {_count(len(new_sessions), 'session')}")
+            parts.append(f"{sum(s.checked for s in new_sessions):,} of {count_text(len(new_sessions), 'session')}")
         if new_finals:
-            parts.append(f"{sum(f.checked for f in new_finals):,} of {_count(len(new_finals), 'image')}")
+            parts.append(f"{sum(f.checked for f in new_finals):,} of {count_text(len(new_finals), 'image')}")
         if not parts:
             lines = ["Everything here is already in your collection."]
         elif not any(s.checked for s in new_sessions) and not any(f.checked for f in new_finals):
@@ -1156,15 +1117,15 @@ class ReviewPage(QWidget):
             return ("All its subs are already in the Session Manager, so nothing will be added."
                     if session.checked else "Unchecked: all its subs are already in the Session Manager.")
         if session.status == "Partly imported":
-            missing, imported = _count(missing, "sub"), _count(session.imported, "sub")
+            missing, imported = count_text(missing, "sub"), count_text(session.imported, "sub")
             if not session.checked:
                 return (f"Unchecked: the {missing} not yet in the Session Manager won't be added.\n"
                         f"Check it to add them to the session that has the other {imported}.")
             return (f"Checked: the {missing} not yet in the Session Manager will be added to the session "
                     f"that has the other {imported}. That session keeps its status.")
-        what = _count(len(session.lights), "sub")
+        what = count_text(len(session.lights), "sub")
         if session.calibration:
-            what += f" and {_count(len(session.calibration), 'calibration frame')}"
+            what += f" and {count_text(len(session.calibration), 'calibration frame')}"
         if not session.checked:
             return f"Unchecked: it won't be imported.\nCheck it to add its {what} to the Session Manager."
         all_finals = [f for g in self.library.groups.values() for f in g.finals]
@@ -1230,10 +1191,10 @@ class ReviewPage(QWidget):
         sessions = sum(len(g.sessions) for g in groups)
         finals = sum(len(g.finals) for g in groups)
         unknown = sum(1 for g in library.groups.values() if not g.dsodetailid)
-        text = (f"Found {_count(len(groups), 'object', bold=True)} with {_count(sessions, 'session', bold=True)} "
-                f"and {_count(finals, 'image', bold=True)}")
+        text = (f"Found {count_text(len(groups), 'object', bold=True)} with {count_text(sessions, 'session', bold=True)} "
+                f"and {count_text(finals, 'image', bold=True)}")
         if unknown:
-            text += f" · {_count(unknown, 'group')} {'needs' if unknown == 1 else 'need'} an object"
+            text += f" · {count_text(unknown, 'group')} {'needs' if unknown == 1 else 'need'} an object"
         if self.scan.new_files and self.scan.headers_cached:
             text += f" · {self.scan.new_files:,} files new since the last scan"
         self.summary.setText(text)
@@ -1361,9 +1322,9 @@ class ReviewPage(QWidget):
             return
         parts = []
         if sessions:
-            parts.append(_count(len(sessions), "session"))
+            parts.append(count_text(len(sessions), "session"))
         if finals:
-            parts.append(_count(len(finals), "image"))
+            parts.append(count_text(len(finals), "image"))
         keys = {s.dso_key for s in sessions} | {f.dso_key for f in finals}
         current = next(iter(keys)) if len(keys) == 1 else None
         dialog = ObjectPickerDialog(self.library.catalog, self._suggestions(sessions, finals),
@@ -1714,8 +1675,7 @@ class DetailsPane(QWidget):
     def _open(self, folder):
         if not folder:
             return
-        from cosmoscollection.core.ResourceManager import ResourceManager
-        ResourceManager.open_file_manager(folder)
+        show_in_folder(folder)
 
     def _set_table(self, headers, rows, numeric=()):
         """rows of values - a (text, tooltip) pair for a cell with a tooltip."""
@@ -1743,7 +1703,7 @@ class DetailsPane(QWidget):
         if not group.dsodetailid:
             lines.append("Cosmos Collection couldn't tell which object these files are. Choose one with "
                          "Change Object, or let plate solving find it.")
-        lines.append(f"{_count(len(group.sessions), 'session')} · {_count(len(group.finals), 'image')}")
+        lines.append(f"{count_text(len(group.sessions), 'session')} · {count_text(len(group.finals), 'image')}")
         integration = sum(s.integration_seconds for s in group.sessions)
         if integration:
             lines.append(f"Total integration: {format_duration(integration)}")
@@ -2147,7 +2107,7 @@ class ImportWizardWindow(WindowPositionMixin, QDialog):
         self.worker = None
         self.scan, self.library = scan, library
         self.folders_page.refresh_scan_dates()
-        _refresh_session_manager()  # Sessions it already had may have been given their mounts
+        refresh_open("SessionManagerWindow", "_load_sessions")  # Sessions it already had may have been given their mounts
         # Names in the files nobody has matched to equipment yet: ask first
         equipment = library.equipment or LibraryScanner.EquipmentInfo()
         if any(not equipment.decided(row["kind"], row["value"]) for row in LibraryScanner.equipment_in_files(library)):
@@ -2177,22 +2137,11 @@ class ImportWizardWindow(WindowPositionMixin, QDialog):
         """Save the matches (adding the new equipment, linking gallery images given
         those names), then group the sessions by them."""
         from cosmoscollection.core.DatabaseManager import DatabaseManager
+        from cosmoscollection.equipment import EquipmentMapper
         try:
             with DatabaseManager().get_connection() as conn:
-                for kind, value, header in new:
-                    measured = LibraryScanner.equipment_from_header(kind, header)
-                    if kind == LibraryScanner.TELESCOPE:
-                        item_id = LibraryScanner.add_telescope(conn, value, measured["focal_length"], measured["aperture"])
-                    else:
-                        width, height = measured["sensor_width"], measured["sensor_height"]
-                        if width and height and width < height:   # A portrait frame: the sensor is landscape
-                            width, height = height, width
-                        item_id = LibraryScanner.add_camera(conn, value, width, height, measured["pixel_size"])
-                    decisions[(kind, value)] = item_id
                 # Gallery images given these names link to the equipment too
-                from cosmoscollection.equipment import EquipmentMapper
-                EquipmentMapper.save_matches(conn, decisions)
-                equipment = LibraryScanner.load_equipment_info(conn)
+                equipment = EquipmentMapper.save_wizard_matches(conn, decisions, new)
         except Exception as e:
             logger.error(f"Couldn't save the equipment matches: {e}", exc_info=True)
             QMessageBox.critical(self, "Equipment", f"The equipment matches couldn't be saved:\n{e}")
@@ -2215,12 +2164,12 @@ class ImportWizardWindow(WindowPositionMixin, QDialog):
         calibration = sum(len(s.calibration) for s in sessions)
         lines = []
         if sessions:
-            line = f"{_count(len(sessions), 'session')} with {_count(lights, 'sub')}"
+            line = f"{count_text(len(sessions), 'session')} with {count_text(lights, 'sub')}"
             if calibration:
-                line += f" and {_count(calibration, 'calibration frame')}"
+                line += f" and {count_text(calibration, 'calibration frame')}"
             lines.append(line + " into the Session Manager")
         if finals:
-            lines.append(f"{_count(len(finals), 'image')} into the gallery")
+            lines.append(f"{count_text(len(finals), 'image')} into the gallery")
         gap = self.library.session_gap_days
         if QMessageBox.question(
                 self, "Import",
@@ -2283,24 +2232,24 @@ class ImportWizardWindow(WindowPositionMixin, QDialog):
             refresh_open_image_views()
         except Exception as e:
             logger.debug(f"Couldn't refresh the gallery: {e}")
-        _refresh_session_manager()
+        refresh_open("SessionManagerWindow", "_load_sessions")
 
         lines = []
         if report.sessions_created:
-            lines.append(f"{_count(report.sessions_created, 'new session')} "
+            lines.append(f"{count_text(report.sessions_created, 'new session')} "
                          f"({report.completed} Completed, {report.in_progress} In Progress)")
         if report.sessions_extended:
-            lines.append(f"{_count(report.sessions_extended, 'existing session')} got more subs")
+            lines.append(f"{count_text(report.sessions_extended, 'existing session')} got more subs")
         if report.subs_added or report.calibration_added:
-            lines.append(f"{_count(report.subs_added, 'sub')} and {_count(report.calibration_added, 'calibration frame')}")
+            lines.append(f"{count_text(report.subs_added, 'sub')} and {count_text(report.calibration_added, 'calibration frame')}")
         if report.images_added:
-            lines.append(f"{_count(report.images_added, 'image')} added to the gallery")
+            lines.append(f"{count_text(report.images_added, 'image')} added to the gallery")
         if report.subs_skipped:
-            lines.append(f"{_count(report.subs_skipped, 'sub')} skipped - already in another session")
+            lines.append(f"{count_text(report.subs_skipped, 'sub')} skipped - already in another session")
         if report.images_skipped:
-            lines.append(f"{_count(report.images_skipped, 'image')} skipped - already in the gallery")
+            lines.append(f"{count_text(report.images_skipped, 'image')} skipped - already in the gallery")
         if report.images_linked:
-            lines.append(f"{_count(report.images_linked, 'gallery image')} linked to "
+            lines.append(f"{count_text(report.images_linked, 'gallery image')} linked to "
                          f"{'its session' if report.images_linked == 1 else 'their sessions'}")
         text = "\n".join("• " + line for line in lines) or "Nothing new was imported."
         if report.cancelled:
@@ -2346,17 +2295,6 @@ class ImportWizardWindow(WindowPositionMixin, QDialog):
         self.review_page.shutdown()
         self.review_page.save_state()
         super().closeEvent(event)
-
-
-def _refresh_session_manager():
-    """An open Session Manager shows the sessions just imported."""
-    from PySide6.QtWidgets import QApplication
-    for widget in QApplication.topLevelWidgets():
-        if type(widget).__name__ == "SessionManagerWindow" and widget.isVisible():
-            try:
-                widget._load_sessions()
-            except Exception as e:
-                logger.debug(f"Couldn't refresh the Session Manager: {e}")
 
 
 def _refresh_equipment_window():

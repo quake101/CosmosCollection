@@ -20,9 +20,9 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import date
 
-from PySide6.QtCore import QSettings
 
 from cosmoscollection.sessions import SessionFileScanner
+from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.sessions import SessionObservations
 from cosmoscollection.core.UrlOpener import clean_subprocess_env
 
@@ -57,10 +57,6 @@ def wbpp_filter_name(name):
     """The filter name WBPP sees for a user-corrected filter, which reaches it
     through the staged file name (smart naming) rather than the header."""
     return _WBPP_VALUE_INVALID_RE.sub("-", str(name or "").strip()) or "NoFilter"
-
-
-def _settings():
-    return QSettings("CosmosCollection", "CosmosCollection")
 
 
 # ---- Executable detection --------------------------------------------------
@@ -140,7 +136,7 @@ def find_wbpp_script(pixinsight_path):
 def resolve_executable(app):
     """The executable to run for an app given its saved path setting (or
     auto-detection when that's empty), or None."""
-    configured = _settings().value(f"{app}_path", "", type=str)
+    configured = app_settings().value(f"{app}_path", "", type=str)
     return find_siril_cli(configured) if app == SIRIL else find_pixinsight(configured)
 
 
@@ -148,7 +144,7 @@ def integration_status(app):
     """(ready, message) - ready only when the integration is enabled in Settings
     and its executable (and for PixInsight, WBPP.js) can be found."""
     label = APP_LABELS[app]
-    if not _settings().value(f"{app}_integration_enabled", False, type=bool):
+    if not app_settings().value(f"{app}_integration_enabled", False, type=bool):
         return False, f"Enable {label} in Settings → Integrations to use this."
     exe = resolve_executable(app)
     if not exe:
@@ -410,7 +406,7 @@ def default_workspace(app, dso_name, session_date, frames):
     """<base>/<DSO>_<date>_<App>, where base is the app's workspace setting or
     else the folder above the lights. Never an existing non-empty folder - a
     numeric suffix is added instead, so a re-run never mixes with an old one."""
-    base = _settings().value(f"{app}_workspace_dir", "", type=str).strip()
+    base = app_settings().value(f"{app}_workspace_dir", "", type=str).strip()
     if not base:
         folders = frames.light_folders()
         if folders:

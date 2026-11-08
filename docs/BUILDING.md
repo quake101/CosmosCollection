@@ -25,13 +25,16 @@
 ## Project Layout
 
 ```
-main.py                 Launcher: runs app/Bootstrap.py, then app/Startup.py
+main.py                 Launcher: the command line (cli/) when given a command, else
+                        app/Bootstrap.py, then app/Startup.py
 CosmosCollection.spec   PyInstaller build for the app
 build_tools/            Build-time scripts (release version stamping, Windows version info)
 catalogs/  images/  web/   Data shipped with the app (DSO catalog, icons, Aladin Lite)
 updater/                The separate updater program and its PyInstaller spec
+tests/                  Command line tests (python -m unittest discover tests)
 cosmoscollection/       The app's code
-  app/        Startup, main window, Settings, About/update dialogs, command-line mode, tray
+  cli/        The command line (docs/CLI.md): no GUI modules, only PySide6.QtCore for settings
+  app/        Startup, main window, Settings, About/update dialogs, tray, the old CLI options
   ui/         Theme, window position/lifetime helpers, shared dialogs (map location picker)
   core/       Database, resource paths, network limits/offline mode, diagnostics, app updater
   catalog/    DSO names, SIMBAD lookups, the DSO detail window
@@ -44,6 +47,8 @@ cosmoscollection/       The app's code
 ```
 
 Imports are absolute, e.g. `from cosmoscollection.core.DatabaseManager import DatabaseManager`. `app/Bootstrap.py` must be imported before anything that loads numpy or Qt, so keep the package `__init__.py` files empty.
+
+The command line imports logic modules directly, so keep work that a command could use out of modules that import `QtGui`, `QtWidgets` or matplotlib, and import numpy and other heavy packages inside the functions that need them. `tests/test_cli.py` fails if a command loads a GUI module. The `COSMOS_DATA_DIR` environment variable points the app and the command line at another data folder (database and logs), for testing on a copy.
 
 A few modules also run on their own, for testing. Run them as modules from the repo root:
 

@@ -8,7 +8,7 @@ import logging
 import os
 from typing import Optional, Dict
 
-from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, QThread, QUrl
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, QThread
 from PySide6.QtGui import QPixmap, QPainter, QAction
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QLineEdit,
@@ -23,6 +23,7 @@ from cosmoscollection.ui.WindowLifetime import release_on_close, window_is_open
 from cosmoscollection.ui.Theme import COLORS, adapt_color, font_size, themed_style, themed_text
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
 from cosmoscollection.core.UrlOpener import open_url
+from cosmoscollection.core.Formatting import format_dec, format_ra
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -244,7 +245,7 @@ class DSODetailWindow(QDialog):
         self.user_images = []
         self.current_image_index = 0
 
-        self.ra_str, self.dec_str = self._format_coordinates(data["ra_deg"], data["dec_deg"])
+        self.ra_str, self.dec_str = format_ra(data["ra_deg"]), format_dec(data["dec_deg"])
 
         logger.debug(f"About to set up UI for {data['name']}")
         self._setup_ui()
@@ -340,25 +341,6 @@ class DSODetailWindow(QDialog):
             parts.append(entry)
 
         return "<br><b>Name Sources:</b> " + " &middot; ".join(parts)
-
-    def _format_coordinates(self, ra_deg, dec_deg):
-        """Format RA and Dec coordinates efficiently"""
-        ra_hours = ra_deg / 15.0
-        ra_h = int(ra_hours)
-        ra_remaining = (ra_hours - ra_h) * 60
-        ra_m = int(ra_remaining)
-        ra_s = (ra_remaining - ra_m) * 60
-        ra_str = f"{ra_h:02d}h{ra_m:02d}m{ra_s:05.2f}s"
-
-        dec_sign = '-' if dec_deg < 0 else '+'
-        dec_abs = abs(dec_deg)
-        dec_d = int(dec_abs)
-        dec_remaining = (dec_abs - dec_d) * 60
-        dec_m = int(dec_remaining)
-        dec_s = (dec_remaining - dec_m) * 60
-        dec_str = f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
-
-        return ra_str, dec_str
 
     def _query_emission_data(self):
         """Query SIMBAD for emission line and spectral information"""

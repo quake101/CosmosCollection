@@ -113,6 +113,37 @@ def reference_stars(ra, dec, radius, count=CATALOG_DEPTH):
 
 # ---- Image stars -------------------------------------------------------------
 
+def _picture_luminance(path):
+    """A PNG/JPG/TIFF (not rotated by its EXIF orientation) as a mono float32
+    array, top row first. In the app Qt reads it, as its windows do (16-bit
+    TIFFs at full depth); the command line, which never loads Qt's GUI
+    modules, reads it with Pillow."""
+    if "PySide6.QtGui" in sys.modules:
+        from PySide6.QtGui import QImage
+        from cosmoscollection.imaging.ImageLoader import read_image_file
+        image, _error = read_image_file(path, auto_transform=False)
+        if image is None:
+            raise SolveFailed("The image couldn't be read")
+        image = image.convertToFormat(QImage.Format_Grayscale16)
+        width, height = image.width(), image.height()
+        row_pixels = image.bytesPerLine() // 2
+        img = np.frombuffer(image.constBits(), dtype=np.uint16, count=row_pixels * height)
+        return img.reshape(height, row_pixels)[:, :width].astype(np.float32)
+
+    from io import BytesIO
+    from PIL import Image
+    from cosmoscollection.imaging.ImageArrays import read_file_bytes
+    Image.MAX_IMAGE_PIXELS = None  # Big stacks and mosaics aren't decompression bombs
+    try:
+        with Image.open(BytesIO(read_file_bytes(path))) as image:
+            if image.mode in ("I;16", "I;16B", "I;16L", "I", "F"):
+                return np.asarray(image, dtype=np.float32)
+            return np.asarray(image.convert("L"), dtype=np.float32)
+    except Exception as e:
+        logger.debug(f"Pillow couldn't read {path}: {e}")
+        raise SolveFailed("The image couldn't be read")
+
+
 def _load_luminance(path):
     """(mono float32 image at most ANALYSIS_SIDE across, original pixels per
     analysis pixel, (original width, height), FITS-style header dict)."""
@@ -125,16 +156,8 @@ def _load_luminance(path):
         img, factor, _summed = _luminance(data, header)
         del data
     else:
-        from PySide6.QtGui import QImage
-        from cosmoscollection.imaging.ImageLoader import read_image_file
-        image, _error = read_image_file(path, auto_transform=False)
-        if image is None:
-            raise SolveFailed("The image couldn't be read")
-        image = image.convertToFormat(QImage.Format_Grayscale16)
-        width, height = image.width(), image.height()
-        row_pixels = image.bytesPerLine() // 2
-        img = np.frombuffer(image.constBits(), dtype=np.uint16, count=row_pixels * height)
-        img = img.reshape(height, row_pixels)[:, :width].astype(np.float32)
+        img = _picture_luminance(path)
+        height, width = img.shape
         factor = 1
     k = math.ceil(max(img.shape) / ANALYSIS_SIDE)
     if k > 1:
@@ -489,8 +512,9 @@ def equipment_scales(path):
     try:
         import sqlite3
         from collections import Counter
+        from cosmoscollection.core.Paths import path_key
         from cosmoscollection.core.ResourceManager import ResourceManager
-        from cosmoscollection.imaging.AnnotationOverlay import read_wcs_header
+        from cosmoscollection.imaging.WCS import read_wcs_header
         from cosmoscollection.equipment import EquipmentMapper
         conn = sqlite3.connect(str(ResourceManager.get_database_path()))
         try:
@@ -499,13 +523,13 @@ def equipment_scales(path):
                 "WHERE ui.image_path IS NOT NULL AND ui.image_path != ''").fetchall()]
         finally:
             conn.close()
-        wanted = os.path.normcase(os.path.normpath(path))
-        mine = next((key for p, key in rows if os.path.normcase(os.path.normpath(p)) == wanted), None)
+        wanted = path_key(path)
+        mine = next((key for p, key in rows if path_key(p) == wanted), None)
         if mine is None or mine == "|":  # Not in the gallery, or no telescope or camera
             return []
         found = Counter()
         for other, key in rows:
-            if key != mine or os.path.normcase(os.path.normpath(other)) == wanted or not os.path.isfile(other):
+            if key != mine or path_key(other) == wanted or not os.path.isfile(other):
                 continue
             header = read_wcs_header(other)
             if not header:
@@ -528,6 +552,7 @@ def equipment_scales(path):
 def _hint_for(path):
     """(ra, dec) of the image's object from the database, or (None, None)."""
     import sqlite3
+    from cosmoscollection.core.Paths import path_key
     from cosmoscollection.core.ResourceManager import ResourceManager
     conn = sqlite3.connect(str(ResourceManager.get_database_path()))
     try:
@@ -535,9 +560,9 @@ def _hint_for(path):
                             "JOIN dsodetail d ON d.id = ui.dsodetailid").fetchall()
     finally:
         conn.close()
-    wanted = os.path.normcase(os.path.normpath(path))  # Stored paths mix / and \
+    wanted = path_key(path)  # Stored paths mix / and \
     return next(((ra, dec) for stored, ra, dec in rows
-                 if stored and os.path.normcase(os.path.normpath(stored)) == wanted), (None, None))
+                 if stored and path_key(stored) == wanted), (None, None))
 
 
 def main(argv):
@@ -550,7 +575,7 @@ def main(argv):
     args = parser.parse_args(argv)
     from PySide6.QtGui import QGuiApplication
     app = QGuiApplication.instance() or QGuiApplication(["NativePlateSolver"])  # For reading images
-    from cosmoscollection.imaging.AnnotationOverlay import read_wcs_header, WCSTransform, flip_wcs_rows
+    from cosmoscollection.imaging.WCS import read_wcs_header, WCSTransform, flip_wcs_rows
 
     for path in args.images:
         ra, dec = (args.ra, args.dec) if args.ra is not None else _hint_for(path)
@@ -567,7 +592,7 @@ def main(argv):
                 f"{info['scale']:.2f}\"/px, {info['seconds']:.1f}s, {info['tries']} field(s) tried")
         saved = read_wcs_header(path)
         if saved:
-            from cosmoscollection.imaging.AnnotationOverlay import image_pixel_size
+            from cosmoscollection.imaging.WCS import image_pixel_size
             w, h = image_pixel_size(path)
             fits = os.path.splitext(path)[1].lower() in FITS_EXTENSIONS
             mine = WCSTransform(flip_wcs_rows(solution, h) if fits else solution, w, h)

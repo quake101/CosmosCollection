@@ -314,6 +314,22 @@ def load_active_horizon(conn=None):
     ], "the active location")
 
 
+def load_horizon_for_location(location_id, conn=None):
+    """The custom horizon of the saved location (usersettings row) with this
+    id; None if it has none."""
+    return _load_horizon(conn, [
+        ("SELECT horizon_points, horizon_name FROM usersettings WHERE id = ?", (location_id,)),
+    ], f"location {location_id}")
+
+
+def load_horizon_for_site(site):
+    """The custom horizon of an Observer.Site: its own when it's a saved
+    location, else that of a saved location at its coordinates."""
+    if getattr(site, "id", None) is not None:
+        return load_horizon_for_location(site.id)
+    return load_horizon_for_coordinates(site.lat, site.lon)
+
+
 def load_horizon_for_coordinates(lat, lon, conn=None):
     """Load the custom horizon of the saved location at the given coordinates.
 

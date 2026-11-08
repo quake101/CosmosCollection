@@ -35,8 +35,8 @@ def is_offline():
     """Whether offline mode is on - read each time, so a change in Settings
     takes effect at once, from any thread."""
     try:
-        from PySide6.QtCore import QSettings
-        return QSettings("CosmosCollection", "CosmosCollection").value(OFFLINE_SETTING, False, type=bool)
+        from cosmoscollection.core.Settings import app_settings
+        return app_settings().value(OFFLINE_SETTING, False, type=bool)
     except Exception:
         return False
 

@@ -12,11 +12,13 @@ SessionObservations.set_file_filters; clearing goes back to the files' own filte
 import logging
 from datetime import timedelta
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
                                QSpinBox, QHeaderView, QAbstractItemView)
 
-from cosmoscollection.sessions.SessionManager import _make_table, _table_item, format_exposure
+from cosmoscollection.sessions.SessionManager import _make_table, _table_item
+from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Formatting import format_exposure
 from cosmoscollection.ui.Theme import COLORS, themed_style
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.sessions import ProcessingHandoff
@@ -145,7 +147,7 @@ class NightFiltersDialog(WindowPositionMixin, QDialog):
         self.gap_spin = QSpinBox()
         self.gap_spin.setRange(1, 240)
         self.gap_spin.setSuffix(" min")
-        self.gap_spin.setValue(QSettings("CosmosCollection", "CosmosCollection").value(
+        self.gap_spin.setValue(app_settings().value(
             GAP_SETTING, DEFAULT_GAP_MINUTES, type=int))
         self.gap_spin.valueChanged.connect(self._on_gap_changed)
         gap_row.addWidget(self.gap_spin)
@@ -230,7 +232,7 @@ class NightFiltersDialog(WindowPositionMixin, QDialog):
                 self._chosen[f["id"]] = None if choice == _FROM_FILE else choice
 
     def _on_gap_changed(self, value):
-        QSettings("CosmosCollection", "CosmosCollection").setValue(GAP_SETTING, value)
+        app_settings().setValue(GAP_SETTING, value)
         self._apply_rows()
         self._fill_runs()
 

@@ -30,7 +30,7 @@ from datetime import datetime
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRectF, QSettings, QSize, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QRectF, QSize, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QWidget, QLabel, QPushButton,
                                QComboBox, QCheckBox, QListWidget, QListWidgetItem, QToolButton, QSpinBox,
@@ -38,6 +38,9 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, Q
                                QTableWidgetItem, QHeaderView, QDialogButtonBox, QAbstractItemView)
 
 from cosmoscollection.imaging import ImageDetails
+from cosmoscollection.core.UrlOpener import show_in_folder
+from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Formatting import trim_number
 from cosmoscollection.imaging.AnnotationOverlay import paint_annotations
 from cosmoscollection.ui.Theme import COLORS, font_size, themed_style
 from cosmoscollection.ui.WindowPositionManager import WindowPositionManager, WindowPositionMixin
@@ -64,10 +67,6 @@ ASTROBIN_FILTER_IDS_SETTING = "image_export/astrobin/filter_ids"
 # Workers that outlived their dialog. A QThread destroyed while it runs
 # crashes the app, so a reference is kept until it finishes.
 _orphaned_workers = set()
-
-
-def _settings():
-    return QSettings("CosmosCollection", "CosmosCollection")
 
 
 def is_astro_file(path):
@@ -383,14 +382,14 @@ REQUIRED_COLUMNS = {"date", "filter", "number", "duration"}
 def load_filter_ids():
     """{filter key (SessionObservations.normalize_filter): AstroBin filter ID}"""
     try:
-        value = json.loads(_settings().value(ASTROBIN_FILTER_IDS_SETTING, "{}", type=str) or "{}")
+        value = json.loads(app_settings().value(ASTROBIN_FILTER_IDS_SETTING, "{}", type=str) or "{}")
     except (TypeError, ValueError):
         return {}
     return {str(k): str(v) for k, v in value.items() if v} if isinstance(value, dict) else {}
 
 
 def save_filter_ids(ids):
-    _settings().setValue(ASTROBIN_FILTER_IDS_SETTING, json.dumps({k: v for k, v in ids.items() if v}))
+    app_settings().setValue(ASTROBIN_FILTER_IDS_SETTING, json.dumps({k: v for k, v in ids.items() if v}))
 
 
 def parse_filter_id(text):
@@ -401,11 +400,6 @@ def parse_filter_id(text):
     if match:
         return match.group(1)
     return text if text.isdigit() else ""
-
-
-def _number(value, decimals):
-    """'300' or '0.25' - at most decimals places, no trailing zeros."""
-    return f"{float(value):.{decimals}f}".rstrip("0").rstrip(".")
 
 
 def _iso_date(value):
@@ -484,10 +478,10 @@ def acquisition_rows(conn, session_id, filter_ids=None):
             continue
         filter_key, bucket = so.normalize_filter(filter_name), so.exposure_bucket(exposure)
         row = {"date": _iso_date(night) if night else "", "filter": filter_ids.get(filter_key, ""),
-               "number": str(int(count)), "duration": _number(exposure, 4)}
+               "number": str(int(count)), "duration": trim_number(exposure, 4)}
         gains, binnings, temperatures = lights.get((obs_id, filter_key, bucket), ([], [], []))
         if gains:
-            row["gain"] = _number(Counter(gains).most_common(1)[0][0], 2)
+            row["gain"] = trim_number(Counter(gains).most_common(1)[0][0], 2)
         binning = Counter(int(b) for b in binnings).most_common(1)[0][0] if binnings else None
         if binning in (1, 2, 3, 4):
             row["binning"] = str(binning)
@@ -676,7 +670,7 @@ class AstroBinAssist(Destination):
         if check is not None:
             return check.isChecked()
         default = next(on for k, _name, on in self.OPTIONS if k == key)
-        return _settings().value(f"image_export/astrobin/{key}", default, type=bool)
+        return app_settings().value(f"image_export/astrobin/{key}", default, type=bool)
 
     def more_widget(self):
         widget = QWidget()
@@ -685,7 +679,7 @@ class AstroBinAssist(Destination):
         for key, name, _on in self.OPTIONS:
             check = QCheckBox(name)
             check.setChecked(self._option(key))
-            check.toggled.connect(lambda on, key=key: _settings().setValue(f"image_export/astrobin/{key}", on))
+            check.toggled.connect(lambda on, key=key: app_settings().setValue(f"image_export/astrobin/{key}", on))
             layout.addWidget(check)
             self.checks[key] = check
         ids_button = QPushButton("AstroBin Filter IDs...")
@@ -958,8 +952,8 @@ class ExportDialog(WindowPositionMixin, QDialog):
         self.quality_spin.setRange(50, 100)
         self.quality_spin.setSuffix("%")
         self.quality_spin.setToolTip("Higher keeps more of the faint detail, in a larger file")
-        self.quality_spin.setValue(_settings().value(JPEG_QUALITY_SETTING, DEFAULT_JPEG_QUALITY, type=int))
-        self.quality_spin.valueChanged.connect(lambda value: _settings().setValue(JPEG_QUALITY_SETTING, value))
+        self.quality_spin.setValue(app_settings().value(JPEG_QUALITY_SETTING, DEFAULT_JPEG_QUALITY, type=int))
+        self.quality_spin.valueChanged.connect(lambda value: app_settings().setValue(JPEG_QUALITY_SETTING, value))
         more_form.addRow("JPEG quality:", self.quality_spin)
         more_layout.addLayout(more_form)
         self.more_stack = QStackedWidget()
@@ -983,10 +977,10 @@ class ExportDialog(WindowPositionMixin, QDialog):
         buttons.addWidget(close_button)
         right.addLayout(buttons)
 
-        more_shown = _settings().value(MORE_OPTIONS_SETTING, False, type=bool)
+        more_shown = app_settings().value(MORE_OPTIONS_SETTING, False, type=bool)
         self.more_toggle.setChecked(more_shown)
         self._toggle_more(more_shown)
-        last = _settings().value(LAST_DESTINATION_SETTING, "", type=str)
+        last = app_settings().value(LAST_DESTINATION_SETTING, "", type=str)
         index = next((i for i, d in enumerate(self.destinations) if d.key == last), 0)
         self.destination_list.currentRowChanged.connect(self._on_destination_changed)
         self.destination_list.setCurrentRow(index)
@@ -1117,7 +1111,7 @@ class ExportDialog(WindowPositionMixin, QDialog):
     def _on_destination_changed(self, row):
         destination = self._current()
         self.more_stack.setCurrentIndex(max(0, row))
-        size = _settings().value(f"image_export/{destination.key}/size", destination.default_size, type=str)
+        size = app_settings().value(f"image_export/{destination.key}/size", destination.default_size, type=str)
         self.size_combo.blockSignals(True)
         self.size_combo.setCurrentIndex(max(0, self.size_combo.findData(size)))
         self.size_combo.blockSignals(False)
@@ -1126,17 +1120,16 @@ class ExportDialog(WindowPositionMixin, QDialog):
         self.refresh()
 
     def _on_size_changed(self, _index):
-        _settings().setValue(f"image_export/{self._current().key}/size", self.size_combo.currentData())
+        app_settings().setValue(f"image_export/{self._current().key}/size", self.size_combo.currentData())
         self.refresh()
 
     def _toggle_more(self, shown):
         self.more.setVisible(shown)
         self.more_toggle.setArrowType(Qt.DownArrow if shown else Qt.RightArrow)
-        _settings().setValue(MORE_OPTIONS_SETTING, shown)
+        app_settings().setValue(MORE_OPTIONS_SETTING, shown)
 
     def _show_in_folder(self, path):
-        from cosmoscollection.core.ResourceManager import ResourceManager
-        if not ResourceManager.open_file_manager(path):
+        if not show_in_folder(path):
             QMessageBox.critical(self, "Error", "Failed to open the file's folder")
 
     # Running
@@ -1149,7 +1142,7 @@ class ExportDialog(WindowPositionMixin, QDialog):
         options = self._options(state)
         source, target, _banner = self._sizes(state)
         context = ExportContext(self.viewer.file_path, self.viewer.title, options, source, target, state["details"])
-        _settings().setValue(LAST_DESTINATION_SETTING, destination.key)
+        app_settings().setValue(LAST_DESTINATION_SETTING, destination.key)
         image = None
         if destination.wants_render(context):
             self.setCursor(Qt.BusyCursor)

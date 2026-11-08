@@ -44,6 +44,44 @@ def window_is_open(window):
         return False
 
 
+# --- Threads that outlive their owner ---
+# Dropping the last reference to a running QThread destroys it mid-run, which
+# aborts the whole app (natively), so threads that may outlive a stop request or
+# their window are referenced here until they end.
+_running_threads = set()
+
+
+def keep_alive_until_finished(thread):
+    """Hold a reference to a running QThread until it finishes."""
+    _running_threads.add(thread)
+    thread.finished.connect(lambda: _running_threads.discard(thread))
+
+
+def retire_thread(thread):
+    """Abandon a superseded worker thread that's still running. quit() can't
+    interrupt a QThread whose work is in run() (no event loop), and wait()-ing for
+    one freezes the UI until it finishes - e.g. clicking a second session
+    mid-fetch. So its signals are blocked (late results are dropped) and it's
+    kept referenced until it ends."""
+    _running_threads.difference_update([t for t in _running_threads if not t.isRunning()])
+    if thread is not None and thread.isRunning():
+        thread.blockSignals(True)
+        _running_threads.add(thread)
+
+
+def refresh_open(class_name, method_name, visible_only=True):
+    """Call method_name on each open top-level window of class class_name - for
+    windows that don't watch the database (e.g. the Session Manager's list after
+    a session was added elsewhere)."""
+    for widget in QApplication.topLevelWidgets():
+        if type(widget).__name__ != class_name or (visible_only and not widget.isVisible()):
+            continue
+        try:
+            getattr(widget, method_name)()
+        except Exception as e:
+            logger.warning(f"Could not refresh {class_name}: {e}")
+
+
 def release_on_close(window):
     """Delete window once it's closed and idle (see the module notes)."""
     _open.add(window)

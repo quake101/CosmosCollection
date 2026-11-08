@@ -40,12 +40,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from cosmoscollection.sessions import MountDetection
+from cosmoscollection.sessions import MountDetection, SessionFileScanner
+from cosmoscollection.core.Paths import path_key
+from cosmoscollection.core.Formatting import format_duration
 from cosmoscollection.sessions import SessionFileScanner
 from cosmoscollection.sessions import SessionObservations
 from cosmoscollection.sessions.SessionObservations import make_sub_key, parse_obs_datetime, night_date_for, FILE_FILTER_SQL
 from cosmoscollection.core.DatabaseManager import add_user_image_row
-from cosmoscollection.catalog.DSONames import CATALOG_RANK, pick_common_name, with_common_name
+from cosmoscollection.catalog.DSONames import CATALOG_RANK, NOT_DSO_TYPES, pick_common_name, with_common_name
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +127,6 @@ POSITION_MATCH_RADIUS = 0.25
 # A name-matched DSO this far from where the subs were pointed is flagged
 POSITION_MISMATCH_DEG = 3.0
 
-NOT_DSO_TYPES = {"1STAR", "2STAR", "3STAR", "4STAR", "NONEX"}
 
 # Catalog prefixes as people write them -> the catalog's own name
 CATALOG_ALIASES = {
@@ -398,7 +399,7 @@ class ScanIndex:
     def load(self, roots):
         """{normcase path: (size, mtime_ns, header or None, first_seen)} of the
         indexed files in roots - pass it to scan_library()."""
-        root_keys = [os.path.normcase(os.path.normpath(r)) for r in roots]
+        root_keys = [path_key(r) for r in roots]
         found = {}
         conn = self._connect()
         try:
@@ -423,7 +424,7 @@ class ScanIndex:
         conn = self._connect()
         try:
             row = conn.execute("SELECT last_scan FROM roots WHERE root_key = ?",
-                               (os.path.normcase(os.path.normpath(root)),)).fetchone()
+                               (path_key(root),)).fetchone()
         finally:
             conn.close()
         return row[0] if row else None
@@ -547,15 +548,8 @@ def _keyword_tier(text, rules):
     return 0
 
 
-def _number(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def exposure_of(header):
-    return _number(header.get('EXPTIME', header.get('EXPOSURE'))) if header else None
+    return SessionFileScanner.to_float(header.get('EXPTIME', header.get('EXPOSURE'))) if header else None
 
 
 def _calibration_hint(record):
@@ -579,7 +573,7 @@ def _classify_header_file(record, rules):
     tier = _keyword_tier(record.stem, rules)
     # A stack that kept its first sub's header but made EXPTIME the total (Astro
     # Pixel Processor: EXPTIME 9660, EXPOSURE 30). A sub's two are the same.
-    exptime, exposure = _number(header.get('EXPTIME')), _number(header.get('EXPOSURE'))
+    exptime, exposure = SessionFileScanner.to_float(header.get('EXPTIME')), SessionFileScanner.to_float(header.get('EXPOSURE'))
     summed = bool(exptime and exposure and exptime > exposure * 1.5)
     if (image_type.startswith("MASTER") and "LIGHT" not in image_type) or CALIBRATION_MASTER_NAME.search(record.stem):
         record.kind, record.reason = "processing", "calibration master"
@@ -588,8 +582,8 @@ def _classify_header_file(record, rules):
     elif tier == 3:
         # Its header is often a light's, copied along - never take it for a sub
         record.kind, record.tier, record.reason = "final", 3, "software's default output name"
-    elif tier == 2 or "MASTERLIGHT" in image_type or (_number(header.get('STACKCNT')) or 0) > 1 \
-            or (_number(header.get('NCOMBINE')) or 0) > 1 or summed:
+    elif tier == 2 or "MASTERLIGHT" in image_type or (SessionFileScanner.to_float(header.get('STACKCNT')) or 0) > 1 \
+            or (SessionFileScanner.to_float(header.get('NCOMBINE')) or 0) > 1 or summed:
         count = header.get('STACKCNT') or header.get('NCOMBINE')
         record.kind = "final"
         if tier == 2 or summed:
@@ -1050,7 +1044,7 @@ def _night(record):
     time zone."""
     header = record.header or {}
     utc = _obs_time(record)
-    longitude = _number(header.get('SITELONG', header.get('LONG-OBS')))
+    longitude = SessionFileScanner.to_float(header.get('SITELONG', header.get('LONG-OBS')))
     if longitude is not None:
         local = utc + timedelta(hours=longitude / 15.0)
     else:
@@ -1072,7 +1066,7 @@ def _coords(header):
     coords = SessionFileScanner._file_coordinates(header)
     if coords:
         return coords
-    ra, dec = _number(header.get('CRVAL1')), _number(header.get('CRVAL2'))
+    ra, dec = SessionFileScanner.to_float(header.get('CRVAL1')), SessionFileScanner.to_float(header.get('CRVAL2'))
     return (ra, dec) if ra is not None and dec is not None else None
 
 
@@ -1177,21 +1171,17 @@ class KnownItems:
     sub_keys: set = field(default_factory=set)
 
 
-def _norm_path(path):
-    return os.path.normcase(os.path.normpath(path or ""))
-
-
 def load_known(conn):
     known = KnownItems()
     for (path,) in conn.execute("SELECT image_path FROM userimages WHERE image_path IS NOT NULL"):
-        known.image_paths.add(_norm_path(path))
+        known.image_paths.add(path_key(path))
     # Fingerprints made here, not read from sub_key, so they match _sub_key()
     # even in a database the app hasn't migrated yet. From the header's filter,
     # not a user's correction - _sub_key() reads the header too.
     for path, date_obs, exptime, filter_name, frame_type, camera in conn.execute(
             f"SELECT file_path, date_obs, exptime_seconds, {FILE_FILTER_SQL}, frame_type, camera "
             "FROM usersessionfiles"):
-        known.session_paths.add(_norm_path(path))
+        known.session_paths.add(path_key(path))
         sub_key = make_sub_key(date_obs, exptime, filter_name, frame_type, camera)
         if sub_key:
             known.sub_keys.add(sub_key)
@@ -1209,11 +1199,13 @@ FOCAL_LENGTH_TOLERANCE = 0.03
 PIXEL_SIZE_TOLERANCE = 0.05     # microns
 
 
-def _alias_key(value):
+def alias_key(value):
+    """How a name in the files is matched to Equipment (equipmentaliases.alias_key):
+    case and surrounding spaces ignored."""
     return (value or "").strip().casefold()
 
 
-def _plain(name):
+def plain_name(name):
     """'ZWO ASI2600MC Pro' -> 'zwoasi2600mcpro', for comparing names."""
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
 
@@ -1231,12 +1223,12 @@ class EquipmentInfo:
 
     def decided(self, kind, value):
         """Whether the user has said what this name in the files is."""
-        return (kind, _alias_key(value)) in self.aliases
+        return (kind, alias_key(value)) in self.aliases
 
     def match(self, kind, value):
         """(equipment id or None, the name to show) for a TELESCOP/INSTRUME value."""
         value = _clean(value)
-        equipment_id = self.aliases.get((kind, _alias_key(value)))
+        equipment_id = self.aliases.get((kind, alias_key(value)))
         item = self.items(kind).get(equipment_id) if equipment_id is not None else None
         return (equipment_id, item["name"]) if item else (None, value)
 
@@ -1277,7 +1269,7 @@ def save_equipment_aliases(conn, decisions):
     _ensure_alias_table(conn)
     conn.executemany(
         "INSERT OR REPLACE INTO equipmentaliases (kind, alias_key, header_value, equipment_id) VALUES (?, ?, ?, ?)",
-        [(kind, _alias_key(value), value, equipment_id) for (kind, value), equipment_id in decisions.items()])
+        [(kind, alias_key(value), value, equipment_id) for (kind, value), equipment_id in decisions.items()])
     conn.commit()
 
 
@@ -1306,17 +1298,17 @@ def equipment_from_header(kind, header):
     "sensor_height" (mm)} - the values a new Equipment entry starts with."""
     header = header or {}
     if kind == TELESCOPE:
-        focal = _number(header.get('FOCALLEN'))
-        aperture = _number(header.get('APTDIA'))
-        ratio = _number(header.get('FOCRATIO'))
+        focal = SessionFileScanner.to_float(header.get('FOCALLEN'))
+        aperture = SessionFileScanner.to_float(header.get('APTDIA'))
+        ratio = SessionFileScanner.to_float(header.get('FOCRATIO'))
         if not aperture and focal and ratio:
             aperture = round(focal / ratio, 1)
         if aperture and aperture < 1:   # Some software writes metres
             aperture *= 1000
         return {"focal_length": focal or None, "aperture": aperture or None}
-    pixel = _number(header.get('XPIXSZ'))
-    binning = _number(header.get('XBINNING')) or 1
-    width, height = _number(header.get('NAXIS1')), _number(header.get('NAXIS2'))
+    pixel = SessionFileScanner.to_float(header.get('XPIXSZ'))
+    binning = SessionFileScanner.to_float(header.get('XBINNING')) or 1
+    width, height = SessionFileScanner.to_float(header.get('NAXIS1')), SessionFileScanner.to_float(header.get('NAXIS2'))
     return {"pixel_size": round(pixel / max(binning, 1), 2) if pixel else None,
             # Binned pixels times the binned pixel size: the sensor's size either way
             "sensor_width": round(width * pixel / 1000, 2) if width and pixel else None,
@@ -1328,12 +1320,12 @@ def suggest_equipment(kind, value, header, info):
     name ('ZWO ASI2600MC Pro' ~ 'ASI2600MC Pro'), else by focal length or pixel
     size when exactly one item fits - or (None, "")."""
     items = info.items(kind)
-    plain = _plain(value)
+    plain = plain_name(value)
     if not plain or not items:
         return None, ""
     named = []
     for item_id, item in items.items():
-        other = _plain(item["name"])
+        other = plain_name(item["name"])
         if other and min(len(other), len(plain)) >= 3 and (other in plain or plain in other):
             named.append(item_id)
     measured = equipment_from_header(kind, header)
@@ -1351,7 +1343,7 @@ def suggest_equipment(kind, value, header, info):
         both = [i for i in named if i in fits]
         candidates = both or named
         # The closest name, enabled equipment first
-        best = min(candidates, key=lambda i: (not items[i]["is_active"], abs(len(_plain(items[i]["name"])) - len(plain))))
+        best = min(candidates, key=lambda i: (not items[i]["is_active"], abs(len(plain_name(items[i]["name"])) - len(plain))))
         return best, "same name" + (f" and {fit_reason}" if best in fits else "")
     if len(fits) == 1:
         return fits[0], fit_reason
@@ -1374,7 +1366,7 @@ def equipment_in_files(library):
                     value = _clean(record.header.get(HEADER_KEY_OF[kind]))
                     if not value:
                         continue
-                    entry = found.setdefault((kind, _alias_key(value)), {
+                    entry = found.setdefault((kind, alias_key(value)), {
                         "kind": kind, "spellings": Counter(), "subs": 0, "sessions": set(),
                         "header": record.header, "first": None, "last": None})
                     entry["spellings"][value] += 1
@@ -1442,7 +1434,7 @@ def _rig_key(record, equipment):
     """Lights with the same key were taken with the same camera and telescope:
     matched ones by their Equipment entry ('Seestar S50' and 'S50_5a91178b'
     alike), others by name."""
-    return tuple(("id", equipment_id) if equipment_id is not None else ("name", _alias_key(name))
+    return tuple(("id", equipment_id) if equipment_id is not None else ("name", alias_key(name))
                  for equipment_id, name in _rig(record, equipment))
 
 
@@ -1480,7 +1472,7 @@ def _same_camera(session, camera_value, equipment):
     camera_id, name = equipment.match(CAMERA, camera_value)
     if camera_id is not None or session.camera_id is not None:
         return camera_id == session.camera_id
-    return _alias_key(name) == _alias_key(session.camera)
+    return alias_key(name) == alias_key(session.camera)
 
 
 def build_library(scan, catalog, known=None, rules=None, assignments=None, equipment=None):
@@ -1560,7 +1552,7 @@ def build_library(scan, catalog, known=None, rules=None, assignments=None, equip
         all_sessions.extend(sessions)
     for session in all_sessions:
         for r in session.lights:
-            r.imported = _norm_path(r.path) in known.session_paths or _sub_key(r) in known.sub_keys
+            r.imported = path_key(r.path) in known.session_paths or _sub_key(r) in known.sub_keys
         # Nothing can be imported without a DSO - unknown groups wait for the user to name them
         session.checked = session.imported < len(session.lights) and not session.dso_key.startswith("unknown:")
     for group in library.groups.values():
@@ -1623,7 +1615,7 @@ def build_library(scan, catalog, known=None, rules=None, assignments=None, equip
                 resolution.dsodetailid, resolution.name = best, library.groups[best].name
         group = group_for(resolution, record.folder)
         final = FinalImage(record, group.key, resolution)
-        final.imported = any(_norm_path(r.path) in known.image_paths for r in [record] + record.variants)
+        final.imported = any(path_key(r.path) in known.image_paths for r in [record] + record.variants)
         final.session = _pair_session(final, group.sessions)
         group.finals.append(final)
     for group in library.groups.values():
@@ -1860,7 +1852,7 @@ def save_known_mounts(conn, library):
             mounts = session.mounts
             if not mounts or not session.imported:
                 continue
-            owners = {by_path.get(os.path.normcase(os.path.normpath(r.path))) or by_key.get(_sub_key(r))
+            owners = {by_path.get(path_key(r.path)) or by_key.get(_sub_key(r))
                       for r in session.lights} - {None}
             for session_id in owners:
                 MountDetection.save(conn, session_id, mounts, tidy=False)
@@ -1990,7 +1982,7 @@ def _owners(conn):
     for session_id, path, date_obs, exptime, filter_name, frame_type, camera in conn.execute(
             f"SELECT session_id, file_path, date_obs, exptime_seconds, {FILE_FILTER_SQL}, frame_type, camera "
             "FROM usersessionfiles"):
-        by_path[os.path.normcase(os.path.normpath(path or ""))] = session_id
+        by_path[path_key(path or "")] = session_id
         key = SessionObservations.make_sub_key(date_obs, exptime, filter_name, frame_type, camera)
         if key:
             by_key[key] = session_id
@@ -2001,7 +1993,7 @@ def _existing_session(session, by_path, by_key):
     """The Session Manager session holding most of this session's subs already, or None."""
     owners = Counter()
     for record in session.lights:
-        owner = by_path.get(os.path.normcase(os.path.normpath(record.path))) or by_key.get(_sub_key(record))
+        owner = by_path.get(path_key(record.path)) or by_key.get(_sub_key(record))
         if owner:
             owners[owner] += 1
     return owners.most_common(1)[0][0] if owners else None
@@ -2032,8 +2024,8 @@ def _session_location(session, locations):
     lats, lons = [], []
     for record in session.lights[::max(1, len(session.lights) // 50)]:
         header = record.header or {}
-        lat = _number(header.get('SITELAT', header.get('LAT-OBS')))
-        lon = _number(header.get('SITELONG', header.get('LONG-OBS')))
+        lat = SessionFileScanner.to_float(header.get('SITELAT', header.get('LAT-OBS')))
+        lon = SessionFileScanner.to_float(header.get('SITELONG', header.get('LONG-OBS')))
         if lat is not None and lon is not None and (lat or lon):
             lats.append(lat)
             lons.append(lon)
@@ -2069,15 +2061,6 @@ def _status(session, finals, gap_days, today):
     if any(f.session is session and (f.checked or f.imported) for f in finals):
         return "Completed"
     return "In Progress"
-
-
-def _format_integration(seconds):
-    """'2h 30m' - the gallery's integration time format."""
-    total_minutes = round((seconds or 0) / 60.0)
-    hours, minutes = divmod(total_minutes, 60)
-    if hours and minutes:
-        return f"{hours}h {minutes}m"
-    return f"{hours}h" if hours else f"{minutes}m"
 
 
 def import_library(conn, library, progress=None, cancelled=None, today=None, common_names=False):
@@ -2190,7 +2173,7 @@ def _import_session(conn, session, group, all_finals, library, catalog, by_path,
         conn.execute("INSERT OR IGNORE INTO telescope_equipment (telescope_id, equipment_id) VALUES (?, ?)",
                      (session.telescope_id, session.camera_id))
     for record in session.lights:
-        key = os.path.normcase(os.path.normpath(record.path))
+        key = path_key(record.path)
         by_path.setdefault(key, session_id)
     return session_id
 
@@ -2205,13 +2188,13 @@ def link_gallery_images(conn, library, by_path=None, by_key=None, report=None):
     unlinked = {}
     for image_id, path in conn.execute(
             "SELECT id, image_path FROM userimages WHERE session_id IS NULL AND image_path IS NOT NULL"):
-        unlinked.setdefault(_norm_path(path), []).append(image_id)
+        unlinked.setdefault(path_key(path), []).append(image_id)
     linked = 0
     for group in library.groups.values():
         for final in group.finals:
             if not final.imported or final.session is None:
                 continue
-            ids = [i for r in [final.record] + final.record.variants for i in unlinked.pop(_norm_path(r.path), [])]
+            ids = [i for r in [final.record] + final.record.variants for i in unlinked.pop(path_key(r.path), [])]
             if not ids:
                 continue
             session_id = (report.session_ids.get(id(final.session)) if report else None) or \
@@ -2240,7 +2223,7 @@ def _import_images(conn, finals, library, by_path, by_key, report):
             session_id = report.session_ids.get(id(session)) or _existing_session(session, by_path, by_key)
         equipment = {"telescope_id": session.telescope_id, "telescope_name": session.telescope or None,
                      "camera_id": session.camera_id, "camera_name": session.camera or None} if session else None
-        integration = _format_integration(session.integration_seconds) if session else ""
+        integration = format_duration(session.integration_seconds) if session else ""
         taken = final.date
         add_user_image_row(conn.cursor(), group.dsodetailid, final.record.path, integration,
                            taken.strftime("%Y-%m-%d") if taken else "", "", session_id, equipment=equipment)
@@ -2251,11 +2234,6 @@ def _import_images(conn, finals, library, by_path, by_key, report):
 # ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
-
-def _format_duration(seconds):
-    minutes = int(round(seconds / 60))
-    return f"{minutes // 60}h{minutes % 60:02d}m" if minutes >= 60 else f"{minutes}m"
-
 
 def print_library(library, scan, out, new_only=False):
     roots = scan.roots
@@ -2297,7 +2275,7 @@ def print_library(library, scan, out, new_only=False):
             filters = ", ".join(f"{k} {v}" for k, v in s.filters.most_common())
             nights = s.nights
             out.write(f"   [{'x' if s.checked else ' '}] Session {n}: {nights[0]} -> {nights[-1]}, "
-                      f"{len(s.nights)} nights, {len(s.lights)} lights, {_format_duration(s.integration_seconds)}, "
+                      f"{len(s.nights)} nights, {len(s.lights)} lights, {format_duration(s.integration_seconds)}, "
                       f"{s.camera or '?'} / {s.telescope or '?'}, {filters} [{s.status}]{new}\n")
             for night, mount in s.night_mounts.items():
                 out.write(f"         {night} mount: {mount.mount or 'Unknown'} ({mount.source or '-'}) - "

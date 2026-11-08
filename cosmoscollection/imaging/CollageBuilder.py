@@ -23,11 +23,10 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
 from PySide6.QtCore import (Qt, QObject, QEvent, QThread, QRunnable, QThreadPool, Signal, QTimer,
-                            QRectF, QPointF, QLineF, QSize, QSizeF, QMimeData, QByteArray,
-                            QSettings, QUrl)
+                            QRectF, QPointF, QLineF, QSize, QSizeF, QMimeData, QByteArray, QUrl)
 from PySide6.QtGui import (QColor, QPainter, QPainterPath, QPixmap, QImage, QFont, QFontMetricsF,
                            QPen, QIcon, QUndoCommand, QUndoStack, QUndoGroup, QKeySequence,
-                           QAction, QDesktopServices, QBrush, QLinearGradient, QRadialGradient, QTransform,
+                           QAction, QBrush, QLinearGradient, QRadialGradient, QTransform,
                            QCursor)
 from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QSplitter,
                                QListWidget, QListWidgetItem, QListView, QAbstractItemView,
@@ -39,7 +38,12 @@ from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QForm
                                QButtonGroup, QScrollArea)
 
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
-from cosmoscollection.ui.Theme import COLORS, contrast_text, font_px, themed_style, theme_manager
+from cosmoscollection.core.UrlOpener import open_url, show_in_folder
+from cosmoscollection.ui.WindowLifetime import keep_alive_until_finished
+from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Paths import path_key
+from cosmoscollection.core.Formatting import natural_key
+from cosmoscollection.ui.Theme import COLORS, contrast_text, font_px, show_color_on_button, themed_style, theme_manager
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.catalog.DSONames import CONSTELLATIONS, load_common_names
 from cosmoscollection.solving.PlateSolver import describe_solving
@@ -76,19 +80,6 @@ DSO_NAME_SQL = """(SELECT c.catalogue || ' ' || c.designation
                             c.designation
                    LIMIT 1)"""
 
-# QThreads still running after their owner is gone - dropping the last
-# reference to a running QThread aborts the app
-_running_threads = set()
-
-
-def keep_alive_until_finished(thread):
-    _running_threads.add(thread)
-    thread.finished.connect(lambda: _running_threads.discard(thread))
-
-
-def natural_key(text):
-    """Sort key putting "M 2" before "M 13"."""
-    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text or "")]
 
 
 # --------------------------------------------------------------------
@@ -1007,7 +998,7 @@ def build_suggestions(library, object_info, years, times, min_images=MIN_SUGGEST
     by_name = lambda rs: sorted(rs, key=lambda r: (natural_key(r["dso_name"]), r["id"]))
     unique_files = {}
     for row in by_name(rows):
-        unique_files.setdefault(os.path.normcase(row["image_path"]), row)  # One frame per file
+        unique_files.setdefault(path_key(row["image_path"]), row)  # One frame per file
     suggestions = [Suggestion("all", "All Images", "", [r["id"] for r in unique_files.values()])]
 
     def add(key, title, chosen, **extra):
@@ -3101,7 +3092,7 @@ class ArrangeDialog(QDialog):
         themed_style(info, lambda: f"color: {COLORS['text_secondary']};")
         layout.addWidget(info)
 
-        saved = _json_dict(QSettings("CosmosCollection", "CosmosCollection").value(self.SETTING, "", type=str))
+        saved = _json_dict(app_settings().value(self.SETTING, "", type=str))
         default_gap = round(min(collage.width, collage.height) * 0.012)
         self.modes = QButtonGroup(self)
         mode_row = QHBoxLayout()
@@ -3179,7 +3170,7 @@ class ArrangeDialog(QDialog):
     def _accept(self):
         params = dict(self.params())
         params.pop("feature")
-        QSettings("CosmosCollection", "CosmosCollection").setValue(self.SETTING, json.dumps(params))
+        app_settings().setValue(self.SETTING, json.dumps(params))
         self.accept()
 
 
@@ -3353,7 +3344,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setStretchFactor(2, 0)
         self.splitter.setSizes([300, 840, 270])
-        saved = QSettings("CosmosCollection", "CosmosCollection").value(self.SPLITTER_SETTING)
+        saved = app_settings().value(self.SPLITTER_SETTING)
         if saved is not None:
             self.splitter.restoreState(saved)
         root.addWidget(self.splitter, 1)
@@ -3960,11 +3951,6 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         """A passing message in the status area (until the next save)."""
         self._set_status(text)
 
-    @staticmethod
-    def _color_button(button, color):
-        button.setText(color.upper())
-        button.setStyleSheet(f"QPushButton {{ background-color: {color}; color: {contrast_text(color)}; }}")
-
     # New images for suggested collages
 
     def _build_banner(self):
@@ -4022,7 +4008,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
             self._save_timer.start()
             return []
         seen = set(rule["seen"])
-        files = {self._file_key(f.image_path) for f in collage.frames if f.is_image}
+        files = {path_key(f.image_path) for f in collage.frames if f.is_image}
         shown = {self._object_of(f.image_id) for f in collage.frames if f.is_image}
         shown |= {dso for f in collage.frames for dso in f.merged_dsos()}
         new = []
@@ -4031,7 +4017,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
             if image_id in seen or row is None:
                 continue
             if rule["key"] == "all":
-                if self._file_key(row["image_path"]) not in files:
+                if path_key(row["image_path"]) not in files:
                     new.append(image_id)
             elif self._object_of(image_id) not in shown:
                 new.append(image_id)
@@ -4264,10 +4250,6 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         self.library = {row["id"]: row for row in rows}
         self._rebuild_library_items()
 
-    @staticmethod
-    def _file_key(path):
-        return os.path.normcase(os.path.normpath(path)) if path else ""
-
     def _rebuild_library_items(self):
         """One library item per image file: entries sharing a file (one image
         of M 31 and M 32) show once, named "M 31 & M 32"."""
@@ -4275,7 +4257,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                                if row["dsodetailid"] and row.get("common_name")}
         groups = {}
         for row in sorted(self.library.values(), key=lambda r: (natural_key(r["dso_name"]), r["id"])):
-            groups.setdefault(self._file_key(row["image_path"]) or f"id:{row['id']}", []).append(row["id"])
+            groups.setdefault(path_key(row["image_path"]) or f"id:{row['id']}", []).append(row["id"])
         self._groups = groups
         self._group_of = {image_id: ids for ids in groups.values() for image_id in ids}
         self.library_list.clear()
@@ -4383,7 +4365,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         if row is None:
             return
         old_path = row["image_path"]
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         # Start in the nearest folder of the old location that still exists
         start = os.path.dirname(old_path)
         while start and not os.path.isdir(start) and os.path.dirname(start) != start:
@@ -4935,13 +4917,13 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                 self.preset_combo.setCurrentIndex(index if index >= 0 else self.preset_combo.count() - 1)
                 self.width_spin.setValue(collage.width)
                 self.height_spin.setValue(collage.height)
-                self._color_button(self.background_button, collage.background)
+                show_color_on_button(self.background_button, collage.background)
                 gradient = bool(collage.background2)
                 self.gradient_check.setChecked(gradient)
                 self.background2_button.setEnabled(gradient)
                 self.gradient_combo.setEnabled(gradient)
                 if gradient:
-                    self._color_button(self.background2_button, collage.background2)
+                    show_color_on_button(self.background2_button, collage.background2)
                 else:
                     self.background2_button.setText("")
                     self.background2_button.setStyleSheet("")
@@ -5023,7 +5005,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                 self.font_size_spin.setValue(round(first.font_size))
                 self.bold_button.setChecked(bool(first.bold))
                 self.italic_button.setChecked(bool(first.italic))
-                self._color_button(self.text_color_button, first.text_color)
+                show_color_on_button(self.text_color_button, first.text_color)
                 self.align_combo.setCurrentIndex(max(0, self.align_combo.findData(first.align)))
                 self.text_box_combo.setCurrentIndex(max(0, self.text_box_combo.findData(first.text_box)))
 
@@ -5035,7 +5017,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
                                self.corner_label, self.corner_spin):
                     widget.setVisible(bool(images))  # Text boxes have a shadow only
                 self.border_spin.setValue(round(first.border_width))
-                self._color_button(self.border_color_button, first.border_color)
+                show_color_on_button(self.border_color_button, first.border_color)
                 self.corner_spin.setValue(round(first.corner_radius))
                 self.shadow_slider.setValue(round(first.shadow * 100))
 
@@ -5159,9 +5141,9 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         row = self.library.get(frame.image_id)
         if row is None or not row["dsodetailid"]:
             return []
-        key = self._file_key(row["image_path"])
+        key = path_key(row["image_path"])
         return [other for other in self.library.values()
-                if other["dsodetailid"] == row["dsodetailid"] and self._file_key(other["image_path"]) != key]
+                if other["dsodetailid"] == row["dsodetailid"] and path_key(other["image_path"]) != key]
 
     # Snapping (your preference, for every collage)
 
@@ -5169,7 +5151,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
 
     def _load_snap_options(self):
         options = {"objects": True, "spacing": True, "grid": False, "grid_size": 100}
-        saved = _json_dict(QSettings("CosmosCollection", "CosmosCollection").value(self.SNAP_SETTING, "", type=str))
+        saved = _json_dict(app_settings().value(self.SNAP_SETTING, "", type=str))
         options.update({key: value for key, value in saved.items() if key in options})
         return options
 
@@ -5177,7 +5159,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         self.snap_options = {"objects": self.snap_objects_check.isChecked(),
                              "spacing": self.snap_spacing_check.isChecked(),
                              "grid": self.snap_grid_check.isChecked(), "grid_size": self.grid_size_spin.value()}
-        QSettings("CosmosCollection", "CosmosCollection").setValue(self.SNAP_SETTING, json.dumps(self.snap_options))
+        app_settings().setValue(self.SNAP_SETTING, json.dumps(self.snap_options))
         self.grid_size_spin.setEnabled(self.snap_options["grid"])
         self.scene.grid_size = self.snap_options["grid_size"] if self.snap_options["grid"] else 0
         self.scene.update()
@@ -5373,7 +5355,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         by_file = {}
         for frame in sorted(frames, key=lambda f: -f.w * f.h):  # Largest frame of each file first
             if frame.is_image:
-                by_file.setdefault(self._file_key(frame.image_path), frame)
+                by_file.setdefault(path_key(frame.image_path), frame)
         if len(by_file) <= 1:
             keep = next(iter(by_file.values()), frames[0])
             return [("Merge into One Frame", keep.uid)]
@@ -5553,7 +5535,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         if collage is None or not collage.frames:
             return
         self._save_dirty()
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         folder = settings.value(self.EXPORT_DIR_SETTING, "", type=str) or os.path.expanduser("~")
         base = re.sub(r'[<>:"/\\|?*]+', "_", collage.name).strip() or "Collage"
         if scale != 1.0:
@@ -5613,23 +5595,9 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         box.addButton(QMessageBox.Close)
         box.exec()
         if box.clickedButton() is open_button:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            open_url(QUrl.fromLocalFile(path))
         elif box.clickedButton() is folder_button:
-            self._show_in_folder(path)
-
-    @staticmethod
-    def _show_in_folder(path):
-        import subprocess
-        import platform
-        try:
-            if platform.system() == "Windows":
-                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
-            elif platform.system() == "Darwin":
-                subprocess.Popen(["open", "-R", path])
-            else:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
-        except Exception as e:
-            logger.error(f"Could not show {path}: {e}")
+            show_in_folder(path)
 
     # Other windows
 
@@ -5730,7 +5698,7 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
         if self.view._mode in ("move", "resize", "rotate"):
             self.view.cancel_drag()
         self._save_dirty()
-        QSettings("CosmosCollection", "CosmosCollection").setValue(self.SPLITTER_SETTING, self.splitter.saveState())
+        app_settings().setValue(self.SPLITTER_SETTING, self.splitter.saveState())
         super().closeEvent(event)
 
 

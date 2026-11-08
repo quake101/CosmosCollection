@@ -5,7 +5,7 @@ Reads the user's time format preference from QSettings and provides helper
 functions to format time and datetime objects accordingly.
 """
 
-from PySide6.QtCore import QSettings
+from cosmoscollection.core.Settings import app_settings
 
 
 def get_time_format_24h():
@@ -14,7 +14,7 @@ def get_time_format_24h():
     Returns:
         bool: True if 24-hour format, False if 12-hour format.
     """
-    settings = QSettings("CosmosCollection", "CosmosCollection")
+    settings = app_settings()
     time_format = settings.value("time_format", "12-hour", type=str)
     return time_format == "24-hour"
 

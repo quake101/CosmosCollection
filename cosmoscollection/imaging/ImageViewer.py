@@ -14,7 +14,7 @@ from html import escape
 from pathlib import Path
 from datetime import datetime, timezone
 
-from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QSettings, QThread, QRectF, QObject, QRunnable, QThreadPool
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QThread, QRectF, QObject, QRunnable, QThreadPool
 from PySide6.QtGui import QPixmap, QPainter, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
@@ -22,12 +22,15 @@ from PySide6.QtWidgets import (
 )
 
 from cosmoscollection.imaging import ImageDetails
+from cosmoscollection.core.UrlOpener import show_in_folder
+from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Paths import path_key
 from cosmoscollection.ui.Theme import COLORS, adapt_color, font_size, theme_manager, themed_style
 from cosmoscollection.ui.WindowPositionManager import WindowPositionManager
 from cosmoscollection.ui.WindowLifetime import window_is_open
-from cosmoscollection.core.ResourceManager import ResourceManager
+from cosmoscollection.core.Formatting import format_dec, format_ra, trim_number
 from cosmoscollection.ui.TimeFormatHelper import format_datetime
-from cosmoscollection.sessions.SessionFileScanner import (FITS_EXTENSIONS, XISF_EXTENSIONS, read_xisf_xml,
+from cosmoscollection.sessions.SessionFileScanner import (FITS_EXTENSIONS, XISF_EXTENSIONS, read_xisf_xml, to_float,
                                 _coerce_fits_value, _file_coordinates, _parse_sexagesimal)
 from cosmoscollection.imaging.AnnotationOverlay import (ANNOTATION_LAYER_SETTINGS, ANNOTATION_LAYERS, AnnotationData, annotation_store,
                                image_pixel_size, paint_annotations, read_wcs_header, saved_annotation_layers,
@@ -429,7 +432,7 @@ def _target_rows(kw):
         rows.append(("Airmass", f"{airmass:.3f}"))
     rotation = _to_float(kw.get('OBJCTROT'))
     if rotation is not None:
-        rows.append(("Rotation", f"{_fmt_num(rotation, 2)}°"))
+        rows.append(("Rotation", f"{trim_number(rotation, 2)}°"))
     _add_row(rows, "Pier Side", kw.get('PIERSIDE'))
     return rows
 
@@ -453,7 +456,7 @@ def _capture_rows(kw, history):
 
     exposure = _to_float(_first_value(kw, 'EXPTIME', 'EXPOSURE'))
     if exposure is not None:
-        rows.append(("Exposure", format_duration(exposure)))
+        rows.append(("Exposure", format_seconds_detail(exposure)))
 
     frames = _to_float(_first_value(kw, 'NCOMBINE', 'STACKCNT'))
     if frames is None:
@@ -467,15 +470,15 @@ def _capture_rows(kw, history):
         rows.append(("Frames Stacked", f"{frames:.0f}"))
         live_time = _to_float(kw.get('LIVETIME'))
         if live_time is not None:
-            rows.append(("Total Integration", format_duration(live_time)))
+            rows.append(("Total Integration", format_seconds_detail(live_time)))
 
     _add_row(rows, "Filter", kw.get('FILTER'))
     for label, keyword in (("Gain", 'GAIN'), ("Offset", 'OFFSET')):
         number = _to_float(kw.get(keyword))
-        _add_row(rows, label, _fmt_num(number, 2) if number is not None else kw.get(keyword))
+        _add_row(rows, label, trim_number(number, 2) if number is not None else kw.get(keyword))
     egain = _to_float(kw.get('EGAIN'))
     if egain is not None:
-        rows.append(("e-/ADU", _fmt_num(egain, 3)))
+        rows.append(("e-/ADU", trim_number(egain, 3)))
 
     x_bin, y_bin = _to_float(kw.get('XBINNING')), _to_float(kw.get('YBINNING'))
     if x_bin is not None:
@@ -484,21 +487,21 @@ def _capture_rows(kw, history):
     sensor_temp = _to_float(_first_value(kw, 'CCD-TEMP', 'CCD_TEMP', 'TEMPERAT'))
     set_temp = _to_float(_first_value(kw, 'SET-TEMP', 'SET_TEMP'))
     if sensor_temp is not None:
-        text = f"{_fmt_num(sensor_temp, 1)} °C"
+        text = f"{trim_number(sensor_temp, 1)} °C"
         if set_temp is not None:
-            text += f" (set {_fmt_num(set_temp, 1)} °C)"
+            text += f" (set {trim_number(set_temp, 1)} °C)"
         rows.append(("Sensor Temp", text))
     elif set_temp is not None:
-        rows.append(("Set Temp", f"{_fmt_num(set_temp, 1)} °C"))
+        rows.append(("Set Temp", f"{trim_number(set_temp, 1)} °C"))
 
     _add_row(rows, "Readout Mode", kw.get('READOUTM'))
     _add_row(rows, "Bayer Pattern", kw.get('BAYERPAT'))
     hfr = _to_float(kw.get('HFR'))
     if hfr is not None:
-        rows.append(("HFR", f"{_fmt_num(hfr, 2)} px"))
+        rows.append(("HFR", f"{trim_number(hfr, 2)} px"))
     fwhm = _to_float(kw.get('FWHM'))
     if fwhm is not None:
-        rows.append(("FWHM", _fmt_num(fwhm, 2)))
+        rows.append(("FWHM", trim_number(fwhm, 2)))
     return rows
 
 
@@ -510,20 +513,20 @@ def _equipment_rows(kw, image_size):
     focal_length = _to_float(kw.get('FOCALLEN'))
     aperture = _to_float(kw.get('APTDIA'))
     if focal_length:
-        rows.append(("Focal Length", f"{_fmt_num(focal_length, 1)} mm"))
+        rows.append(("Focal Length", f"{trim_number(focal_length, 1)} mm"))
     if aperture:
-        rows.append(("Aperture", f"{_fmt_num(aperture, 1)} mm"))
+        rows.append(("Aperture", f"{trim_number(aperture, 1)} mm"))
     focal_ratio = _to_float(kw.get('FOCRATIO'))
     if not focal_ratio and focal_length and aperture:
         focal_ratio = focal_length / aperture
     if focal_ratio:
-        rows.append(("Focal Ratio", f"f/{_fmt_num(focal_ratio, 1)}"))
+        rows.append(("Focal Ratio", f"f/{trim_number(focal_ratio, 1)}"))
 
     x_pixel, y_pixel = _to_float(kw.get('XPIXSZ')), _to_float(kw.get('YPIXSZ'))
     if x_pixel:
-        text = f"{_fmt_num(x_pixel, 2)} µm"
+        text = f"{trim_number(x_pixel, 2)} µm"
         if y_pixel and abs(y_pixel - x_pixel) > 1e-6:
-            text = f"{_fmt_num(x_pixel, 2)} x {_fmt_num(y_pixel, 2)} µm"
+            text = f"{trim_number(x_pixel, 2)} x {trim_number(y_pixel, 2)} µm"
         rows.append(("Pixel Size", text))
 
     # Image scale as recorded, or from the optics (XPIXSZ already includes binning)
@@ -538,10 +541,10 @@ def _equipment_rows(kw, image_size):
     _add_row(rows, "Focuser Position", _first_value(kw, 'FOCPOS', 'FOCUSPOS'))
     focuser_temp = _to_float(_first_value(kw, 'FOCTEMP', 'FOCUSTEM'))
     if focuser_temp is not None:
-        rows.append(("Focuser Temp", f"{_fmt_num(focuser_temp, 1)} °C"))
+        rows.append(("Focuser Temp", f"{trim_number(focuser_temp, 1)} °C"))
     rotator = _to_float(_first_value(kw, 'ROTATANG', 'ROTATOR'))
     if rotator is not None:
-        rows.append(("Rotator Angle", f"{_fmt_num(rotator, 2)}°"))
+        rows.append(("Rotator Angle", f"{trim_number(rotator, 2)}°"))
     return rows
 
 
@@ -635,13 +638,8 @@ def _add_row(rows, label, value):
 
 
 def _to_float(value):
-    if isinstance(value, bool) or value is None:
-        return None
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
+    """A header value as a number (FITS T/F booleans aren't numbers here)."""
+    return None if isinstance(value, bool) else to_float(value)
 
 
 def _to_degrees(value):
@@ -650,11 +648,6 @@ def _to_degrees(value):
     if result is None and isinstance(value, str):
         result = _parse_sexagesimal(value)
     return result
-
-
-def _fmt_num(value, decimals):
-    """Number with up to `decimals` places, without trailing zeros"""
-    return f"{value:.{decimals}f}".rstrip('0').rstrip('.')
 
 
 def _parse_iso_datetime(value):
@@ -674,9 +667,9 @@ def _is_plate_solved(wcs_keywords):
             and ('CD1_1' in wcs_keywords or 'CDELT1' in wcs_keywords))
 
 
-def format_duration(seconds):
-    """'300 s (5m)' style exposure/integration time"""
-    text = f"{_fmt_num(seconds, 3)} s"
+def format_seconds_detail(seconds):
+    """'300 s (5m)': exact seconds, then the time in hours/minutes/seconds"""
+    text = f"{trim_number(seconds, 3)} s"
     if seconds < 60:
         return text
     hours, remainder = divmod(seconds, 3600)
@@ -687,25 +680,8 @@ def format_duration(seconds):
     if minutes:
         parts.append(f"{minutes:.0f}m")
     if secs >= 0.05:
-        parts.append(f"{_fmt_num(secs, 1)}s")
+        parts.append(f"{trim_number(secs, 1)}s")
     return f"{text} ({' '.join(parts)})"
-
-
-def format_ra(ra_deg):
-    """RA in degrees as '05h 35m 17.3s'"""
-    total_seconds = round((ra_deg % 360.0) / 15.0 * 3600.0, 1) % 86400.0
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02.0f}h {minutes:02.0f}m {seconds:04.1f}s"
-
-
-def format_dec(dec_deg):
-    """Dec in degrees as '+22° 00' 52"'"""
-    sign = '-' if dec_deg < 0 else '+'
-    total_arcsec = round(abs(dec_deg) * 3600.0)
-    degrees, remainder = divmod(total_arcsec, 3600)
-    arcmin, arcsec = divmod(remainder, 60)
-    return f"{sign}{degrees:02d}° {arcmin:02d}' {arcsec:02d}\""
 
 
 def format_fov(scale_arcsec, width, height):
@@ -732,7 +708,7 @@ class ImageViewerWindow(QDialog):
         super().__init__(parent)
         self.screen_stretch = screen_stretch
         self.title = title
-        key = lambda path: os.path.normcase(os.path.normpath(path))
+        key = path_key
         self.versions = list(versions or []) if file_path and pixmap is None else []
         self.version_index = next((i for i, path in enumerate(self.versions) if key(path) == key(file_path)), None)
         if self.version_index is None or len(self.versions) < 2:
@@ -889,7 +865,7 @@ class ImageViewerWindow(QDialog):
         # Annotations come from the shared store (loaded in the background from
         # the image's .wcs), or from a solve that couldn't be saved next to it
         self._unsaved_annotations = None
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         self.annotations_enabled = settings.value("annotation_enabled", False, type=bool)
         if self.file_path:
             annotation_store().ready.connect(self._on_annotations_ready)
@@ -1082,7 +1058,7 @@ class ImageViewerWindow(QDialog):
             self._start_image_load()
 
         # Reopen the file info panel if it was open last time
-        if self.file_path and QSettings("CosmosCollection", "CosmosCollection").value(
+        if self.file_path and app_settings().value(
                 self.INFO_PANEL_SETTING, False, type=bool):
             self._set_file_info_visible(True)
 
@@ -1096,7 +1072,7 @@ class ImageViewerWindow(QDialog):
             if self.original_pixmap is not None:
                 self._load_details()  # Given the image - otherwise once it loads
             # Reopen the details dialog if it was open last time
-            if self.details_style["enabled"] and QSettings("CosmosCollection", "CosmosCollection").value(
+            if self.details_style["enabled"] and app_settings().value(
                     ImageDetails.DIALOG_SETTING, False, type=bool):
                 QTimer.singleShot(0, self._open_details_dialog)
 
@@ -1487,8 +1463,7 @@ class ImageViewerWindow(QDialog):
     def _open_file_location(self):
         """Open the file location in the system's file explorer"""
         if self.file_path:
-            success = ResourceManager.open_file_manager(self.file_path)
-            if not success:
+            if not show_in_folder(self.file_path):
                 QMessageBox.critical(self, "Error", "Failed to open file location")
 
     # The image's session (userimages.session_id)
@@ -1698,7 +1673,7 @@ class ImageViewerWindow(QDialog):
         if hasattr(self, 'file_info_panel'):
             visible = not self.file_info_panel.isVisible()
             self._set_file_info_visible(visible)
-            QSettings("CosmosCollection", "CosmosCollection").setValue(self.INFO_PANEL_SETTING, visible)
+            app_settings().setValue(self.INFO_PANEL_SETTING, visible)
 
     def _set_file_info_visible(self, visible):
         self.file_info_panel.setVisible(visible)
@@ -1989,7 +1964,7 @@ class ImageViewerWindow(QDialog):
 
     def _update_annotation_settings(self):
         """Save the layer choices and redraw"""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         for key, setting in ANNOTATION_LAYER_SETTINGS.items():
             settings.setValue(setting, self.layer_actions[key].isChecked())
         self._update_zoom()
@@ -1998,7 +1973,7 @@ class ImageViewerWindow(QDialog):
     def _toggle_annotations(self, enabled):
         """Turn the annotations overlay on or off"""
         self.annotations_enabled = enabled
-        QSettings("CosmosCollection", "CosmosCollection").setValue("annotation_enabled", enabled)
+        app_settings().setValue("annotation_enabled", enabled)
         self._update_annotation_controls()
         self._update_zoom()
         if self.export_dialog is not None:
@@ -2119,7 +2094,7 @@ class ImageViewerWindow(QDialog):
 
     def _on_details_dialog_closed(self, _result=None):
         if not self._closing:
-            QSettings("CosmosCollection", "CosmosCollection").setValue(ImageDetails.DIALOG_SETTING, False)
+            app_settings().setValue(ImageDetails.DIALOG_SETTING, False)
         self.details_dialog = None
 
     def _on_details_style_changed(self, style):
@@ -2157,7 +2132,7 @@ class ImageViewerWindow(QDialog):
         self._save_details_edits()
         if self.details_dialog is not None:
             self._closing = True
-            QSettings("CosmosCollection", "CosmosCollection").setValue(ImageDetails.DIALOG_SETTING, True)
+            app_settings().setValue(ImageDetails.DIALOG_SETTING, True)
             self.details_dialog.close()
 
         # Cancel any running plate solve

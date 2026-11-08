@@ -8,7 +8,8 @@ import logging
 import sys
 from typing import List, Optional, Callable
 
-from PySide6.QtCore import QObject, Signal, QSettings, QTimer
+from PySide6.QtCore import QObject, Signal, QTimer
+from cosmoscollection.core.Settings import app_settings
 from PySide6.QtGui import QIcon, QAction, QCursor
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication, QWidget
 
@@ -201,7 +202,7 @@ class SystemTrayManager(QObject):
             # Show balloon message on first minimize
             if self._first_minimize:
                 self._first_minimize = False
-                settings = QSettings("CosmosCollection", "CosmosCollection")
+                settings = app_settings()
                 if not settings.value("tray_notification_shown", False, type=bool):
                     self._tray_icon.showMessage(
                         "Cosmos Collection",

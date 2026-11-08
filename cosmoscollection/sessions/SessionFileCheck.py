@@ -10,155 +10,30 @@ the session. Files on disk are never changed.
 
 import os
 import logging
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from collections import Counter
 
-from PySide6.QtCore import Qt, QThread, Signal, QSettings
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
                                QTableWidgetItem, QHeaderView, QAbstractItemView, QProgressBar, QFileDialog,
                                QMessageBox)
 
-from cosmoscollection.sessions import SessionFileScanner
 from cosmoscollection.sessions import SessionObservations
+from cosmoscollection.ui.WindowLifetime import retire_thread
+from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.Theme import COLORS, themed_style
-from cosmoscollection.sessions.SessionManager import _retire_thread
+# The disk checks (moved to FileCheck.py, which has no UI imports; kept importable from here)
+from cosmoscollection.sessions.FileCheck import (  # noqa: F401
+    MAX_SEARCH_FOLDERS, MISSING, MOVED, NO_NIGHT, SEARCH_LEVELS_UP, UNREACHABLE, CheckResult,
+    _existing_ancestor, _fingerprint, _list_tree, check_files, find_moved, group_problems,
+    missing_paths, problem_summary, stranded_calibration, unattached)
 
 logger = logging.getLogger(__name__)
 
-# A missing folder's renamed copy is looked for under its nearest existing
-# parent, at most this many levels up (a night folder inside a target folder).
-SEARCH_LEVELS_UP = 3
-# Most folders one search lists - keeps a mistaken pick of a whole drive bounded.
-MAX_SEARCH_FOLDERS = 20000
 
-
-# ---- Disk checks (worker threads) ---------------------------------------------
-
-def missing_paths(paths, cancelled=None):
-    """(missing, unreachable): the paths not on disk, and of those, the ones on a
-    drive or share that isn't there at all (offline NAS, unplugged disk) - those
-    may well come back. One folder listing per folder instead of a check per file,
-    which is much faster on a network drive."""
-    by_folder = defaultdict(list)
-    for path in paths:
-        by_folder[os.path.dirname(path)].append(path)
-    missing, unreachable = set(), set()
-    for folder, files in by_folder.items():
-        if cancelled and cancelled():
-            break
-        try:
-            names = {os.path.normcase(name) for name in os.listdir(folder)}
-        except OSError:
-            missing.update(files)
-            if not _existing_ancestor(folder):
-                unreachable.update(files)
-            continue
-        missing.update(p for p in files if os.path.normcase(os.path.basename(p)) not in names)
-    return missing, unreachable
-
-
-def _existing_ancestor(folder, levels=None):
-    """(nearest existing folder above folder, levels climbed), or None - within
-    levels, or up to the drive or share root."""
-    current, climbed = folder, 0
-    while True:
-        parent = os.path.dirname(current)
-        if not parent or parent == current:
-            return None
-        current, climbed = parent, climbed + 1
-        if levels is not None and climbed > levels:
-            return None
-        if os.path.isdir(current):
-            return current, climbed
-
-
-def _list_tree(root, depth, wanted, found, budget, cancelled):
-    """Add files under root (up to depth folders down) whose normcased name is in
-    wanted to found {name: [paths]}. Skips Rejected folders. budget: [folders left]."""
-    stack = [(root, 0)]
-    while stack and budget[0] > 0:
-        if cancelled and cancelled():
-            return
-        folder, level = stack.pop()
-        budget[0] -= 1
-        try:
-            with os.scandir(folder) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            if level < depth and entry.name.lower() != SessionFileScanner.REJECTED_FOLDER.lower():
-                                stack.append((entry.path, level + 1))
-                        elif os.path.normcase(entry.name) in wanted:
-                            found[os.path.normcase(entry.name)].append(os.path.normpath(entry.path))
-                    except OSError:
-                        continue
-        except OSError:
-            continue
-
-
-def _fingerprint(path):
-    data = SessionFileScanner.scan_file(path)
-    if data is None:
-        return None
-    row = SessionFileScanner.file_dict_to_row(data)
-    return SessionObservations.make_sub_key(row["date_obs"], row["exptime_seconds"], row["filter_name"],
-                                           row["frame_type"], row["camera"])
-
-
-def find_moved(files, search_root=None, progress=None, cancelled=None):
-    """{file id: new path} for missing files found again by name, and confirmed
-    by their headers' fingerprint when the file has one (a name-only match must
-    be the only file of that name). files: file dicts with id, file_path, sub_key.
-    With search_root None each file is looked for near where it was - under its
-    nearest existing parent folder, about as deep as it was (a renamed night
-    folder); otherwise anywhere under search_root."""
-    progress = progress or (lambda text: None)
-    wanted = {os.path.normcase(os.path.basename(f["file_path"])) for f in files}
-    found = defaultdict(list)
-    budget = [MAX_SEARCH_FOLDERS]
-    if search_root:
-        progress(f"Looking through {search_root}...")
-        _list_tree(search_root, 64, wanted, found, budget, cancelled)
-    else:
-        searches = {}
-        for folder in {os.path.dirname(f["file_path"]) for f in files}:
-            anchor = _existing_ancestor(folder, SEARCH_LEVELS_UP) if not os.path.isdir(folder) else (folder, 0)
-            if anchor:
-                root, climbed = anchor
-                key = os.path.normcase(root)
-                searches[key] = (root, max(climbed + 1, searches.get(key, (root, 0))[1]))
-        for root, depth in searches.values():
-            progress(f"Looking for moved files in {root}...")
-            _list_tree(root, depth, wanted, found, budget, cancelled)
-
-    moves = {}
-    for n, f in enumerate(files):
-        if cancelled and cancelled():
-            break
-        old = os.path.normcase(os.path.normpath(f["file_path"]))
-        candidates = [p for p in found.get(os.path.normcase(os.path.basename(f["file_path"])), [])
-                      if os.path.normcase(os.path.normpath(p)) != old]
-        if not candidates:
-            continue
-        progress(f"Checking the files found: {n + 1:,} of {len(files):,}")
-        if f.get("sub_key"):
-            match = next((p for p in candidates if _fingerprint(p) == f["sub_key"]), None)
-        else:
-            match = candidates[0] if len(candidates) == 1 else None
-        if match:
-            moves[f["id"]] = match
-    return moves
-
-
-@dataclass
-class CheckResult:
-    missing: set = field(default_factory=set)       # file ids not on disk
-    unreachable: set = field(default_factory=set)   # of those, on a drive or share that isn't there
-    moved: dict = field(default_factory=dict)       # file id -> where it was found
-
+# ---- The check, off the UI thread ----------------------------------------------
 
 class FileCheckWorker(QThread):
     """Checks which files are on disk and, with find, looks for the missing ones."""
@@ -179,47 +54,10 @@ class FileCheckWorker(QThread):
     def run(self):
         result = CheckResult()
         try:
-            cancelled = lambda: self._stop
-            self.status.emit(f"Checking {len(self.files):,} file(s) on disk...")
-            by_path = defaultdict(list)
-            for f in self.files:
-                by_path[f["file_path"]].append(f["id"])
-            missing, unreachable = missing_paths(list(by_path), cancelled)
-            result.missing = {i for p in missing for i in by_path[p]}
-            result.unreachable = {i for p in unreachable for i in by_path[p]}
-            lost = [f for f in self.files if f["id"] in result.missing and f["id"] not in result.unreachable]
-            if self.find and lost:
-                result.moved = find_moved(lost, self.search_root, self.status.emit, cancelled)
+            result = check_files(self.files, self.find, self.search_root, self.status.emit, lambda: self._stop)
         except Exception as e:
             logger.error(f"Checking session files failed: {e}", exc_info=True)
         self.checked.emit(result)
-
-
-# ---- Summaries ------------------------------------------------------------------
-
-def stranded_calibration(files):
-    """Calibration frames on no night - a night with no lights left, or taken on
-    a night the session has no lights for."""
-    return [f for f in files if f["observation_id"] is None and f["frame_type"] != "Light"]
-
-
-def problem_summary(files, result):
-    """(text, is_warning) for the Files tab's line, or ('', False) when all's well."""
-    by_id = {f["id"]: f for f in files}
-    missing = Counter(by_id[i]["frame_type"] for i in result.missing if i in by_id)
-    alone = Counter(f["frame_type"] for f in stranded_calibration(files) if f["id"] not in result.missing)
-    parts = []
-    if missing:
-        unreachable = len(result.unreachable)
-        where = " (their drive isn't available)" if unreachable and unreachable == sum(missing.values()) else ""
-        parts.append(f"{SessionObservations.describe_frame_counts(missing)} "
-                     f"{'is' if sum(missing.values()) == 1 else 'are'} missing on disk{where}")
-    if alone:
-        parts.append(f"{SessionObservations.describe_frame_counts(alone)} "
-                     f"{'is' if sum(alone.values()) == 1 else 'are'}n't on any night")
-    if not parts:
-        return "", False
-    return "; ".join(parts) + ".", bool(missing)
 
 
 # ---- Asking before a night's last lights go ------------------------------------
@@ -246,9 +84,6 @@ def ask_stranded(parent, db_manager, session_id, file_ids):
 
 
 # ---- The clean up dialog ----------------------------------------------------------
-
-MOVED, MISSING, UNREACHABLE, NO_NIGHT = "moved", "missing", "unreachable", "no_night"
-
 
 class SessionFileCheckDialog(WindowPositionMixin, QDialog):
     """A session's files that need attention, grouped by folder, with what
@@ -377,31 +212,16 @@ class SessionFileCheckDialog(WindowPositionMixin, QDialog):
             return moved
         try:
             with self.db_manager.get_connection() as conn:
-                attached = {os.path.normcase(os.path.normpath(row[0]))
-                            for row in conn.execute("SELECT file_path FROM usersessionfiles")}
+                return unattached(conn, moved)
         except Exception as e:
             logger.error(f"Error reading attached files: {e}")
             return {}
-        return {i: p for i, p in moved.items() if os.path.normcase(os.path.normpath(p)) not in attached}
 
     # ---- Table ----
 
     def _fill_table(self):
         result = self._result
-        groups = defaultdict(list)  # (kind, folder, new folder) -> files
-        for f in self._files:
-            folder = os.path.normpath(os.path.dirname(f["file_path"]))
-            if f["id"] in result.moved:
-                groups[(MOVED, folder, os.path.dirname(result.moved[f["id"]]))].append(f)
-            elif f["id"] in result.unreachable:
-                groups[(UNREACHABLE, folder, None)].append(f)
-            elif f["id"] in result.missing:
-                groups[(MISSING, folder, None)].append(f)
-        for f in stranded_calibration(self._files):
-            if f["id"] not in result.missing:
-                groups[(NO_NIGHT, os.path.normpath(os.path.dirname(f["file_path"])), None)].append(f)
-        order = {MOVED: 0, MISSING: 1, UNREACHABLE: 2, NO_NIGHT: 3}
-        self._groups = sorted(groups.items(), key=lambda item: (order[item[0][0]], item[0][1].lower()))
+        self._groups = group_problems(self._files, result)
 
         problem = {MOVED: "Moved", MISSING: "Not on disk", UNREACHABLE: "Drive not available",
                    NO_NIGHT: "Not on any night"}
@@ -460,7 +280,7 @@ class SessionFileCheckDialog(WindowPositionMixin, QDialog):
     # ---- Actions ----
 
     def _find_in_folder(self):
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         start = settings.value(self.FIND_DIR_SETTING, "", type=str)
         if not start:
             lost = [f["file_path"] for f in self._files if f["id"] in self._result.missing]
@@ -512,5 +332,5 @@ class SessionFileCheckDialog(WindowPositionMixin, QDialog):
     def done(self, result):
         if self._worker is not None:
             self._worker.stop()
-            _retire_thread(self._worker)
+            retire_thread(self._worker)
         super().done(result)

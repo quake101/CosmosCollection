@@ -109,7 +109,7 @@ sudo pacman -S libxml2-legacy
 
 - [Getting Started guide](docs/GETTING-STARTED.md): setup and first steps for new users
 - [Building from source](docs/BUILDING.md)
-- [Command line interface](docs/CLI.md): add images and search objects from scripts
+- [Command line interface](docs/CLI.md): look up objects, sessions and totals, import your library, check session files, grade light frames, plate solve, plan the night (best objects, visibility, weather), and add images and targets, from a terminal or scripts (with JSON output)
 - [Code signing policy](docs/CODE-SIGNING.md): free code signing provided by SignPath.io, certificate by SignPath Foundation (waiting for approval)
 - [Privacy policy](docs/PRIVACY.md): what the app sends over the internet, and how to turn it off
 

@@ -19,13 +19,16 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QCompleter, QSlider, QProgressDialog, QPlainTextEdit,
                                QSizePolicy, QCheckBox, QToolButton, QProgressBar,
                                QListWidget, QListWidgetItem)
-from PySide6.QtCore import QSettings
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QFontMetricsF
 
 from cosmoscollection.equipment import EquipmentMapper
+from cosmoscollection.catalog.DSONames import type_name
+from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Paths import path_key
 from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.core.Formatting import format_dec, format_duration, format_ra
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
-from cosmoscollection.ui.WindowLifetime import release_on_close
+from cosmoscollection.ui.WindowLifetime import refresh_open, release_on_close
 from cosmoscollection.ui.Theme import COLORS, font_px, font_size, themed_style
 from cosmoscollection.imaging.ImageLoader import load_astro_pixmap, load_astro_qimage, read_image_file, write_image_file
 from cosmoscollection.solving.PlateSolver import describe_solving
@@ -43,11 +46,6 @@ SOLVE_BADGES = {"unsolved": "Not solved", "queued": "Waiting to solve", "solving
 
 # The gallery's Show filter: a card per object (its other images behind it), or per image file
 SHOW_BY_OBJECT, SHOW_EVERY_IMAGE = "One per object", "Every image"
-
-
-def _file_key(path):
-    """Paths of the same file compare equal ('/' or '\\', any case on Windows)."""
-    return os.path.normcase(os.path.normpath(path)) if path else ""
 
 
 def _main_name(name):
@@ -92,15 +90,8 @@ def insert_user_image(db_manager, image_data, others=None):
 def refresh_open_image_views():
     """The main window's image counts and an open gallery don't watch the
     database, so refresh whichever of them are open."""
-    for widget in QApplication.topLevelWidgets():
-        name = type(widget).__name__
-        try:
-            if name == "DSOGalleryWindow" and widget.isVisible():
-                widget._refresh_gallery()
-            elif name == "MainWindow":
-                widget._refresh_data()
-        except Exception as e:
-            logger.warning(f"Could not refresh {name} after adding an image: {e}")
+    refresh_open("DSOGalleryWindow", "_refresh_gallery")
+    refresh_open("MainWindow", "_refresh_data", visible_only=False)  # Also while it's in the tray
 
 
 def import_image(parent, file_path=None, dsodetailid=None, session=None):
@@ -431,7 +422,7 @@ class ThumbnailRunnable(QRunnable):
                 return
 
             # Check if disk caching is enabled
-            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings = app_settings()
             disk_cache_enabled = settings.value("cache_thumbnails_to_disk", True, type=bool)
             disk_cache_path = self._get_disk_cache_path() if disk_cache_enabled else None
 
@@ -511,37 +502,6 @@ class DataLoaderRunnable(QRunnable):
         """
         super().__init__()
         self.signals = signals
-
-    def _get_friendly_type_name(self, dso_type):
-        """Convert DSO type code to user-friendly name"""
-        type_mapping = {
-            "GALXY": "Galaxy",
-            "DRKNB": "Dark Nebula",
-            "OPNCL": "Open Cluster",
-            "PLNNB": "Planetary Nebula",
-            "BRTNB": "Bright Nebula",
-            "SNREM": "Supernova Remnant",
-            "GALCL": "Galaxy Cluster",
-            "GLOCL": "Globular Cluster",
-            "CL+NB": "Cluster + Nebula",
-            "GX+DN": "Galaxy + Dark Nebula",
-            "ASTER": "Asterism",
-            "2STAR": "Double Star",
-            "3STAR": "Triple Star",
-            "4STAR": "Quadruple Star",
-            "1STAR": "Single Star",
-            "QUASR": "Quasar",
-            "NONEX": "Non-existent",
-            "LMCCN": "LMC Cluster/Nebula",
-            "LMCDN": "LMC Dark Nebula",
-            "LMCGC": "LMC Globular Cluster",
-            "LMCOC": "LMC Open Cluster",
-            "SMCCN": "SMC Cluster/Nebula",
-            "SMCDN": "SMC Dark Nebula",
-            "SMCGC": "SMC Globular Cluster",
-            "SMCOC": "SMC Open Cluster"
-        }
-        return type_mapping.get(dso_type, dso_type)
 
     def run(self):
         """Load gallery data from database"""
@@ -623,7 +583,7 @@ class DataLoaderRunnable(QRunnable):
                         'dsotype': row[10] or '',
                         'constellation': row[11] or '',
                         'name': row[12] or 'Unknown',
-                        'friendly_type': self._get_friendly_type_name(row[10] or ''),
+                        'friendly_type': type_name(row[10] or ''),
                         'created_date': row[13] or '',
                         'ra_deg': row[14],
                         'dec_deg': row[15],
@@ -654,25 +614,6 @@ _open_windows = []  # Windows opened here, kept alive until closed
 def _keep(window):
     _open_windows.append(window)
     window.destroyed.connect(lambda *_args, w=window: _open_windows.remove(w) if w in _open_windows else None)
-
-
-def _format_ra(ra_deg):
-    """RA in degrees as HH:MM:SS.SS"""
-    ra_hours = ra_deg / 15.0
-    hours = int(ra_hours)
-    minutes = int((ra_hours - hours) * 60)
-    seconds = ((ra_hours - hours) * 60 - minutes) * 60
-    return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
-
-
-def _format_dec(dec_deg):
-    """Dec in degrees as DD:MM:SS.S"""
-    sign = '+' if dec_deg >= 0 else '-'
-    dec_abs = abs(dec_deg)
-    degrees = int(dec_abs)
-    minutes = int((dec_abs - degrees) * 60)
-    seconds = ((dec_abs - degrees) * 60 - minutes) * 60
-    return f"{sign}{degrees:02d}:{minutes:02d}:{seconds:04.1f}"
 
 
 def open_image_viewer(parent, name, image_path, ra_deg=None, dec_deg=None, versions=None):
@@ -742,8 +683,8 @@ def open_dso_details(parent, dsodetailid, name=None):
 
         data = {
             "name": name or designations,
-            "ra": _format_ra(ra),
-            "dec": _format_dec(dec),
+            "ra": format_ra(ra),
+            "dec": format_dec(dec),
             "ra_deg": ra,
             "dec_deg": dec,
             "magnitude": magnitude,
@@ -1422,23 +1363,11 @@ class AddImageDialog(WindowPositionMixin, QDialog):
             self.date_edit.setText(str(session["session_date"])[:10])
             self._date_auto_filled = True
         if session["integration_seconds"]:
-            self.integration_edit.setText(self._format_integration_seconds(session["integration_seconds"]))
+            self.integration_edit.setText(format_duration(session["integration_seconds"]))
             self._integration_auto_filled = True
 
         self._clear_error(self.telescope_combo)
         self._clear_error(self.camera_combo)
-
-    @staticmethod
-    def _format_integration_seconds(seconds):
-        """Format a session's total integration_seconds as 'Xh Ym', matching
-        this dialog's integration_edit placeholder convention (e.g. '2h 30m')."""
-        total_minutes = round(seconds / 60.0)
-        hours, minutes = divmod(total_minutes, 60)
-        if hours and minutes:
-            return f"{hours}h {minutes}m"
-        elif hours:
-            return f"{hours}h"
-        return f"{minutes}m"
 
     def _on_dso_manually_changed(self, index):
         """User picked a DSO themselves; stop treating the selection as a guess"""
@@ -1933,7 +1862,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         }
 
         # Restore previously used search/filter selections
-        filter_settings = QSettings("CosmosCollection", "CosmosCollection")
+        filter_settings = app_settings()
         self.current_filters['search'] = filter_settings.value("gallery_filter_search", '', type=str)
         self.current_filters['catalog'] = filter_settings.value("gallery_filter_catalog", 'All', type=str)
         self.current_filters['type'] = filter_settings.value("gallery_filter_type", 'All', type=str)
@@ -1950,7 +1879,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             'Extra Large': 500
         }
         # Load thumbnail size from settings (default to Medium)
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         saved_size_name = settings.value("gallery_thumbnail_size", "Medium")
         self.thumbnail_size = self.thumbnail_size_options.get(saved_size_name, 150)
 
@@ -2273,7 +2202,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         from cosmoscollection.imaging.CollageBuilder import join_names
         self._files, self._objects, by_file = [], {}, {}
         for row in self.all_items:
-            key = _file_key(row['image_path']) or f"id:{row['imageid']}"
+            key = path_key(row['image_path']) or f"id:{row['imageid']}"
             entry = by_file.get(key)
             if entry is None:
                 entry = by_file[key] = dict(row, rows=[])
@@ -2642,7 +2571,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     def _showing_text(self):
         """Status text for how many of the images are shown (counting those
         behind each object's card)"""
-        files = {_file_key(row['image_path']) for card in self.filtered_items for row in card.get('stack') or [card]}
+        files = {path_key(row['image_path']) for card in self.filtered_items for row in card.get('stack') or [card]}
         total = len(self._files)
         images = (f"all {total} image{'s' if total != 1 else ''}" if len(files) == total
                   else f"{len(files)} of {total} images")
@@ -2763,12 +2692,12 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
     def _on_annotations_toggled(self, enabled):
         self.annotations_enabled = enabled
-        QSettings("CosmosCollection", "CosmosCollection").setValue(self.ANNOTATIONS_SETTING, enabled)
+        app_settings().setValue(self.ANNOTATIONS_SETTING, enabled)
         self._annotate_all_cards()
 
     def _on_annotation_layers_changed(self):
         self.annotation_layers = {key: action.isChecked() for key, action in self.layer_actions.items()}
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         for key, value in self.annotation_layers.items():
             settings.setValue(f"{self.LAYERS_SETTING}/{key}", value)
         self._annotate_all_cards()
@@ -2928,7 +2857,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
             self.thumbnail_size = new_size
 
             # Save setting
-            settings = QSettings("CosmosCollection", "CosmosCollection")
+            settings = app_settings()
             settings.setValue("gallery_thumbnail_size", size_name)
 
             # The memory cache is kept - it's keyed by size, so switching back is instant
@@ -2961,7 +2890,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
     def _save_filter_settings(self):
         """Persist current search/filter/sort state to settings"""
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         settings.setValue("gallery_filter_search", self.current_filters['search'])
         settings.setValue("gallery_filter_catalog", self.current_filters['catalog'])
         settings.setValue("gallery_filter_type", self.current_filters['type'])

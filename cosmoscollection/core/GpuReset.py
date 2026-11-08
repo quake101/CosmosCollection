@@ -85,10 +85,10 @@ def restart_app(reopen=None):
     reopen: what to open again in the new app, e.g. {"tool": "fov", "data": {...}}
     (JSON-friendly; dropped if it isn't)."""
     global _restart_requested
-    from PySide6.QtCore import QSettings
+    from cosmoscollection.core.Settings import app_settings
     from PySide6.QtWidgets import QApplication
 
-    settings = QSettings("CosmosCollection", "CosmosCollection")
+    settings = app_settings()
     text = None
     if reopen:
         try:
@@ -141,8 +141,8 @@ def relaunch_if_requested():
 
 def take_reopen():
     """The tool restart_app() asked to open again ({"tool": ..., ...}), or None. Only once."""
-    from PySide6.QtCore import QSettings
-    settings = QSettings("CosmosCollection", "CosmosCollection")
+    from cosmoscollection.core.Settings import app_settings
+    settings = app_settings()
     text = settings.value(_REOPEN_KEY)
     if text is None:
         return None

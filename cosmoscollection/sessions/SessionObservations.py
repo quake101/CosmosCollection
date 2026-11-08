@@ -21,6 +21,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 
 from cosmoscollection.sessions import SessionFileScanner
+from cosmoscollection.core.Paths import path_key
 
 logger = logging.getLogger(__name__)
 
@@ -607,7 +608,7 @@ def relink_moved(conn, found):
         for file_id, old, key in cursor.fetchall():
             new = by_key[key]
             # Only checked when the paths differ, so re-attaching a folder stays cheap
-            if _normalized_path(old) != _normalized_path(new) and not os.path.isfile(old):
+            if path_key(old) != path_key(new) and not os.path.isfile(old):
                 moves.append((file_id, old, new))
     relink_files(conn, moves)
     return moves
@@ -704,10 +705,6 @@ def _rows_from_file_dicts(file_dicts):
     return rows
 
 
-def _normalized_path(path):
-    return os.path.normcase(os.path.normpath(path or ""))
-
-
 def _find_owners(conn, exclude_session_id, rows):
     """[owner label or None per row] - the session (other than exclude_session_id)
     that already holds each row's sub, matched by fingerprint or by path."""
@@ -730,14 +727,14 @@ def _find_owners(conn, exclude_session_id, rows):
         SELECT f.file_path, s.dso_name, s.session_date FROM usersessionfiles f
         JOIN usersessions s ON s.id = f.session_id WHERE f.session_id != ?
     """, (exclude_session_id,))
-    wanted = {_normalized_path(r["file_path"]) for r in rows}
+    wanted = {path_key(r["file_path"]) for r in rows}
     for file_path, dso_name, session_date in cursor.fetchall():
-        normalized = _normalized_path(file_path)
+        normalized = path_key(file_path)
         if normalized in wanted:
             owners_by_path.setdefault(normalized, f"{dso_name} — {session_date}")
 
     return [
-        (owners_by_key.get(r["sub_key"]) if r["sub_key"] else None) or owners_by_path.get(_normalized_path(r["file_path"]))
+        (owners_by_key.get(r["sub_key"]) if r["sub_key"] else None) or owners_by_path.get(path_key(r["file_path"]))
         for r in rows
     ]
 
@@ -760,10 +757,10 @@ def attach_files(conn, session_id, file_dicts):
 
     moves = relink_moved(conn, [(r["file_path"], r["sub_key"]) for r in rows])
     report["relinked"] = len(moves)
-    relinked = {_normalized_path(new) for _id, _old, new in moves}
+    relinked = {path_key(new) for _id, _old, new in moves}
     cursor = conn.cursor()
     for row, owner in zip(rows, _find_owners(conn, session_id, rows)):
-        if _normalized_path(row["file_path"]) in relinked:
+        if path_key(row["file_path"]) in relinked:
             continue
         if owner:
             report["dup_other_sessions"][owner] += 1

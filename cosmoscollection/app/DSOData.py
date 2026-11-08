@@ -1,11 +1,11 @@
-"""Loading the DSO catalog for the main table, and the search matching helpers."""
+"""Loading the DSO catalog for the main table, and the search matching helpers.
+
+No Qt: the command line uses these too (the startup loading thread is in Startup.py)."""
 
 import logging
 import re
 
-from PySide6.QtCore import QThread, Signal
-
-from cosmoscollection.core.ResourceManager import ResourceManager
+from cosmoscollection.core.Formatting import format_dec, format_ra, natural_key
 
 logger = logging.getLogger(__name__)
 
@@ -37,31 +37,6 @@ DSO_QUERY = """
     LEFT JOIN userimages ui ON ui.id = img.first_id
     WHERE EXISTS (SELECT 1 FROM cataloguenr c WHERE c.dsodetailid = d.id)
 """
-
-
-def format_ra(ra_deg):
-    """Convert RA in degrees to hms format"""
-    if ra_deg is None:
-        return ""
-    ra_hours = ra_deg / 15.0
-    ra_h = int(ra_hours)
-    ra_remaining = (ra_hours - ra_h) * 60
-    ra_m = int(ra_remaining)
-    ra_s = (ra_remaining - ra_m) * 60
-    return f"{ra_h:02d}h{ra_m:02d}m{ra_s:05.2f}s"
-
-
-def format_dec(dec_deg):
-    """Convert Dec in degrees to dms format"""
-    if dec_deg is None:
-        return ""
-    dec_sign = '-' if dec_deg < 0 else '+'
-    dec_abs = abs(dec_deg)
-    dec_d = int(dec_abs)
-    dec_remaining = (dec_abs - dec_d) * 60
-    dec_m = int(dec_remaining)
-    dec_s = (dec_remaining - dec_m) * 60
-    return f"{dec_sign}{dec_d:02d}°{dec_m:02d}'{dec_s:04.1f}\""
 
 
 def dso_row_to_dict(row):
@@ -104,35 +79,6 @@ def load_all_dso_data(conn):
     catalogs = [row[0] for row in cursor.fetchall()]
     cursor.execute(DSO_QUERY)
     return [dso_row_to_dict(row) for row in cursor.fetchall()], catalogs
-
-
-# --- Startup Data Loader Thread ---
-class InitialDataLoadWorker(QThread):
-    """Loads the whole DSO catalog on startup without blocking the UI.
-
-    A single query takes well under a second for the full catalog, so everything
-    is loaded up front and filtering/sorting happen in memory."""
-    data_loaded = Signal(list, list)  # dso_data, catalogs
-    load_failed = Signal(str)  # error message
-
-    def run(self):
-        conn = None
-        try:
-            import sqlite3
-            from cosmoscollection.core.ResourceManager import attach_update_catalogs
-
-            conn = sqlite3.connect(str(ResourceManager.get_database_path()))
-            attach_update_catalogs(conn)
-            dso_data, catalogs = load_all_dso_data(conn)
-            logger.debug(f"Loaded {len(dso_data)} DSOs in background thread")
-            self.data_loaded.emit(dso_data, catalogs)
-
-        except Exception as e:
-            logger.error(f"Error loading initial data in background: {e}", exc_info=True)
-            self.load_failed.emit(str(e))
-        finally:
-            if conn is not None:
-                conn.close()
 
 
 # --- Search matching helpers ---
@@ -200,10 +146,120 @@ def designation_in_catalog(designation, catalog):
     return True
 
 
-_NATURAL_SPLIT_RE = re.compile(r"(\d+)")
+class DSOSearch:
+    """The main window's DSO list filters and search ranking (DSOTableModel),
+    without Qt, so the command line finds the same objects. Keeps a cache of
+    each designations string's search keys."""
 
+    def __init__(self):
+        self._key_cache = {}  # designations string -> [(designation, normalized)]
 
-def _natural_key(text):
-    """Sort key that orders embedded numbers numerically ("M 2" before "M 10")"""
-    return tuple((0, int(part)) if part.isdecimal() else (1, part.lower())
-                 for part in _NATURAL_SPLIT_RE.split(text or "") if part)
+    def search_keys(self, designations):
+        """[(designation, normalized designation)], cached by designations string"""
+        keys = self._key_cache.get(designations)
+        if keys is None:
+            keys = [(designation, normalize_search_text(designation))
+                    for designation in designations.split(", ")]
+            self._key_cache[designations] = keys
+        return keys
+
+    def filter(self, dso_data, search_text, selected_catalog=None, show_images_only=False,
+               selected_type=None, show_no_images_only=False):
+        """The entries passing all filters, search matches tagged with their rank
+        ("search_rank") and the designation that matched ("matched_designation")"""
+        catalog = selected_catalog if selected_catalog and selected_catalog != "All Catalogs" else None
+        type_code = selected_type if selected_type and selected_type != "All Types" else None
+        query = prepare_search_query(search_text, catalog)
+
+        if not (query or catalog or type_code or show_images_only or show_no_images_only):
+            return list(dso_data)
+
+        matches = []
+        for item in dso_data:
+            if catalog and not any(designation_in_catalog(designation, catalog)
+                                   for designation, _ in self.search_keys(item["designations"])):
+                continue
+
+            if type_code and item.get("dso_type", "") != type_code:
+                continue
+
+            if show_images_only and item["image_count"] == 0:
+                continue
+
+            if show_no_images_only and item["image_count"] > 0:
+                continue
+
+            if query is None:
+                matches.append(item)
+                continue
+
+            match = self.match_item(item, query)
+            if match is None:
+                continue
+
+            rank, matched_designation = match
+            item_copy = item.copy()
+            item_copy["search_rank"] = rank
+            if matched_designation:
+                item_copy["matched_designation"] = matched_designation
+            matches.append(item_copy)
+
+        return matches
+
+    def match_item(self, item, query):
+        """Match an item against a prepared search query.
+
+        Returns (rank, matched_designation) or None. On equal rank, a designation
+        from the selected catalog is preferred so it is the one displayed.
+        """
+        best = None  # (rank, outside_catalog, designation)
+        for designation, key in self.search_keys(item["designations"]):
+            in_catalog = bool(query["catalog_prefix"]) and designation.lower().startswith(query["catalog_prefix"])
+
+            ranks = []
+            if query["norm"]:
+                ranks.append(_rank_search_key(key, query["norm"]))
+            if in_catalog:
+                ranks.append(_rank_search_key(key, query["catalog_norm"]))
+            ranks = [rank for rank in ranks if rank is not None]
+            if not ranks:
+                continue
+
+            candidate = (min(ranks), not in_catalog, designation)
+            if best is None or candidate[:2] < best[:2]:
+                best = candidate
+
+        if best is not None:
+            return best[0], best[2]
+
+        # Coordinate search: typed fragment of an RA/Dec, or a pasted full RA/Dec string
+        if query["is_coordinate"] and item.get("ra_deg") is not None and item.get("dec_deg") is not None:
+            raw = query["raw"].replace(" ", "")  # '00h42m' and '00h 42m' both match
+            for formatted in (format_ra(item["ra_deg"]).lower().replace(" ", ""),
+                              format_dec(item["dec_deg"]).lower().replace(" ", "")):
+                if raw in formatted or formatted in raw:
+                    return SEARCH_RANK_SUBSTRING, None
+
+        return None
+
+    def display_designation(self, entry, selected_catalog=None):
+        """(catalog, designation) shown for an entry: the search match if any, else
+        its designation in the selected catalog, else its primary designation"""
+        matched_designation = entry.get("matched_designation")
+        if matched_designation:
+            catalog, sep, designation = matched_designation.partition(" ")
+            return catalog, designation if sep else matched_designation
+
+        if selected_catalog:
+            for designation, _ in self.search_keys(entry["designations"]):
+                if designation_in_catalog(designation, selected_catalog):
+                    return selected_catalog, designation.split(" ", 1)[1]
+            return selected_catalog, entry["id"]
+        return entry["catalogue"], entry["id"]
+
+    def sort_key(self, selected_catalog=None):
+        """Sort key for entries by their shown designation (natural number order)"""
+        def key(entry):
+            catalog, designation = self.display_designation(entry, selected_catalog)
+            return natural_key(catalog), natural_key(designation)
+        return key

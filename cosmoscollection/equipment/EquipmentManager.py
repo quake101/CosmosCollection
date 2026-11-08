@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from cosmoscollection.equipment import EquipmentMapper
+from cosmoscollection.core.Formatting import count_text
 from cosmoscollection.sessions import LibraryScanner
 from cosmoscollection.sessions.LibraryScanner import TELESCOPE, CAMERA
 from cosmoscollection.core.DatabaseManager import DatabaseManager
@@ -75,11 +76,6 @@ BARLOW_PRESETS = {
 # Pixel sizes from the user's own subs
 # ---------------------------------------------------------------------------
 
-def _plain(name):
-    """'ZWO ASI2600MC Pro' -> 'zwoasi2600mcpro', for matching camera names."""
-    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
-
-
 def pixel_sizes_from_subs(conn):
     """{plain camera name: (pixel size µm, subs)} from the XPIXSZ in the headers of
     the user's session subs (NINA and most capture software write it). The
@@ -97,7 +93,7 @@ def pixel_sizes_from_subs(conn):
             pixel = float(values["XPIXSZ"]) / max(float(values.get("XBINNING") or 1), 1.0)
         except (ValueError, KeyError, TypeError):
             continue
-        name = _plain(values.get("INSTRUME") or camera)
+        name = LibraryScanner.plain_name(values.get("INSTRUME") or camera)
         if name and 0.5 < pixel < 50:
             counts[(name, round(pixel, 2))] += 1
     found = {}
@@ -108,7 +104,7 @@ def pixel_sizes_from_subs(conn):
 
 def pixel_size_for(name, sub_pixels):
     """(pixel size, subs) recorded for a camera named like 'name' in the user's subs, or None."""
-    plain = _plain(name)
+    plain = LibraryScanner.plain_name(name)
     if len(plain) < 4:
         return None
     matches = [value for recorded, value in sub_pixels.items() if plain in recorded or recorded in plain]
@@ -179,18 +175,13 @@ def _fmt(number):
     return f"{number:g}" if number is not None else ""
 
 
-def _count(n, word):
-    """'1 session', '3 sessions'."""
-    return f"{n} {word}{'s' if n != 1 else ''}"
-
-
 def _and(parts):
     """'a', 'a and b', 'a, b and c'."""
     return parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} and {parts[-1]}"
 
 
 def _images_keep_name(images):
-    return (f"{_count(images, 'gallery image')} taken with it {'keeps' if images == 1 else 'keep'} its name."
+    return (f"{count_text(images, 'gallery image')} taken with it {'keeps' if images == 1 else 'keep'} its name."
             if images else "")
 
 
@@ -758,9 +749,9 @@ class TelescopesPage(_EquipmentPage):
         linked = conn.execute("SELECT COUNT(*) FROM telescope_equipment WHERE telescope_id = ?",
                               (item_id,)).fetchone()[0]
         images = EquipmentMapper.images_using(conn, TELESCOPE, item_id)
-        uses = [_count(n, word) for n, word in ((sessions, "session"), (targets, "target")) if n]
+        uses = [count_text(n, word) for n, word in ((sessions, "session"), (targets, "target")) if n]
         if short:
-            uses += [_count(images, "gallery image")] if images else []
+            uses += [count_text(images, "gallery image")] if images else []
             return [f"Used by {_and(uses)}."] if uses else []
         lines = []
         if uses:
@@ -1205,18 +1196,6 @@ def _combo_choice(combo):
         (ADD_NEW if choice == ADD_NEW else None)
 
 
-def _add_equipment(conn, kind, name, header=None):
-    """A new telescope or camera named so (the one already named so, if
-    there is one), with what a file's header says about it. Its id."""
-    measured = LibraryScanner.equipment_from_header(kind, header)
-    if kind == TELESCOPE:
-        return LibraryScanner.add_telescope(conn, name, measured["focal_length"], measured["aperture"])
-    width, height = measured["sensor_width"], measured["sensor_height"]
-    if width and height and width < height:  # A portrait frame: the sensor is landscape
-        width, height = height, width
-    return LibraryScanner.add_camera(conn, name, width, height, measured["pixel_size"])
-
-
 def _sized_rows(table):
     """Even rows, and no taller than they need (the space left goes below)."""
     row_height = max(QComboBox().sizeHint().height() + 6, 26)
@@ -1368,7 +1347,7 @@ class MatchesPage(QWidget):
         try:
             with self.db_manager.get_connection() as conn:
                 if choice == ADD_NEW:
-                    choice = _add_equipment(conn, kind, name)
+                    choice = EquipmentMapper.add_from_header(conn, kind, name)
                     conn.commit()
                 changed = EquipmentMapper.save_matches(conn, {(kind, name): choice})
                 item = LibraryScanner.load_equipment_info(conn).items(kind).get(choice)
@@ -1535,7 +1514,7 @@ def choose_equipment(parent, telescope, camera, header=None, record="image"):
             with db_manager.get_connection() as conn:
                 if clicked is add_button:
                     for kind, name, _like in unlisted:
-                        chosen[kind] = (_add_equipment(conn, kind, name, header), name)
+                        chosen[kind] = (EquipmentMapper.add_from_header(conn, kind, name, header), name)
                     conn.commit()
                 elif clicked is use_button:
                     # Matched to the user's own (any without one stay as typed) - other

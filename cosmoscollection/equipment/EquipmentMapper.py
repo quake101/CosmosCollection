@@ -59,10 +59,6 @@ def ensure_session_columns(cursor):
     return _add_columns(cursor, SESSIONS, ("camera_id INTEGER",))
 
 
-def _key(name):
-    return (name or "").strip().casefold()
-
-
 def _clean(name):
     name = (name or "").strip()
     return name or None
@@ -98,7 +94,7 @@ def equipment_key(telescope_id, telescope_name, camera_id, camera_name):
     def part(prefix, item_id, name):
         if item_id is not None:
             return f"{prefix}{item_id}"
-        return f"n:{_key(name)}" if _key(name) else ""
+        return f"n:{LibraryScanner.alias_key(name)}" if LibraryScanner.alias_key(name) else ""
     return f"{part('t', telescope_id, telescope_name)}|{part('c', camera_id, camera_name)}"
 
 
@@ -128,13 +124,13 @@ def resolve(kind, name, info):
     """The id of the equipment a name means, or None: the equipment it's
     matched to (Import Wizard / Matches tab), else the user's telescope or
     camera of that name. info: LibraryScanner.EquipmentInfo."""
-    if not _key(name):
+    if not LibraryScanner.alias_key(name):
         return None
     equipment_id, _shown = info.match(kind, name)
     if equipment_id is not None:
         return equipment_id
     items = info.items(kind)
-    named = [item_id for item_id, item in items.items() if _key(item["name"]) == _key(name)]
+    named = [item_id for item_id, item in items.items() if LibraryScanner.alias_key(item["name"]) == LibraryScanner.alias_key(name)]
     # Enabled equipment first, should two share the name
     return min(named, key=lambda i: (not items[i]["is_active"], i)) if named else None
 
@@ -144,7 +140,7 @@ def suggest(kind, name, info, header=None):
     matched to it, as the Import Wizard suggests (a similar name, or the
     header's focal length / pixel size) - (None, "") when nothing fits, or
     the user chose to leave the name unmatched."""
-    if not _key(name) or info.decided(kind, name):
+    if not LibraryScanner.alias_key(name) or info.decided(kind, name):
         return None, ""
     return LibraryScanner.suggest_equipment(kind, name.strip(), header, info)
 
@@ -194,7 +190,7 @@ def link_name(conn, kind, name, equipment_id, previous_id=None):
     (what the name meant before). Ones linked to other equipment are left
     alone. Does not commit; {table: how many changed}."""
     changed = Counter()
-    key = _key(name)
+    key = LibraryScanner.alias_key(name)
     if not key:
         return changed
     for (table, link_kind), (id_column, name_column) in LINKS.items():
@@ -202,7 +198,7 @@ def link_name(conn, kind, name, equipment_id, previous_id=None):
             continue
         ids = [row_id for row_id, row_name, linked in conn.execute(
             f"SELECT id, {name_column}, {id_column} FROM {table} WHERE {name_column} IS NOT NULL")
-            if _key(row_name) == key and linked != equipment_id and (linked is None or linked == previous_id)]
+            if LibraryScanner.alias_key(row_name) == key and linked != equipment_id and (linked is None or linked == previous_id)]
         conn.executemany(f"UPDATE {table} SET {id_column} = ? WHERE id = ?", [(equipment_id, i) for i in ids])
         changed[table] += len(ids)
     return changed
@@ -216,16 +212,41 @@ def save_matches(conn, decisions):
     LibraryScanner.save_equipment_aliases(conn, decisions)
     changed = Counter()
     for (kind, name), equipment_id in decisions.items():
-        changed += link_name(conn, kind, name, equipment_id, previous.get((kind, _key(name))))
+        changed += link_name(conn, kind, name, equipment_id, previous.get((kind, LibraryScanner.alias_key(name))))
     conn.commit()
     return changed
+
+
+def add_from_header(conn, kind, value, header=None):
+    """Add a name from the files as new Equipment, starting from what a light's
+    header says (focal length and aperture, or pixel and sensor size); its id.
+    Does not commit."""
+    measured = LibraryScanner.equipment_from_header(kind, header)
+    if kind == LibraryScanner.TELESCOPE:
+        return LibraryScanner.add_telescope(conn, value, measured["focal_length"], measured["aperture"])
+    width, height = measured["sensor_width"], measured["sensor_height"]
+    if width and height and width < height:   # A portrait frame: the sensor is landscape
+        width, height = height, width
+    return LibraryScanner.add_camera(conn, value, width, height, measured["pixel_size"])
+
+
+def save_wizard_matches(conn, decisions, new):
+    """The Import Wizard's equipment step: add new (each (kind, name, header)) as
+    Equipment, then save every match - decisions {(kind, name in files): id or
+    None} - linking the gallery images and sessions given those names. Commits;
+    the user's EquipmentInfo afterwards."""
+    decisions = dict(decisions)
+    for kind, value, header in new:
+        decisions[(kind, value)] = add_from_header(conn, kind, value, header)
+    save_matches(conn, decisions)
+    return LibraryScanner.load_equipment_info(conn)
 
 
 def forget_match(conn, kind, name):
     """Remove a saved match: the Import Wizard asks about the name again.
     Images and sessions stay as they are. Commits."""
     LibraryScanner.load_equipment_info(conn)  # The table exists
-    conn.execute("DELETE FROM equipmentaliases WHERE kind = ? AND alias_key = ?", (kind, _key(name)))
+    conn.execute("DELETE FROM equipmentaliases WHERE kind = ? AND alias_key = ?", (kind, LibraryScanner.alias_key(name)))
     conn.commit()
 
 
@@ -240,8 +261,8 @@ def matches(conn, info=None):
     for (table, kind), (_id_column, name_column) in LINKS.items():
         for (name,) in conn.execute(f"SELECT {name_column} FROM {table} "
                                     f"WHERE TRIM(COALESCE({name_column}, '')) != ''"):
-            used[(kind, _key(name))][table] += 1
-            spelled.setdefault((kind, _key(name)), name.strip())
+            used[(kind, LibraryScanner.alias_key(name))][table] += 1
+            spelled.setdefault((kind, LibraryScanner.alias_key(name)), name.strip())
     found = {}
     for kind, key, header_value, equipment_id in conn.execute(
             "SELECT kind, alias_key, header_value, equipment_id FROM equipmentaliases"):
@@ -249,12 +270,12 @@ def matches(conn, info=None):
             continue
         if equipment_id not in info.items(kind):
             equipment_id = None  # Matched to equipment that's since been deleted
-        elif _key(info.items(kind)[equipment_id]["name"]) == key:
+        elif LibraryScanner.alias_key(info.items(kind)[equipment_id]["name"]) == key:
             continue  # Its own name - nothing to manage (until it's renamed)
         found[(kind, key)] = {"kind": kind, "name": header_value or spelled.get((kind, key)) or key,
                               "equipment_id": equipment_id, "saved": True, "used": used.get((kind, key), Counter())}
     for (kind, key), name in spelled.items():
-        if (kind, key) in found or any(_key(item["name"]) == key for item in info.items(kind).values()):
+        if (kind, key) in found or any(LibraryScanner.alias_key(item["name"]) == key for item in info.items(kind).values()):
             continue
         found[(kind, key)] = {"kind": kind, "name": name, "equipment_id": None, "saved": False,
                               "used": used[(kind, key)]}
@@ -329,7 +350,7 @@ def suggestions(conn, info=None):
     for (table, kind), (id_column, name_column) in LINKS.items():
         for row_id, name in conn.execute(f"SELECT id, {name_column} FROM {table} WHERE {id_column} IS NULL "
                                          f"AND TRIM(COALESCE({name_column}, '')) != ''"):
-            entry = by_name.setdefault((kind, _key(name)), {"kind": kind, "name": name.strip(),
+            entry = by_name.setdefault((kind, LibraryScanner.alias_key(name)), {"kind": kind, "name": name.strip(),
                                                            "ids": defaultdict(list)})
             entry["ids"][table].append(row_id)
     found = []
@@ -381,7 +402,7 @@ def apply_suggestion(conn, suggestion, equipment_id):
         return changed
     info = LibraryScanner.load_equipment_info(conn)
     item = info.items(suggestion["kind"]).get(equipment_id)
-    if item is not None and _key(item["name"]) == _key(suggestion["name"]):
+    if item is not None and LibraryScanner.alias_key(item["name"]) == LibraryScanner.alias_key(suggestion["name"]):
         changed = link_name(conn, suggestion["kind"], suggestion["name"], equipment_id)  # Its own name
         conn.commit()
         return changed

@@ -14,7 +14,8 @@ import tempfile
 import weakref
 from dataclasses import dataclass, asdict
 
-from PySide6.QtCore import QObject, QPointF, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QPointF, Qt, QTimer, Signal
+from cosmoscollection.core.Settings import app_settings
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPalette, QPen
 
 logger = logging.getLogger(__name__)
@@ -50,9 +51,6 @@ CHECKBOX_STYLES = {
     'filled': 'Filled',
 }
 
-_SETTINGS_ORG = "CosmosCollection"
-_SETTINGS_APP = "CosmosCollection"
-
 
 @dataclass
 class ThemeSettings:
@@ -71,7 +69,7 @@ class ThemeSettings:
 def load_settings():
     """Read the saved theme settings, falling back to defaults."""
     defaults = ThemeSettings()
-    settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+    settings = app_settings()
     mode = settings.value("theme/mode", defaults.mode, type=str)
     accent = settings.value("theme/accent", defaults.accent, type=str)
     font_size = settings.value("theme/font_size", defaults.font_size, type=int)
@@ -88,7 +86,7 @@ def load_settings():
 
 def save_settings(theme_settings):
     """Persist theme settings to QSettings."""
-    settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+    settings = app_settings()
     for key, value in asdict(theme_settings).items():
         settings.setValue(f"theme/{key}", value)
 
@@ -992,6 +990,13 @@ def contrast_text(background):
     if _current_mode == 'night':
         return _pick_text(background, COLORS['text_on_accent'], '#000000', 3.0)
     return _text_on(background)
+
+
+def show_color_on_button(button, color):
+    """A color picker button showing its color: the color as its background and
+    its hex code as its text, in a readable text color."""
+    button.setText(color.upper())
+    button.setStyleSheet(f"QPushButton {{ background-color: {color}; color: {contrast_text(color)}; }}")
 
 
 # --------------------------------------------------------------------

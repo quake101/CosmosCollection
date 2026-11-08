@@ -11,8 +11,11 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-from PySide6.QtCore import QSettings, QThread, Signal
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QMessageBox
+
+from cosmoscollection.core.Formatting import format_dec, format_ra
+from cosmoscollection.core.Settings import app_settings
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -55,7 +58,7 @@ class NINAIntegration:
         Returns:
             bool: True if NINA integration is enabled, False otherwise
         """
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         return settings.value("nina_integration_enabled", False, type=bool)
 
     @staticmethod
@@ -66,7 +69,7 @@ class NINAIntegration:
         Returns:
             tuple: (host: str, port: int)
         """
-        settings = QSettings("CosmosCollection", "CosmosCollection")
+        settings = app_settings()
         host = settings.value("nina_api_host", "localhost", type=str)
         port = settings.value("nina_api_port", 1888, type=int)
         return host, port
@@ -284,19 +287,7 @@ class NINAIntegration:
 
         host, port = NINAIntegration.get_settings()
 
-        # Format coordinates for display
-        ra_h = ra_deg / 15.0
-        ra_hours = int(ra_h)
-        ra_min = int((ra_h - ra_hours) * 60)
-        ra_sec = ((ra_h - ra_hours) * 60 - ra_min) * 60
-
-        dec_sign = '+' if dec_deg >= 0 else '-'
-        dec_abs = abs(dec_deg)
-        dec_d = int(dec_abs)
-        dec_m = int((dec_abs - dec_d) * 60)
-        dec_s = ((dec_abs - dec_d) * 60 - dec_m) * 60
-
-        coord_str = f"RA: {ra_hours:02d}h {ra_min:02d}m {ra_sec:05.2f}s\nDec: {dec_sign}{dec_d:02d}° {dec_m:02d}' {dec_s:04.1f}\""
+        coord_str = f"RA: {format_ra(ra_deg)}\nDec: {format_dec(dec_deg)}"
 
         # Show confirmation dialog
         if parent_widget:

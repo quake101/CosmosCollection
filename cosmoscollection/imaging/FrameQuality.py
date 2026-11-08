@@ -171,7 +171,7 @@ def read_file(path):
 def _read_frame(path, raw=None):
     """(pixels, header dict) for a FITS or XISF file; raw is the FITS file's
     bytes from read_file, when already read."""
-    from cosmoscollection.imaging.ImageLoader import read_astro_array, _read_fits_array
+    from cosmoscollection.imaging.ImageArrays import read_astro_array, _read_fits_array
     ext = os.path.splitext(path)[1].lower()
     if ext in SessionFileScanner.XISF_EXTENSIONS:
         header = SessionFileScanner.extract_xisf_header(path)

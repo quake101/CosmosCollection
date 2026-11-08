@@ -54,9 +54,12 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-import numpy as np
+# numpy is imported where the field turn is measured, not here: the database
+# setup (DatabaseManager) imports this module for ensure_schema, and numpy's
+# import is half a second of every command-line command's start
 
 from cosmoscollection.sessions import SessionFileScanner
+from cosmoscollection.core.Paths import path_key
 from cosmoscollection.sessions.SessionObservations import make_sub_key, night_date_for, parse_obs_datetime
 
 logger = logging.getLogger(__name__)
@@ -130,13 +133,6 @@ class NightMount:
 # Building the nights
 # ---------------------------------------------------------------------------
 
-def _number(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def rig_of(header):
     """The camera and telescope as the files name them - the key nights share a verdict by."""
     header = header or {}
@@ -167,7 +163,7 @@ def sub_from_header(path, header, size=0, mtime_ns=0, frame_type="Light"):
     if when is None:
         return None
     coords = SessionFileScanner._file_coordinates(header or {})
-    exposure = _number(header.get("EXPTIME", header.get("EXPOSURE")))
+    exposure = SessionFileScanner.to_float(header.get("EXPTIME", header.get("EXPOSURE")))
     key = make_sub_key(header.get("DATE-OBS"), exposure, SessionFileScanner._clean_str(header.get("FILTER")),
                        frame_type, SessionFileScanner._clean_str(header.get("INSTRUME")))
     lat, lon = site_of(header)
@@ -178,8 +174,8 @@ def sub_from_header(path, header, size=0, mtime_ns=0, frame_type="Light"):
 def site_of(header):
     """(lat, lon) a header says it was taken at, or (None, None)."""
     header = header or {}
-    lat = _number(header.get("SITELAT", header.get("LAT-OBS")))
-    lon = _number(header.get("SITELONG", header.get("LONG-OBS")))
+    lat = SessionFileScanner.to_float(header.get("SITELAT", header.get("LAT-OBS")))
+    lon = SessionFileScanner.to_float(header.get("SITELONG", header.get("LONG-OBS")))
     if lat is None or lon is None or not (lat or lon):
         return None, None
     return lat, lon
@@ -194,7 +190,7 @@ def nights_from_file_dicts(files, longitude=None):
         sub = sub_from_header(f["_file_path"], f)
         if sub is None:
             continue
-        site_lon = _number(f.get("SITELONG", f.get("LONG-OBS")))
+        site_lon = SessionFileScanner.to_float(f.get("SITELONG", f.get("LONG-OBS")))
         groups[(night_of(sub.when, site_lon if site_lon is not None else longitude), rig_of(f))].append(sub)
     return [(night, rig, subs) for (night, rig), subs in sorted(groups.items())]
 
@@ -275,6 +271,7 @@ def _stars(path, memo=None):
 
 def _match(za, zb, brightest):
     """(turn in degrees, matched stars) taking stars za onto zb, or None."""
+    import numpy as np
     from cosmoscollection.solving.NativePlateSolver import _quads, _similarity, _matches, close_pairs
     top_a, top_b = za[:brightest], zb[:brightest]
     if top_a.size < 6 or top_b.size < 6:
@@ -326,7 +323,7 @@ def _file_key(sub):
         stat = os.stat(sub.path)
         size, mtime_ns = stat.st_size, stat.st_mtime_ns
         sub.size, sub.mtime_ns = size, mtime_ns
-    return f"{os.path.normcase(os.path.normpath(sub.path))}|{size}|{mtime_ns}"
+    return f"{path_key(sub.path)}|{size}|{mtime_ns}"
 
 
 class MountCache:
@@ -520,7 +517,7 @@ def _eqmode(hints):
     for hint in hints:
         value = hint.get("EQMODE")
         if isinstance(value, str):
-            value = {"T": 1, "F": 0}.get(value.strip().upper(), _number(value))
+            value = {"T": 1, "F": 0}.get(value.strip().upper(), SessionFileScanner.to_float(value))
         if value in (0, 1):
             return int(value)
     return None
@@ -538,6 +535,7 @@ def _chain(subs, angles, first, last, cache, cancelled, memo=None):
     """The field's total turn from subs[first] to subs[last], measured in steps
     of at most STEP degrees of predicted turn (unwrapped, so it can pass 180),
     and the fewest stars any step matched. (None, 0) if a step's stars don't match."""
+    import numpy as np
     total, fewest = 0.0, None
     k = first
     while k < last:
@@ -564,6 +562,7 @@ def _chain(subs, angles, first, last, cache, cancelled, memo=None):
 
 def _judge_rotation(result, subs, lat, lon, cache, cancelled, memo=None):
     """Rotation verdict for subs (time order); lat/lon for those whose own header has no site."""
+    import numpy as np
     pointed = [s for s in subs if s.ra is not None and s.dec is not None]
     if len(pointed) < 2:
         result.evidence = "The subs don't say where they were pointed"
@@ -649,7 +648,7 @@ def _judge_angle(result, subs, lat, lon, cache, memo):
     solved = None
     for apart, sub, q in [c for c in candidates if c[0] >= ANGLE_MIN_SEPARATION][:ANGLE_TRIES]:
         hint = _hint(sub, cache)
-        width, height = _number(hint.get("NAXIS1")), _number(hint.get("NAXIS2"))
+        width, height = SessionFileScanner.to_float(hint.get("NAXIS1")), SessionFileScanner.to_float(hint.get("NAXIS2"))
         if not (width and height and width < height):
             return ""  # Not the S50's own portrait frames (cropped or turned by other software)
         try:
@@ -821,11 +820,11 @@ def save(conn, session_id, mounts, tidy=True):
     for file_id, path, sub_key in cursor.execute(
             "SELECT id, file_path, sub_key FROM usersessionfiles WHERE session_id = ? AND frame_type = 'Light'",
             (session_id,)).fetchall():
-        by_path[os.path.normcase(os.path.normpath(path or ""))] = file_id
+        by_path[path_key(path or "")] = file_id
         if sub_key:
             by_key[sub_key] = file_id
     for mount in mounts:
-        ids = {by_path.get(os.path.normcase(os.path.normpath(s.path))) or by_key.get(s.sub_key)
+        ids = {by_path.get(path_key(s.path)) or by_key.get(s.sub_key)
                for s in mount.subs} - {None}
         if not ids:
             continue
