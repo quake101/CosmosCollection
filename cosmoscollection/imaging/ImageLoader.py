@@ -26,7 +26,8 @@ QT_IMAGE_IO_LOCK = threading.Lock()
 
 # Reading pixel data (no Qt - shared with frame measurement and the command line)
 from cosmoscollection.imaging.ImageArrays import (  # noqa: E402,F401
-    FITS_EXTENSIONS, XISF_EXTENSIONS, _READ_CHUNK, _read_fits_array, read_astro_array, read_file_bytes)
+    _READ_CHUNK, _read_fits_array, read_astro_array, read_file_bytes)
+from cosmoscollection.sessions.SessionFileScanner import SUPPORTED_EXTENSIONS  # noqa: E402
 
 
 # Percentile limits are estimated from a strided sample of about this many
@@ -226,7 +227,7 @@ def load_image_qimage(file_path, max_dim=None, progress=None):
         return None, "File not found"
 
     ext = os.path.splitext(file_path)[1].lower()
-    if ext in FITS_EXTENSIONS + XISF_EXTENSIONS:
+    if ext in SUPPORTED_EXTENSIONS:
         qimage = load_astro_qimage(file_path, progress)
         if qimage is None:
             return None, "Failed to load FITS/XISF file"

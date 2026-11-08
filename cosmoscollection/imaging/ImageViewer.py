@@ -30,8 +30,11 @@ from cosmoscollection.ui.WindowPositionManager import WindowPositionManager
 from cosmoscollection.ui.WindowLifetime import window_is_open
 from cosmoscollection.core.Formatting import format_dec, format_ra, trim_number
 from cosmoscollection.ui.TimeFormatHelper import format_datetime
-from cosmoscollection.sessions.SessionFileScanner import (FITS_EXTENSIONS, XISF_EXTENSIONS, read_xisf_xml, to_float,
-                                _coerce_fits_value, _file_coordinates, _parse_sexagesimal)
+from cosmoscollection.sessions.SessionObservations import parse_obs_datetime
+from cosmoscollection.sessions.SessionFileScanner import (FITS_EXTENSIONS, SUPPORTED_EXTENSIONS, XISF_EXTENSIONS, read_xisf_xml,
+                                site_latitude,
+                                site_longitude, to_float,
+                                _coerce_fits_value, _file_coordinates)
 from cosmoscollection.imaging.AnnotationOverlay import (ANNOTATION_LAYER_SETTINGS, ANNOTATION_LAYERS, AnnotationData, annotation_store,
                                image_pixel_size, paint_annotations, read_wcs_header, saved_annotation_layers,
                                screen_name_px)
@@ -103,7 +106,7 @@ class ImageLoadWorker(QThread):
     def run(self):
         try:
             from cosmoscollection.imaging.ImageLoader import load_image_qimage, load_screen_stretched_qimage
-            is_astro = os.path.splitext(self.file_path)[1].lower() in ('.fits', '.fit', '.fts', '.xisf')
+            is_astro = os.path.splitext(self.file_path)[1].lower() in SUPPORTED_EXTENSIONS
             if self.screen_stretch and is_astro:
                 qimage, error = load_screen_stretched_qimage(self.file_path)
             else:
@@ -442,12 +445,12 @@ def _capture_rows(kw, history):
     _add_row(rows, "Frame Type", _first_value(kw, 'IMAGETYP', 'FRAME'))
 
     date_obs = kw.get('DATE-OBS')
-    utc = _parse_iso_datetime(date_obs)
+    utc = parse_obs_datetime(date_obs)
     if utc is not None:
         utc = utc.replace(tzinfo=timezone.utc) if utc.tzinfo is None else utc.astimezone(timezone.utc)
         rows.append(("Date (UTC)", format_datetime(utc, seconds=True)))
         # Prefer the capture site's local time when the file records it
-        local = _parse_iso_datetime(kw.get('DATE-LOC'))
+        local = parse_obs_datetime(kw.get('DATE-LOC'))
         if local is None:
             local = utc.astimezone()
         rows.append(("Date (Local)", format_datetime(local, seconds=True)))
@@ -588,13 +591,11 @@ def _plate_solution_rows(kw, image_size, fallback_wcs):
 
 def _site_rows(kw):
     rows = []
-    latitude = _to_degrees(_first_value(kw, 'SITELAT', 'OBSGEO-B', 'LAT-OBS'))
+    latitude = site_latitude(kw)
     if latitude is not None:
         rows.append(("Latitude", f"{abs(latitude):.4f}° {'N' if latitude >= 0 else 'S'}"))
-    longitude = _to_degrees(_first_value(kw, 'SITELONG', 'OBSGEO-L', 'LONG-OBS'))
+    longitude = site_longitude(kw)
     if longitude is not None:
-        if longitude > 180:
-            longitude -= 360
         rows.append(("Longitude", f"{abs(longitude):.4f}° {'E' if longitude >= 0 else 'W'}"))
     elevation = _to_float(_first_value(kw, 'SITEELEV', 'OBSGEO-H', 'ALT-OBS'))
     if elevation is not None:
@@ -640,26 +641,6 @@ def _add_row(rows, label, value):
 def _to_float(value):
     """A header value as a number (FITS T/F booleans aren't numbers here)."""
     return None if isinstance(value, bool) else to_float(value)
-
-
-def _to_degrees(value):
-    """Degrees from a number or a sexagesimal string like '+40 30 00'"""
-    result = _to_float(value)
-    if result is None and isinstance(value, str):
-        result = _parse_sexagesimal(value)
-    return result
-
-
-def _parse_iso_datetime(value):
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip().replace('Z', '+00:00')
-    # fromisoformat only takes up to 6 fractional digits
-    text = re.sub(r'(\.\d{6})\d+', r'\1', text)
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError:
-        return None
 
 
 def _is_plate_solved(wcs_keywords):

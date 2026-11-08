@@ -81,6 +81,58 @@ def to_float(value):
     return result if math.isfinite(result) else None
 
 
+def exposure_of(header):
+    """A sub's exposure in seconds (EXPTIME, else EXPOSURE), or None."""
+    return to_float(header.get('EXPTIME', header.get('EXPOSURE'))) if header else None
+
+
+def _first_value(header, names):
+    return next((header[name] for name in names if header.get(name) not in (None, "")), None)
+
+
+def _degrees(value):
+    """Degrees from a number or a sexagesimal string ('+40 30 00'), or None."""
+    result = to_float(value)
+    if result is None and isinstance(value, str):
+        result = _parse_sexagesimal(value)
+    return result
+
+
+def site_latitude(header):
+    """Where a header says it was taken: latitude in degrees, or None."""
+    return _degrees(_first_value(header or {}, ('SITELAT', 'OBSGEO-B', 'LAT-OBS')))
+
+
+def site_longitude(header):
+    """Where a header says it was taken: longitude in degrees, east positive
+    (-180 to 180, also from headers that count 0-360), or None."""
+    longitude = _degrees(_first_value(header or {}, ('SITELONG', 'OBSGEO-L', 'LONG-OBS')))
+    if longitude is not None and longitude > 180:
+        longitude -= 360
+    return longitude
+
+
+def site_of(header):
+    """(lat, lon) a header says it was taken at, or (None, None) - also for a
+    0, 0 placeholder."""
+    lat, lon = site_latitude(header), site_longitude(header)
+    if lat is None or lon is None or not (lat or lon):
+        return None, None
+    return lat, lon
+
+
+def read_header(file_path):
+    """Every keyword of a FITS or XISF file's header (COMMENT/HISTORY left out):
+    FITS through the fast block reader, XISF from its XML (never the pixels).
+    Raises ValueError for other files, OSError if it can't be read."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in FITS_EXTENSIONS:
+        return read_fits_header_fast(file_path)
+    if ext in XISF_EXTENSIONS:
+        return extract_xisf_header(file_path, keywords=None)
+    raise ValueError(f"Not a FITS or XISF file: {file_path}")
+
+
 def _clean_str(value):
     if value is None:
         return None

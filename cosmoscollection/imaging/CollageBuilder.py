@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QForm
                                QButtonGroup, QScrollArea)
 
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
+from cosmoscollection.sessions.SessionFileScanner import SUPPORTED_EXTENSIONS
 from cosmoscollection.core.UrlOpener import open_url, show_in_folder
 from cosmoscollection.ui.WindowLifetime import keep_alive_until_finished
 from cosmoscollection.core.Settings import app_settings
@@ -49,7 +50,7 @@ from cosmoscollection.catalog.DSONames import CONSTELLATIONS, load_common_names
 from cosmoscollection.solving.PlateSolver import describe_solving
 from cosmoscollection.sessions.SessionObservations import parse_obs_datetime
 from cosmoscollection.imaging.AnnotationOverlay import (ANNOTATION_LAYERS, DEFAULT_ANNOTATION_LAYERS, annotation_store,
-                               load_annotation_data, paint_annotations, plate_solve_queue, read_fits_cards)
+                               load_annotation_data, paint_annotations, plate_solve_queue)
 
 logger = logging.getLogger(__name__)
 
@@ -906,11 +907,11 @@ def slot_label(catalogue, designation):
 
 def read_capture_date(path):
     """DATE-OBS from a FITS or XISF header, as text ("" if none)."""
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".xisf":
-        from cosmoscollection.sessions.SessionFileScanner import extract_xisf_header
-        return str(extract_xisf_header(path).get("DATE-OBS") or "")
-    return str(read_fits_cards(path).get("DATE-OBS") or "")
+    from cosmoscollection.sessions.SessionFileScanner import read_header
+    try:
+        return str(read_header(path).get("DATE-OBS") or "")
+    except (OSError, ValueError, SyntaxError):  # SyntaxError: XISF XML that doesn't parse
+        return ""
 
 
 def image_year_and_time(row, header_reader=read_capture_date):
@@ -927,7 +928,7 @@ def image_year_and_time(row, header_reader=read_capture_date):
             return year, datetime(year, 1, 1).timestamp(), "taken"
     path = row.get("image_path") or ""
     ext = os.path.splitext(path)[1].lower()
-    if ext in (".fits", ".fit", ".fts", ".xisf") and os.path.isfile(path):
+    if ext in SUPPORTED_EXTENSIONS and os.path.isfile(path):
         try:
             # None for a missing or placeholder date ('N/A' from Astro Pixel Processor)
             when = parse_obs_datetime(header_reader(path))

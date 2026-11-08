@@ -27,6 +27,8 @@ import itertools
 
 import numpy as np
 
+from cosmoscollection.sessions.SessionFileScanner import FITS_EXTENSIONS, SUPPORTED_EXTENSIONS
+
 logger = logging.getLogger(__name__)
 
 TYCHO_RADIUS = 0.45       # Catalog cones this wide (degrees) try Tycho-2 first
@@ -43,8 +45,6 @@ MATCH_PX = 3.0            # A star matches the catalog within this many analysis
 MIN_MATCHED = 10          # Matched stars needed to accept a solution
 FIELD_STEP = 1.45         # Ratio between the fields of view tried
 FIELDS = [0.25 * FIELD_STEP ** i for i in range(11)]  # Image diagonals tried, degrees (0.25 to ~10)
-FITS_EXTENSIONS = (".fits", ".fit", ".fts")
-XISF_EXTENSIONS = (".xisf",)
 
 
 class SolveFailed(Exception):
@@ -149,7 +149,7 @@ def _load_luminance(path):
     analysis pixel, (original width, height), FITS-style header dict)."""
     ext = os.path.splitext(path)[1].lower()
     header = {}
-    if ext in FITS_EXTENSIONS + XISF_EXTENSIONS:
+    if ext in SUPPORTED_EXTENSIONS:
         from cosmoscollection.imaging.FrameQuality import _read_frame, _luminance
         data, header = _read_frame(path)
         height, width = data.shape[:2]

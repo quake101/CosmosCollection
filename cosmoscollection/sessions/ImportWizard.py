@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from cosmoscollection.sessions import LibraryScanner
+from cosmoscollection.sessions import LibraryScanner, SessionFileScanner
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.ui.WindowLifetime import refresh_open
@@ -967,7 +967,7 @@ class ReviewPage(QWidget):
         header.setText(COL_STATUS, "Darks, flats and bias frames shared by several objects")
         self._bold(header)
         for library in libraries:
-            exposures = sorted({e for e in (LibraryScanner.exposure_of(r.header) for r in library.files) if e})
+            exposures = sorted({e for e in (SessionFileScanner.exposure_of(r.header) for r in library.files) if e})
             item = QTreeWidgetItem([f"{library.frame_type} frames"])
             item.setData(COL_NAME, ITEM_ROLE, ("calibration", library))
             item.setText(COL_STATUS, ", ".join(f"{e:g}s" for e in exposures[:4]) + ("..." if len(exposures) > 4 else ""))
@@ -1742,7 +1742,7 @@ class DetailsPane(QWidget):
         per_night = defaultdict(lambda: [0, 0.0])
         for record in session.lights:
             key = (LibraryScanner._night(record), LibraryScanner._clean(record.header.get('FILTER')) or "None",
-                   LibraryScanner.exposure_of(record.header) or 0)
+                   SessionFileScanner.exposure_of(record.header) or 0)
             per_night[key][0] += 1
             per_night[key][1] += key[2]
         rows = []
@@ -1782,7 +1782,7 @@ class DetailsPane(QWidget):
     def show_calibration(self, library, rel):
         self._pixmap = None
         self.thumbnail.setVisible(False)
-        exposures = sorted({e for e in (LibraryScanner.exposure_of(r.header) for r in library.files) if e})
+        exposures = sorted({e for e in (SessionFileScanner.exposure_of(r.header) for r in library.files) if e})
         self.text.setText("<br>".join([
             f"<h3>{library.frame_type} frames</h3>",
             f"{len(library.files):,} frames · {_html(library.camera or 'Unknown camera')}",
@@ -1918,7 +1918,7 @@ class SplitSessionDialog(QDialog):
         for record in session.lights:
             night = LibraryScanner._night(record)
             counts[night][0] += 1
-            counts[night][1] += LibraryScanner.exposure_of(record.header) or 0
+            counts[night][1] += SessionFileScanner.exposure_of(record.header) or 0
         self.nights = QListWidget()
         for night in sorted(counts):
             subs, seconds = counts[night]

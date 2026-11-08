@@ -15,7 +15,6 @@ import logging
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -38,6 +37,7 @@ from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.ui.WindowLifetime import retire_thread
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.sessions import SessionFileScanner
+from cosmoscollection.sessions.SessionObservations import night_label
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.Theme import (COLORS, chart_background, chart_color, chart_font_size, font_size, themed_style,
@@ -908,7 +908,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             return
         rejected, held, kept_any = [], [], False
         for night, (grade, issue, count, grades) in sorted(self._bad_nights().items()):
-            label, why = self._night_label(night), issue.replace("?; ", "? ")
+            label, why = night_label(night), issue.replace("?; ", "? ")
             if grade == FrameQuality.GRADE_REJECT:
                 kept = count - grades[FrameQuality.GRADE_REJECT]
                 kept_any = kept_any or bool(kept)
@@ -1433,7 +1433,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
                 tooltip.insert(1, f"{g.grade}" + (f" · score {g.score:.0f}" if g.grade in CHART_RANKED else ""))
             if value is not None and key != "score":
                 tooltip.insert(2, f"{axis}: {value:.2f}" if abs(value) < 10 else f"{axis}: {value:,.0f}")
-            points.append(ChartPoint(path=path, night=self._night_label(f["night_date"]), value=value,
+            points.append(ChartPoint(path=path, night=night_label(f["night_date"]), value=value,
                                      grade=g.grade if g else "", tooltip="\n".join(t for t in tooltip if t),
                                      checked=path in self._checked))
         self.chart.set_points(points, axis, self._chart_lines(key, paths))
@@ -1462,7 +1462,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         # Each night is graded against its own median - its own lines, across its band
         by_night = {}
         for p in shown:
-            by_night.setdefault(self._night_label(self._lights[p]["night_date"]), self._grades[p].medians)
+            by_night.setdefault(night_label(self._lights[p]["night_date"]), self._grades[p].medians)
         return [(y, label, kind, night if len(by_night) > 1 else None)
                 for night, med in by_night.items() for y, label, kind in self._metric_lines(key, med, s)]
 
@@ -1511,14 +1511,6 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             return grade.outside * 100 if grade and grade.outside is not None else None
         return relative.get({"stars": "stars", "flux": "flux", "sky": "background", "signal": "signal"}[key])
 
-    @staticmethod
-    @lru_cache(maxsize=None)
-    def _night_label(night_date):
-        try:
-            return datetime.strptime(night_date, "%Y-%m-%d").strftime("%b %d")
-        except (TypeError, ValueError):
-            return "No date"
-
     def _local_time(self, date_obs):
         """DATE-OBS (UTC) as the session's local time, for the graph's tooltips.
         Remembered - the graph is redrawn as results arrive, thousands of points at a time."""
@@ -1544,8 +1536,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         return moment.strftime("%b %d %H:%M UTC")
 
     def _on_chart_metric_changed(self):
-        app_settings().setValue(GRAPH_METRIC_SETTING,
-                                                                   self.chart_metric_combo.currentData())
+        app_settings().setValue(GRAPH_METRIC_SETTING, self.chart_metric_combo.currentData())
         self._refresh_chart()
 
     def _on_graph_toggled(self, visible):
@@ -1884,8 +1875,8 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         self._regrade()
         if gone:
             moved = sum(1 for p, grade in before.items() if p in self._grades and self._grades[p].grade != grade)
-            nights = ", ".join(f"all of {self._night_label(night)} ({count:,} frames)" if count == bad_nights[night] else
-                               f"{count:,} of {self._night_label(night)}'s {bad_nights[night]:,} frames"
+            nights = ", ".join(f"all of {night_label(night)} ({count:,} frames)" if count == bad_nights[night] else
+                               f"{count:,} of {night_label(night)}'s {bad_nights[night]:,} frames"
                                for night, count in sorted(gone.items()))
             self._removal_note = (
                 f"<b>Removed {nights}.</b> The other frames were regraded - "

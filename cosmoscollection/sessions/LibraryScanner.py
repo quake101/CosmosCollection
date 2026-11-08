@@ -45,7 +45,7 @@ from cosmoscollection.core.Paths import path_key
 from cosmoscollection.core.Formatting import format_duration
 from cosmoscollection.sessions import SessionFileScanner
 from cosmoscollection.sessions import SessionObservations
-from cosmoscollection.sessions.SessionObservations import make_sub_key, parse_obs_datetime, night_date_for, FILE_FILTER_SQL
+from cosmoscollection.sessions.SessionObservations import make_sub_key, parse_obs_datetime, FILE_FILTER_SQL
 from cosmoscollection.core.DatabaseManager import add_user_image_row
 from cosmoscollection.catalog.DSONames import CATALOG_RANK, NOT_DSO_TYPES, pick_common_name, with_common_name
 
@@ -228,10 +228,7 @@ def _list_dir(path):
 
 def _read_header(record):
     try:
-        if record.ext in FITS_EXTENSIONS:
-            header = SessionFileScanner.read_fits_header_fast(record.path)
-        else:
-            header = SessionFileScanner.extract_xisf_header(record.path, keywords=None)
+        header = SessionFileScanner.read_header(record.path)
         return record, {k: v for k, v in header.items() if k in HEADER_KEYWORDS}, None
     except Exception as e:
         return record, None, str(e) or type(e).__name__
@@ -548,10 +545,6 @@ def _keyword_tier(text, rules):
     return 0
 
 
-def exposure_of(header):
-    return SessionFileScanner.to_float(header.get('EXPTIME', header.get('EXPOSURE'))) if header else None
-
-
 def _calibration_hint(record):
     """Dark/Flat/Bias when a 'Light' sub's folder or OBJECT says it's calibration."""
     for text in (os.path.basename(record.folder), _clean((record.header or {}).get('OBJECT'))):
@@ -602,7 +595,7 @@ def _classify_header_file(record, rules):
         frame_type = SessionFileScanner._normalize_frame_type(header)
         if frame_type == "Light":
             frame_type = _calibration_hint(record) or frame_type
-        if frame_type != "Unknown" and (exposure_of(header) is not None or frame_type == "Bias"):
+        if frame_type != "Unknown" and (SessionFileScanner.exposure_of(header) is not None or frame_type == "Bias"):
             record.kind, record.frame_type = "sub", frame_type
         else:
             record.kind, record.reason = "processing", "processing file"
@@ -916,7 +909,7 @@ class Session:
 
     @property
     def integration_seconds(self):
-        return sum(exposure_of(r.header) or 0 for r in self.lights)
+        return sum(SessionFileScanner.exposure_of(r.header) or 0 for r in self.lights)
 
     @property
     def filters(self):
@@ -1027,27 +1020,16 @@ def _obs_time(record):
     cached = getattr(record, "_obs_time", None)
     if cached is not None:
         return cached
-    dt = parse_obs_datetime((record.header or {}).get('DATE-OBS'))
+    dt = SessionObservations.to_utc((record.header or {}).get('DATE-OBS'))
     if dt is None:
-        dt = datetime.fromtimestamp(record.mtime_ns / 1e9, timezone.utc)
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        dt = datetime.fromtimestamp(record.mtime_ns / 1e9, timezone.utc).replace(tzinfo=None)
     record._obs_time = dt
     return dt
 
 
 def _night(record):
-    """The observing night of a sub: local time from the site longitude
-    (solar time, close enough to split nights at noon), else this computer's
-    time zone."""
-    header = record.header or {}
-    utc = _obs_time(record)
-    longitude = SessionFileScanner.to_float(header.get('SITELONG', header.get('LONG-OBS')))
-    if longitude is not None:
-        local = utc + timedelta(hours=longitude / 15.0)
-    else:
-        local = utc.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
-    return night_date_for(local)
+    """The observing night of a sub (SessionObservations.night_of)."""
+    return SessionObservations.night_of(_obs_time(record), SessionFileScanner.site_longitude(record.header or {}))
 
 
 def _coords(header):
@@ -1418,7 +1400,7 @@ def save_assignments(conn, assignments):
 
 def _sub_key(record):
     h = record.header or {}
-    return make_sub_key(h.get('DATE-OBS'), exposure_of(h), _clean(h.get('FILTER')), record.frame_type,
+    return make_sub_key(h.get('DATE-OBS'), SessionFileScanner.exposure_of(h), _clean(h.get('FILTER')), record.frame_type,
                         _clean(h.get('INSTRUME')))
 
 
@@ -1825,7 +1807,7 @@ def detect_mounts(library, site=None, cache=None, status=None, cancel=None):
                     coords = SessionFileScanner._file_coordinates(record.header or {})
                     sub = MountDetection.Sub(record.path, _obs_time(record), *(coords or (None, None)),
                                              record.size, record.mtime_ns, _sub_key(record),
-                                             *MountDetection.site_of(record.header))
+                                             *SessionFileScanner.site_of(record.header))
                     records_of[id(sub)] = record
                     subs.append(sub)
                 nights.append((night, rig, subs))
@@ -2029,9 +2011,8 @@ def _session_location(session, locations):
     lats, lons = [], []
     for record in session.lights[::max(1, len(session.lights) // 50)]:
         header = record.header or {}
-        lat = SessionFileScanner.to_float(header.get('SITELAT', header.get('LAT-OBS')))
-        lon = SessionFileScanner.to_float(header.get('SITELONG', header.get('LONG-OBS')))
-        if lat is not None and lon is not None and (lat or lon):
+        lat, lon = SessionFileScanner.site_of(header)
+        if lat is not None:
             lats.append(lat)
             lons.append(lon)
     if lats:
@@ -2303,7 +2284,7 @@ def print_library(library, scan, out, new_only=False):
     if calibration:
         out.write("\n== Calibration libraries\n")
         for c in calibration:
-            exposures = sorted({exposure_of(r.header) for r in c.files if exposure_of(r.header) is not None})
+            exposures = sorted({SessionFileScanner.exposure_of(r.header) for r in c.files if SessionFileScanner.exposure_of(r.header) is not None})
             out.write(f"   {c.frame_type} x{len(c.files)} {c.camera or '?'} "
                       f"{', '.join(f'{e:g}s' for e in exposures)}: {rel(c.folder)}\n")
 

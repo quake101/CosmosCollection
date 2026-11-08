@@ -51,7 +51,7 @@ import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from typing import Optional
 
 # numpy is imported where the field turn is measured, not here: the database
@@ -61,7 +61,7 @@ from typing import Optional
 from cosmoscollection.sessions import SessionFileScanner
 from cosmoscollection.core.DatabaseManager import add_columns
 from cosmoscollection.core.Paths import path_key
-from cosmoscollection.sessions.SessionObservations import make_sub_key, night_date_for, parse_obs_datetime
+from cosmoscollection.sessions.SessionObservations import make_sub_key, night_of, to_utc
 
 logger = logging.getLogger(__name__)
 
@@ -140,46 +140,18 @@ def rig_of(header):
     return "|".join(str(header.get(k) or "").strip().lower() for k in ("INSTRUME", "TELESCOP"))
 
 
-def utc_of(header):
-    """A header's DATE-OBS as a naive UTC datetime, or None."""
-    when = parse_obs_datetime((header or {}).get("DATE-OBS"))
-    if when is not None and when.tzinfo is not None:
-        when = when.astimezone(timezone.utc).replace(tzinfo=None)
-    return when
-
-
-def night_of(when, longitude=None):
-    """The observing night of a UTC time: local solar time from the site
-    longitude, else this computer's time zone (as LibraryScanner splits nights)."""
-    if longitude is not None:
-        local = when + timedelta(hours=longitude / 15.0)
-    else:
-        local = when.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
-    return night_date_for(local)
-
-
 def sub_from_header(path, header, size=0, mtime_ns=0, frame_type="Light"):
     """A Sub from a light's header, or None without a capture time."""
-    when = utc_of(header)
+    when = to_utc((header or {}).get("DATE-OBS"))
     if when is None:
         return None
     coords = SessionFileScanner._file_coordinates(header or {})
-    exposure = SessionFileScanner.to_float(header.get("EXPTIME", header.get("EXPOSURE")))
+    exposure = SessionFileScanner.exposure_of(header)
     key = make_sub_key(header.get("DATE-OBS"), exposure, SessionFileScanner._clean_str(header.get("FILTER")),
                        frame_type, SessionFileScanner._clean_str(header.get("INSTRUME")))
-    lat, lon = site_of(header)
+    lat, lon = SessionFileScanner.site_of(header)
     return Sub(path, when, coords[0] if coords else None, coords[1] if coords else None, size, mtime_ns, key,
                lat, lon)
-
-
-def site_of(header):
-    """(lat, lon) a header says it was taken at, or (None, None)."""
-    header = header or {}
-    lat = SessionFileScanner.to_float(header.get("SITELAT", header.get("LAT-OBS")))
-    lon = SessionFileScanner.to_float(header.get("SITELONG", header.get("LONG-OBS")))
-    if lat is None or lon is None or not (lat or lon):
-        return None, None
-    return lat, lon
 
 
 def nights_from_file_dicts(files, longitude=None):
@@ -191,7 +163,7 @@ def nights_from_file_dicts(files, longitude=None):
         sub = sub_from_header(f["_file_path"], f)
         if sub is None:
             continue
-        site_lon = SessionFileScanner.to_float(f.get("SITELONG", f.get("LONG-OBS")))
+        site_lon = SessionFileScanner.site_longitude(f)
         groups[(night_of(sub.when, site_lon if site_lon is not None else longitude), rig_of(f))].append(sub)
     return [(night, rig, subs) for (night, rig), subs in sorted(groups.items())]
 
@@ -394,10 +366,7 @@ def _hint(sub, cache):
     if cached is not None:
         return cached
     try:
-        if os.path.splitext(sub.path)[1].lower() in SessionFileScanner.XISF_EXTENSIONS:
-            header = SessionFileScanner.extract_xisf_header(sub.path, keywords=None)
-        else:
-            header = SessionFileScanner.read_fits_header_fast(sub.path)
+        header = SessionFileScanner.read_header(sub.path)
     except (OSError, ValueError) as e:
         logger.debug(f"Couldn't read the header of {sub.path}: {e}")
         return {}
@@ -526,7 +495,7 @@ def _eqmode(hints):
 
 def _site(hints, site):
     for hint in hints:
-        lat, lon = site_of(hint)
+        lat, lon = SessionFileScanner.site_of(hint)
         if lat is not None:
             return lat, lon
     return site or (None, None)

@@ -11,6 +11,7 @@ import threading
 from collections import Counter
 
 from cosmoscollection.cli.LibraryCommands import REFRESH_NOTE, Progress, _run_stoppable
+from cosmoscollection.sessions.SessionFileScanner import SUPPORTED_EXTENSIONS
 from cosmoscollection.core.Paths import path_key
 from cosmoscollection.cli.Output import (EXIT_ERROR, EXIT_USAGE, CliError, Column, note, print_json,
                                          print_table)
@@ -18,7 +19,7 @@ from cosmoscollection.core.Formatting import count_text, format_duration
 
 SOLVER_CHOICES = ("builtin", "astap", "astrometry")
 PICTURE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
-SOLVABLE_EXTENSIONS = (".fits", ".fit", ".fts", ".xisf") + PICTURE_EXTENSIONS
+SOLVABLE_EXTENSIONS = tuple(SUPPORTED_EXTENSIONS) + PICTURE_EXTENSIONS
 HINT_RADIUS = 15  # degrees ASTAP searches around a position hint (as the image viewer does)
 
 
@@ -100,16 +101,11 @@ def _image_paths(paths, extensions):
 
 def _file_header(path):
     """A FITS/XISF file's header keywords ({} for other images or unreadable)."""
-    from cosmoscollection.sessions import SessionFileScanner as sfs
-    ext = os.path.splitext(path)[1].lower()
+    from cosmoscollection.sessions.SessionFileScanner import read_header
     try:
-        if ext in sfs.FITS_EXTENSIONS:
-            return sfs.read_fits_header_fast(path)
-        if ext in sfs.XISF_EXTENSIONS:
-            return sfs.extract_xisf_header(path, keywords=None)
+        return read_header(path)
     except Exception:
-        pass
-    return {}
+        return {}
 
 
 def _gallery_positions(conn):
@@ -282,7 +278,7 @@ def _folder_lights(ctx, paths, progress):
     except CliError:
         zone = Observer.local_zone(None)  # No location set up: this computer's time zone
 
-    from cosmoscollection.sessions.SessionFileScanner import to_float as number
+    from cosmoscollection.sessions.SessionFileScanner import exposure_of, to_float as number
 
     progress.show(f"Reading {count_text(len(files), 'header')}...")
     with ThreadPoolExecutor(max_workers=16) as pool:
@@ -299,7 +295,7 @@ def _folder_lights(ctx, paths, progress):
             if when.tzinfo is None:
                 when = when.replace(tzinfo=timezone.utc)  # DATE-OBS is UTC
             night = night_date_for(when.astimezone(zone).replace(tzinfo=None)).isoformat()
-        exposure = number(header.get("EXPTIME", header.get("EXPOSURE")))
+        exposure = exposure_of(header)
         binning = number(header.get("XBINNING"))
         lights[path] = {"id": None, "file_path": path, "frame_type": "Light",
                         "filter_name": str(header["FILTER"]).strip() if header.get("FILTER") else None,
@@ -331,14 +327,6 @@ def _frame_json(path, light, metrics, grade):
 def _ranked():
     from cosmoscollection.imaging import FrameQuality as fq
     return (fq.GRADE_GOOD, fq.GRADE_MARGINAL, fq.GRADE_REJECT)
-
-
-def _night_label(night):
-    from datetime import datetime
-    try:
-        return datetime.strptime(night, "%Y-%m-%d").strftime("%b %d")
-    except (TypeError, ValueError):
-        return "No date"
 
 
 def run_quality(ctx):
@@ -504,6 +492,7 @@ def _print_quality(ctx, session, lights, shown, metrics, grades, by_grade, night
                    integration):
     from cosmoscollection.imaging import FrameQuality as fq
     from cosmoscollection.imaging import LightQuality as lq
+    from cosmoscollection.sessions.SessionObservations import night_label
 
     args = ctx.args
     if session:
@@ -545,12 +534,12 @@ def _print_quality(ctx, session, lights, shown, metrics, grades, by_grade, night
         why = issue.replace("?; ", "? ")
         if grade == fq.GRADE_REJECT:
             kept = count - frame_grades[fq.GRADE_REJECT]
-            print(f"\n{_night_label(night)} doesn't match your other nights. {why} "
+            print(f"\n{night_label(night)} doesn't match your other nights. {why} "
                   + (f"All {count:,} of its frames are Rejects." if not kept else
                      f"{count - kept:,} of its {count:,} frames are Rejects; the {kept:,} that hold up on their "
                      f"own are kept."))
         else:
-            print(f"\n{_night_label(night)} is a little behind your other nights. {why} Its frames are Marginal "
+            print(f"\n{night_label(night)} is a little behind your other nights. {why} Its frames are Marginal "
                   f"at best - still worth stacking with Good + Marginal.")
 
     listed = shown if args.all else [p for p in shown if not (p in grades and grades[p].grade == fq.GRADE_GOOD)]

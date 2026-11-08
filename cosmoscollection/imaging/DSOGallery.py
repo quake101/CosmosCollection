@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QFontMetricsF
 
 from cosmoscollection.equipment import EquipmentMapper
+from cosmoscollection.sessions.SessionFileScanner import SUPPORTED_EXTENSIONS
 from cosmoscollection.app.DSOData import DESIGNATIONS_SQL
 from cosmoscollection.catalog.DSONames import type_name
 from cosmoscollection.core.Settings import app_settings
@@ -39,7 +40,7 @@ from cosmoscollection.imaging.AnnotationOverlay import (ANNOTATION_LAYERS, DEFAU
 logger = logging.getLogger(__name__)
 
 # Image extensions supported for DSO images throughout the gallery
-SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.fits', '.fit', '.fts', '.xisf'}
+SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff'} | SUPPORTED_EXTENSIONS
 
 # Thumbnail badges for images without a plate solve (while annotations are shown)
 SOLVE_BADGES = {"unsolved": "Not solved", "queued": "Waiting to solve", "solving": "Solving…",
@@ -396,7 +397,7 @@ class ThumbnailRunnable(QRunnable):
 
     def _decode_original(self, ext):
         """Decode the original image - at about thumbnail size where the format allows"""
-        if ext in ['.fits', '.fit', '.fts', '.xisf']:
+        if ext in SUPPORTED_EXTENSIONS:
             return load_astro_qimage(self.image_path)
         # Not EXIF-rotated, so plate-solve annotations line up with it
         image, _error = read_image_file(self.image_path, max_dim=self.thumbnail_size, auto_transform=False)
@@ -463,7 +464,7 @@ class ThumbnailRunnable(QRunnable):
                 return
 
             if image is None:
-                is_astro = ext in ['.fits', '.fit', '.fts', '.xisf']
+                is_astro = ext in SUPPORTED_EXTENSIONS
                 self.signals.thumbnail_error.emit(self.card, "Image Load Error" if is_astro else "Load Error")
                 return
 
@@ -651,7 +652,7 @@ def _load_preview_pixmap(image_path, max_dim=200):
 
     _, ext = os.path.splitext(image_path.lower())
 
-    if ext in ('.fits', '.fit', '.fts', '.xisf'):
+    if ext in SUPPORTED_EXTENSIONS:
         return load_astro_pixmap(image_path, max_dim=max_dim)
 
     image, _error = read_image_file(image_path, max_dim=max_dim, auto_transform=False)
@@ -1020,14 +1021,9 @@ class AddImageDialog(WindowPositionMixin, QDialog):
         for other formats, or if the header can't be read."""
         if not self.selected_file:
             return None
-        ext = os.path.splitext(self.selected_file)[1].lower()
+        from cosmoscollection.sessions.SessionFileScanner import read_header
         try:
-            if ext in ('.fits', '.fit', '.fts'):
-                from cosmoscollection.sessions.SessionFileScanner import extract_fits_header
-                return extract_fits_header(self.selected_file)
-            elif ext == '.xisf':
-                from cosmoscollection.sessions.SessionFileScanner import extract_xisf_header
-                return extract_xisf_header(self.selected_file)
+            return read_header(self.selected_file)
         except Exception as e:
             logger.debug(f"Could not read capture header from {self.selected_file}: {e}")
         return None

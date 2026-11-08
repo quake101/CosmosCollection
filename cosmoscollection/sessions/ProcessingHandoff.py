@@ -845,5 +845,5 @@ def find_siril_results(frames_dir):
         return []
     return sorted(
         os.path.join(frames_dir, name) for name in os.listdir(frames_dir)
-        if name.lower().startswith("result_") and os.path.splitext(name)[1].lower() in (".fit", ".fits", ".fts")
+        if name.lower().startswith("result_") and os.path.splitext(name)[1].lower() in SessionFileScanner.FITS_EXTENSIONS
     )

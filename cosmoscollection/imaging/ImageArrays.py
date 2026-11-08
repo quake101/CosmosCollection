@@ -10,8 +10,7 @@ import os
 
 import numpy as np
 
-FITS_EXTENSIONS = ('.fits', '.fit', '.fts')
-XISF_EXTENSIONS = ('.xisf',)
+from cosmoscollection.sessions.SessionFileScanner import FITS_EXTENSIONS, XISF_EXTENSIONS
 
 # Reads that report progress go in pieces this big. From the NAS, one read of
 # a whole file is fastest (Windows keeps many requests in flight); each piece

@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, Q
                                QTableWidgetItem, QHeaderView, QDialogButtonBox, QAbstractItemView)
 
 from cosmoscollection.imaging import ImageDetails
+from cosmoscollection.sessions.SessionFileScanner import SUPPORTED_EXTENSIONS
 from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import trim_number
@@ -48,7 +49,6 @@ from cosmoscollection.ui.WindowPositionManager import WindowPositionManager, Win
 logger = logging.getLogger(__name__)
 
 
-ASTRO_EXTENSIONS = ('.fits', '.fit', '.fts', '.xisf')
 
 # (key, name) - the long edge it's exported at; never larger than the image
 SIZES = [("full", "Full size"), ("screen", "Screen size"), ("4096", "4096 px"),
@@ -70,7 +70,7 @@ _orphaned_workers = set()
 
 
 def is_astro_file(path):
-    return Path(path or "").suffix.lower() in ASTRO_EXTENSIONS
+    return Path(path or "").suffix.lower() in SUPPORTED_EXTENSIONS
 
 
 def keep_running(worker, *signals):

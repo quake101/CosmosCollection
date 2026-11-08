@@ -23,7 +23,7 @@ import os
 import sqlite3
 import statistics
 from collections import Counter
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 
 from PySide6.QtCore import Qt, QObject, QRectF, QRunnable, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPainterPath, QPen
@@ -31,11 +31,12 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, Q
                                QComboBox, QCheckBox, QLineEdit, QListWidget, QListWidgetItem, QAbstractItemView,
                                QToolButton, QSlider, QFontComboBox, QColorDialog, QInputDialog, QMessageBox)
 
-from cosmoscollection.ui.Theme import COLORS, contrast_text, font_size, show_color_on_button, themed_style
+from cosmoscollection.ui.Theme import COLORS, font_size, show_color_on_button, themed_style
 from cosmoscollection.core.DatabaseManager import open_connection
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Paths import path_key
 from cosmoscollection.core.Formatting import count_text, format_duration, format_exposure, trim_number
+from cosmoscollection.sessions import SessionFileScanner, SessionObservations
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 
 logger = logging.getLogger(__name__)
@@ -361,18 +362,16 @@ def made_date(image_path):
 
 def sub_nights(keywords):
     """(first night, last night) of a stack's subs from its header's DATE-OBS
-    and DATE-END (UTC) - a night being the evening's date, here - or None."""
-    from cosmoscollection.imaging.ImageViewer import _parse_iso_datetime
+    and DATE-END (UTC), split into nights as a library scan splits its subs
+    (the header's site, else this computer's time zone) - or None."""
+    keywords = keywords or {}
+    longitude = SessionFileScanner.site_longitude(keywords)
 
-    def night_of(value):
-        when = _parse_iso_datetime(value)
-        if when is None:
-            return None
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=timezone.utc)
-        return (when.astimezone() - timedelta(hours=12)).date()
+    def night(name):
+        when = SessionObservations.to_utc(keywords.get(name))
+        return SessionObservations.night_of(when, longitude) if when else None
 
-    first, last = night_of((keywords or {}).get('DATE-OBS')), night_of((keywords or {}).get('DATE-END'))
+    first, last = night('DATE-OBS'), night('DATE-END')
     return (first, last) if first and last and first <= last else None
 
 
@@ -623,7 +622,8 @@ def _equipment_numbers(conn, numbers):
 
 def _header_details(header, details, numbers):
     """Fill what's still missing from the file's FITS/XISF header."""
-    from cosmoscollection.imaging.ImageViewer import _first_value, _parse_iso_datetime, _to_float
+    from cosmoscollection.imaging.ImageViewer import _first_value, _to_float
+    parse = SessionObservations.parse_obs_datetime
     kw = header.keywords
 
     def fill(key, value):
@@ -631,7 +631,7 @@ def _header_details(header, details, numbers):
             details[key] = str(value).strip()
 
     fill("title", _first_value(kw, 'OBJECT', 'OBJNAME'))
-    when = _parse_iso_datetime(kw.get('DATE-LOC')) or _parse_iso_datetime(kw.get('DATE-OBS'))
+    when = parse(kw.get('DATE-LOC')) or parse(kw.get('DATE-OBS'))
     if when is not None:
         fill("dates", format_dates([when.date()]))
 

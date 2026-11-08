@@ -18,7 +18,8 @@ import os
 import re
 import logging
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 
 from cosmoscollection.sessions import SessionFileScanner
 from cosmoscollection.core.DatabaseManager import add_columns
@@ -200,6 +201,7 @@ def parse_obs_datetime(value):
     if not value:
         return None
     text = str(value).strip().replace("Z", "+00:00")
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)  # Some writers give more than 6 fractional digits
     try:
         return datetime.fromisoformat(text)
     except ValueError:
@@ -211,6 +213,15 @@ def parse_obs_datetime(value):
         return datetime.strptime(text[:10], "%Y-%m-%d")
     except ValueError:
         return None
+
+
+def to_utc(value):
+    """A DATE-OBS style string as a naive UTC datetime (no offset = UTC, as
+    the FITS standard has it), or None."""
+    dt = parse_obs_datetime(value)
+    if dt is not None and dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 def to_local(value, tz_name):
@@ -241,6 +252,26 @@ def night_date_for(dt_local):
     return dt_local.date()
 
 
+def night_of(utc, longitude=None):
+    """The observing night of a naive UTC time, as a library scan splits
+    nights: local solar time from the site longitude (close enough to split at
+    noon), else this computer's time zone."""
+    if longitude is not None:
+        local = utc + timedelta(hours=longitude / 15.0)
+    else:
+        local = utc.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    return night_date_for(local)
+
+
+@lru_cache(maxsize=None)
+def night_label(night_date):
+    """'Oct 04' for a 'YYYY-MM-DD' night, 'No date' without one."""
+    try:
+        return datetime.strptime(night_date, "%Y-%m-%d").strftime("%b %d")
+    except (TypeError, ValueError):
+        return "No date"
+
+
 def session_timezone(conn, session_id):
     """The session's own timezone, else the active saved location's."""
     cursor = conn.cursor()
@@ -253,7 +284,8 @@ def session_timezone(conn, session_id):
     return site.timezone if site else None
 
 
-def format_datetime(dt):
+def to_db_datetime(dt):
+    """A datetime as the text the database stores, or None."""
     return dt.strftime(DATETIME_FORMAT) if dt else None
 
 
@@ -303,11 +335,9 @@ def make_sub_key(date_obs, exptime, filter_name, frame_type, camera):
     sub has no DATE-OBS (those fall back to path-only matching). The time keeps
     milliseconds (SUB_KEY_TIME): sub-second flats and bias frames are often
     taken several to a second, and whole seconds made them look like copies."""
-    dt = parse_obs_datetime(date_obs)
+    dt = to_utc(date_obs)
     if dt is None:
         return None
-    if dt.tzinfo is not None:
-        dt = dt.replace(tzinfo=None) - (dt.utcoffset() or timedelta(0))
     try:
         exposure = f"{float(exptime):.1f}" if exptime is not None else ""
     except (TypeError, ValueError):
@@ -853,7 +883,7 @@ def assign_files_to_observations(conn, session_id):
                 INSERT INTO usersessionobservations
                     (session_id, night_date, start_datetime, end_datetime, is_manual, modified_date)
                 VALUES (?, ?, ?, ?, 0, ?)
-            """, (session_id, night_date, format_datetime(night["min"]), format_datetime(night["max"]), now))
+            """, (session_id, night_date, to_db_datetime(night["min"]), to_db_datetime(night["max"]), now))
             obs = {"id": cursor.lastrowid, "is_manual": False}
             observations[night_date] = obs
         elif night["min"] is not None:
@@ -865,7 +895,7 @@ def assign_files_to_observations(conn, session_id):
             else:
                 start, end = night["min"], night["max"]
             cursor.execute("UPDATE usersessionobservations SET start_datetime = ?, end_datetime = ? WHERE id = ?",
-                           (format_datetime(start), format_datetime(end), obs["id"]))
+                           (to_db_datetime(start), to_db_datetime(end), obs["id"]))
 
         stale = [file_id for file_id, current in night["files"] if current != obs["id"]]
         for chunk in _chunks(stale):

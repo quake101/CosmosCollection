@@ -1523,8 +1523,8 @@ class ObservationDialog(WindowPositionMixin, QDialog):
 
         self.result = {
             "night_date": night,
-            "start_datetime": SessionObservations.format_datetime(start),
-            "end_datetime": SessionObservations.format_datetime(end),
+            "start_datetime": SessionObservations.to_db_datetime(start),
+            "end_datetime": SessionObservations.to_db_datetime(end),
             "notes": self.notes_edit.toPlainText().strip(),
             "logged": logged,
         }

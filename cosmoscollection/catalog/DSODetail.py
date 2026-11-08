@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from cosmoscollection.equipment import EquipmentMapper
+from cosmoscollection.sessions.SessionFileScanner import SUPPORTED_EXTENSIONS
 from cosmoscollection.planning.Observer import active_site
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.ui.WindowPositionManager import WindowPositionManager
@@ -1283,7 +1284,7 @@ class DSODetailWindow(QDialog):
         self.image_progress.hide()
         file_ext = os.path.splitext(image_path)[1].lower()
 
-        if file_ext in ['.fits', '.fit', '.fts', '.xisf']:
+        if file_ext in SUPPORTED_EXTENSIONS:
             self.image_label.setText(f"Failed to load FITS/XISF file:\n{os.path.basename(image_path)}\n\nRequires astropy library for FITS support\nError: {error_message}")
         else:
             self.image_label.setText(f"Failed to load image:\n{os.path.basename(image_path)}\n\nError: {error_message}")

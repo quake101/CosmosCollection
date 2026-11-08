@@ -12,7 +12,7 @@ import os
 import re
 from typing import Any, Dict, Tuple
 
-FITS_EXTENSIONS = (".fits", ".fit", ".fts")
+from cosmoscollection.sessions.SessionFileScanner import FITS_EXTENSIONS
 
 
 def _has_matrix(wcs_header: Dict[str, Any], prefix: str) -> bool:

@@ -1428,9 +1428,7 @@ def _collect_paths(args):
 def _frame_info(path):
     """(group key, gain) from a frame's header."""
     try:
-        ext = os.path.splitext(path)[1].lower()
-        header = (SessionFileScanner.extract_xisf_header(path) if ext in SessionFileScanner.XISF_EXTENSIONS
-                  else SessionFileScanner.extract_fits_header(path))
+        header = SessionFileScanner.read_header(path)
     except Exception:
         return ("?", None, None), None
     key = (str(header.get("FILTER") or "No filter"), header.get("EXPTIME"), header.get("XBINNING") or 1)
