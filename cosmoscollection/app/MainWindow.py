@@ -41,8 +41,7 @@ from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 
 from cosmoscollection.app.AboutDialog import AboutDialog
 from cosmoscollection.app.BulkAddToTargetDialog import BulkAddToTargetDialog
-from cosmoscollection.app.DSOData import DSO_QUERY, dso_row_to_dict, load_all_dso_data
-from cosmoscollection.core.Formatting import format_dec, format_ra
+from cosmoscollection.app.DSOData import load_all_dso_data, load_dso
 from cosmoscollection.app.DSOTableModel import DSOTableModel
 from cosmoscollection.app.SettingsDialog import SettingsDialog
 from cosmoscollection.app.UpdateDialogs import offer_update_and_apply, run_update_check
@@ -1065,34 +1064,21 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
             # Get fresh data from database using the connection manager
             with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-
-                # Query the object with its user image
-                cursor.execute(DSO_QUERY + " AND d.id = ?", (entry["dsodetailid"],))
-
-                result = cursor.fetchone()
-                logger.debug(f"Database result: {result}")
-
-                if not result:
-                    logger.error(f"Could not find object {entry['name']}")
-                    return
-
-                # Process the result and create the detail window
-                self._create_detail_window(result, entry)
+                data = load_dso(conn, entry["dsodetailid"])
+            if not data:
+                logger.error(f"Could not find object {entry['name']}")
+                return
+            self._create_detail_window(data, entry)
 
         except Exception as e:
             logger.error(f"Error in _on_double_click: {str(e)}", exc_info=True)
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Error", f"An error occurred: {str(e)}")
 
-    def _create_detail_window(self, result, entry):
-        """Create and show the detail window with the given data"""
-        data = dso_row_to_dict(result)
+    def _create_detail_window(self, data, entry):
+        """Create and show the detail window with the given data (load_dso's dict)"""
         # Use the name from the table entry instead of reconstructing it
         data["name"] = entry["name"]
-        # Coordinates formatted for display
-        data["ra"] = format_ra(data["ra_deg"])
-        data["dec"] = format_dec(data["dec_deg"])
 
         logger.debug(f"Data dictionary: {data}")
 

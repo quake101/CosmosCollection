@@ -1934,7 +1934,7 @@ class SessionDetailsDialog(WindowPositionMixin, QDialog):
 
     def _open_framing_in_fov(self):
         """The FOV Simulator with this session's framing (or a fresh one to make it)."""
-        from cosmoscollection.planning.DSOTargetList import find_full_dso_data
+        from cosmoscollection.app.DSOData import find_full_dso_data
         data = find_full_dso_data(self.db_manager, self.session_data.get("dso_name", ""), self.session_data)
         if not data:
             QMessageBox.warning(self, "Object Not Found",
@@ -4322,7 +4322,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
     def _catalog_data(self, session):
         """Catalogue data for the session's object (for DSO Details / FOV
         Simulator, and coordinates when the session has none), or None."""
-        from cosmoscollection.planning.DSOTargetList import find_full_dso_data
+        from cosmoscollection.app.DSOData import find_full_dso_data
         return find_full_dso_data(self.db_manager, session.get("dso_name", ""), session)
 
     def _session_coordinates(self, session):

@@ -21,8 +21,8 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
 from PySide6.QtGui import QFont, QColor
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.app.DSOData import find_full_dso_data
 from cosmoscollection.core.Settings import app_settings
-from cosmoscollection.core.Formatting import format_dec, format_ra
 from cosmoscollection.catalog.DSONames import (designation_candidates, display_name, preferred_designation,
                                               suggestion_names, type_code,
                                               type_name)
@@ -504,131 +504,6 @@ class AddTargetDialog(QDialog):
             logger.error(f"Error saving target: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to save target: {str(e)}")
 
-
-# ---- Catalogue lookup (shared with the Session Manager's right-click menu) ----
-
-_DSO_DETAIL_QUERY = """
-    SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
-           CAST(d.sizemin/60.0 AS REAL) as sizemin,
-           CAST(d.sizemax/60.0 AS REAL) as sizemax,
-           d.constellation, d.dsotype, d.dsoclass,
-           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-               CASE c.catalogue
-                   WHEN 'M' THEN 1
-                   WHEN 'NGC' THEN 2
-                   WHEN 'IC' THEN 3
-                   ELSE 4
-               END, c.designation) as designations,
-           ui.image_path, ui.integration_time, ui.date_taken, ui.notes,
-           (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-    FROM dsodetail d
-    JOIN cataloguenr c ON d.id = c.dsodetailid
-    LEFT JOIN userimages ui ON d.id = ui.dsodetailid
-"""
-
-
-def _split_designation(name):
-    """('M', '31') from 'M 31' or 'M31'; ('NGC', '7000') from 'NGC7000'; else None.
-    Session names often come from FITS OBJECT headers, which usually drop the space."""
-    parts = (name or "").split()
-    if len(parts) >= 2:
-        return parts[0], " ".join(parts[1:])
-    match = re.fullmatch(r"([A-Za-z]+)[-_ ]?(\d[\w.+-]*)", (name or "").strip())
-    return (match.group(1), match.group(2)) if match else None
-
-
-def find_full_dso_data(db_manager, target_name, target_data):
-    """Full catalogue data for a target (the dict DSODetailWindow and
-    AladinLiteWindow expect) - looked up by catalogue designation, falling
-    back to the nearest object within 0.1 degrees of target_data's
-    ra_deg/dec_deg. None if not found."""
-    try:
-        split = _split_designation(target_name)
-        if split:
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                # Query the full DSO data the same way the main window does
-                cursor.execute(_DSO_DETAIL_QUERY + """
-                    WHERE d.id = (
-                        SELECT d2.id FROM dsodetail d2
-                        JOIN cataloguenr c2 ON d2.id = c2.dsodetailid
-                        WHERE c2.catalogue = ? COLLATE NOCASE AND c2.designation = ? COLLATE NOCASE
-                        LIMIT 1)
-                    GROUP BY d.id
-                """, split)
-                result = cursor.fetchone()
-            if result:
-                return _process_dso_query_result(result, target_data)
-        # If not found by name, try by coordinates
-        return _dso_data_by_coordinates(db_manager, target_data)
-    except Exception as e:
-        logger.error(f"Error querying DSO database: {str(e)}")
-        return None
-
-
-def _dso_data_by_coordinates(db_manager, target_data):
-    """Try to find DSO by coordinates (within reasonable tolerance)"""
-    ra_deg, dec_deg = target_data.get("ra_deg"), target_data.get("dec_deg")
-    if ra_deg is None or dec_deg is None:
-        return None
-    tolerance = 0.1  # degrees
-    try:
-        with db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(_DSO_DETAIL_QUERY + """
-                WHERE ABS(d.ra - ?) < ? AND ABS(d.dec - ?) < ?
-                GROUP BY d.id
-                ORDER BY ABS(d.ra - ?) + ABS(d.dec - ?) ASC
-                LIMIT 1
-            """, (ra_deg, tolerance, dec_deg, tolerance, ra_deg, dec_deg))
-            result = cursor.fetchone()
-        if result:
-            return _process_dso_query_result(result, target_data)
-    except Exception as e:
-        logger.error(f"Error querying DSO by coordinates: {str(e)}")
-    return None
-
-
-def _process_dso_query_result(result, target_data):
-    """Process database query result into DSODetailWindow format"""
-    try:
-        (obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max, constellation, dso_type, dso_class,
-         designations, image_path, integration_time, date_taken, notes, image_count) = result
-
-        # Get the primary designation
-        primary_designation = designations.split(',')[0].strip()
-
-        # Handle size values
-        size_min_arcmin = float(size_min) if size_min is not None else 0.0
-        size_max_arcmin = float(size_max) if size_max is not None else 0.0
-
-        return {
-            "name": primary_designation,
-            "ra": format_ra(ra),
-            "dec": format_dec(dec),
-            "ra_deg": ra,
-            "dec_deg": dec,
-            "magnitude": magnitude,
-            "surface_brightness": surface_brightness,
-            "size_min": size_min_arcmin,
-            "size_max": size_max_arcmin,
-            "constellation": constellation,
-            "dso_type": dso_type,
-            "dso_class": dso_class,
-            "designations": designations,
-            "catalogue": primary_designation.split()[0] if " " in primary_designation else "",
-            "id": " ".join(primary_designation.split()[1:]) if " " in primary_designation else primary_designation,
-            "dsodetailid": obj_id,
-            "image_path": image_path,
-            "integration_time": integration_time,
-            "date_taken": date_taken,
-            "notes": notes if notes else target_data.get("notes", ""),  # Use target notes if DB notes empty
-            "image_count": image_count
-        }
-
-    except Exception as e:
-        logger.error(f"Error processing DSO query result: {str(e)}")
-        return None
 
 
 # ---- Duplicate entries --------------------------------------------------------

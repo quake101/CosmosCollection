@@ -22,11 +22,12 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QFontMetricsF
 
 from cosmoscollection.equipment import EquipmentMapper
+from cosmoscollection.app.DSOData import DESIGNATIONS_SQL
 from cosmoscollection.catalog.DSONames import type_name
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Paths import path_key
 from cosmoscollection.core.DatabaseManager import DatabaseManager
-from cosmoscollection.core.Formatting import format_dec, format_duration, format_ra
+from cosmoscollection.core.Formatting import format_duration
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import refresh_open, release_on_close
 from cosmoscollection.ui.Theme import COLORS, font_px, font_size, themed_style
@@ -525,23 +526,15 @@ class DataLoaderRunnable(QRunnable):
                     ui.is_favorite,
                     d.dsotype,
                     d.constellation,
-                    GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', '
-                        ORDER BY
-                            CASE c.catalogue
-                                WHEN 'M' THEN 1
-                                WHEN 'NGC' THEN 2
-                                WHEN 'IC' THEN 3
-                                ELSE 4
-                            END, c.designation) as name,
+                    {DESIGNATIONS_SQL} as name,
                     ui.created_date,
                     d.ra,
                     d.dec,
                     ui.date_taken
                 FROM userimages ui
                 INNER JOIN dsodetail d ON d.id = ui.dsodetailid
-                INNER JOIN cataloguenr c ON d.id = c.dsodetailid
                 WHERE ui.image_path IS NOT NULL AND ui.image_path != ''
-                GROUP BY ui.id
+                  AND EXISTS (SELECT 1 FROM cataloguenr c WHERE c.dsodetailid = d.id)
                 ORDER BY name
                 """
 
@@ -629,65 +622,14 @@ def open_dso_details(parent, dsodetailid, name=None):
     try:
         from cosmoscollection.catalog.DSODetail import DSODetailWindow
 
+        from cosmoscollection.app.DSOData import load_dso
         with DatabaseManager().get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
-                       CAST(d.sizemin/60.0 AS REAL) as sizemin,
-                       CAST(d.sizemax/60.0 AS REAL) as sizemax,
-                       d.constellation, d.dsotype, d.dsoclass,
-                       GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-                           CASE c.catalogue
-                               WHEN 'M' THEN 1
-                               WHEN 'NGC' THEN 2
-                               WHEN 'IC' THEN 3
-                               ELSE 4
-                           END, c.designation) as designations,
-                       ui.image_path, ui.integration_time, ui.date_taken, ui.notes,
-                       (SELECT COUNT(*) FROM userimages WHERE dsodetailid = d.id) as image_count
-                FROM dsodetail d
-                JOIN cataloguenr c ON d.id = c.dsodetailid
-                LEFT JOIN userimages ui ON d.id = ui.dsodetailid AND ui.is_favorite = 1
-                WHERE d.id = ?
-                GROUP BY d.id
-            """, (dsodetailid,))
-            result = cursor.fetchone()
-
-        if not result:
+            data = load_dso(conn, dsodetailid)
+        if not data:
             QMessageBox.warning(parent, "Error", "Could not load DSO details")
             return None
-
-        (obj_id, ra, dec, magnitude, surface_brightness, size_min, size_max,
-         constellation, dso_type, dso_class, designations, image_path, integration_time,
-         date_taken, notes, image_count) = tuple(result)
-
-        # Primary designation for catalogue and id
-        primary_designation = designations.split(',')[0]
-        catalogue, designation = primary_designation.strip().split(' ', 1)
-
-        data = {
-            "name": name or designations,
-            "ra": format_ra(ra),
-            "dec": format_dec(dec),
-            "ra_deg": ra,
-            "dec_deg": dec,
-            "magnitude": magnitude,
-            "surface_brightness": surface_brightness,
-            "size_min": size_min if size_min else 0.0,
-            "size_max": size_max if size_max else 0.0,
-            "constellation": constellation,
-            "dso_type": dso_type,
-            "dso_class": dso_class,
-            "designations": designations,
-            "catalogue": catalogue,
-            "id": designation,
-            "dsodetailid": obj_id,
-            "image_path": image_path,
-            "integration_time": integration_time,
-            "date_taken": date_taken,
-            "notes": notes,
-            "image_count": image_count
-        }
+        if name:
+            data["name"] = name
         detail_window = DSODetailWindow(data)
         _keep(detail_window)
         detail_window.show()
@@ -951,22 +893,15 @@ class AddImageDialog(WindowPositionMixin, QDialog):
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                query = """
+                query = f"""
                     SELECT d.id as dsodetailid,
-                           GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', '
-                               ORDER BY CASE c.catalogue
-                                   WHEN 'M' THEN 1
-                                   WHEN 'NGC' THEN 2
-                                   WHEN 'IC' THEN 3
-                                   ELSE 4
-                               END, c.designation) as name,
+                           {DESIGNATIONS_SQL} as name,
                            d.constellation,
                            d.dsotype,
                            d.ra,
                            d.dec
                     FROM dsodetail d
-                    JOIN cataloguenr c ON d.id = c.dsodetailid
-                    GROUP BY d.id
+                    WHERE EXISTS (SELECT 1 FROM cataloguenr c WHERE c.dsodetailid = d.id)
                     ORDER BY
                         CASE
                             WHEN name LIKE 'M %' THEN 1

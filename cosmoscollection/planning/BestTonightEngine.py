@@ -21,6 +21,7 @@ from astropy.coordinates import SkyCoord
 from astropy.time import Time
 
 from cosmoscollection.core.DatabaseManager import open_connection
+from cosmoscollection.app.DSOData import DESIGNATIONS_SQL
 
 warnings.filterwarnings('ignore')
 
@@ -258,19 +259,11 @@ class BestTonightCalculation:
                     if magnitude is None:
                         magnitude = UNKNOWN_MAGNITUDE
                     # Query designations from main database by matching coordinates
-                    cursor.execute("""
-                        SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-                            CASE c.catalogue
-                                WHEN 'M' THEN 1
-                                WHEN 'NGC' THEN 2
-                                WHEN 'IC' THEN 3
-                                ELSE 4
-                            END, c.designation) as designations
+                    cursor.execute(f"""
+                        SELECT {DESIGNATIONS_SQL} as designations
                         FROM dsodetail d
-                        JOIN cataloguenr c ON d.id = c.dsodetailid
                         WHERE ABS(d.ra - ?) < 0.001
                           AND ABS(d.dec - ?) < 0.001
-                        GROUP BY d.id
                         ORDER BY ABS(d.ra - ?) + ABS(d.dec - ?) ASC
                         LIMIT 1
                     """, (ra_deg, dec_deg, ra_deg, dec_deg))
@@ -307,20 +300,10 @@ class BestTonightCalculation:
             cursor = conn.cursor()
 
             # Build the query with catalog filtering if specified
-            base_query = """
+            base_query = f"""
                 SELECT
                     d.id,
-                    (
-                        SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-                            CASE c.catalogue
-                                WHEN 'M' THEN 1
-                                WHEN 'NGC' THEN 2
-                                WHEN 'IC' THEN 3
-                                ELSE 4
-                            END, c.designation)
-                        FROM cataloguenr c
-                        WHERE c.dsodetailid = d.id
-                    ) as name,
+                    {DESIGNATIONS_SQL} as designations,
                     d.dsotype as type,
                     d.constellation,
                     d.magnitude,
@@ -329,18 +312,7 @@ class BestTonightCalculation:
                     CAST(d.sizemax/60.0 AS REAL) as sizemax,
                     d.dsoclass,
                     d.ra as ra_deg,
-                    d.dec as dec_deg,
-                    (
-                        SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-                            CASE c.catalogue
-                                WHEN 'M' THEN 1
-                                WHEN 'NGC' THEN 2
-                                WHEN 'IC' THEN 3
-                                ELSE 4
-                            END, c.designation)
-                        FROM cataloguenr c
-                        WHERE c.dsodetailid = d.id
-                    ) as designations
+                    d.dec as dec_deg
                 FROM dsodetail d
                 WHERE d.magnitude IS NOT NULL
                     AND d.magnitude <= ?
@@ -376,10 +348,10 @@ class BestTonightCalculation:
             rows = cursor.fetchall()
             dsos = []
             for row in rows:
-                dso_id, name, dso_type, constellation, magnitude, surface_brightness, size_min, size_max, dso_class, ra_deg, dec_deg, designations = row
-                if name and magnitude is not None and ra_deg is not None and dec_deg is not None:
+                dso_id, designations, dso_type, constellation, magnitude, surface_brightness, size_min, size_max, dso_class, ra_deg, dec_deg = row
+                if designations and magnitude is not None and ra_deg is not None and dec_deg is not None:
                     # Take the first designation as the primary name
-                    primary_name = name.split(',')[0].strip()
+                    primary_name = designations.split(',')[0].strip()
                     dsos.append({
                         "id": dso_id,
                         "name": primary_name,
@@ -392,7 +364,7 @@ class BestTonightCalculation:
                         "dso_class": dso_class or "Unknown",
                         "ra_deg": float(ra_deg),
                         "dec_deg": float(dec_deg),
-                        "designations": designations or name
+                        "designations": designations
                     })
 
             conn.close()

@@ -155,9 +155,8 @@ def _load_dsos(conn):
 
 
 def _load_dso(conn, dsodetailid):
-    from cosmoscollection.app.DSOData import DSO_QUERY, dso_row_to_dict
-    row = conn.execute(DSO_QUERY + " AND d.id = ?", (dsodetailid,)).fetchone()
-    return dso_row_to_dict(tuple(row)) if row else None
+    from cosmoscollection.app.DSOData import load_dso
+    return load_dso(conn, dsodetailid)
 
 
 def _label(dso):

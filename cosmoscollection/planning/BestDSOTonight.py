@@ -893,52 +893,20 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         """Show detailed information for the selected DSO"""
         try:
             from cosmoscollection.catalog.DSODetail import DSODetailWindow
-            
-            # Get DSO coordinates from astropy result
-            coordinates = dso_data.get("coordinates")
-            if coordinates:
-                ra_deg = coordinates.ra.degree
-                dec_deg = coordinates.dec.degree
-            else:
-                # Fallback - try to get coordinates again
-                from astropy.coordinates import SkyCoord
-                try:
-                    coord = SkyCoord.from_name(dso_data["dso_info"]["name"])
-                    ra_deg = coord.ra.degree
-                    dec_deg = coord.dec.degree
-                except:
-                    ra_deg = 0.0
-                    dec_deg = 0.0
-            
-            # Debug: log designations
-            logger.debug(f"BestDSO opening detail for: {dso_data['dso_info']['name']}")
-            logger.debug(f"Designations from dso_info: {dso_data['dso_info']['designations']}")
+            from cosmoscollection.app.DSOData import find_full_dso_data, load_dso
+            info = dso_data["dso_info"]
+            db_manager = DatabaseManager()
+            detail_data = None
+            if info.get("id") is not None:  # A catalog object (Target List entries have no id)
+                with db_manager.get_connection() as conn:
+                    detail_data = load_dso(conn, info["id"])
+            if detail_data is None:
+                detail_data = find_full_dso_data(db_manager, info["name"], info)
+            if detail_data is None:
+                QMessageBox.warning(self, "Not Found", f"{info['name']} isn't in the catalog.")
+                return
+            detail_data["name"] = info["name"]
 
-            # Create the data dictionary expected by DSODetailWindow
-            detail_data = {
-                "name": dso_data["dso_info"]["name"],
-                "type": dso_data["dso_info"]["type"],
-                "constellation": dso_data["dso_info"]["constellation"],
-                "magnitude": dso_data["dso_info"]["magnitude"],
-                "surface_brightness": dso_data["dso_info"]["surface_brightness"],
-                "size_min": dso_data["dso_info"]["size_min"],
-                "size_max": dso_data["dso_info"]["size_max"],
-                "dso_type": dso_data["dso_info"]["type"],
-                "dso_class": dso_data["dso_info"]["dso_class"],
-                "ra_deg": ra_deg,
-                "dec_deg": dec_deg,
-                "catalogue": dso_data["dso_info"]["name"].split()[0],  # Extract catalog prefix
-                "id": dso_data["dso_info"]["name"].split()[1] if len(dso_data["dso_info"]["name"].split()) > 1 else "",
-                "designations": dso_data["dso_info"]["designations"],
-                # Add visibility info as additional data
-                "visibility_info": {
-                    "max_altitude": dso_data["max_altitude"],
-                    "optimal_time": dso_data["optimal_time"],
-                    "direction": dso_data["direction"],
-                    "visible_hours": dso_data["visible_hours"]
-                }
-            }
-            
             # Create and show the detail window
             detail_window = DSODetailWindow(detail_data, self)
             detail_window.show()

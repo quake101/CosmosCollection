@@ -11,23 +11,22 @@ logger = logging.getLogger(__name__)
 
 
 # --- DSO data loading ---
-# One row per catalogued object. Designations and the first user image come from
-# subqueries rather than joins, so an object with several images doesn't repeat
-# every designation once per image.
-DSO_QUERY = """
+# An object's designations, best known catalog first ("M 31, NGC 224, UGC 454"),
+# for a query whose dsodetail table is "d". A subquery rather than a join, so it
+# never repeats a designation once per joined row (e.g. per image).
+DESIGNATIONS_SQL = """(SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
+                           CASE c.catalogue WHEN 'M' THEN 1 WHEN 'NGC' THEN 2 WHEN 'IC' THEN 3 ELSE 4 END,
+                           c.designation)
+                       FROM cataloguenr c WHERE c.dsodetailid = d.id)"""
+
+# One row per catalogued object, with its first user image (also a subquery).
+# Add conditions with " AND ...".
+DSO_QUERY = f"""
     SELECT d.id, d.ra, d.dec, d.magnitude, d.surfacebrightness,
            CAST(d.sizemin/60.0 AS REAL) as sizemin,
            CAST(d.sizemax/60.0 AS REAL) as sizemax,
            d.constellation, d.dsotype, d.dsoclass,
-           (SELECT GROUP_CONCAT(c.catalogue || ' ' || c.designation, ', ' ORDER BY
-                       CASE c.catalogue
-                           WHEN 'M' THEN 1
-                           WHEN 'NGC' THEN 2
-                           WHEN 'IC' THEN 3
-                           ELSE 4
-                       END, c.designation)
-            FROM cataloguenr c
-            WHERE c.dsodetailid = d.id) as designations,
+           {DESIGNATIONS_SQL} as designations,
            ui.image_path, ui.integration_time, ui.date_taken, ui.notes,
            COALESCE(img.image_count, 0) as image_count
     FROM dsodetail d
@@ -70,6 +69,53 @@ def dso_row_to_dict(row):
         "notes": notes,
         "image_count": image_count
     }
+
+
+def load_dso(conn, dsodetailid):
+    """One object as the main window loads it (dso_row_to_dict), or None."""
+    row = conn.execute(DSO_QUERY + " AND d.id = ?", (dsodetailid,)).fetchone()
+    return dso_row_to_dict(tuple(row)) if row else None
+
+
+def _split_designation(name):
+    """('M', '31') from 'M 31' or 'M31'; ('NGC', '7000') from 'NGC7000'; else None.
+    Session names often come from FITS OBJECT headers, which usually drop the space."""
+    parts = (name or "").split()
+    if len(parts) >= 2:
+        return parts[0], " ".join(parts[1:])
+    match = re.fullmatch(r"([A-Za-z]+)[-_ ]?(\d[\w.+-]*)", (name or "").strip())
+    return (match.group(1), match.group(2)) if match else None
+
+
+def find_full_dso_data(db_manager, target_name, target_data):
+    """An object's data (load_dso's dict, the one DSODetailWindow and the FOV
+    Simulator take) for a Target List entry or session: looked up by catalog
+    designation, else the nearest object within 0.1 degrees of target_data's
+    ra_deg/dec_deg. Its notes fall back to target_data's. None if not found."""
+    try:
+        with db_manager.get_connection() as conn:
+            row = None
+            split = _split_designation(target_name)
+            if split:
+                row = conn.execute(DSO_QUERY + """
+                    AND d.id = (SELECT c2.dsodetailid FROM cataloguenr c2
+                                WHERE c2.catalogue = ? COLLATE NOCASE AND c2.designation = ? COLLATE NOCASE
+                                LIMIT 1)""", split).fetchone()
+            ra, dec = target_data.get("ra_deg"), target_data.get("dec_deg")
+            if row is None and ra is not None and dec is not None:
+                tolerance = 0.1  # degrees
+                row = conn.execute(DSO_QUERY + """
+                    AND ABS(d.ra - ?) < ? AND ABS(d.dec - ?) < ?
+                    ORDER BY ABS(d.ra - ?) + ABS(d.dec - ?) LIMIT 1""",
+                                   (ra, tolerance, dec, tolerance, ra, dec)).fetchone()
+        if row is None:
+            return None
+        data = dso_row_to_dict(tuple(row))
+        data["notes"] = data["notes"] or target_data.get("notes", "")
+        return data
+    except Exception as e:
+        logger.error(f"Error looking up {target_name!r} in the catalog: {e}")
+        return None
 
 
 def load_all_dso_data(conn):

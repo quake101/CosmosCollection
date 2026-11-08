@@ -3267,7 +3267,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
     def _find_catalog_target(self, text):
         """The object's catalog data for a name typed or picked, or None."""
-        from cosmoscollection.planning.DSOTargetList import find_full_dso_data
+        from cosmoscollection.app.DSOData import find_full_dso_data
         database = DatabaseManager()
         exact = self._search_names.get(text) or next(
             (value for key, value in self._search_names.items() if key.lower() == text.lower()), None)
