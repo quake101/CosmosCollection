@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from cosmoscollection.app.SystemTrayManager import SystemTrayManager
+from cosmoscollection.planning.Observer import active_site
 from cosmoscollection.catalog.DSONames import DSO_TYPES
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.catalog.DSODetail import DSODetailWindow
@@ -339,14 +340,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         """Check if user has configured their location and prompt if not"""
         try:
             with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-
-                if not row or row[0] is None or row[1] is None:
+                if active_site(conn) is None:
                     # Location not configured, show dialog
                     msg = QMessageBox(self)
                     msg.setIcon(QMessageBox.Information)
@@ -1659,18 +1653,11 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
             # Get user location
             with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT location_lat, location_lon, timezone
-                    FROM usersettings WHERE is_active = 1
-                """)
-                row = cursor.fetchone()
-
-            if not row or row[0] is None or row[1] is None:
+                site = active_site(conn)
+            if site is None:
                 logger.debug("No location configured for tray weather refresh")
                 return
-
-            lat, lon, timezone = row
+            lat, lon, timezone = site.lat, site.lon, site.timezone
 
             # Check if cache is still valid (don't re-fetch if recently updated)
             cache = WeatherCache()
@@ -1698,18 +1685,10 @@ class MainWindow(WindowPositionMixin, QMainWindow):
 
             # Get location to store in cache
             with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT location_lat, location_lon
-                    FROM usersettings WHERE is_active = 1
-                """)
-                row = cursor.fetchone()
-
-            if row and row[0] is not None and row[1] is not None:
-                lat, lon = row
+                site = active_site(conn)
+            if site is not None:
                 # Store in cache (this will trigger the callback to update tooltip)
-                cache = WeatherCache()
-                cache.set(lat, lon, weather_data)
+                WeatherCache().set(site.lat, site.lon, weather_data)
                 logger.debug("Tray weather data cached and tooltip updated")
 
         except Exception as e:

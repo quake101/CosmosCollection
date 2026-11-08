@@ -281,8 +281,8 @@ def _load_horizon(conn, queries, description):
     """
     own_conn = conn is None
     if own_conn:
-        from cosmoscollection.core.ResourceManager import ResourceManager
-        conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+        from cosmoscollection.core.DatabaseManager import open_connection
+        conn = open_connection(catalogs=False)
     try:
         cursor = conn.cursor()
         row = None

@@ -1292,40 +1292,10 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         # and a generation number so a stale worker's result is ignored
         self._direction_cells = {}
         self._direction_generation = 0
-        self._init_database()
         self._init_ui()
         theme_manager().theme_changed.connect(self._apply_direction_cells)
         self._load_targets()
     
-    def _init_database(self):
-        """Initialize the target list database table"""
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS usertargetlist (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        dso_type TEXT,
-                        constellation TEXT,
-                        ra_deg REAL,
-                        dec_deg REAL,
-                        magnitude REAL,
-                        size_info TEXT,
-                        priority TEXT DEFAULT 'Medium',
-                        status TEXT DEFAULT 'Not Observed',
-                        best_months TEXT,
-                        notes TEXT,
-                        date_added TEXT,
-                        date_observed TEXT,
-                        created_date TEXT DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                conn.commit()
-                logger.debug("DSO target list table initialized successfully")
-        except Exception as e:
-            logger.error(f"Error initializing target list database: {str(e)}")
-
     def _populate_telescope_filter(self):
         """Populate telescope filter dropdown with all telescopes (including inactive)"""
         self.telescope_filter.clear()

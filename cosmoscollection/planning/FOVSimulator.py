@@ -20,6 +20,7 @@ from astropy import units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.planning.Observer import active_site, local_zone
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import format_dec, format_ra
 from cosmoscollection.catalog.DSONames import NOT_DSO_TYPES, display_name
@@ -2433,8 +2434,8 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         name = display_name(self.data.get('name') or "Target", self.data.get('dsodetailid'),
                             self.data.get('designations'), conn=conn)
         ra, dec = self._target_position()
-        location = conn.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings "
-                                "WHERE is_active = 1 LIMIT 1").fetchone() or (None, None, None, None)
+        site = active_site(conn)
+        location = (site.lat, site.lon, site.name, site.timezone) if site else (None, None, None, None)
         target_id = None
         try:
             from cosmoscollection.planning.DSOTargetList import find_existing_target
@@ -2462,16 +2463,12 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         """Load the active location (and its custom horizon) from the DB. Returns True on success."""
         try:
             with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings "
-                               "WHERE is_active = 1 LIMIT 1")
-                row = cursor.fetchone()
-                if row and row[0] is not None and row[1] is not None:
-                    from cosmoscollection.planning.DSOTargetList import local_zone
-                    self.observer_lat = float(row[0])
-                    self.observer_lon = float(row[1])
-                    self.observer_name = row[2]
-                    self.observer_tz = local_zone(row[3])
+                site = active_site(conn)
+                if site is not None:
+                    self.observer_lat = float(site.lat)
+                    self.observer_lon = float(site.lon)
+                    self.observer_name = site.name
+                    self.observer_tz = local_zone(site.timezone)
                     self.horizon_profile = load_active_horizon(conn)
                     return True
         except Exception as e:

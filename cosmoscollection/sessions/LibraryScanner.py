@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from cosmoscollection.sessions import MountDetection, SessionFileScanner
+from cosmoscollection.sessions import MountDetection
 from cosmoscollection.core.Paths import path_key
 from cosmoscollection.core.Formatting import format_duration
 from cosmoscollection.sessions import SessionFileScanner
@@ -874,11 +874,9 @@ class Catalog:
 
 
 def load_catalog():
-    import sqlite3
-    from cosmoscollection.core.ResourceManager import ResourceManager, attach_update_catalogs
-    conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+    from cosmoscollection.core.DatabaseManager import open_connection
+    conn = open_connection()
     try:
-        attach_update_catalogs(conn)
         return Catalog(conn)
     finally:
         conn.close()
@@ -1883,9 +1881,9 @@ def scan_and_build(roots, rules=None, progress=None, cancel=None, reread=False, 
     status("Sorting files into sessions and images...")
     classify(scan, rules)
 
-    from cosmoscollection.core.ResourceManager import ResourceManager
+    from cosmoscollection.core.DatabaseManager import open_connection
     catalog = load_catalog()
-    conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+    conn = open_connection()
     relinked = 0
     try:
         # Session subs whose folder was renamed or moved: point them at where this
@@ -1906,7 +1904,7 @@ def scan_and_build(roots, rules=None, progress=None, cancel=None, reread=False, 
     library = build_library(scan, catalog, known, rules, assignments, equipment)
     library.relinked = relinked
     if mounts and not (cancel and cancel.is_set()):
-        active = next((loc for loc in locations if loc[4]), locations[0] if locations else None)
+        active = _active_location(locations)
         cache = None
         try:
             cache = MountDetection.MountCache(scan_index.path) if scan_index else None
@@ -2009,10 +2007,17 @@ def _saved_locations(conn):
     try:
         return [row for row in conn.execute(
             "SELECT location_lat, location_lon, location_name, timezone, is_active FROM usersettings "
-            "WHERE location_lat IS NOT NULL AND location_lon IS NOT NULL")]
+            "WHERE location_lat IS NOT NULL AND location_lon IS NOT NULL ORDER BY id")]
     except Exception as e:
         logger.debug(f"No saved locations: {e}")
         return []
+
+
+
+def _active_location(locations):
+    """The active one of _saved_locations() - as Observer.active_site, the
+    newest when none is marked active; None when there are none."""
+    return next((loc for loc in locations if loc[4]), locations[-1] if locations else None)
 
 
 def _session_location(session, locations):
@@ -2020,7 +2025,7 @@ def _session_location(session, locations):
     nearest where its subs say they were taken (within LOCATION_MATCH_KM), else
     that site as a custom location (with the active location's time zone), else
     the active location."""
-    active = next((loc for loc in locations if loc[4]), locations[0] if locations else None)
+    active = _active_location(locations)
     lats, lons = [], []
     for record in session.lights[::max(1, len(session.lights) // 50)]:
         header = record.header or {}

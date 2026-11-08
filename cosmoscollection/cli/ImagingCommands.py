@@ -394,9 +394,8 @@ def run_quality(ctx):
         def flush():
             # Its own connection: the command's is tied to the main thread
             if pending:
-                import sqlite3
-                from cosmoscollection.core.ResourceManager import ResourceManager
-                conn = sqlite3.connect(str(ResourceManager.get_database_path()), timeout=30)
+                from cosmoscollection.core.DatabaseManager import open_connection
+                conn = open_connection()
                 try:
                     lq.save_cached(conn, pending)
                     conn.commit()

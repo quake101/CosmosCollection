@@ -59,6 +59,7 @@ from typing import Optional
 # import is half a second of every command-line command's start
 
 from cosmoscollection.sessions import SessionFileScanner
+from cosmoscollection.core.DatabaseManager import add_columns
 from cosmoscollection.core.Paths import path_key
 from cosmoscollection.sessions.SessionObservations import make_sub_key, night_date_for, parse_obs_datetime
 
@@ -791,11 +792,8 @@ def ensure_schema(conn):
             strength REAL DEFAULT 0
         )
     """)
-    for table, column in (("usersessionfiles", "mount_id INTEGER"), ("usersessions", "mount_override TEXT")):
-        try:
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+    add_columns(cursor, "usersessionfiles", ("mount_id INTEGER",))
+    add_columns(cursor, "usersessions", ("mount_override TEXT",))
     try:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessionfiles_mount_id ON usersessionfiles(mount_id)")
         _remove_orphans(cursor)

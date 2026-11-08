@@ -510,13 +510,12 @@ def equipment_scales(path):
     """Image scales (arcsec/pixel) of the plate-solved images in the library
     taken with the same equipment as path, the most common first - [] if none."""
     try:
-        import sqlite3
         from collections import Counter
         from cosmoscollection.core.Paths import path_key
-        from cosmoscollection.core.ResourceManager import ResourceManager
+        from cosmoscollection.core.DatabaseManager import open_connection
         from cosmoscollection.imaging.WCS import read_wcs_header
         from cosmoscollection.equipment import EquipmentMapper
-        conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+        conn = open_connection()
         try:
             rows = [(row[0], EquipmentMapper.image_equipment(row[1:])["equipment_key"]) for row in conn.execute(
                 f"SELECT ui.image_path, {EquipmentMapper.select_sql('ui')} FROM userimages ui "
@@ -551,10 +550,9 @@ def equipment_scales(path):
 
 def _hint_for(path):
     """(ra, dec) of the image's object from the database, or (None, None)."""
-    import sqlite3
     from cosmoscollection.core.Paths import path_key
-    from cosmoscollection.core.ResourceManager import ResourceManager
-    conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+    from cosmoscollection.core.DatabaseManager import open_connection
+    conn = open_connection()
     try:
         rows = conn.execute("SELECT ui.image_path, d.ra, d.dec FROM userimages ui "
                             "JOIN dsodetail d ON d.id = ui.dsodetailid").fetchall()

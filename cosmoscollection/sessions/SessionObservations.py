@@ -21,6 +21,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 
 from cosmoscollection.sessions import SessionFileScanner
+from cosmoscollection.core.DatabaseManager import add_columns
 from cosmoscollection.core.Paths import path_key
 
 logger = logging.getLogger(__name__)
@@ -85,16 +86,14 @@ def ensure_schema(conn):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessionobservationfilters_observation_id "
                    "ON usersessionobservationfilters(observation_id)")
 
-    for column_sql in ("ALTER TABLE usersessionfiles ADD COLUMN observation_id INTEGER",
-                       "ALTER TABLE usersessionfiles ADD COLUMN sub_key TEXT",
-                       # A filter the user set (see set_file_filters) - filter_name holds it,
-                       # filter_from_file what the file's header said
-                       "ALTER TABLE usersessionfiles ADD COLUMN filter_corrected INTEGER DEFAULT 0",
-                       "ALTER TABLE usersessionfiles ADD COLUMN filter_from_file TEXT"):
-        try:
-            cursor.execute(column_sql)
-        except Exception:
-            pass  # Column already exists
+    add_columns(cursor, "usersessionfiles", (
+        "observation_id INTEGER",
+        "sub_key TEXT",
+        # A filter the user set (see set_file_filters) - filter_name holds it,
+        # filter_from_file what the file's header said
+        "filter_corrected INTEGER DEFAULT 0",
+        "filter_from_file TEXT",
+    ))
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessionfiles_observation_id "
                    "ON usersessionfiles(observation_id)")
 
@@ -249,9 +248,9 @@ def session_timezone(conn, session_id):
     row = cursor.fetchone()
     if row and row[0]:
         return row[0]
-    cursor.execute("SELECT timezone FROM usersettings WHERE is_active = 1 AND timezone IS NOT NULL LIMIT 1")
-    row = cursor.fetchone()
-    return row[0] if row else None
+    from cosmoscollection.planning.Observer import active_site
+    site = active_site(conn)
+    return site.timezone if site else None
 
 
 def format_datetime(dt):

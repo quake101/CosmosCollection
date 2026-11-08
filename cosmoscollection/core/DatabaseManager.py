@@ -28,6 +28,34 @@ def add_user_image_row(cursor, dsodetailid, image_path, integration_time="", dat
     return cursor.lastrowid
 
 
+def open_connection(timeout=30, rows=False, catalogs=True):
+    """A new connection to the app's database - for a worker thread or a command
+    (DatabaseManager's shared connection belongs to the UI thread). timeout:
+    seconds to wait while another connection writes. rows: rows as sqlite3.Row
+    (by name) instead of tuples. catalogs: attach the update catalogs, so objects
+    have the same names as everywhere else in the app."""
+    from cosmoscollection.core.ResourceManager import ResourceManager, attach_update_catalogs
+    conn = sqlite3.connect(str(ResourceManager.get_database_path()), timeout=timeout)
+    if rows:
+        conn.row_factory = sqlite3.Row
+    if catalogs:
+        attach_update_catalogs(conn)
+    return conn
+
+
+def add_columns(cursor, table, columns):
+    """Add columns ("name TYPE ...") a table made by an older version lacks.
+    True if any was added. Does not commit."""
+    added = False
+    for column in columns:
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+            added = True
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+    return added
+
+
 class DatabaseManager:
     """Singleton database manager for the Cosmos Collection application"""
     
@@ -113,65 +141,32 @@ class DatabaseManager:
                     )
                 """)
 
-                # Add is_favorite column if it doesn't exist (for existing databases)
-                try:
-                    cursor.execute("ALTER TABLE userimages ADD COLUMN is_favorite BOOLEAN DEFAULT 0")
-                    logger.debug("Added is_favorite column to userimages table")
-                except sqlite3.OperationalError:
-                    # Column already exists, ignore
-                    pass
-
-                # Add created_date column if it doesn't exist (for existing databases)
-                # Note: ALTER TABLE cannot use CURRENT_TIMESTAMP as default, so we use NULL
-                try:
-                    cursor.execute("ALTER TABLE userimages ADD COLUMN created_date TEXT")
-                    logger.debug("Added created_date column to userimages table")
-                except sqlite3.OperationalError:
-                    # Column already exists, ignore
-                    pass
-
-                # The Session Manager session an image came from (set by the Add Image
-                # dialog's session prefill and the Import Wizard). No foreign key
-                # enforcement - SessionObservations.delete_session_children clears it.
-                try:
-                    cursor.execute("ALTER TABLE userimages ADD COLUMN session_id INTEGER "
-                                   "REFERENCES usersessions(id) ON DELETE SET NULL")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
-
-                # The nights of that session the image was stacked from - night
-                # dates, comma separated (ImageDetails.py); NULL for all of them
-                try:
-                    cursor.execute("ALTER TABLE userimages ADD COLUMN session_nights TEXT")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
+                add_columns(cursor, "userimages", (
+                    "is_favorite BOOLEAN DEFAULT 0",
+                    # ALTER TABLE can't default to CURRENT_TIMESTAMP, so older rows have NULL
+                    "created_date TEXT",
+                    # The Session Manager session an image came from (set by the Add Image
+                    # dialog's session prefill and the Import Wizard). No foreign key
+                    # enforcement - SessionObservations.delete_session_children clears it.
+                    "session_id INTEGER REFERENCES usersessions(id) ON DELETE SET NULL",
+                    # The nights of that session the image was stacked from - night
+                    # dates, comma separated (ImageDetails.py); NULL for all of them
+                    "session_nights TEXT",
+                ))
 
                 # The telescope and camera each image was taken with, linked to
                 # the user's Equipment (EquipmentMapper.py) - converted below
                 from cosmoscollection.equipment import EquipmentMapper
                 first_equipment_run = EquipmentMapper.ensure_columns(cursor)
 
-                # Add is_active column to usersettings for multi-location support
-                try:
-                    cursor.execute("ALTER TABLE usersettings ADD COLUMN is_active INTEGER DEFAULT 0")
-                    # Mark most recent record as active for migration
+                # Several locations, one of them active: the newest becomes the active one
+                if add_columns(cursor, "usersettings", ("is_active INTEGER DEFAULT 0",)):
                     cursor.execute("""
                         UPDATE usersettings SET is_active = 1
                         WHERE id = (SELECT id FROM usersettings ORDER BY id DESC LIMIT 1)
                     """)
-                    logger.debug("Added is_active column to usersettings table")
-                except sqlite3.OperationalError:
-                    # Column already exists, ignore
-                    pass
-
-                # Add custom horizon columns to usersettings (per-location horizon profile,
-                # stored as JSON [[az, alt], ...] - see HorizonProfile.py)
-                for column in ("horizon_points", "horizon_name"):
-                    try:
-                        cursor.execute(f"ALTER TABLE usersettings ADD COLUMN {column} TEXT")
-                        logger.debug(f"Added {column} column to usersettings table")
-                    except sqlite3.OperationalError:
-                        pass  # Column already exists
+                # Each location's custom horizon, JSON [[az, alt], ...] (HorizonProfile.py)
+                add_columns(cursor, "usersettings", ("horizon_points TEXT", "horizon_name TEXT"))
 
                 # Create usertargetlist table for user's observing target list
                 cursor.execute("""
@@ -195,11 +190,8 @@ class DatabaseManager:
                     )
                 """)
 
-                # Add telescope_id column if it doesn't exist (for existing databases)
-                try:
-                    cursor.execute("ALTER TABLE usertargetlist ADD COLUMN telescope_id INTEGER REFERENCES usertelescopes(id) ON DELETE SET NULL")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
+                add_columns(cursor, "usertargetlist",
+                            ("telescope_id INTEGER REFERENCES usertelescopes(id) ON DELETE SET NULL",))
                 
                 # Create usercollages table for user's collage projects
                 cursor.execute("""
@@ -233,15 +225,9 @@ class DatabaseManager:
                 # Canvas collages (Collage Builder): canvas size, collage-wide settings
                 # (JSON) and each image's frame (JSON). layout_version NULL marks a
                 # collage from the old grid editor, converted when it's opened.
-                for table, column in (("usercollages", "canvas_width INTEGER"),
-                                      ("usercollages", "canvas_height INTEGER"),
-                                      ("usercollages", "settings TEXT"),
-                                      ("usercollages", "layout_version INTEGER"),
-                                      ("usercollageimages", "layout TEXT")):
-                    try:
-                        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
-                    except sqlite3.OperationalError:
-                        pass  # Column already exists
+                add_columns(cursor, "usercollages",
+                            ("canvas_width INTEGER", "canvas_height INTEGER", "settings TEXT", "layout_version INTEGER"))
+                add_columns(cursor, "usercollageimages", ("layout TEXT",))
 
                 # Create usersessions table for planned/logged observing sessions
                 cursor.execute("""
@@ -275,22 +261,13 @@ class DatabaseManager:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_target_id ON usersessions(target_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_session_date ON usersessions(session_date)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_usersessions_status ON usersessions(status)")
-                # Equipment can be disabled (kept, but not offered) like telescopes
-                try:
-                    cursor.execute("ALTER TABLE userequipment ADD COLUMN is_active INTEGER DEFAULT 1")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
-                # A camera's pixel size (microns) - for the FOV Simulator's pixel scale
-                try:
-                    cursor.execute("ALTER TABLE userequipment ADD COLUMN pixel_size REAL")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
+                add_columns(cursor, "userequipment", (
+                    "is_active INTEGER DEFAULT 1",  # Disabled equipment is kept, but not offered
+                    "pixel_size REAL",              # A camera's (microns), for the FOV Simulator
+                ))
                 # The session's framing saved from the FOV Simulator (mosaic, rotation,
                 # equipment - JSON, see FOVSimulator.py)
-                try:
-                    cursor.execute("ALTER TABLE usersessions ADD COLUMN framing TEXT")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
+                add_columns(cursor, "usersessions", ("framing TEXT",))
                 # The session's camera linked to the user's Equipment (EquipmentMapper.py) - converted below
                 first_session_equipment_run = EquipmentMapper.ensure_session_columns(cursor)
 
@@ -344,12 +321,7 @@ class DatabaseManager:
     def get_connection(self):
         """Get a database connection with proper error handling"""
         if self._connection is None:
-            # Import here to avoid circular imports
-            from cosmoscollection.core.ResourceManager import ResourceManager, attach_update_catalogs
-            db_path = ResourceManager.get_database_path()
-            self._connection = sqlite3.connect(str(db_path))
-            self._connection.row_factory = sqlite3.Row
-            attach_update_catalogs(self._connection)
+            self._connection = open_connection(timeout=5.0, rows=True)
             
         try:
             yield self._connection

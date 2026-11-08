@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from cosmoscollection.equipment import EquipmentMapper
+from cosmoscollection.planning.Observer import active_site
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.ui.WindowPositionManager import WindowPositionManager
 from cosmoscollection.ui.WindowLifetime import release_on_close, window_is_open
@@ -264,13 +265,8 @@ class DSODetailWindow(QDialog):
         """Perform heavy calculations after window is shown"""
         try:
             with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-            if row and row[0] is not None and row[1] is not None:
+                site = active_site(conn)
+            if site is not None:
                 QTimer.singleShot(500, self._set_season_label_from_location)
             else:
                 self.season_label.setText("Set your location in Settings to see viewing season.")
@@ -1024,18 +1020,12 @@ class DSODetailWindow(QDialog):
         """
         try:
             with DatabaseManager().get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-            if not row or row[0] is None or row[1] is None:
+                site = active_site(conn)
+            if site is None:
                 self.season_label.setText("Set your location in Settings to see viewing season.")
                 return
 
-            lat = float(row[0])
-            lon = float(row[1])
+            lat, lon = float(site.lat), float(site.lon)
             ra_deg = self.data.get("ra_deg")
             dec_deg = self.data.get("dec_deg")
             object_name = self.data.get("name")

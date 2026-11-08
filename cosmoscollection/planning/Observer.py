@@ -30,16 +30,15 @@ class Site:
 
 
 def load_observer(conn):
-    """(lat, lon, timezone name or None) of the active location, or None."""
-    cursor = conn.cursor()
-    cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
-    row = cursor.fetchone()
-    if not row:
-        cursor.execute("SELECT location_lat, location_lon, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-        row = cursor.fetchone()
-    if not row or row[0] is None or row[1] is None:
-        return None
-    return row[0], row[1], row[2]
+    """(lat, lon, timezone name or None) of the active location (see
+    active_site), or None."""
+    site = active_site(conn)
+    return (site.lat, site.lon, site.timezone) if site else None
+
+
+def coordinates_text(lat, lon):
+    """'40.71°N, 74.01°W'"""
+    return f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'}, {abs(lon):.2f}°{'W' if lon < 0 else 'E'}"
 
 
 def local_zone(tz_name):

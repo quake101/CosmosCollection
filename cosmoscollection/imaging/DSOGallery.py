@@ -505,27 +505,11 @@ class DataLoaderRunnable(QRunnable):
 
     def run(self):
         """Load gallery data from database"""
-        import sqlite3
-        from cosmoscollection.core.ResourceManager import ResourceManager
+        from cosmoscollection.core.DatabaseManager import open_connection
 
         try:
-            # Create new SQLite connection in this thread (DatabaseManager is a singleton)
-            db_path = ResourceManager.get_database_path()
-            conn = sqlite3.connect(str(db_path))
-            from cosmoscollection.core.ResourceManager import attach_update_catalogs
-            attach_update_catalogs(conn)
-
-            # Ensure created_date column exists (migration for older databases)
-            # Do this before setting row_factory
-            # Note: ALTER TABLE cannot use CURRENT_TIMESTAMP as default, so we use NULL
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(userimages)")
-            columns = [row[1] for row in cursor.fetchall()]
-            if 'created_date' not in columns:
-                cursor.execute("ALTER TABLE userimages ADD COLUMN created_date TEXT")
-                conn.commit()
-
-            conn.row_factory = sqlite3.Row
+            # A connection of this thread's own (DatabaseManager's is the UI thread's)
+            conn = open_connection(rows=True)
 
             try:
                 cursor = conn.cursor()

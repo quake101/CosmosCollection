@@ -126,10 +126,9 @@ class ScanWorker(QThread):
 
     def _save_known_mounts(self, library):
         """Sessions already in the Session Manager get the mounts just detected."""
-        import sqlite3
-        from cosmoscollection.core.ResourceManager import ResourceManager
+        from cosmoscollection.core.DatabaseManager import open_connection
         try:
-            conn = sqlite3.connect(str(ResourceManager.get_database_path()), timeout=30)
+            conn = open_connection()
             try:
                 LibraryScanner.save_known_mounts(conn, library)
             finally:
@@ -154,11 +153,9 @@ class ImportWorker(QThread):
         self.cancel.set()
 
     def run(self):
-        import sqlite3
-        from cosmoscollection.core.ResourceManager import ResourceManager
+        from cosmoscollection.core.DatabaseManager import open_connection
         try:
-            conn = sqlite3.connect(str(ResourceManager.get_database_path()))
-            conn.row_factory = sqlite3.Row
+            conn = open_connection(rows=True)
             try:
                 report = LibraryScanner.import_library(conn, self.library, progress=self.progress.emit,
                                                        cancelled=self.cancel.is_set, common_names=self.common_names)

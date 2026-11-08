@@ -2863,15 +2863,13 @@ class SuggestionWorker(QThread):
         self.library = {key: dict(row) for key, row in library.items()}
 
     def run(self):
-        import sqlite3
         try:
             years, times, sources = {}, {}, {}
             for image_id, row in self.library.items():
                 years[image_id], times[image_id], sources[image_id] = image_year_and_time(row)
-            from cosmoscollection.core.ResourceManager import ResourceManager, attach_update_catalogs
-            conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+            from cosmoscollection.core.DatabaseManager import open_connection
+            conn = open_connection()  # Its update catalogs: the same names the rest of the app sees
             try:
-                attach_update_catalogs(conn)  # The same names the rest of the app sees
                 info = load_object_info(conn, [row["dsodetailid"] for row in self.library.values()])
                 # Every rule, however few images - the dialog shows only the bigger ones,
                 # new-match banners need the rest

@@ -16,7 +16,8 @@ from astropy import units as u
 from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_sun
 from astropy.time import Time
 
-from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.core.DatabaseManager import DatabaseManager, open_connection
+from cosmoscollection.planning.Observer import active_site
 
 warnings.filterwarnings('ignore')
 
@@ -48,18 +49,22 @@ class DSOVisibilityCalculator:
         # passing it to find_optimal_viewing_times(horizon=...)
         self.horizon = None
 
+        site = None
         if location_lat is not None and location_lon is not None:
             self.set_location(location_lat, location_lon, height)
         else:
-            self._load_location_from_database()
-            if self.location is not None:
+            site = self._saved_site()
+            if site is not None:
+                self.set_location(site.lat, site.lon, height)
                 from cosmoscollection.planning.HorizonProfile import load_active_horizon
                 self.horizon = load_active_horizon()
 
         if timezone:
             self.set_timezone(timezone)
         else:
-            self._load_timezone_from_database()
+            site = site or self._saved_site()
+            if site is not None and site.timezone:
+                self.set_timezone(site.timezone)
 
     def set_location(self, lat, lon, height=250):
         """Set observer location."""
@@ -72,37 +77,15 @@ class DSOVisibilityCalculator:
         except pytz.UnknownTimeZoneError:
             self.timezone = pytz.UTC
 
-    def _load_location_from_database(self):
-        """Load observer location from database."""
+    @staticmethod
+    def _saved_site():
+        """The active saved location (Observer.active_site), or None."""
         try:
-            db_manager = DatabaseManager()
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-                if row and row[0] is not None and row[1] is not None:
-                    self.set_location(row[0], row[1])
-        except Exception:
-            pass
-
-    def _load_timezone_from_database(self):
-        """Load timezone from database."""
-        try:
-            db_manager = DatabaseManager()
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-                if row and row[0]:
-                    self.set_timezone(row[0])
-        except Exception:
-            pass
+            with DatabaseManager().get_connection() as conn:
+                return active_site(conn)
+        except Exception as e:
+            logger.debug(f"No saved location: {e}")
+            return None
 
     def get_dso_coordinates(self, dso_name):
         """
@@ -136,14 +119,11 @@ class DSOVisibilityCalculator:
         # The app's own catalog: offline, and knows designations written any way
         # ("Sh2 129 (Squid Nebula)", "sh2-129") and common names
         try:
-            import sqlite3
             from cosmoscollection.catalog.DSONames import catalog_ids
-            from cosmoscollection.core.ResourceManager import ResourceManager, attach_update_catalogs
             # A connection of its own: this runs in worker threads, and the
             # DatabaseManager singleton's connection only works in the thread that made it
-            conn = sqlite3.connect(str(ResourceManager.get_database_path()), timeout=30)
+            conn = open_connection()
             try:
-                attach_update_catalogs(conn)
                 ids = catalog_ids(conn, dso_name)
                 if len(ids) == 1:
                     row = conn.execute("SELECT ra, dec FROM dsodetail WHERE id = ?", (next(iter(ids)),)).fetchone()

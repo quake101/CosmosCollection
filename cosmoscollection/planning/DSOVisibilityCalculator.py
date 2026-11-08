@@ -43,6 +43,7 @@ from cosmoscollection.ui.Theme import (
     COLORS, adapt_color, chart_background, chart_color, chart_font_size, contrast_text, font_size,
     sky_shade, theme_manager, themed_style, tint,
 )
+from cosmoscollection.planning.Observer import active_site, coordinates_text
 from cosmoscollection.planning.NightTimes import compass_direction
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import format_duration
@@ -1577,28 +1578,11 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         try:
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-                if row:
-                    lat, lon, location_name, timezone = row
-                    self.user_timezone = timezone
-                else:
-                    lat, lon, location_name, timezone = None, None, None, None
-                    self.user_timezone = None
-
-                if lat is not None and lon is not None:
-                    # Format coordinates nicely
-                    lat_str = f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'}"
-                    lon_str = f"{abs(lon):.2f}°{'W' if lon < 0 else 'E'}"
-
-                    # Use the location name if available, otherwise fall back to "User Location"
-                    display_name = location_name if location_name else "User Location"
-                    self.location_name_label.setText(display_name)
-                    self.location_coords_label.setText(f"Lat: {lat_str}, Lon: {lon_str}")
+                site = active_site(conn)
+                self.user_timezone = site.timezone if site else None
+                if site is not None:
+                    self.location_name_label.setText(site.name)
+                    self.location_coords_label.setText(coordinates_text(site.lat, site.lon))
                 else:
                     # No location configured - prompt user to set location
                     self.location_name_label.setText("Location not set")

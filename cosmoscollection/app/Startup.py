@@ -34,11 +34,8 @@ class InitialDataLoadWorker(QThread):
     def run(self):
         conn = None
         try:
-            import sqlite3
-            from cosmoscollection.core.ResourceManager import attach_update_catalogs
-
-            conn = sqlite3.connect(str(ResourceManager.get_database_path()))
-            attach_update_catalogs(conn)
+            from cosmoscollection.core.DatabaseManager import open_connection
+            conn = open_connection()
             dso_data, catalogs = load_all_dso_data(conn)
             logger.debug(f"Loaded {len(dso_data)} DSOs in background thread")
             self.data_loaded.emit(dso_data, catalogs)

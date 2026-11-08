@@ -11,7 +11,6 @@ Time choice and Maximum Threads.
 import logging
 import math
 import os
-import sqlite3
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -20,6 +19,8 @@ import pytz
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.time import Time
+
+from cosmoscollection.core.DatabaseManager import open_connection
 
 warnings.filterwarnings('ignore')
 
@@ -76,15 +77,6 @@ def describe_time_window(mode, start, end):
     return f"tonight ({span})" if mode == "night" else span
 
 
-def _connect():
-    """A connection of this thread's own (the DatabaseManager singleton's is
-    bound to the thread that made it), with the update catalogs attached."""
-    from cosmoscollection.core.ResourceManager import ResourceManager, attach_update_catalogs
-    conn = sqlite3.connect(str(ResourceManager.get_database_path()), timeout=30)
-    attach_update_catalogs(conn)
-    return conn
-
-
 def _get_available_catalogs():
     """Get list of available catalogs from database.
 
@@ -93,7 +85,7 @@ def _get_available_catalogs():
     have to pay for building a full DSOVisibilityCalculator.
     """
     try:
-        conn = _connect()
+        conn = open_connection()
         try:
             return [row[0] for row in conn.execute("SELECT DISTINCT catalogue FROM cataloguenr ORDER BY catalogue")]
         finally:
@@ -238,7 +230,7 @@ class BestTonightCalculation:
     def load_dsos_from_target_list(self):
         """Load DSOs from the user's target list"""
         try:
-            conn = _connect()
+            conn = open_connection()
             cursor = conn.cursor()
 
             # Query target list entries with telescope information
@@ -311,7 +303,7 @@ class BestTonightCalculation:
     def load_dsos_from_database(self):
         """Load DSOs from the database with thread-safe connection"""
         try:
-            conn = _connect()
+            conn = open_connection()
             cursor = conn.cursor()
 
             # Build the query with catalog filtering if specified

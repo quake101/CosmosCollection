@@ -29,6 +29,7 @@ warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.planning.Observer import active_site, coordinates_text
 from cosmoscollection.catalog.DSONames import type_name
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
@@ -97,10 +98,9 @@ class TimeWindowThread(QThread):
 
     def run(self):
         try:
-            import sqlite3
-            from cosmoscollection.core.ResourceManager import ResourceManager
+            from cosmoscollection.core.DatabaseManager import open_connection
             # Own connection: the DatabaseManager singleton's is bound to the GUI thread
-            conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+            conn = open_connection()
             try:
                 from cosmoscollection.planning.Observer import load_observer
                 observer = load_observer(conn)
@@ -517,35 +517,19 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         try:
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings WHERE is_active = 1 LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT location_lat, location_lon, location_name, timezone FROM usersettings ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-
-                if row:
-                    lat, lon, location_name, timezone = row
-                    if lat is not None and lon is not None:
-                        lat_str = f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'}"
-                        lon_str = f"{abs(lon):.2f}°{'W' if lon < 0 else 'E'}"
-                        display_name = location_name if location_name else "User Location"
-                        
-                        location_text = f"{display_name} - {lat_str}, {lon_str}"
-                        if timezone:
-                            try:
-                                tz_obj = pytz.timezone(timezone)
-                                now = datetime.now(tz_obj)
-                                tz_abbrev = now.strftime('%Z')
-                                location_text += f" ({tz_abbrev})"
-                            except Exception:
-                                pass
-                        if self.active_horizon is not None:
-                            location_text += f" · Horizon: {self.active_horizon.name or 'custom'}"
-
-                        self._show_location(location_text)
-                        self.calculate_btn.setEnabled(True)
-                        return
+                site = active_site(conn)
+                if site is not None:
+                    location_text = f"{site.name} - {coordinates_text(site.lat, site.lon)}"
+                    if site.timezone:
+                        try:
+                            location_text += f" ({datetime.now(pytz.timezone(site.timezone)).strftime('%Z')})"
+                        except Exception:
+                            pass
+                    if self.active_horizon is not None:
+                        location_text += f" · Horizon: {self.active_horizon.name or 'custom'}"
+                    self._show_location(location_text)
+                    self.calculate_btn.setEnabled(True)
+                    return
                 
                 # No location configured
                 self._show_location("Location not configured - please set it in the main application")

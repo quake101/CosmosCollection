@@ -765,9 +765,8 @@ class _connect:
     """A database connection of its own, closed afterwards."""
 
     def __enter__(self):
-        import sqlite3
-        from cosmoscollection.core.ResourceManager import ResourceManager
-        self.conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+        from cosmoscollection.core.DatabaseManager import open_connection
+        self.conn = open_connection()
         return self.conn
 
     def __exit__(self, *_exc):

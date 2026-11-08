@@ -403,10 +403,8 @@ def _import(ctx, library, common_names, progress):
 
     def work():
         # Its own connection, as the wizard's import worker opens one: this runs on another thread
-        import sqlite3
-        from cosmoscollection.core.ResourceManager import ResourceManager
-        conn = sqlite3.connect(str(ResourceManager.get_database_path()), timeout=30)
-        conn.row_factory = sqlite3.Row
+        from cosmoscollection.core.DatabaseManager import open_connection
+        conn = open_connection(rows=True)
         try:
             return LibraryScanner.import_library(
                 conn, library, progress=lambda done, total, text: progress.show(f"Importing {done}/{total}: {text}"),

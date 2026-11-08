@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QColor
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.planning.Observer import active_site, coordinates_text
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close
@@ -1175,30 +1176,12 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         try:
             db_manager = DatabaseManager()
             with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT location_lat, location_lon, location_name, timezone "
-                    "FROM usersettings WHERE is_active = 1 LIMIT 1"
-                )
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute(
-                        "SELECT location_lat, location_lon, location_name, timezone "
-                        "FROM usersettings ORDER BY id DESC LIMIT 1"
-                    )
-                    row = cursor.fetchone()
-
-                if row:
-                    self.lat, self.lon, location_name, self.timezone = row
-                    if self.lat is not None and self.lon is not None:
-                        lat_str = f"{abs(self.lat):.2f}{'N' if self.lat >= 0 else 'S'}"
-                        lon_str = f"{abs(self.lon):.2f}{'W' if self.lon < 0 else 'E'}"
-                        display_name = location_name if location_name else "User Location"
-                        self.location_label.setText(f"Location: {display_name} ({lat_str}, {lon_str})")
-
-                        # Auto-fetch weather
-                        self._refresh_forecast()
-                        return
+                site = active_site(conn)
+                if site is not None:
+                    self.lat, self.lon, self.timezone = site.lat, site.lon, site.timezone
+                    self.location_label.setText(f"Location: {site.name} ({coordinates_text(site.lat, site.lon)})")
+                    self._refresh_forecast()  # Auto-fetch weather
+                    return
 
             # No location configured
             self.lat = None

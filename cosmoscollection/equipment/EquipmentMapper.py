@@ -23,6 +23,7 @@ import sqlite3
 from collections import Counter, defaultdict
 
 from cosmoscollection.sessions import LibraryScanner
+from cosmoscollection.core.DatabaseManager import add_columns
 from cosmoscollection.sessions.LibraryScanner import TELESCOPE, CAMERA
 
 logger = logging.getLogger(__name__)
@@ -36,27 +37,16 @@ COLUMNS = {kind: LINKS[(IMAGES, kind)] for kind in (TELESCOPE, CAMERA)}  # An im
 TABLES = {TELESCOPE: "usertelescopes", CAMERA: "userequipment"}
 
 
-def _add_columns(cursor, table, columns):
-    added = False
-    for column in columns:
-        try:
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
-            added = True
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-    return added
-
-
 def ensure_columns(cursor):
     """Add the image equipment columns. True when they're new - the
     database's first run with them."""
-    return _add_columns(cursor, IMAGES, ("telescope_id INTEGER", "camera_id INTEGER",
+    return add_columns(cursor, IMAGES, ("telescope_id INTEGER", "camera_id INTEGER",
                                          "telescope_name TEXT", "camera_name TEXT"))
 
 
 def ensure_session_columns(cursor):
     """Add usersessions.camera_id. True when it's new."""
-    return _add_columns(cursor, SESSIONS, ("camera_id INTEGER",))
+    return add_columns(cursor, SESSIONS, ("camera_id INTEGER",))
 
 
 def _clean(name):

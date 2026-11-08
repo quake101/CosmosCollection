@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QStyledItemDelegate)
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.planning.Observer import active_site
 from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import format_dec, format_duration, format_exposure, format_ra
@@ -2714,12 +2715,11 @@ class _ScanStopped(Exception):
 
 
 def _active_site(db_manager):
-    """(lat, lon) of the active saved location, or None."""
+    """(lat, lon) of the active saved location (Observer.active_site), or None."""
     try:
         with db_manager.get_connection() as conn:
-            row = conn.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 "
-                               "AND location_lat IS NOT NULL AND location_lon IS NOT NULL").fetchone()
-        return (row[0], row[1]) if row else None
+            site = active_site(conn)
+        return (site.lat, site.lon) if site else None
     except Exception as e:
         logger.debug(f"No active location: {e}")
         return None
@@ -3556,75 +3556,8 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         self._current_session = None
         self._visibility_thread = None
         self._weather_key = None  # location of the forecast the details panel is waiting for
-        self._init_database()
         self._init_ui()
         self._load_sessions()
-
-    def _init_database(self):
-        """Belt-and-suspenders table creation, mirroring DSOTargetListWindow's own
-        _init_database() on top of DatabaseManager's copy."""
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS usersessions (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        target_id INTEGER REFERENCES usertargetlist(id) ON DELETE SET NULL,
-                        dso_name TEXT NOT NULL,
-                        ra_deg REAL,
-                        dec_deg REAL,
-                        status TEXT NOT NULL DEFAULT 'Planned',
-                        session_date TEXT NOT NULL,
-                        start_time TEXT,
-                        end_time TEXT,
-                        location_lat REAL,
-                        location_lon REAL,
-                        location_name TEXT,
-                        location_timezone TEXT,
-                        location_source TEXT DEFAULT 'active',
-                        telescope_id INTEGER REFERENCES usertelescopes(id) ON DELETE SET NULL,
-                        camera TEXT,
-                        filters_used TEXT,
-                        sub_count INTEGER DEFAULT 0,
-                        integration_seconds REAL DEFAULT 0,
-                        earliest_sub_date TEXT,
-                        latest_sub_date TEXT,
-                        notes TEXT,
-                        created_date TEXT DEFAULT CURRENT_TIMESTAMP,
-                        modified_date TEXT
-                    )
-                """)
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS usersessionfiles (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        session_id INTEGER NOT NULL REFERENCES usersessions(id) ON DELETE CASCADE,
-                        file_path TEXT NOT NULL,
-                        file_type TEXT,
-                        frame_type TEXT,
-                        object_name TEXT,
-                        date_obs TEXT,
-                        exptime_seconds REAL,
-                        filter_name TEXT,
-                        camera TEXT,
-                        telescope TEXT,
-                        gain REAL,
-                        offset_value REAL,
-                        ccd_temp REAL,
-                        xbinning INTEGER,
-                        ybinning INTEGER,
-                        header_json TEXT,
-                        added_date TEXT DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(session_id, file_path)
-                    )
-                """)
-                conn.commit()
-                # Observation tables, then place any not-yet-grouped files on their nights.
-                SessionObservations.migrate(conn)
-                MountDetection.ensure_schema(conn)
-                conn.commit()
-        except Exception as e:
-            _rollback(self.db_manager)
-            logger.error(f"Error initializing session manager database: {e}")
 
     def _init_ui(self):
         central_widget = QWidget()

@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, Q
                                QToolButton, QSlider, QFontComboBox, QColorDialog, QInputDialog, QMessageBox)
 
 from cosmoscollection.ui.Theme import COLORS, contrast_text, font_size, show_color_on_button, themed_style
+from cosmoscollection.core.DatabaseManager import open_connection
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Paths import path_key
 from cosmoscollection.core.Formatting import count_text, format_duration, format_exposure, trim_number
@@ -799,7 +800,6 @@ class DetailsTask(QRunnable):
     def run(self):
         try:
             from cosmoscollection.imaging.ImageViewer import read_file_info
-            from cosmoscollection.core.ResourceManager import ResourceManager, attach_update_catalogs
             from cosmoscollection.imaging.AnnotationOverlay import read_wcs_header
             info = self.file_info
             if info is None:
@@ -809,9 +809,8 @@ class DetailsTask(QRunnable):
                     logger.debug(f"Couldn't read {self.image_path} for its details: {e}")
             header = info.get("header") if isinstance(info, dict) else None
             wcs_header = self.wcs_header or read_wcs_header(self.image_path)
-            conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+            conn = open_connection()
             try:
-                attach_update_catalogs(conn)
                 auto = gather(conn, self.image_path, header, self.image_size, wcs_header, self.fallback_title)
                 edits = load_edits(conn, self.image_path)
             finally:

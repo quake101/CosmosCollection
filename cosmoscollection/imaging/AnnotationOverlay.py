@@ -219,12 +219,10 @@ def _annotation_priority(item):
 
 def _dsos_in_view(wcs, width, height):
     """Catalog objects inside the image, most notable first (the local catalog)."""
-    import sqlite3
-    from cosmoscollection.core.ResourceManager import ResourceManager, attach_update_catalogs
+    from cosmoscollection.core.DatabaseManager import open_connection
     min_ra, max_ra, min_dec, max_dec = wcs.get_field_of_view()
-    conn = sqlite3.connect(str(ResourceManager.get_database_path()))
+    conn = open_connection()
     try:
-        attach_update_catalogs(conn)
         rows = conn.execute("""
             SELECT d.id, d.ra, d.dec, d.magnitude, d.dsotype, COALESCE(d.sizemax, d.sizemin) / 60.0,
                    d.sizemin / 60.0, d.positionangle,
