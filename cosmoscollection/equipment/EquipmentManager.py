@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from cosmoscollection.equipment import EquipmentMapper
+from cosmoscollection.equipment.EquipmentPicker import ADD_NEW, combo_choice, equipment_combo, size_rows
 from cosmoscollection.core.Formatting import count_text
 from cosmoscollection.sessions import LibraryScanner
 from cosmoscollection.sessions.LibraryScanner import TELESCOPE, CAMERA
@@ -124,51 +125,6 @@ def fill_pixel_sizes(conn, sub_pixels=None):
     if filled:
         conn.commit()
     return filled
-
-
-def telescope_label(name, aperture, focal_length):
-    """'Name (80mm f/6.0)' for a telescope picker."""
-    if aperture and focal_length and aperture > 0:
-        return f"{name} ({int(aperture)}mm f/{focal_length / aperture:.1f})"
-    if aperture:
-        return f"{name} ({int(aperture)}mm)"
-    return name
-
-
-def fill_telescope_combo(combo, db_manager):
-    """List the enabled telescopes in a picker, after 'Any' (no telescope).
-    Each item's data is the telescope's id; select_telescope picks a saved one."""
-    combo.clear()
-    combo.addItem("Any", None)
-    try:
-        with db_manager.get_connection() as conn:
-            for telescope_id, name, aperture, focal_length in conn.execute(
-                    "SELECT id, name, aperture, focal_length FROM usertelescopes WHERE is_active = 1 "
-                    "ORDER BY name").fetchall():
-                combo.addItem(telescope_label(name, aperture, focal_length), telescope_id)
-    except Exception as e:
-        logger.error(f"Error loading telescopes: {e}")
-
-
-def select_telescope(combo, db_manager, telescope_id):
-    """Select a saved record's telescope in a picker that lists enabled telescopes.
-    A disabled one is added (marked) so it stays selected - and saving keeps it."""
-    if telescope_id is None:
-        return False
-    index = combo.findData(telescope_id)
-    if index < 0:
-        try:
-            with db_manager.get_connection() as conn:
-                row = conn.execute("SELECT name FROM usertelescopes WHERE id = ?", (telescope_id,)).fetchone()
-        except Exception as e:
-            logger.error(f"Error loading telescope {telescope_id}: {e}")
-            row = None
-        if not row:
-            return False  # Deleted
-        combo.addItem(f"{row[0]} (disabled)", telescope_id)
-        index = combo.count() - 1
-    combo.setCurrentIndex(index)
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1192,44 +1148,6 @@ class BarlowsPage(_EquipmentPage):
 # Matches: the names in files and images, and the equipment each one is
 # ---------------------------------------------------------------------------
 
-# Combo item data (strings: Qt can't compare Python tuples in findData)
-NOT_MATCHED, ADD_NEW = "none", "new"
-
-
-def _equipment_combo(kind, info, chosen_id, not_matched="Not matched - keep the name", add_new=True):
-    """A picker of the user's telescopes or cameras (enabled ones first),
-    with chosen_id selected - else the 'not matched' item."""
-    combo = QComboBox()
-    if not_matched:
-        combo.addItem(not_matched, NOT_MATCHED)
-    items = info.items(kind)
-    for item_id in sorted(items, key=lambda i: (not items[i]["is_active"], (items[i]["name"] or "").lower())):
-        item = items[item_id]
-        combo.addItem(item["name"] + ("" if item["is_active"] else " (disabled)"), f"id:{item_id}")
-    if add_new:
-        combo.addItem(f"Add as a new {kind}", ADD_NEW)
-    index = combo.findData(f"id:{chosen_id}") if chosen_id is not None else -1
-    combo.setCurrentIndex(index if index >= 0 else 0)
-    return combo
-
-
-def _combo_choice(combo):
-    """An _equipment_combo's choice: an equipment id, None (not matched) or ADD_NEW."""
-    choice = combo.currentData()
-    return int(choice[3:]) if isinstance(choice, str) and choice.startswith("id:") else \
-        (ADD_NEW if choice == ADD_NEW else None)
-
-
-def _sized_rows(table):
-    """Even rows, and no taller than they need (the space left goes below)."""
-    row_height = max(QComboBox().sizeHint().height() + 6, 26)
-    table.verticalHeader().setDefaultSectionSize(row_height)
-    for row in range(table.rowCount()):
-        table.setRowHeight(row, row_height)
-    table.setMaximumHeight(table.horizontalHeader().sizeHint().height() + row_height * table.rowCount()
-                           + 2 * table.frameWidth() + 2)
-
-
 def refresh_image_views():
     """An open gallery and the main window show images' new equipment."""
     try:
@@ -1341,7 +1259,7 @@ class MatchesPage(QWidget):
             table.setRowCount(len(kind_rows))
             for row, entry in enumerate(kind_rows):
                 self._fill_row(table, row, entry)
-            _sized_rows(table)
+            size_rows(table)
         self.empty_label.setVisible(not rows)
         could = {table: len({i for s in self._suggestions for i in s["ids"].get(table, [])})
                  for table in (EquipmentMapper.IMAGES, EquipmentMapper.SESSIONS)}
@@ -1354,7 +1272,7 @@ class MatchesPage(QWidget):
                              "Given to gallery images or sessions, but not matched to your equipment")
         table.setItem(row, 0, name_item)
         table.setItem(row, 1, QTableWidgetItem(EquipmentMapper.describe(entry["used"]) or "-"))
-        combo = _equipment_combo(entry["kind"], self._info, entry["equipment_id"])
+        combo = equipment_combo(entry["kind"], self._info, entry["equipment_id"])
         combo.currentIndexChanged.connect(lambda _i, e=entry, c=combo: self._on_match_changed(e, c))
         table.setCellWidget(row, 2, combo)
         forget = QPushButton("Forget")
@@ -1367,7 +1285,7 @@ class MatchesPage(QWidget):
 
     def _on_match_changed(self, entry, combo):
         kind, name = entry["kind"], entry["name"]
-        choice = _combo_choice(combo)
+        choice = combo_choice(combo)
         try:
             with self.db_manager.get_connection() as conn:
                 if choice == ADD_NEW:
@@ -1457,10 +1375,10 @@ class FixImagesDialog(QDialog):
             self.table.setItem(row, 0, what)
             used = {table: len(ids) for table, ids in suggestion["ids"].items()}
             self.table.setItem(row, 1, QTableWidgetItem(EquipmentMapper.describe(used)))
-            self.table.setCellWidget(row, 2, _equipment_combo(suggestion["kind"], info, suggestion["equipment_id"],
+            self.table.setCellWidget(row, 2, equipment_combo(suggestion["kind"], info, suggestion["equipment_id"],
                                                               not_matched=None, add_new=False))
             self.table.setItem(row, 3, QTableWidgetItem(suggestion["reason"]))
-        _sized_rows(self.table)
+        size_rows(self.table)
         self.table.setMaximumHeight(16777215)
         layout.addWidget(self.table, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
@@ -1474,7 +1392,7 @@ class FixImagesDialog(QDialog):
         """[(suggestion, equipment id)] for the ticked rows."""
         chosen = []
         for row, suggestion in enumerate(self.suggestions):
-            equipment_id = _combo_choice(self.table.cellWidget(row, 2))
+            equipment_id = combo_choice(self.table.cellWidget(row, 2))
             if self.table.item(row, 0).checkState() == Qt.Checked and isinstance(equipment_id, int):
                 chosen.append((suggestion, equipment_id))
         return chosen

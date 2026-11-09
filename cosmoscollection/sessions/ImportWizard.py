@@ -32,6 +32,7 @@ from cosmoscollection.ui.WindowLifetime import refresh_open
 from cosmoscollection.core.Paths import path_key
 from cosmoscollection.core.Formatting import count_text, format_duration, natural_key
 from cosmoscollection.sessions import MountDetection
+from cosmoscollection.equipment.EquipmentPicker import ADD_NEW, combo_choice, equipment_combo, size_rows
 from cosmoscollection.sessions.LibraryScanner import ScanRules, scan_and_build, ScanIndex
 from cosmoscollection.ui.Theme import COLORS, font_size, themed_style
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
@@ -465,14 +466,6 @@ class ScanningPage(QWidget):
 # Page 3: equipment
 # ---------------------------------------------------------------------------
 
-# Combo item data (strings: Qt can't compare Python tuples in findData)
-NOT_MATCHED, ADD_NEW = "none", "new"
-
-
-def _matched(item_id):
-    return f"id:{item_id}"
-
-
 class EquipmentPage(QWidget):
     """Match the telescope and camera names in the files (TELESCOP / INSTRUME)
     to the user's Equipment, so sessions are grouped and filed by what they
@@ -538,13 +531,7 @@ class EquipmentPage(QWidget):
             table.setRowCount(len(kind_rows))
             for row, entry in enumerate(kind_rows):
                 self._fill_row(table, row, entry, info)
-            # Even rows, and no taller than they need (the space left goes below)
-            row_height = max(QComboBox().sizeHint().height() + 6, 26)
-            table.verticalHeader().setDefaultSectionSize(row_height)
-            for row in range(table.rowCount()):
-                table.setRowHeight(row, row_height)
-            table.setMaximumHeight(table.horizontalHeader().sizeHint().height() + row_height * len(kind_rows)
-                                   + 2 * table.frameWidth() + 2)
+            size_rows(table)
 
     def _fill_row(self, table, row, entry, info):
         kind, value = entry["kind"], entry["value"]
@@ -557,20 +544,14 @@ class EquipmentPage(QWidget):
             cell.setTextAlignment((Qt.AlignRight if column == 1 else Qt.AlignLeft) | Qt.AlignVCenter)
             table.setItem(row, column, cell)
 
-        combo = QComboBox()
-        combo.addItem(LibraryScanner.KEEP_NAME_CHOICE, NOT_MATCHED)
-        for item_id, name in LibraryScanner.equipment_choices(info, kind):
-            combo.addItem(name, _matched(item_id))
-        combo.addItem(LibraryScanner.add_equipment_choice(kind, entry["header"]), ADD_NEW)
-
         if info.decided(kind, value):
             chosen = info.aliases[(kind, LibraryScanner.alias_key(value))]
             why = "Chosen before"
         else:
             chosen, reason = LibraryScanner.suggest_equipment(kind, value, entry["header"], info)
             why = f"Suggested: {reason}" if chosen is not None else "No match found"
-        index = combo.findData(_matched(chosen)) if chosen is not None else 0
-        combo.setCurrentIndex(max(index, 0))
+        combo = equipment_combo(kind, info, chosen, not_matched=LibraryScanner.KEEP_NAME_CHOICE,
+                                add_new=LibraryScanner.add_equipment_choice(kind, entry["header"]))
         why_item = QTableWidgetItem(why)
         table.setItem(row, 4, why_item)
         combo.currentIndexChanged.connect(lambda _i, item=why_item: item.setText("Your choice"))
@@ -581,11 +562,11 @@ class EquipmentPage(QWidget):
         for kind, (_label, table) in self.tables.items():
             for row in range(table.rowCount()):
                 entry = table.item(row, 0).data(Qt.UserRole)
-                choice = table.cellWidget(row, 3).currentData()
+                choice = combo_choice(table.cellWidget(row, 3))
                 if choice == ADD_NEW:
                     new.append((kind, entry["value"], entry["header"]))
                 else:
-                    decisions[(kind, entry["value"])] = int(choice[3:]) if choice.startswith("id:") else None
+                    decisions[(kind, entry["value"])] = choice
         self.finished.emit(decisions, new)
 
 

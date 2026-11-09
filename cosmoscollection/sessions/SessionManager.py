@@ -35,7 +35,7 @@ from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close, retire_thread
 from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.DSONameCompleter import DSONameCompleter
-from cosmoscollection.equipment.EquipmentManager import fill_telescope_combo
+from cosmoscollection.equipment.EquipmentPicker import fill_telescope_combo, select_telescope
 from cosmoscollection.ui.TimeFormatHelper import format_time
 from cosmoscollection.ui.Theme import COLORS, font_px, themed_style
 from cosmoscollection.sessions import ImportSettings, MountDetection
@@ -472,7 +472,6 @@ class SessionFormWidget(QWidget):
         self._ra_deg = target_data.get("ra_deg")
         self._dec_deg = target_data.get("dec_deg")
         self._target_id = target_data.get("id")
-        from cosmoscollection.equipment.EquipmentManager import select_telescope
         select_telescope(self.telescope_combo, self.db_manager, target_data.get("telescope_id"))
 
     def _on_common_name_toggled(self, checked):
@@ -506,7 +505,6 @@ class SessionFormWidget(QWidget):
         camera, telescope = summary.get("camera"), summary.get("telescope")
         if camera or telescope:
             from cosmoscollection.equipment import EquipmentMapper
-            from cosmoscollection.equipment.EquipmentManager import select_telescope
             info = self._equipment_info()
             if camera:
                 self.camera_combo.setCurrentText(EquipmentMapper.display_name(EquipmentMapper.CAMERA, camera, info))
@@ -562,7 +560,6 @@ class SessionFormWidget(QWidget):
                 h, mnt = (int(p) for p in end_time.split(":")[:2])
                 self.end_time_edit.setTime(QTime(h, mnt))
 
-        from cosmoscollection.equipment.EquipmentManager import select_telescope
         select_telescope(self.telescope_combo, self.db_manager, session_data.get("telescope_id"))
 
         self.camera_combo.setCurrentText(session_data.get("camera") or "")

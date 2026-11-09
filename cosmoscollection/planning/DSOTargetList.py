@@ -29,7 +29,7 @@ from cosmoscollection.ui.Theme import COLORS, font_px, theme_manager, themed_sty
 from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.DSONameCompleter import DSONameCompleter
 from cosmoscollection.ui.NightTimeChooser import NightTimeChooser
-from cosmoscollection.equipment.EquipmentManager import fill_telescope_combo
+from cosmoscollection.equipment.EquipmentPicker import fill_telescope_combo, select_telescope
 from cosmoscollection.sessions import SessionFileScanner
 # The Target List's rows (moved to TargetRows.py, which has no UI imports; kept
 # importable from here)
@@ -1333,7 +1333,6 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         dialog.notes_edit.setPlainText(target_data.get("notes", ""))
 
         # Set telescope selection (a disabled one is kept)
-        from cosmoscollection.equipment.EquipmentManager import select_telescope
         if not select_telescope(dialog.telescope_combo, self.db_manager, target_data.get("telescope_id")):
             dialog.telescope_combo.setCurrentIndex(0)  # "Any"
 
@@ -1757,7 +1756,6 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             dialog.notes_edit.setPlainText(target_data.get("notes", ""))
 
             # Set telescope selection (a disabled one is kept)
-            from cosmoscollection.equipment.EquipmentManager import select_telescope
             if not select_telescope(dialog.telescope_combo, self.db_manager, target_data.get("telescope_id")):
                 dialog.telescope_combo.setCurrentIndex(0)  # "Any"
 
