@@ -498,11 +498,8 @@ class MapLocationPickerDialog(QDialog):
 
             # No WebGL here usually means the web views' graphics are broken - after a
             # graphics reset, the map may not draw either
-            self.web_view.page().runJavaScript(
-                "(function () { var c = document.createElement('canvas');"
-                " return !!(c.getContext('webgl2') || c.getContext('webgl')); })()",
-                lambda ok: None if ok else self._check_gpu_reset()
-            )
+            from cosmoscollection.ui.GpuResetBar import check_webgl
+            check_webgl(self.web_view.page(), lambda info: None if info.get("available") else self._check_gpu_reset())
         else:
             # If the renderer already crashed, _on_render_process_terminated has already shown
             # a more accurate message -- don't stomp it with the generic one.
@@ -519,15 +516,9 @@ class MapLocationPickerDialog(QDialog):
             # Chromium can fire this signal again (e.g. an automatic reload attempt) before
             # reject() below has actually torn the dialog down. Only handle the first one.
             return
-        from PySide6.QtWebEngineCore import QWebEnginePage
-        status_names = {
-            QWebEnginePage.RenderProcessTerminationStatus.NormalTerminationStatus: "Normal",
-            QWebEnginePage.RenderProcessTerminationStatus.AbnormalTerminationStatus: "Abnormal",
-            QWebEnginePage.RenderProcessTerminationStatus.CrashedTerminationStatus: "Crashed",
-            QWebEnginePage.RenderProcessTerminationStatus.KilledTerminationStatus: "Killed",
-        }
-        status_name = status_names.get(termination_status, f"Unknown({termination_status})")
-        logger.error(f"Map picker renderer process terminated: {status_name}, exit code: {exit_code}")
+        from cosmoscollection.ui.GpuResetBar import termination_status_name
+        logger.error(f"Map picker renderer process terminated: {termination_status_name(termination_status)}, "
+                     f"exit code: {exit_code}")
         self._renderer_crashed = True
         if self._check_gpu_reset():
             return  # The bar offers Try Again / Restart App instead of closing the map

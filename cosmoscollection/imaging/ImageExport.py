@@ -33,7 +33,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QRectF, QSize, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QWidget, QLabel, QPushButton,
-                               QComboBox, QCheckBox, QListWidget, QListWidgetItem, QToolButton, QSpinBox,
+                               QComboBox, QCheckBox, QListWidget, QListWidgetItem, QSpinBox,
                                QStackedWidget, QSizePolicy, QFileDialog, QMessageBox, QTableWidget,
                                QTableWidgetItem, QHeaderView, QDialogButtonBox, QAbstractItemView)
 
@@ -43,6 +43,7 @@ from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import trim_number
 from cosmoscollection.imaging.AnnotationOverlay import paint_annotations
+from cosmoscollection.ui.Disclosure import disclosure_toggle
 from cosmoscollection.ui.Theme import COLORS, font_size, themed_style
 from cosmoscollection.ui.WindowPositionManager import WindowPositionManager, WindowPositionMixin
 
@@ -934,15 +935,10 @@ class ExportDialog(WindowPositionMixin, QDialog):
         right.addLayout(form)
 
         # More options: tucked away, most people never need them
-        self.more_toggle = QToolButton()
-        self.more_toggle.setText("More options")
-        self.more_toggle.setCheckable(True)
-        self.more_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.more_toggle.setArrowType(Qt.RightArrow)
-        self.more_toggle.setStyleSheet("QToolButton { border: none; }")
-        self.more_toggle.toggled.connect(self._toggle_more)
-        right.addWidget(self.more_toggle)
         self.more = QWidget()
+        self.more_toggle = disclosure_toggle("More options", self.more)
+        self.more_toggle.toggled.connect(lambda shown: app_settings().setValue(MORE_OPTIONS_SETTING, shown))
+        right.addWidget(self.more_toggle)
         more_layout = QVBoxLayout(self.more)
         more_layout.setContentsMargins(20, 0, 0, 0)
         more_form = QFormLayout()
@@ -976,9 +972,7 @@ class ExportDialog(WindowPositionMixin, QDialog):
         buttons.addWidget(close_button)
         right.addLayout(buttons)
 
-        more_shown = app_settings().value(MORE_OPTIONS_SETTING, False, type=bool)
-        self.more_toggle.setChecked(more_shown)
-        self._toggle_more(more_shown)
+        self.more_toggle.setChecked(app_settings().value(MORE_OPTIONS_SETTING, False, type=bool))
         last = app_settings().value(LAST_DESTINATION_SETTING, "", type=str)
         index = next((i for i, d in enumerate(self.destinations) if d.key == last), 0)
         self.destination_list.currentRowChanged.connect(self._on_destination_changed)
@@ -1121,11 +1115,6 @@ class ExportDialog(WindowPositionMixin, QDialog):
     def _on_size_changed(self, _index):
         app_settings().setValue(f"image_export/{self._current().key}/size", self.size_combo.currentData())
         self.refresh()
-
-    def _toggle_more(self, shown):
-        self.more.setVisible(shown)
-        self.more_toggle.setArrowType(Qt.DownArrow if shown else Qt.RightArrow)
-        app_settings().setValue(MORE_OPTIONS_SETTING, shown)
 
     def _show_in_folder(self, path):
         if not show_in_folder(path):

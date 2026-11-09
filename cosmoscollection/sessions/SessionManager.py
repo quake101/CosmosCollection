@@ -35,7 +35,8 @@ from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close, retire_thread
 from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.DSONameCompleter import DSONameCompleter
-from cosmoscollection.equipment.EquipmentPicker import fill_telescope_combo, select_telescope
+from cosmoscollection.equipment.EquipmentPicker import (equipment_filter_combo, fill_equipment_filter,
+                                                        fill_telescope_combo, select_telescope)
 from cosmoscollection.ui.TimeFormatHelper import format_time
 from cosmoscollection.ui.Theme import COLORS, font_px, themed_style
 from cosmoscollection.sessions import ImportSettings, MountDetection
@@ -3022,14 +3023,11 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         search_row.addWidget(self.search_box)
 
         # Telescope and camera filters: the equipment the sessions use
-        self.telescope_filter = QComboBox()
-        self.camera_filter = QComboBox()
+        self.telescope_filter = equipment_filter_combo()
+        self.camera_filter = equipment_filter_combo()
         for label, combo in (("Telescope:", self.telescope_filter), ("Camera:", self.camera_filter)):
             search_row.addSpacing(12)
             search_row.addWidget(QLabel(label))
-            combo.addItem("All")
-            combo.setMinimumWidth(140)
-            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             combo.currentTextChanged.connect(self._filter_sessions)
             search_row.addWidget(combo)
         # Equatorial or alt-az: detected from the lights, set by hand, else the telescope's Equipment
@@ -3280,16 +3278,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         """The telescope and camera filters: the equipment the loaded sessions
         use - a session with no telescope ("Any") only shows under All."""
         for combo, key in ((self.telescope_filter, "telescope_name"), (self.camera_filter, "camera")):
-            current = combo.currentText()
-            names = sorted({s[key] for s in self.sessions_data if s.get(key)}, key=str.casefold)
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItem("All")
-            combo.addItems(names)
-            combo.setCurrentText(current if current in names else "All")
-            combo.blockSignals(False)
-            # Wide enough a dropdown to show the full names
-            combo.view().setMinimumWidth(combo.minimumSizeHint().width())
+            fill_equipment_filter(combo, (s.get(key) for s in self.sessions_data), combo.currentText())
 
     def _filter_sessions(self):
         search_text = self.search_box.text().strip().lower()

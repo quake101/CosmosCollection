@@ -31,6 +31,7 @@ from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.core.Formatting import format_duration
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import refresh_open, release_on_close
+from cosmoscollection.equipment.EquipmentPicker import equipment_filter_combo, fill_equipment_filter
 from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.Theme import COLORS, font_px, font_size, themed_style
 from cosmoscollection.imaging.ImageLoader import load_astro_pixmap, load_astro_qimage, read_image_file, write_image_file
@@ -1914,13 +1915,10 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         filters_layout.addWidget(self.type_combo)
 
         # Telescope and camera filters
-        self.telescope_filter = QComboBox()
-        self.camera_filter = QComboBox()
+        self.telescope_filter = equipment_filter_combo()
+        self.camera_filter = equipment_filter_combo()
         for label, combo in (("Telescope:", self.telescope_filter), ("Camera:", self.camera_filter)):
             filters_layout.addWidget(QLabel(label))
-            combo.addItem("All")
-            combo.setMinimumWidth(140)
-            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             combo.currentTextChanged.connect(self._on_filter_changed)
             filters_layout.addWidget(combo)
 
@@ -2145,21 +2143,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
     def _populate_equipment_filters(self):
         """The telescope and camera filters: those the loaded images were taken with"""
         for combo, key in ((self.telescope_filter, 'telescope'), (self.camera_filter, 'camera')):
-            names = sorted({item[key] for item in self.all_items if item[key]}, key=str.casefold)
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItem("All")
-            combo.addItems(names)
-
-            # Restore saved filter selection if it still exists among the options
-            if self.current_filters.get(key, 'All') in names:
-                combo.setCurrentText(self.current_filters[key])
-            else:
-                self.current_filters[key] = 'All'
-            combo.blockSignals(False)
-
-            # Ensure dropdown view is wide enough to show full text
-            combo.view().setMinimumWidth(combo.minimumSizeHint().width())
+            # The saved choice stays if it's still among them
+            self.current_filters[key] = fill_equipment_filter(
+                combo, (item[key] for item in self.all_items), self.current_filters.get(key, 'All'))
 
     def _grid_width(self):
         """Width the cards can use: the scroll area's, less a scrollbar whether

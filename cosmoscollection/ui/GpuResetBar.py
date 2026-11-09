@@ -7,9 +7,64 @@ App (always works).
     layout.insertWidget(0, bar)
 """
 
+import json
+import logging
+
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton
 
 from cosmoscollection.ui.Theme import COLORS, themed_style
+
+logger = logging.getLogger(__name__)
+
+
+def termination_status_name(status):
+    """'Crashed' etc. for a web page's renderProcessTerminated status, for the log."""
+    from PySide6.QtWebEngineCore import QWebEnginePage
+    names = {
+        QWebEnginePage.RenderProcessTerminationStatus.NormalTerminationStatus: "Normal",
+        QWebEnginePage.RenderProcessTerminationStatus.AbnormalTerminationStatus: "Abnormal",
+        QWebEnginePage.RenderProcessTerminationStatus.CrashedTerminationStatus: "Crashed",
+        QWebEnginePage.RenderProcessTerminationStatus.KilledTerminationStatus: "Killed",
+    }
+    return names.get(status, f"Unknown({status})")
+
+
+# {available, version, vendor, renderer} or {available: false, error} as JSON
+_WEBGL_CHECK_JS = """
+(function () {
+    var canvas = document.createElement('canvas');
+    var gl = canvas.getContext('webgl2') || canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+    if (!gl) {
+        return JSON.stringify({available: false, error: 'WebGL not available'});
+    }
+    var debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+    return JSON.stringify({
+        available: true,
+        version: (typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext)
+            ? 'WebGL2' : 'WebGL1',
+        vendor: debugInfo ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : 'Unknown',
+        renderer: debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : 'Unknown'
+    });
+})();
+"""
+
+
+def check_webgl(page, on_result):
+    """Ask a loaded web page whether WebGL works - without it the web views'
+    graphics are usually broken (e.g. after a graphics reset). on_result gets
+    {"available": bool, "version", "vendor", "renderer"} or {"available": False, "error"}."""
+    def parse(result):
+        try:
+            info = json.loads(result)
+        except (TypeError, ValueError) as e:
+            logger.error(f"Couldn't read the WebGL check: {e} ({result!r})")
+            return
+        on_result(info)
+
+    try:
+        page.runJavaScript(_WEBGL_CHECK_JS, parse)
+    except Exception as e:
+        logger.error(f"Couldn't check WebGL: {e}")
 
 
 class GpuResetBar(QFrame):

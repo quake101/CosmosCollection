@@ -19,21 +19,23 @@ def get_time_format_24h():
     return time_format == "24-hour"
 
 
-def format_time(dt, seconds=False):
+def format_time(dt, seconds=False, strip_zero=False):
     """Format only the time portion of a datetime object.
 
     Args:
         dt: A datetime object.
         seconds: If True, include seconds in the output.
+        strip_zero: If True, no leading zero on a 12-hour time ("7:30 PM", not "07:30 PM").
 
     Returns:
-        str: Formatted time string (e.g., "2:30 PM" or "14:30").
+        str: Formatted time string (e.g., "02:30 PM" or "14:30").
     """
     if get_time_format_24h():
         fmt = "%H:%M:%S" if seconds else "%H:%M"
-    else:
-        fmt = "%I:%M:%S %p" if seconds else "%I:%M %p"
-    return dt.strftime(fmt)
+        return dt.strftime(fmt)
+    fmt = "%I:%M:%S %p" if seconds else "%I:%M %p"
+    text = dt.strftime(fmt)
+    return text[1:] if strip_zero and text.startswith("0") else text
 
 
 def format_datetime(dt, seconds=False):

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
     QProgressBar, QPushButton, QToolTip,
-    QSizePolicy, QSpinBox, QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem, QToolButton,
+    QSizePolicy, QSpinBox, QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -34,6 +34,7 @@ from cosmoscollection.core.Formatting import count_text, format_duration, natura
 from cosmoscollection.sessions import MountDetection
 from cosmoscollection.equipment.EquipmentPicker import ADD_NEW, combo_choice, equipment_combo, size_rows
 from cosmoscollection.sessions.LibraryScanner import ScanRules, scan_and_build, ScanIndex
+from cosmoscollection.ui.Disclosure import disclosure_toggle
 from cosmoscollection.ui.Theme import COLORS, font_size, themed_style
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 
@@ -228,15 +229,9 @@ class FoldersPage(QWidget):
         layout.addLayout(buttons)
 
         # Advanced: tucked away, most people never need it
-        self.advanced_toggle = QToolButton()
-        self.advanced_toggle.setText("Advanced")
-        self.advanced_toggle.setCheckable(True)
-        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.advanced_toggle.setArrowType(Qt.RightArrow)
-        self.advanced_toggle.setStyleSheet("QToolButton { border: none; }")
-        self.advanced_toggle.toggled.connect(self._toggle_advanced)
-        layout.addWidget(self.advanced_toggle)
         self.advanced = QWidget()
+        self.advanced_toggle = disclosure_toggle("Advanced", self.advanced)
+        layout.addWidget(self.advanced_toggle)
         form = QFormLayout(self.advanced)
         form.setContentsMargins(20, 0, 0, 0)
         self.gap_spin = QSpinBox()
@@ -263,7 +258,6 @@ class FoldersPage(QWidget):
         reset_row.addWidget(reset)
         reset_row.addStretch()
         form.addRow(reset_row)
-        self.advanced.setVisible(False)
         layout.addWidget(self.advanced)
 
         bottom = QHBoxLayout()
@@ -328,10 +322,6 @@ class FoldersPage(QWidget):
         has_folders = bool(self.folders())
         self.scan_button.setEnabled(has_folders)
         self.hint.setText("" if has_folders else "Add a folder to start - you can drop folders here too.")
-
-    def _toggle_advanced(self, shown):
-        self.advanced.setVisible(shown)
-        self.advanced_toggle.setArrowType(Qt.DownArrow if shown else Qt.RightArrow)
 
     def _reset_advanced(self):
         defaults = ScanRules()

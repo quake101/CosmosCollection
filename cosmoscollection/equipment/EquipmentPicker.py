@@ -6,6 +6,8 @@ EquipmentPicker.py - Dropdowns of the user's equipment, for any window:
 - equipment_combo / combo_choice: what a telescope or camera name (from files,
   images or sessions) is - a piece of the user's equipment, not matched, or
   added as new (the Equipment window's Matches tab, the Import Wizard)
+- equipment_filter_combo / fill_equipment_filter: a list's Telescope / Camera
+  filter (the gallery, the Session Manager)
 - size_rows: even table rows that fit those dropdowns
 """
 
@@ -99,6 +101,36 @@ def combo_choice(combo):
     if isinstance(choice, str) and choice.startswith("id:"):
         return int(choice[3:])
     return ADD_NEW if choice == ADD_NEW else None
+
+
+# ---- Filtering a list by its equipment ------------------------------------------
+
+ALL = "All"
+
+
+def equipment_filter_combo():
+    """A telescope or camera filter for a list ('All' until filled)."""
+    combo = QComboBox()
+    combo.addItem(ALL)
+    combo.setMinimumWidth(140)
+    combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+    return combo
+
+
+def fill_equipment_filter(combo, names, current):
+    """List 'All' and the names in use (sorted, blanks left out) without
+    sending a change; current stays chosen if it's still listed. Returns the
+    name chosen ('All' if current isn't listed)."""
+    names = sorted({name for name in names if name}, key=str.casefold)
+    chosen = current if current in names else ALL
+    combo.blockSignals(True)
+    combo.clear()
+    combo.addItem(ALL)
+    combo.addItems(names)
+    combo.setCurrentText(chosen)
+    combo.blockSignals(False)
+    combo.view().setMinimumWidth(combo.minimumSizeHint().width())  # The dropdown shows full names
+    return chosen
 
 
 def size_rows(table):

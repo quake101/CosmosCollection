@@ -2750,15 +2750,9 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
 
     def _on_render_process_terminated(self, termination_status, exit_code):
         """Handle GPU/renderer process crash without crashing the whole app"""
-        from PySide6.QtWebEngineCore import QWebEnginePage
-        status_names = {
-            QWebEnginePage.RenderProcessTerminationStatus.NormalTerminationStatus: "Normal",
-            QWebEnginePage.RenderProcessTerminationStatus.AbnormalTerminationStatus: "Abnormal",
-            QWebEnginePage.RenderProcessTerminationStatus.CrashedTerminationStatus: "Crashed",
-            QWebEnginePage.RenderProcessTerminationStatus.KilledTerminationStatus: "Killed",
-        }
-        status_name = status_names.get(termination_status, f"Unknown({termination_status})")
-        logger.error(f"Aladin Lite renderer process terminated: {status_name}, exit code: {exit_code}")
+        from cosmoscollection.ui.GpuResetBar import termination_status_name
+        logger.error(f"Aladin Lite renderer process terminated: {termination_status_name(termination_status)}, "
+                     f"exit code: {exit_code}")
         self.loading_timeout.stop()
         self._renderer_crashed = True
 
@@ -2818,48 +2812,22 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
                 self._on_night_view_toggled(True)
 
     def _check_webgl_support(self):
-        """Check if WebGL is available in the browser context"""
+        """Log whether WebGL works in the sky view (Aladin Lite needs it); without it,
+        check for a graphics reset."""
         if not self.web_view:
             return
 
-        # JavaScript to check WebGL support
-        js_code = """
-        (function() {
-            var canvas = document.createElement('canvas');
-            var gl = canvas.getContext('webgl') || canvas.getContext('webgl2') || canvas.getContext('experimental-webgl');
-            if (gl) {
-                var debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
-                var vendor = debugInfo ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : 'Unknown';
-                var renderer = debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : 'Unknown';
-                return JSON.stringify({
-                    available: true,
-                    version: gl instanceof WebGL2RenderingContext ? 'WebGL2' : 'WebGL1',
-                    vendor: vendor,
-                    renderer: renderer
-                });
-            } else {
-                return JSON.stringify({available: false, error: 'WebGL not available'});
-            }
-        })();
-        """
+        def checked(info):
+            if info.get("available"):
+                logger.info(f"WebGL is available: {info.get('version', 'Unknown')} - Vendor: "
+                            f"{info.get('vendor', 'Unknown')}, Renderer: {info.get('renderer', 'Unknown')}")
+            else:
+                logger.error(f"WebGL is NOT available: {info.get('error', 'Unknown error')}")
+                logger.error("Aladin Lite will not render properly without WebGL support")
+                self._check_gpu_reset()
 
-        def handle_webgl_result(result):
-            try:
-                import json
-                webgl_info = json.loads(result)
-                if webgl_info.get('available'):
-                    logger.info(f"WebGL is available: {webgl_info.get('version', 'Unknown')} - Vendor: {webgl_info.get('vendor', 'Unknown')}, Renderer: {webgl_info.get('renderer', 'Unknown')}")
-                else:
-                    logger.error(f"WebGL is NOT available: {webgl_info.get('error', 'Unknown error')}")
-                    logger.error("Aladin Lite will not render properly without WebGL support")
-                    self._check_gpu_reset()
-            except Exception as e:
-                logger.error(f"Failed to parse WebGL info: {e}, result: {result}")
-
-        try:
-            self.web_view.page().runJavaScript(js_code, handle_webgl_result)
-        except Exception as e:
-            logger.error(f"Failed to check WebGL support: {e}")
+        from cosmoscollection.ui.GpuResetBar import check_webgl
+        check_webgl(self.web_view.page(), checked)
 
     def _handle_loading_timeout(self):
         """Handle loading timeout"""

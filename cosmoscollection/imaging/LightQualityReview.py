@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, Q
 from cosmoscollection.imaging import FrameQuality
 from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.ui.WindowLifetime import retire_thread
+from cosmoscollection.ui.TimeFormatHelper import format_time
 from cosmoscollection.ui.ZoomableImageView import ZoomableImageView
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.sessions import SessionFileScanner
@@ -1414,14 +1415,16 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
             moment = datetime.fromisoformat(str(date_obs)[:19]).replace(tzinfo=timezone.utc)
         except ValueError:
             return str(date_obs)
+        # The session's local time, as Settings > 12/24-hour shows times
         zone = self.session.get("location_timezone")
         if zone:
             try:
                 import pytz
-                return moment.astimezone(pytz.timezone(zone)).strftime("%b %d %H:%M")
+                local = moment.astimezone(pytz.timezone(zone))
+                return f"{local:%b %d} {format_time(local, strip_zero=True)}"
             except Exception:
                 pass
-        return moment.strftime("%b %d %H:%M UTC")
+        return f"{moment:%b %d} {format_time(moment, strip_zero=True)} UTC"
 
     def _on_chart_metric_changed(self):
         app_settings().setValue(GRAPH_METRIC_SETTING, self.chart_metric_combo.currentData())

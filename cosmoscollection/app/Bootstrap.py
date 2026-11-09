@@ -11,7 +11,8 @@ import sys
 
 # Started again by Restart App: wait for the old app to finish exiting first, so the two
 # don't share the database or the web views' storage (see core/GpuReset.py)
-if os.environ.get('COSMOS_RESTART_WAIT_PID'):
+from cosmoscollection.core.GpuReset import RESTART_WAIT_ENV  # noqa: E402 - standard library only
+if os.environ.get(RESTART_WAIT_ENV):
     from cosmoscollection.core.GpuReset import wait_for_previous_app
     wait_for_previous_app()
 

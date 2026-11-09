@@ -29,8 +29,9 @@ from PySide6.QtCore import Qt, QObject, QRectF, QRunnable, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QWidget, QLabel, QPushButton,
                                QComboBox, QCheckBox, QLineEdit, QListWidget, QListWidgetItem, QAbstractItemView,
-                               QToolButton, QSlider, QFontComboBox, QColorDialog, QInputDialog, QMessageBox)
+                               QSlider, QFontComboBox, QColorDialog, QInputDialog, QMessageBox)
 
+from cosmoscollection.ui.Disclosure import disclosure_toggle
 from cosmoscollection.ui.Theme import COLORS, font_size, show_color_on_button, themed_style
 from cosmoscollection.core.DatabaseManager import open_connection
 from cosmoscollection.core.Settings import app_settings
@@ -1208,15 +1209,9 @@ class ImageDetailsDialog(WindowPositionMixin, QDialog):
         layout.addWidget(self.value_hint)
 
         # More options: tucked away, most people never need them
-        self.more_toggle = QToolButton()
-        self.more_toggle.setText("More options")
-        self.more_toggle.setCheckable(True)
-        self.more_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.more_toggle.setArrowType(Qt.RightArrow)
-        self.more_toggle.setStyleSheet("QToolButton { border: none; }")
-        self.more_toggle.toggled.connect(self._toggle_more)
-        layout.addWidget(self.more_toggle)
         self.more = QWidget()
+        self.more_toggle = disclosure_toggle("More options", self.more)
+        layout.addWidget(self.more_toggle)
         more_form = QFormLayout(self.more)
         more_form.setContentsMargins(20, 0, 0, 0)
         self.font_combo = QFontComboBox()
@@ -1265,7 +1260,6 @@ class ImageDetailsDialog(WindowPositionMixin, QDialog):
         self.delete_preset_button.clicked.connect(self._delete_preset)
         preset_row.addWidget(self.delete_preset_button)
         more_form.addRow("Presets:", preset_row)
-        self.more.setVisible(False)
         layout.addWidget(self.more)
 
         buttons = QHBoxLayout()
@@ -1511,10 +1505,6 @@ class ImageDetailsDialog(WindowPositionMixin, QDialog):
         self.style = normalize_style({"custom_text": custom})
         self._show_style()
         self._emit_style()
-
-    def _toggle_more(self, shown):
-        self.more.setVisible(shown)
-        self.more_toggle.setArrowType(Qt.DownArrow if shown else Qt.RightArrow)
 
     # Presets
 

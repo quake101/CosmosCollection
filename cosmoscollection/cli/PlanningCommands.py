@@ -117,10 +117,7 @@ def _horizon(site, ignore):
 def _clock(when):
     """A time as the app shows it (Settings > 12/24-hour)."""
     from cosmoscollection.ui.TimeFormatHelper import format_time
-    if not when:
-        return ""
-    text = format_time(when)
-    return text[1:] if text.startswith("0") and text.endswith(("AM", "PM")) else text  # "7:30 PM"
+    return format_time(when, strip_zero=True) if when else ""  # "7:30 PM"
 
 
 def _iso(when):

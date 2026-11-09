@@ -638,12 +638,8 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
 
         # View mode toggle - show actual dark hours if available
         if self.summary.dark_hours_start and self.summary.dark_hours_end:
-            if get_time_format_24h():
-                start_str = self.summary.dark_hours_start.strftime("%H:%M")
-                end_str = self.summary.dark_hours_end.strftime("%H:%M")
-            else:
-                start_str = self.summary.dark_hours_start.strftime("%I:%M %p").lstrip("0")
-                end_str = self.summary.dark_hours_end.strftime("%I:%M %p").lstrip("0")
+            start_str = format_time(self.summary.dark_hours_start, strip_zero=True)
+            end_str = format_time(self.summary.dark_hours_end, strip_zero=True)
             midnight_label = f"Center on Midnight (tonight's dark hours: {start_str}-{end_str})"
             midnight_tip = "Show hours centered around midnight when sun altitude is below -12° (astronomical darkness)"
         else:
