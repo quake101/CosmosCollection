@@ -126,6 +126,30 @@ def fill_pixel_sizes(conn, sub_pixels=None):
     return filled
 
 
+def telescope_label(name, aperture, focal_length):
+    """'Name (80mm f/6.0)' for a telescope picker."""
+    if aperture and focal_length and aperture > 0:
+        return f"{name} ({int(aperture)}mm f/{focal_length / aperture:.1f})"
+    if aperture:
+        return f"{name} ({int(aperture)}mm)"
+    return name
+
+
+def fill_telescope_combo(combo, db_manager):
+    """List the enabled telescopes in a picker, after 'Any' (no telescope).
+    Each item's data is the telescope's id; select_telescope picks a saved one."""
+    combo.clear()
+    combo.addItem("Any", None)
+    try:
+        with db_manager.get_connection() as conn:
+            for telescope_id, name, aperture, focal_length in conn.execute(
+                    "SELECT id, name, aperture, focal_length FROM usertelescopes WHERE is_active = 1 "
+                    "ORDER BY name").fetchall():
+                combo.addItem(telescope_label(name, aperture, focal_length), telescope_id)
+    except Exception as e:
+        logger.error(f"Error loading telescopes: {e}")
+
+
 def select_telescope(combo, db_manager, telescope_id):
     """Select a saved record's telescope in a picker that lists enabled telescopes.
     A disabled one is added (marked) so it stays selected - and saving keeps it."""

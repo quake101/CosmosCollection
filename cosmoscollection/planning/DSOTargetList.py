@@ -9,25 +9,26 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from PySide6.QtCore import Qt, QTimer, Signal, QStringListModel, QThread, QTime
+from PySide6.QtCore import Qt, QTimer, Signal, QThread, QTime
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
                                QHeaderView, QTextEdit, QDialog, QComboBox,
                                QLineEdit, QCheckBox, QDateEdit, QSpinBox, QMenu,
-                               QCompleter, QListWidget, QListWidgetItem, QSplitter,
+                               QListWidget, QListWidgetItem, QSplitter,
                                QPlainTextEdit, QTimeEdit)
 from PySide6.QtGui import QFont, QColor
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.catalog.DSONames import (designation_candidates, display_name, preferred_designation,
-                                              suggestion_names, type_code,
-                                              type_name)
+                                              type_code, type_name)
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close
 from cosmoscollection.ui.Theme import COLORS, font_px, theme_manager, themed_style, themed_text
 from cosmoscollection.ui import DSOActions
+from cosmoscollection.ui.DSONameCompleter import DSONameCompleter
+from cosmoscollection.equipment.EquipmentManager import fill_telescope_combo
 from cosmoscollection.sessions import SessionFileScanner
 # The Target List's rows (moved to TargetRows.py, which has no UI imports; kept
 # importable from here)
@@ -73,14 +74,6 @@ class AddTargetDialog(QDialog):
         self.db_manager = DatabaseManager()
         self.is_edit_mode = False  # Track if we're editing an existing target
         self.target_id = None  # Store the ID of the target being edited
-        self._dso_cache = {}  # Cache for autocomplete results
-
-        # Debounce timer for DSO catalog search
-        self._search_timer = QTimer()
-        self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(300)
-        self._search_timer.timeout.connect(self._do_dso_search)
-        self._pending_search_text = ""
 
         self._setup_ui()
         
@@ -101,16 +94,8 @@ class AddTargetDialog(QDialog):
         name_layout.addWidget(QLabel("Name:"))
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("e.g., M 31, NGC 7000, IC 1396")
-
-        # Set up autocomplete for DSO catalog
-        self._completer_model = QStringListModel()
-        self._completer = QCompleter()
-        self._completer.setModel(self._completer_model)
-        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self._completer.setFilterMode(Qt.MatchContains)
-        self.name_edit.setCompleter(self._completer)
-        self._completer.activated.connect(self._on_dso_selected)
-        self.name_edit.textChanged.connect(self._on_name_text_changed)
+        self.name_completer = DSONameCompleter(self.name_edit, self.db_manager)
+        self.name_completer.picked.connect(self._on_dso_selected)
 
         name_layout.addWidget(self.name_edit)
         dso_layout.addLayout(name_layout)
@@ -175,7 +160,7 @@ class AddTargetDialog(QDialog):
         telescope_layout = QHBoxLayout()
         telescope_layout.addWidget(QLabel("Telescope:"))
         self.telescope_combo = QComboBox()
-        self._populate_telescope_combo()
+        fill_telescope_combo(self.telescope_combo, self.db_manager)
         telescope_layout.addWidget(self.telescope_combo)
         telescope_layout.addStretch()
         target_layout.addLayout(telescope_layout)
@@ -222,36 +207,6 @@ class AddTargetDialog(QDialog):
         self.target_id = target_id
         self.save_btn.setText("Save Changes")
     
-    def _populate_telescope_combo(self):
-        """Populate telescope dropdown with active telescopes"""
-        self.telescope_combo.clear()
-        self.telescope_combo.addItem("Any", None)  # First item for unassigned
-
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT id, name, aperture, focal_length
-                    FROM usertelescopes
-                    WHERE is_active = 1
-                    ORDER BY name
-                """)
-                telescopes = cursor.fetchall()
-
-                for telescope in telescopes:
-                    tel_id, name, aperture, focal_length = telescope
-                    # Calculate f/ratio if we have both values
-                    if aperture and focal_length and aperture > 0:
-                        f_ratio = focal_length / aperture
-                        display_text = f"{name} ({int(aperture)}mm f/{f_ratio:.1f})"
-                    elif aperture:
-                        display_text = f"{name} ({int(aperture)}mm)"
-                    else:
-                        display_text = name
-                    self.telescope_combo.addItem(display_text, tel_id)
-        except Exception as e:
-            logger.error(f"Error loading telescopes: {str(e)}")
-
     def _populate_from_dso_data(self):
         """Populate dialog fields with DSO data"""
         if not self.dso_data:
@@ -286,104 +241,8 @@ class AddTargetDialog(QDialog):
         # Populate best months if available
         self.months_edit.setText(self.dso_data.get("best_months", ""))
 
-    def _on_name_text_changed(self, text):
-        """Handle text changes in the name field — debounce before searching"""
-        text = text.strip()
-        if len(text) < 2:
-            self._completer_model.setStringList([])
-            self._dso_cache.clear()
-            return
-        self._pending_search_text = text
-        self._search_timer.start()
-
-    def _do_dso_search(self):
-        """Execute the DSO catalog search after debounce"""
-        text = self._pending_search_text
-        if len(text) < 2:
-            return
-        self._search_dso_catalog(text)
-
-    def _search_dso_catalog(self, text):
-        """Search the DSO catalog and update completer suggestions"""
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-
-                # Try to parse a catalogue prefix (e.g., "M 3", "NGC 70", "IC 13")
-                catalogue = None
-                designation_part = None
-                text_upper = text.upper().strip()
-
-                for prefix in ("NGC", "IC", "M"):
-                    if text_upper.startswith(prefix):
-                        remainder = text_upper[len(prefix):]
-                        # Ensure remainder is empty, starts with space, or a digit
-                        if remainder == "" or remainder[0] in (" ", "-") or remainder[0].isdigit():
-                            catalogue = prefix
-                            designation_part = remainder.strip()
-                            break
-
-                if catalogue and designation_part is not None:
-                    # Search within a specific catalogue
-                    cursor.execute("""
-                        SELECT c.catalogue || ' ' || c.designation as name,
-                               d.ra, d.dec, d.magnitude,
-                               d.sizemin / 60.0 as sizemin,
-                               d.sizemax / 60.0 as sizemax,
-                               d.constellation, d.dsotype,
-                               c.dsodetailid, c.catalogue, c.designation
-                        FROM cataloguenr c
-                        JOIN dsodetail d ON d.id = c.dsodetailid
-                        WHERE c.catalogue = ? AND c.designation LIKE ?
-                        ORDER BY CAST(c.designation AS INTEGER), c.designation
-                        LIMIT 20
-                    """, (catalogue, designation_part + "%"))
-                else:
-                    # Search across all catalogues
-                    cursor.execute("""
-                        SELECT c.catalogue || ' ' || c.designation as name,
-                               d.ra, d.dec, d.magnitude,
-                               d.sizemin / 60.0 as sizemin,
-                               d.sizemax / 60.0 as sizemax,
-                               d.constellation, d.dsotype,
-                               c.dsodetailid, c.catalogue, c.designation
-                        FROM cataloguenr c
-                        JOIN dsodetail d ON d.id = c.dsodetailid
-                        WHERE c.catalogue || ' ' || c.designation LIKE ?
-                        ORDER BY c.catalogue, CAST(c.designation AS INTEGER), c.designation
-                        LIMIT 20
-                    """, ("%" + text + "%",))
-
-                results = cursor.fetchall()
-                self._dso_cache.clear()
-                names = []
-                # One suggestion per object, with its common name; a common
-                # name typed in ("Andromeda") finds the object too
-                row_of = {str(row[8]): row for row in results}
-                for name, dso in suggestion_names(conn, [tuple(row)[8:11] for row in results], text):
-                    row = row_of[dso]
-                    names.append(name)
-                    self._dso_cache[name] = {
-                        "ra": row[1],
-                        "dec": row[2],
-                        "magnitude": row[3],
-                        "sizemin": row[4],
-                        "sizemax": row[5],
-                        "constellation": row[6],
-                        "dsotype": row[7],
-                    }
-
-                self._completer_model.setStringList(names)
-
-        except Exception as e:
-            logger.error(f"Error searching DSO catalog: {str(e)}")
-
-    def _on_dso_selected(self, text):
-        """Auto-fill fields when a DSO suggestion is selected"""
-        data = self._dso_cache.get(text)
-        if not data:
-            return
-
+    def _on_dso_selected(self, data):
+        """Fill in the picked suggestion's details (DSONames.search_catalog)"""
         self.type_edit.setText(type_name(data.get("dsotype")))
         self.constellation_edit.setText(data.get("constellation") or "")
 

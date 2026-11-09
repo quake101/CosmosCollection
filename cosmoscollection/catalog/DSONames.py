@@ -277,3 +277,49 @@ def suggestion_names(conn, rows, typed=""):
             seen.add(label)
             labels.append((label, dso))
     return labels
+
+
+# Catalogs searched by number when typed as a prefix ("M 3", "NGC70", "IC 13")
+SEARCH_PREFIXES = ("NGC", "IC", "M")
+
+_SEARCH_COLUMNS = """
+    SELECT c.dsodetailid, c.catalogue, c.designation, d.ra, d.dec, d.magnitude,
+           d.sizemin / 60.0, d.sizemax / 60.0, d.constellation, d.dsotype
+    FROM cataloguenr c
+    JOIN dsodetail d ON d.id = c.dsodetailid
+"""
+
+
+def search_catalog(conn, text, limit=20):
+    """Catalog objects for a name being typed, for a name completer:
+    [(label, details)] in order, one label per object (see suggestion_names).
+    details: dsodetailid, ra, dec (degrees), magnitude, sizemin, sizemax
+    (arcminutes), constellation, dsotype.
+
+    A catalog prefix with a number searches that catalog's numbers from the
+    start; anything else matches anywhere in any designation or common name."""
+    text = (text or "").strip()
+    catalogue = designation = None
+    upper = text.upper()
+    for prefix in SEARCH_PREFIXES:
+        remainder = upper[len(prefix):] if upper.startswith(prefix) else None
+        if remainder is not None and (remainder == "" or remainder[0] in " -" or remainder[0].isdigit()):
+            catalogue, designation = prefix, remainder.strip()
+            break
+
+    if catalogue:
+        rows = conn.execute(_SEARCH_COLUMNS + """
+            WHERE c.catalogue = ? AND c.designation LIKE ?
+            ORDER BY CAST(c.designation AS INTEGER), c.designation
+            LIMIT ?""", (catalogue, designation + "%", limit)).fetchall()
+    else:
+        rows = conn.execute(_SEARCH_COLUMNS + """
+            WHERE c.catalogue || ' ' || c.designation LIKE ?
+            ORDER BY c.catalogue, CAST(c.designation AS INTEGER), c.designation
+            LIMIT ?""", ("%" + text + "%", limit)).fetchall()
+
+    rows = [tuple(row) for row in rows]
+    details = {str(row[0]): dict(zip(("ra", "dec", "magnitude", "sizemin", "sizemax", "constellation", "dsotype"),
+                                     row[3:]), dsodetailid=row[0])
+               for row in rows}
+    return [(label, details[dso]) for label, dso in suggestion_names(conn, [row[:3] for row in rows], text)]

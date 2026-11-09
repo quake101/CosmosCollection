@@ -11,15 +11,14 @@ import threading
 from collections import Counter
 from datetime import datetime, date as date_cls, timedelta
 
-from PySide6.QtCore import (Qt, QDate, QDateTime, QEvent, QTime, QTimer, QPoint, Signal, QThread,
-                            QStringListModel)
+from PySide6.QtCore import Qt, QDate, QDateTime, QEvent, QTime, QTimer, QPoint, Signal, QThread
 from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QPen
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
                                QHeaderView, QTextEdit, QDialog, QComboBox,
                                QLineEdit, QCheckBox, QDateEdit, QTimeEdit, QMenu,
-                               QCompleter, QSplitter, QFormLayout, QRadioButton,
+                               QSplitter, QFormLayout, QRadioButton,
                                QListWidget, QListWidgetItem, QProgressDialog,
                                QTabWidget, QDateTimeEdit,
                                QSpinBox, QDoubleSpinBox, QFileDialog, QAbstractItemView,
@@ -31,10 +30,12 @@ from cosmoscollection.planning.MonthCalendars import LayeredMonthCalendar, Multi
 from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import format_dec, format_duration, format_exposure, format_ra
-from cosmoscollection.catalog.DSONames import display_name, suggestion_names
+from cosmoscollection.catalog.DSONames import display_name
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close, retire_thread
 from cosmoscollection.ui import DSOActions
+from cosmoscollection.ui.DSONameCompleter import DSONameCompleter
+from cosmoscollection.equipment.EquipmentManager import fill_telescope_combo
 from cosmoscollection.ui.TimeFormatHelper import format_time
 from cosmoscollection.ui.Theme import COLORS, font_px, themed_style
 from cosmoscollection.sessions import ImportSettings, MountDetection
@@ -292,18 +293,11 @@ class SessionFormWidget(QWidget):
         self.is_edit_mode = False
         self.session_id = None
         self.saved_session_data = None
-        self._dso_cache = {}
         self._ra_deg = None
         self._dec_deg = None
         self._target_id = None
         self._scanned_aggregate = None
         self._existing_aggregate = None
-
-        self._search_timer = QTimer()
-        self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(300)
-        self._search_timer.timeout.connect(self._do_dso_search)
-        self._pending_search_text = ""
 
         self._setup_ui()
         self.status_combo.setCurrentText(initial_status)
@@ -326,14 +320,8 @@ class SessionFormWidget(QWidget):
         name_row.addWidget(QLabel("DSO Name:"))
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("e.g., M 31, NGC 7000, IC 1396")
-        self._completer_model = QStringListModel()
-        self._completer = QCompleter()
-        self._completer.setModel(self._completer_model)
-        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self._completer.setFilterMode(Qt.MatchContains)
-        self.name_edit.setCompleter(self._completer)
-        self._completer.activated.connect(self._on_dso_selected)
-        self.name_edit.textChanged.connect(self._on_name_text_changed)
+        self.name_completer = DSONameCompleter(self.name_edit, self.db_manager)
+        self.name_completer.picked.connect(self._on_dso_selected)
         name_row.addWidget(self.name_edit)
         # For a session made from scanned files: "M 31" or "M 31 (Andromeda Galaxy)"
         self.common_name_check = QCheckBox("Add common name")
@@ -386,7 +374,7 @@ class SessionFormWidget(QWidget):
         telescope_row = QHBoxLayout()
         telescope_row.addWidget(QLabel("Telescope:"))
         self.telescope_combo = QComboBox()
-        self._populate_telescope_combo()
+        fill_telescope_combo(self.telescope_combo, self.db_manager)
         telescope_row.addWidget(self.telescope_combo, 1)
         equipment_layout.addLayout(telescope_row)
 
@@ -448,27 +436,6 @@ class SessionFormWidget(QWidget):
             text = "Detected (none yet)"
         self.mount_combo.setItemText(0, text)
 
-    def _populate_telescope_combo(self):
-        self.telescope_combo.clear()
-        self.telescope_combo.addItem("Any", None)
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT id, name, aperture, focal_length
-                    FROM usertelescopes WHERE is_active = 1 ORDER BY name
-                """)
-                for tel_id, name, aperture, focal_length in cursor.fetchall():
-                    if aperture and focal_length and aperture > 0:
-                        display_text = f"{name} ({int(aperture)}mm f/{focal_length / aperture:.1f})"
-                    elif aperture:
-                        display_text = f"{name} ({int(aperture)}mm)"
-                    else:
-                        display_text = name
-                    self.telescope_combo.addItem(display_text, tel_id)
-        except Exception as e:
-            logger.error(f"Error loading telescopes: {e}")
-
     def _populate_camera_combo(self):
         self.camera_combo.clear()
         try:
@@ -491,71 +458,8 @@ class SessionFormWidget(QWidget):
             logger.error(f"Error loading the equipment matches: {e}")
             return LibraryScanner.EquipmentInfo()
 
-    def _on_name_text_changed(self, text):
-        text = text.strip()
-        if len(text) < 2:
-            self._completer_model.setStringList([])
-            self._dso_cache.clear()
-            return
-        self._pending_search_text = text
-        self._search_timer.start()
-
-    def _do_dso_search(self):
-        if len(self._pending_search_text) < 2:
-            return
-        self._search_dso_catalog(self._pending_search_text)
-
-    def _search_dso_catalog(self, text):
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                catalogue = None
-                designation_part = None
-                text_upper = text.upper().strip()
-                for prefix in ("NGC", "IC", "M"):
-                    if text_upper.startswith(prefix):
-                        remainder = text_upper[len(prefix):]
-                        if remainder == "" or remainder[0] in (" ", "-") or remainder[0].isdigit():
-                            catalogue = prefix
-                            designation_part = remainder.strip()
-                            break
-
-                if catalogue and designation_part is not None:
-                    cursor.execute("""
-                        SELECT c.dsodetailid, c.catalogue, c.designation, d.ra, d.dec
-                        FROM cataloguenr c
-                        JOIN dsodetail d ON d.id = c.dsodetailid
-                        WHERE c.catalogue = ? AND c.designation LIKE ?
-                        ORDER BY CAST(c.designation AS INTEGER), c.designation
-                        LIMIT 20
-                    """, (catalogue, designation_part + "%"))
-                else:
-                    cursor.execute("""
-                        SELECT c.dsodetailid, c.catalogue, c.designation, d.ra, d.dec
-                        FROM cataloguenr c
-                        JOIN dsodetail d ON d.id = c.dsodetailid
-                        WHERE c.catalogue || ' ' || c.designation LIKE ?
-                        ORDER BY c.catalogue, CAST(c.designation AS INTEGER), c.designation
-                        LIMIT 20
-                    """, ("%" + text + "%",))
-
-                self._dso_cache.clear()
-                names = []
-                # One suggestion per object, with its common name; a common
-                # name typed in ("Andromeda") finds the object too
-                results = [tuple(row) for row in cursor.fetchall()]
-                position = {str(row[0]): row[3:5] for row in results}
-                for name, dso in suggestion_names(conn, [row[:3] for row in results], text):
-                    names.append(name)
-                    self._dso_cache[name] = {"ra": position[dso][0], "dec": position[dso][1]}
-                self._completer_model.setStringList(names)
-        except Exception as e:
-            logger.error(f"Error searching DSO catalog: {e}")
-
-    def _on_dso_selected(self, text):
-        data = self._dso_cache.get(text)
-        if not data:
-            return
+    def _on_dso_selected(self, data):
+        """The picked suggestion's position (DSONames.search_catalog)"""
         if data.get("ra") is not None:
             self._ra_deg = round(data["ra"], 6)
         if data.get("dec") is not None:
