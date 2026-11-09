@@ -8,16 +8,14 @@ Contains the centralized DSOVisibilityCalculator class for all visibility calcul
 
 import sys
 import os
-import calendar
 import matplotlib
 import numpy as np
-from datetime import datetime, date as date_cls, timedelta
-from PySide6.QtCore import Qt, QDate, QThread, Signal, QTimer, QEvent
+from datetime import datetime, timedelta
+from PySide6.QtCore import Qt, QDate, QThread, Signal, QTimer
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLineEdit, QLabel, QTextEdit,
-                               QDateEdit, QSpinBox, QGroupBox, QMessageBox, QCalendarWidget, QSizePolicy,
-                               QComboBox, QTableView, QSplitter)
-from PySide6.QtGui import QTextCharFormat, QColor
+                               QDateEdit, QSpinBox, QGroupBox, QMessageBox, QSizePolicy,
+                               QComboBox, QSplitter)
 
 matplotlib.use('Qt5Agg')
 
@@ -32,18 +30,17 @@ from matplotlib import ticker
 import matplotlib.pyplot as plt
 
 from astropy import units as u
-from astropy.time import Time
-from astropy.coordinates import SkyCoord, EarthLocation, AltAz, get_sun
+from astropy.coordinates import EarthLocation, AltAz, get_sun
 import pytz
 import warnings
 
 warnings.filterwarnings('ignore')
 
 from cosmoscollection.ui.Theme import (
-    COLORS, adapt_color, chart_background, chart_color, chart_font_size, contrast_text, font_size,
-    sky_shade, theme_manager, themed_style, tint,
+    COLORS, chart_background, chart_color, chart_font_size, font_size, sky_shade, theme_manager, themed_style,
 )
 from cosmoscollection.planning.Observer import active_site, coordinates_text
+from cosmoscollection.planning.MonthCalendars import MultiMonthCalendar, hours_legend_row
 from cosmoscollection.planning.NightTimes import compass_direction
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import format_duration
@@ -61,593 +58,40 @@ from cosmoscollection.planning.NightTimes import (  # noqa: E402
     ASTRONOMICAL_DARK_ALTITUDE, DARK_SKY_ALTITUDE, SKY_STATES, sky_state)
 
 
-def visibility_hours_to_color(hours):
-    """Map a day's visibility hours to (background, foreground) QColor pair.
-    Shared by VisibilityCalendar and SessionManager's calendar view so both use
-    the same 7-tier green->red scale rather than duplicating the thresholds."""
-    # Tier colors are adapted to the current theme (see Theme.tint); rank keeps
-    # the tiers in order in Night Vision, where the green-to-red hue is lost.
-    if hours >= 8:
-        base, rank = '#009600', 6
-    elif hours >= 6:
-        base, rank = '#007800', 5
-    elif hours >= 4:
-        base, rank = '#647800', 4
-    elif hours >= 2:
-        base, rank = '#966400', 3
-    elif hours >= 1:
-        base, rank = '#963c00', 2
-    elif hours > 0:
-        base, rank = '#782800', 1
-    else:
-        base, rank = '#500000', 0
-    background = tint(base, 0.8, rank=rank / 6)
-    return QColor(background), QColor(contrast_text(background))
-
-
-def no_visibility_data_colors():
-    """(background, foreground) for calendar days without visibility data."""
-    background = COLORS['background_lighter']
-    return QColor(background), QColor(adapt_color(COLORS['text_secondary'], background=background))
-
-
-class MonthlyVisibilityThread(QThread):
-    """Thread for calculating visibility hours (and moon illumination) for every
-    day in a date range, which may span 1-3 displayed calendar months. Modeled
-    on SessionManager.SessionMonthlyVisibilityThread, minus its location-override
-    params - this always uses the DB's default active location, same as
-    DSOVisibilityCalculator() with no args already does."""
-    progress = Signal(int, int)  # days completed, total days
-    # object, not two dicts: Signal(dict) marshals through QVariantMap across
-    # threads, which requires string keys and silently drops non-string keys
-    # (our keys are datetime.date objects) - same fix as SessionManager's
-    # equivalent thread.
-    finished = Signal(object)  # (visibility_hours_by_date, moon_illumination_by_date)
-    error = Signal(str)
-
-    def __init__(self, dso_coord, dso_name, start_date, end_date, min_altitude, ra_deg=None, dec_deg=None):
-        super().__init__()
-        self.dso_coord = dso_coord
-        self.dso_name = dso_name
-        self.start_date = start_date
-        self.end_date = end_date
-        self.min_altitude = min_altitude
-        self.ra_deg = ra_deg
-        self.dec_deg = dec_deg
-        self.calculator = DSOVisibilityCalculator()
-
-    def run(self):
-        """Calculate visibility and moon illumination for each day in the range"""
-        try:
-            if self.calculator.location is None:
-                self.error.emit("Observer location not configured.")
-                return
-
-            # Get coordinates if not already provided
-            if self.dso_coord is None:
-                if self.ra_deg is not None and self.dec_deg is not None:
-                    self.dso_coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
-                else:
-                    self.dso_coord, error = self.calculator.get_dso_coordinates_enhanced(self.dso_name)
-                    if self.dso_coord is None:
-                        self.error.emit(f"Could not find coordinates: {error}")
-                        return
-
-            visibility_hours = {}
-            moon_illumination = {}
-            total_days = (self.end_date - self.start_date).days + 1
-            current = self.start_date
-            completed = 0
-
-            while current <= self.end_date:
-                date_str = current.strftime("%Y-%m-%d")
-                hours = self.calculator.calculate_visibility_hours_for_day(
-                    self.dso_coord, date_str, self.min_altitude, horizon=self.calculator.horizon)
-                visibility_hours[current] = hours
-                moon_illumination[current] = DSOVisibilityCalculator.get_moon_illumination(
-                    Time(f"{date_str}T12:00:00"))
-                completed += 1
-                self.progress.emit(completed, total_days)
-                current += timedelta(days=1)
-
-            self.finished.emit((visibility_hours, moon_illumination))
-
-        except Exception as e:
-            self.error.emit(f"Calculation error: {str(e)}")
-
-
-class VisibilityCalendar(QCalendarWidget):
-    """One month of the DSO Visibility Calculator's calendar view. Combines two
-    independent, date-keyed layers on the same cells: DSO visibility hours
-    (background fill) and weather astro score (a stripe across the top, only
-    for the ~7 dates with a live forecast) - plus moon illumination, shown only
-    in the hover tooltip. Mirrors SessionManager.SessionMonthCalendar, minus the
-    session-marker dots that don't apply here."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.visibility_hours = {}    # date -> hours
-        self.weather_scores = {}      # date -> astro_score (0-100)
-        self.weather_details = {}     # date -> {"cloud_cover": float, "seeing": str}
-        self.moon_illumination = {}   # date -> fraction (0.0-1.0)
-        self.setGridVisible(True)
-        self.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
-        self.setSelectedDate(QDate.currentDate())
-        self.setMouseTracking(True)
-
-        self.tooltip_label = QLabel(self)
-        self.tooltip_label.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        themed_style(self.tooltip_label, lambda: f"""
-            QLabel {{
-                background-color: {COLORS['background_lighter']};
-                color: {COLORS['text']};
-                border: 1px solid {COLORS['border_light']};
-                border-radius: 3px;
-                padding: 4px 8px;
-                font-size: {font_size(10)};
-            }}
-        """)
-        self.tooltip_label.hide()
-
-        # QCalendarWidget renders its day grid via a private internal QTableView
-        # subclass - overriding mouseMoveEvent/leaveEvent on the QCalendarWidget
-        # itself never fires while hovering over day cells, since those mouse
-        # events are consumed by that internal view and don't propagate up to us.
-        # Install an event filter on the view's viewport instead, which is where
-        # the events actually land. (This replaces a previous implementation that
-        # called the non-existent QCalendarWidget.dateAt() and was silently dead
-        # code - see SessionManager.SessionMonthCalendar for the same fix.)
-        self._day_view = self.findChild(QTableView)
-        if self._day_view is not None:
-            self._day_view.setMouseTracking(True)
-            self._day_view.viewport().setMouseTracking(True)
-            self._day_view.viewport().installEventFilter(self)
-
-    def eventFilter(self, obj, event):
-        if self._day_view is not None and obj is self._day_view.viewport():
-            if event.type() == QEvent.Type.MouseMove:
-                py_date = self._date_from_view_pos(event.pos())
-                self._show_tooltip_for_date(py_date, self._day_view.viewport().mapToGlobal(event.pos()))
-            elif event.type() == QEvent.Type.Leave:
-                self.tooltip_label.hide()
-        return super().eventFilter(obj, event)
-
-    def _date_from_view_pos(self, pos_in_view):
-        """QCalendarWidget has no public dateAt()/similar for this - its day grid
-        is rendered by an internal QTableView whose model is private/undocumented.
-        Resolve the date ourselves from the cell's (row, col) instead: the model's
-        row 0 is a non-clickable weekday-name header, so the real day grid starts
-        at row 1, which is always firstDayOfWeek()-aligned - walk backward from
-        the 1st of the shown month by however many leading days that needs."""
-        index = self._day_view.indexAt(pos_in_view)
-        if not index.isValid() or index.row() < 1:
-            return None
-        first_of_month = date_cls(self.yearShown(), self.monthShown(), 1)
-        qt_first_day = self.firstDayOfWeek().value  # Qt.Monday=1 .. Qt.Sunday=7
-        first_weekday = first_of_month.isoweekday()  # Python: Monday=1 .. Sunday=7
-        # Qt always shows at least one full leading week from the previous month,
-        # even when the 1st already falls exactly on the configured first day of
-        # the week - so this must land in [1, 7], never 0.
-        leading_days = ((first_weekday - qt_first_day - 1) % 7) + 1
-        first_visible_date = first_of_month - timedelta(days=leading_days)
-        cell_offset = (index.row() - 1) * 7 + index.column()
-        return first_visible_date + timedelta(days=cell_offset)
-
-    def set_data(self, visibility_hours=None, weather_scores=None, weather_details=None, moon_illumination=None):
-        """Update one or more data layers and repaint. Any layer left as None
-        (the default) keeps its current values."""
-        if visibility_hours is not None:
-            self.visibility_hours = visibility_hours
-        if weather_scores is not None:
-            self.weather_scores = weather_scores
-        if weather_details is not None:
-            self.weather_details = weather_details
-        if moon_illumination is not None:
-            self.moon_illumination = moon_illumination
-        self.updateCells()
-        self.update()
-
-    def clear_visibility(self):
-        """Clear the visibility-hours and moon-illumination layers (both computed
-        together by MonthlyVisibilityThread). Weather clears independently on its
-        own refresh cycle."""
-        self.visibility_hours = {}
-        self.moon_illumination = {}
-        self.tooltip_label.hide()
-        self.updateCells()
-        self.update()
-
-    def get_color_for_hours(self, hours):
-        """Get background and foreground colors for given visibility hours"""
-        return visibility_hours_to_color(hours)
-
-    def paintCell(self, painter, rect, date):
-        """Override to paint custom cell backgrounds"""
-        from PySide6.QtGui import QPen, QBrush
-        from cosmoscollection.planning.WeatherForecast import get_rating_color
-
-        # Check if this date is in the current month
-        if date.month() != self.monthShown() or date.year() != self.yearShown():
-            # Default painting for dates outside current month (grayed out)
-            super().paintCell(painter, rect, date)
-            return
-
-        py_date = date.toPython()
-
-        # Determine colors based on visibility data
-        if py_date in self.visibility_hours:
-            bg_color, fg_color = self.get_color_for_hours(self.visibility_hours[py_date])
-        else:
-            bg_color, fg_color = no_visibility_data_colors()
-
-        # Fill background
-        painter.fillRect(rect, QBrush(bg_color))
-
-        # Weather stripe across the top, only present for the ~7 forecast days
-        weather_score = self.weather_scores.get(py_date)
-        if weather_score is not None:
-            stripe_rect = rect.adjusted(0, 0, 0, -(rect.height() - 6))
-            painter.fillRect(stripe_rect, QBrush(QColor(get_rating_color(weather_score))))
-
-        # Draw text
-        painter.setPen(QPen(fg_color))
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(date.day()))
-
-        # Draw selection/today highlight
-        if date == self.selectedDate():
-            painter.setPen(QPen(QColor(COLORS['warning']), 2))
-            painter.drawRect(rect.adjusted(1, 1, -1, -1))
-        elif py_date == date_cls.today():
-            painter.setPen(QPen(QColor(COLORS['text']), 1))
-            painter.drawRect(rect.adjusted(1, 1, -1, -1))
-
-    def leaveEvent(self, event):
-        """Hide tooltip when mouse leaves the calendar"""
-        super().leaveEvent(event)
-        self.tooltip_label.hide()
-
-    def _show_tooltip_for_date(self, py_date, global_pos):
-        """py_date is a plain datetime.date (or None); global_pos is the screen
-        position to anchor the tooltip near."""
-        from cosmoscollection.planning.WeatherFetch import get_rating_label
-
-        if py_date is None or py_date.month != self.monthShown() or py_date.year != self.yearShown():
-            self.tooltip_label.hide()
-            return
-
-        lines = []
-        if py_date in self.visibility_hours:
-            lines.append(f"{self.visibility_hours[py_date]:.1f}h visible")
-        if py_date in self.moon_illumination:
-            lines.append(f"Moon: {self.moon_illumination[py_date] * 100:.0f}% illuminated")
-        if py_date in self.weather_scores:
-            score = self.weather_scores[py_date]
-            weather_line = f"Weather: {score}/100 ({get_rating_label(score)})"
-            detail = self.weather_details.get(py_date)
-            if detail:
-                if detail.get("cloud_cover") is not None:
-                    weather_line += f", {detail['cloud_cover']:.0f}% clouds"
-                if detail.get("seeing"):
-                    weather_line += f", seeing {detail['seeing']}"
-            lines.append(weather_line)
-
-        if not lines:
-            self.tooltip_label.hide()
-            return
-
-        self.tooltip_label.setText("\n".join(lines))
-        self.tooltip_label.adjustSize()
-        self.tooltip_label.move(global_pos.x() + 15, global_pos.y() + 15)
-        self.tooltip_label.show()
-        self.tooltip_label.raise_()
-
-
-class MultiMonthVisibilityCalendar(QWidget):
-    """1-3 side-by-side VisibilityCalendar instances kept chronologically
-    chained, with a DSO-visibility layer for whichever DSO was last calculated
-    and a weather layer for the app's default active location. Modeled on
-    SessionManager.SessionCalendarWidget, minus session markers and the
-    per-session location override (there's no "session" concept here - just
-    whatever DSO the user last calculated, always against the default location,
-    same as the rest of this file)."""
+class MultiMonthVisibilityCalendar(MultiMonthCalendar):
+    """The calculator's calendar: the visibility of the object last calculated
+    (with the moon's illumination) at the active location, and its weather."""
 
     MONTH_COUNT_SETTING = "dso_visibility_calendar_month_count"
+    CALENDAR_MAX_HEIGHT = 250
 
     def __init__(self, parent=None):
+        self._request = None  # MonthlyVisibilityThread arguments for the object
         super().__init__(parent)
-        self.calendars = []
-        self._dso_coord = None
-        self._dso_name = None
-        self._ra_deg = None
-        self._dec_deg = None
-        self._min_altitude = 30
-        self.on_date_clicked = None  # callable(date), set by the owning window
-        self._weather_worker = None
-        self._visibility_thread = None
 
-        today = QDate.currentDate()
-        self.anchor_year, self.anchor_month = today.year(), today.month()
-        self.month_count = self._load_month_count()
+    def _add_above_calendars(self, layout):
+        layout.addLayout(hours_legend_row())
 
-        layout = QVBoxLayout(self)
-        layout.addLayout(self._build_controls())
-        layout.addLayout(self._build_hours_legend())
-
-        self.calendars_layout = QHBoxLayout()
-        layout.addLayout(self.calendars_layout, 1)
-
+    def _add_below_calendars(self, layout):
         self.status_label = QLabel("Select a DSO and calculate to see monthly visibility")
         themed_style(self.status_label, lambda: f"color: {COLORS['text_secondary']}; font-style: italic;")
         layout.addWidget(self.status_label)
 
-        self._rebuild_calendars()
+    def _visibility_status(self, text):
+        self.status_label.setText(text)
 
-    def _build_controls(self):
-        row = QHBoxLayout()
+    def _weather_location(self):
+        site = DSOVisibilityCalculator.saved_site()
+        return (site.lat, site.lon, site.timezone or 'UTC') if site else None
 
-        row.addWidget(QLabel("Months:"))
-        self.month_count_combo = QComboBox()
-        self.month_count_combo.addItems(["1 Month", "2 Months", "3 Months"])
-        self.month_count_combo.setCurrentIndex(self.month_count - 1)
-        self.month_count_combo.currentIndexChanged.connect(self._on_month_count_changed)
-        row.addWidget(self.month_count_combo)
-
-        prev_btn = QPushButton("◀ Previous")
-        prev_btn.clicked.connect(self._go_previous)
-        row.addWidget(prev_btn)
-
-        next_btn = QPushButton("Next ▶")
-        next_btn.clicked.connect(self._go_next)
-        row.addWidget(next_btn)
-
-        row.addStretch()
-
-        row.addWidget(QLabel("Weather (top stripe):"))
-        for label, color_key in (
-            ("Excellent", 'success'), ("Good", 'info'),
-            ("Moderate", 'warning'), ("Poor", 'error'),
-        ):
-            swatch = QLabel()
-            swatch.setFixedSize(12, 12)
-            themed_style(swatch, lambda color_key=color_key: f"background-color: {COLORS[color_key]}; border: 1px solid {COLORS['border']};")
-            row.addWidget(swatch)
-            row.addWidget(QLabel(label))
-
-        return row
-
-    def _build_hours_legend(self):
-        row = QHBoxLayout()
-        # (label, representative hours) - colors come from the calendar's scale
-        legend_labels = [
-            ("8+ hrs", 8), ("6-8 hrs", 6), ("4-6 hrs", 4), ("2-4 hrs", 2),
-            ("1-2 hrs", 1), ("<1 hr", 0.5), ("None", 0),
-        ]
-        for text, hours in legend_labels:
-            bg_color, fg_color = visibility_hours_to_color(hours)
-            legend_label = QLabel(text)
-            legend_label.setStyleSheet(
-                f"background-color: {bg_color.name()}; color: {fg_color.name()}; "
-                "padding: 3px; border-radius: 2px;")
-            row.addWidget(legend_label)
-        row.addStretch()
-        return row
-
-    def _load_month_count(self):
-        settings = app_settings()
-        return max(1, min(3, settings.value(self.MONTH_COUNT_SETTING, 1, type=int)))
-
-    def _save_month_count(self, count):
-        settings = app_settings()
-        settings.setValue(self.MONTH_COUNT_SETTING, count)
-
-    def _on_month_count_changed(self, index):
-        self.month_count = index + 1
-        self._save_month_count(self.month_count)
-        self._rebuild_calendars()
-
-    @staticmethod
-    def _next_month(year, month):
-        return (year + 1, 1) if month == 12 else (year, month + 1)
-
-    @staticmethod
-    def _prev_month(year, month):
-        return (year - 1, 12) if month == 1 else (year, month - 1)
-
-    def _display_range(self):
-        start = date_cls(self.anchor_year, self.anchor_month, 1)
-        last_year, last_month = self.anchor_year, self.anchor_month
-        for _ in range(self.month_count - 1):
-            last_year, last_month = self._next_month(last_year, last_month)
-        last_day = calendar.monthrange(last_year, last_month)[1]
-        end = date_cls(last_year, last_month, last_day)
-        return start, end
-
-    def _rebuild_calendars(self):
-        for cal in self.calendars:
-            cal.setParent(None)
-            cal.deleteLater()
-        self.calendars = []
-
-        while self.calendars_layout.count():
-            self.calendars_layout.takeAt(0)
-
-        year, month = self.anchor_year, self.anchor_month
-        for i in range(self.month_count):
-            cal = VisibilityCalendar()
-            cal.setMaximumHeight(250)
-            cal.setCurrentPage(year, month)
-            if i == 0:
-                cal.currentPageChanged.connect(self._on_calendar0_page_changed)
-            else:
-                cal.setNavigationBarVisible(False)
-            cal.clicked.connect(self._on_date_clicked)
-            self.calendars_layout.addWidget(cal)
-            self.calendars.append(cal)
-            year, month = self._next_month(year, month)
-
-        self._trigger_recalculation()
-
-    def _set_anchor(self, year, month):
-        self.anchor_year, self.anchor_month = year, month
-        y, m = year, month
-        for cal in self.calendars:
-            cal.blockSignals(True)
-            cal.setCurrentPage(y, m)
-            cal.blockSignals(False)
-            y, m = self._next_month(y, m)
-        self._trigger_recalculation()
-
-    def _on_calendar0_page_changed(self, year, month):
-        self._set_anchor(year, month)
-
-    def _go_previous(self):
-        year, month = self._prev_month(self.anchor_year, self.anchor_month)
-        self._set_anchor(year, month)
-
-    def _go_next(self):
-        year, month = self._next_month(self.anchor_year, self.anchor_month)
-        self._set_anchor(year, month)
-
-    def _on_date_clicked(self, qdate):
-        if self.on_date_clicked:
-            self.on_date_clicked(qdate)
-
-    def show_date(self, qdate):
-        """Box qdate as the selected day (the one the graph shows), turning the
-        pages to it if it's not in the months shown"""
-        if not qdate.isValid():
-            return
-        start, end = self._display_range()
-        if not start <= qdate.toPython() <= end:
-            self._set_anchor(qdate.year(), qdate.month())
-        # Every month gets the date; only the one it falls in draws the box.
-        # Selecting turns a calendar's page to the date, so turn it back.
-        year, month = self.anchor_year, self.anchor_month
-        for cal in self.calendars:
-            cal.blockSignals(True)
-            cal.setSelectedDate(qdate)
-            cal.setCurrentPage(year, month)
-            cal.blockSignals(False)
-            cal.update()
-            year, month = self._next_month(year, month)
-
-    def _trigger_recalculation(self):
-        self._refresh_weather_layer()
-        self._refresh_visibility_layer()
+    def _visibility_request(self):
+        return self._request
 
     def set_dso(self, dso_coord, dso_name, ra_deg=None, dec_deg=None, min_altitude=30):
-        """Set the DSO to show visibility for and (re)start the calculation."""
-        self._dso_coord = dso_coord
-        self._dso_name = dso_name
-        self._ra_deg = ra_deg
-        self._dec_deg = dec_deg
-        self._min_altitude = min_altitude
+        """Show the visibility of this object, (re)starting the calculation."""
+        self._request = dict(dso_coord=dso_coord, dso_name=dso_name, ra_deg=ra_deg, dec_deg=dec_deg,
+                             min_altitude=min_altitude, with_moon=True)
         self._refresh_visibility_layer()
-
-    def _refresh_visibility_layer(self):
-        if self._dso_coord is None and self._dso_name is None:
-            for cal in self.calendars:
-                cal.clear_visibility()
-            return
-
-        # Never replace a still-running thread's reference - PySide6 can hard-crash
-        # (native, uncatchable) if a QThread object is garbage-collected while its
-        # underlying OS thread is still executing.
-        if self._visibility_thread and self._visibility_thread.isRunning():
-            self._visibility_thread.quit()
-            self._visibility_thread.wait()
-
-        start_date, end_date = self._display_range()
-
-        for cal in self.calendars:
-            cal.clear_visibility()
-        dso_label = self._dso_name or "DSO"
-        self.status_label.setText(f"Calculating monthly visibility for {dso_label}...")
-
-        self._visibility_thread = MonthlyVisibilityThread(
-            self._dso_coord, self._dso_name, start_date, end_date, self._min_altitude,
-            self._ra_deg, self._dec_deg)
-        self._visibility_thread.progress.connect(self._on_visibility_progress)
-        self._visibility_thread.finished.connect(self._on_visibility_finished)
-        self._visibility_thread.error.connect(self._on_visibility_error)
-        self._visibility_thread.start()
-
-    def _on_visibility_progress(self, completed, total):
-        dso_label = self._dso_name or "DSO"
-        self.status_label.setText(f"Calculating {dso_label}: {completed}/{total} days...")
-
-    def _on_visibility_finished(self, payload):
-        hours_by_date, moon_by_date = payload
-        for cal in self.calendars:
-            cal.set_data(visibility_hours=hours_by_date, moon_illumination=moon_by_date)
-        dso_label = self._dso_name or "DSO"
-        self.status_label.setText(f"Monthly visibility for {dso_label} (hover a day for details)")
-
-    def _on_visibility_error(self, error_msg):
-        self.status_label.setText(f"Error: {error_msg}")
-
-    def _refresh_weather_layer(self):
-        calc = DSOVisibilityCalculator()
-        if calc.location is None:
-            self._apply_weather_scores({}, {})
-            return
-
-        lat = calc.location.lat.deg
-        lon = calc.location.lon.deg
-        tz = getattr(calc.timezone, 'zone', 'UTC')
-
-        from cosmoscollection.planning.WeatherForecast import WeatherCache, WeatherWorker
-
-        cache = WeatherCache()
-        cached = cache.get(lat, lon)
-        if cached:
-            self._apply_weather_list(cached)
-            return
-
-        if self._weather_worker and self._weather_worker.isRunning():
-            self._weather_worker.quit()
-            self._weather_worker.wait()
-
-        self._weather_worker = WeatherWorker(lat, lon, tz)
-        self._weather_worker.weather_loaded.connect(lambda data: self._on_weather_loaded(data, lat, lon))
-        self._weather_worker.error_occurred.connect(
-            lambda msg: logger.debug(f"Calendar weather fetch failed: {msg}")
-        )
-        self._weather_worker.start()
-
-    def _on_weather_loaded(self, data, lat, lon):
-        from cosmoscollection.planning.WeatherForecast import WeatherCache
-        WeatherCache().set(lat, lon, data)
-        self._apply_weather_list(data)
-
-    def _apply_weather_list(self, daily_summaries):
-        scores = {}
-        details = {}
-        for summary in daily_summaries:
-            d = summary.date.date()
-            scores[d] = summary.astro_score
-            details[d] = {
-                "cloud_cover": summary.tonight_avg_cloud_cover,
-                "seeing": summary.seeing_estimate,
-            }
-        self._apply_weather_scores(scores, details)
-
-    def _apply_weather_scores(self, scores, details=None):
-        details = details if details is not None else {}
-        for cal in self.calendars:
-            cal.set_data(weather_scores=scores, weather_details=details)
-
-    def shutdown(self):
-        """Stop any running background threads - call from the owning window's closeEvent."""
-        if self._visibility_thread and self._visibility_thread.isRunning():
-            self._visibility_thread.quit()
-            self._visibility_thread.wait()
-        if self._weather_worker and self._weather_worker.isRunning():
-            self._weather_worker.quit()
-            self._weather_worker.wait()
-        for cal in self.calendars:
-            cal.tooltip_label.hide()
-            cal.tooltip_label.destroy()
 
 
 GRAPH_POINTS_PER_HOUR = 12  # The calculator's graph: a point every 5 minutes

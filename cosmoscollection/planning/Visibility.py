@@ -54,7 +54,7 @@ class DSOVisibilityCalculator:
         if location_lat is not None and location_lon is not None:
             self.set_location(location_lat, location_lon, height)
         else:
-            site = self._saved_site()
+            site = self.saved_site()
             if site is not None:
                 self.set_location(site.lat, site.lon, height)
                 from cosmoscollection.planning.HorizonProfile import load_active_horizon
@@ -63,7 +63,7 @@ class DSOVisibilityCalculator:
         if timezone:
             self.set_timezone(timezone)
         else:
-            site = site or self._saved_site()
+            site = site or self.saved_site()
             if site is not None and site.timezone:
                 self.set_timezone(site.timezone)
 
@@ -79,7 +79,7 @@ class DSOVisibilityCalculator:
             self.timezone = pytz.UTC
 
     @staticmethod
-    def _saved_site():
+    def saved_site():
         """The active saved location (Observer.active_site), or None."""
         try:
             with DatabaseManager().get_connection() as conn:

@@ -229,12 +229,42 @@ class WeatherWorker(QThread):
             self.error_occurred.emit(f"Error: {str(e)}")
 
 
-_RATING_COLORS = {"Excellent": "success", "Good": "info", "Moderate": "warning", "Poor": "error"}
+class SharedWeatherFetch:
+    """At most one WeatherWorker per location, shared by everything waiting for
+    that forecast (e.g. the Session Manager's calendar and details panel). A
+    running worker is referenced here until it ends (see
+    WindowLifetime.retire_thread for why), and its result is cached before the
+    callbacks run. Callbacks check that they still want the result."""
+
+    _workers = {}  # (lat, lon) rounded -> running WeatherWorker
+
+    @classmethod
+    def key(cls, lat, lon):
+        return round(float(lat), 2), round(float(lon), 2)
+
+    @classmethod
+    def request(cls, lat, lon, timezone, on_loaded, on_error):
+        key = cls.key(lat, lon)
+        worker = cls._workers.get(key)
+        is_new = worker is None or not worker.isRunning()
+        if is_new:
+            worker = WeatherWorker(lat, lon, timezone)
+            worker.weather_loaded.connect(lambda data: WeatherCache().set(lat, lon, data))
+            worker.finished.connect(lambda w=worker: cls._workers.pop(key, None) if cls._workers.get(key) is w else None)
+            cls._workers[key] = worker
+        worker.weather_loaded.connect(on_loaded)
+        worker.error_occurred.connect(on_error)
+        if is_new:
+            worker.start()
+
+
+# Theme color of each WeatherFetch.RATINGS label
+RATING_COLOR_KEYS = {"Excellent": "success", "Good": "info", "Moderate": "warning", "Poor": "error"}
 
 
 def get_rating_color(score: int) -> str:
     """The theme color of an astro score's rating (WeatherFetch.get_rating_label)."""
-    return COLORS[_RATING_COLORS[get_rating_label(score)]]
+    return COLORS[RATING_COLOR_KEYS[get_rating_label(score)]]
 
 
 class DayWeatherCard(QFrame):
