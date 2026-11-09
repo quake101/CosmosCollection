@@ -21,6 +21,7 @@ from astropy.time import Time
 
 from cosmoscollection.core.OnlineLimits import OFFLINE_NOTE, is_offline
 from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.planning.NightTimes import DARK_SKY_ALTITUDE
 
 logger = logging.getLogger(__name__)
 
@@ -866,7 +867,7 @@ class WeatherFetch:
 
             # Build "tonight" hours: evening dark hours of this day + morning dark hours of next day
             next_hours = daily_data[sorted_dates[date_idx + 1]] if date_idx + 1 < len(sorted_dates) else None
-            tonight_hours = [h for h in night_hours(hours, next_hours) if sun_alt_map.get(h.time, 0) < -12]
+            tonight_hours = [h for h in night_hours(hours, next_hours) if sun_alt_map.get(h.time, 0) < DARK_SKY_ALTITUDE]
 
             # Determine dark hours start and end times
             dark_start = tonight_hours[0].time if tonight_hours else None
@@ -1155,16 +1156,13 @@ def estimate_seeing(humidity: float, wind_speed: float, temp_dew_spread: float,
         return "Poor"
 
 
+# (lowest astro score, rating) from best to worst
+RATINGS = ((80, "Excellent"), (60, "Good"), (40, "Moderate"), (None, "Poor"))
+
+
 def get_rating_label(score: int) -> str:
-    """Get label based on astro score"""
-    if score >= 80:
-        return "Excellent"
-    elif score >= 60:
-        return "Good"
-    elif score >= 40:
-        return "Moderate"
-    else:
-        return "Poor"
+    """'Excellent', 'Good', 'Moderate' or 'Poor' for an astro score (RATINGS)."""
+    return next(label for lowest, label in RATINGS if lowest is None or score >= lowest)
 
 
 def weather_units():
@@ -1278,7 +1276,6 @@ def calculate_moon_phase(date: datetime, timezone: str = None) -> MoonPhaseData:
     Returns:
         MoonPhaseData with phase angle, illumination, name, and emoji
     """
-    import numpy as np
     from astropy.coordinates import GeocentricTrueEcliptic
 
     # Convert local midnight to UTC if timezone is provided
@@ -1304,10 +1301,9 @@ def calculate_moon_phase(date: datetime, timezone: str = None) -> MoonPhaseData:
     elongation = sun.separation(moon)
     phase_angle = elongation.deg
 
-    # Calculate illumination fraction
-    # Illumination = (1 - cos(elongation)) / 2
-    # This gives 0% at new moon (0°) and 100% at full moon (180°)
-    illumination = (1 - np.cos(elongation.rad)) / 2 * 100
+    # Lit share: 0% at new moon (0°), 100% at full moon (180°)
+    from cosmoscollection.planning.Visibility import DSOVisibilityCalculator
+    illumination = DSOVisibilityCalculator.get_moon_illumination(obs_time, sun, moon) * 100
 
     # Determine if waxing or waning by comparing ecliptic longitudes
     # Moon is waxing when its ecliptic longitude is ahead of (greater than) the sun's

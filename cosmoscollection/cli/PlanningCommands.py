@@ -510,6 +510,7 @@ def run_weather(ctx):
     from cosmoscollection.cli.LibraryCommands import Progress
     from cosmoscollection.planning.WeatherFetch import (WeatherFetch, WeatherUnavailable, calculate_sun_altitudes,
                                                         get_rating_label, night_hours, weather_units)
+    from cosmoscollection.planning.NightTimes import DARK_SKY_ALTITUDE
 
     args = ctx.args
     if args.days < 1:
@@ -566,7 +567,7 @@ def run_weather(ctx):
         if hourly_index is not None:
             data["hourly"] = {"date": summaries[hourly_index].date.date().isoformat(), "hours": [
                 {"time": h.time.isoformat(timespec="minutes"), "astro_score": _hour_score(h),
-                 "dark": altitude < -12, "cloud_cover": round(h.cloud_cover), "cloud_low": round(h.cloud_cover_low),
+                 "dark": altitude < DARK_SKY_ALTITUDE, "cloud_cover": round(h.cloud_cover), "cloud_low": round(h.cloud_cover_low),
                  "cloud_mid": round(h.cloud_cover_mid), "cloud_high": round(h.cloud_cover_high),
                  "humidity": round(h.humidity), "wind_kmh": round(h.wind_speed, 1),
                  "gusts_kmh": round(h.wind_gusts, 1), "precipitation_probability": round(h.precipitation_probability),
@@ -607,7 +608,7 @@ def run_weather(ctx):
     rows = list(zip(hours, sun))
     print_table(rows, [
         Column("Time", lambda r: _clock(r[0].time), ">"),
-        Column("Dark", lambda r: "dark" if r[1] < -12 else ""),
+        Column("Dark", lambda r: "dark" if r[1] < DARK_SKY_ALTITUDE else ""),
         Column("Score", lambda r: _hour_score(r[0]), ">"),
         Column("Clouds", lambda r: f"{r[0].cloud_cover:.0f}%", ">"),
         Column("Low/mid/high", lambda r: f"{r[0].cloud_cover_low:.0f}/{r[0].cloud_cover_mid:.0f}/"

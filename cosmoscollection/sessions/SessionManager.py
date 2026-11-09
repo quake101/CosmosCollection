@@ -2794,7 +2794,7 @@ class VisibilityCalcThread(QThread):
 
     def run(self):
         try:
-            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityCalculator
+            from cosmoscollection.planning.Visibility import DSOVisibilityCalculator
             from astropy.coordinates import SkyCoord
             from astropy import units as u
             import pytz
@@ -2887,7 +2887,7 @@ class SessionMonthlyVisibilityThread(QThread):
 
     def run(self):
         try:
-            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityCalculator
+            from cosmoscollection.planning.Visibility import DSOVisibilityCalculator
             from astropy.coordinates import SkyCoord
             from astropy import units as u
             from datetime import timedelta
@@ -3090,7 +3090,7 @@ class SessionMonthCalendar(QCalendarWidget):
     def _show_tooltip_for_date(self, py_date, global_pos):
         """py_date is a plain datetime.date (or None); global_pos is the screen
         position to anchor the tooltip near."""
-        from cosmoscollection.planning.WeatherForecast import get_rating_label
+        from cosmoscollection.planning.WeatherFetch import get_rating_label
 
         if py_date is None or py_date.month != self.monthShown() or py_date.year != self.yearShown():
             self.tooltip_label.hide()
@@ -4073,7 +4073,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
             pass
 
     def _apply_weather_summary(self, day_summary):
-        from cosmoscollection.planning.WeatherForecast import get_rating_label
+        from cosmoscollection.planning.WeatherFetch import get_rating_label
         lines = [
             f"Astro score: {day_summary.astro_score}/100 ({get_rating_label(day_summary.astro_score)})",
             f"Avg cloud cover tonight: {day_summary.tonight_avg_cloud_cover:.0f}%",

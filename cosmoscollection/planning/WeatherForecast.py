@@ -45,6 +45,7 @@ from cosmoscollection.ui.Theme import COLORS, chart_background, chart_font_size,
 from cosmoscollection.ui.TimeFormatHelper import format_time, format_datetime, get_time_format_24h
 from cosmoscollection.core.UrlOpener import open_url
 from cosmoscollection.core.OnlineLimits import OFFLINE_NOTE, is_offline
+from cosmoscollection.planning.NightTimes import DARK_SKY_ALTITUDE, sky_state
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -228,16 +229,12 @@ class WeatherWorker(QThread):
             self.error_occurred.emit(f"Error: {str(e)}")
 
 
+_RATING_COLORS = {"Excellent": "success", "Good": "info", "Moderate": "warning", "Poor": "error"}
+
+
 def get_rating_color(score: int) -> str:
-    """Get color based on astro score"""
-    if score >= 80:
-        return COLORS['success']  # Green
-    elif score >= 60:
-        return COLORS['info']  # Blue
-    elif score >= 40:
-        return COLORS['warning']  # Yellow
-    else:
-        return COLORS['error']  # Red
+    """The theme color of an astro score's rating (WeatherFetch.get_rating_label)."""
+    return COLORS[_RATING_COLORS[get_rating_label(score)]]
 
 
 class DayWeatherCard(QFrame):
@@ -464,35 +461,13 @@ class HourlyAstroChart(FigureCanvas):
         self.draw()
 
     def _add_darkness_shading(self, num_hours: int):
-        """Add background shading to show darkness levels based on sun altitude.
-
-        Colors represent (matching DSO Visibility Calculator):
-        - Daylight (sun > 0°): No shading (default background)
-        - Civil twilight (0° to -6°): Light shade
-        - Nautical twilight (-6° to -12°): Medium shade
-        - Astronomical twilight (-12° to -18°): Dark shade
-        - Night (< -18°): Darkest shade
-        """
+        """Shade each hour's column by how dark the sky is (NightTimes.SKY_STATES,
+        as the DSO Visibility Calculator shades its chart)."""
         if not self.sun_altitudes or len(self.sun_altitudes) != num_hours:
             return
-
-        # Sun altitude thresholds and theme shades
-        # Format: (sun_max, sun_min, (color, alpha))
-        darkness_levels = [
-            (90, 0, sky_shade('day')),
-            (0, -6, sky_shade('civil')),
-            (-6, -12, sky_shade('nautical')),
-            (-12, -18, sky_shade('astronomical')),
-            (-18, -90, sky_shade('night')),
-        ]
-
-        # For each hour, shade based on its sun altitude
         for i, sun_alt in enumerate(self.sun_altitudes):
-            for sun_max, sun_min, (color, alpha) in darkness_levels:
-                if sun_alt <= sun_max and sun_alt > sun_min:
-                    # Shade this bar's column
-                    self.ax.axvspan(i - 0.5, i + 0.5, facecolor=color, alpha=alpha, zorder=0)
-                    break  # Only apply one darkness level per hour
+            color, alpha = sky_shade(sky_state(sun_alt)[0])
+            self.ax.axvspan(i - 0.5, i + 0.5, facecolor=color, alpha=alpha, zorder=0)
 
     def _on_mouse_move(self, event):
         """Handle mouse movement to detect bar hover"""
@@ -752,7 +727,7 @@ class DayDetailDialog(WindowPositionMixin, QDialog):
             if self.lat is not None and self.lon is not None:
                 sun_alts = self._get_sun_altitudes(all_night_hours)
                 if sun_alts:
-                    dark_hours = [h for h, alt in zip(all_night_hours, sun_alts) if alt < -12]
+                    dark_hours = [h for h, alt in zip(all_night_hours, sun_alts) if alt < DARK_SKY_ALTITUDE]
                     if dark_hours:
                         return dark_hours
 

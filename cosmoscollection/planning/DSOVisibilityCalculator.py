@@ -57,6 +57,8 @@ from cosmoscollection.ui.TimeFormatHelper import format_time
 
 
 from cosmoscollection.planning.Visibility import DSOVisibilityCalculator  # noqa: E402,F401
+from cosmoscollection.planning.NightTimes import (  # noqa: E402
+    ASTRONOMICAL_DARK_ALTITUDE, DARK_SKY_ALTITUDE, SKY_STATES, sky_state)
 
 
 def visibility_hours_to_color(hours):
@@ -307,7 +309,7 @@ class VisibilityCalendar(QCalendarWidget):
     def _show_tooltip_for_date(self, py_date, global_pos):
         """py_date is a plain datetime.date (or None); global_pos is the screen
         position to anchor the tooltip near."""
-        from cosmoscollection.planning.WeatherForecast import get_rating_label
+        from cosmoscollection.planning.WeatherFetch import get_rating_label
 
         if py_date is None or py_date.month != self.monthShown() or py_date.year != self.yearShown():
             self.tooltip_label.hide()
@@ -821,31 +823,15 @@ class VisibilityPlot(FigureCanvas):
             self.plot_visibility(self._last_results, keep_view=True)
 
     def _add_darkness_shading(self, ax, hours_from_start, sun_altitudes):
-        """Add background shading to show darkness levels based on sun altitude.
-
-        Colors represent:
-        - Daylight (sun > 0°): No shading (default background)
-        - Civil twilight (0° to -6°): Light shade
-        - Nautical twilight (-6° to -12°): Medium shade
-        - Astronomical twilight (-12° to -18°): Dark shade
-        - Night (< -18°): Darkest shade
-        """
-        # Darkness thresholds and theme shades (from lightest to darkest)
-        # Format: (sun_max, sun_min, (color, alpha))
-        darkness_levels = [
-            (0, -6, sky_shade('civil')),
-            (-6, -12, sky_shade('nautical')),
-            (-12, -18, sky_shade('astronomical')),
-            (-18, -90, sky_shade('night')),
-        ]
-
-        # For each darkness level, find and shade the regions
-        for sun_max, sun_min, (color, alpha) in darkness_levels:
-            # Find indices where sun is in this range
-            in_range = (sun_altitudes <= sun_max) & (sun_altitudes > sun_min)
-
+        """Shade the background by how dark the sky is (NightTimes.SKY_STATES):
+        civil, nautical and astronomical twilight, then night, darker each;
+        daylight isn't shaded."""
+        states = np.array([sky_state(alt)[0] for alt in sun_altitudes])
+        for key, _name, _above in SKY_STATES[1:]:
+            in_range = states == key
             if not np.any(in_range):
                 continue
+            color, alpha = sky_shade(key)
 
             # Find contiguous regions
             diff = np.diff(np.concatenate(([False], in_range, [False])).astype(int))
@@ -1128,8 +1114,8 @@ class VisibilityPlot(FigureCanvas):
 
         ax3.plot(hours_from_start, sun_altaz.alt.deg, color=chart_color('#ffaa00'), linewidth=2, label='Sun Altitude')
         ax3.axhline(y=0, color=chart_color('#888888'), linestyle='-', alpha=0.6, label='Horizon')
-        ax3.axhline(y=-12, color=chart_color('#4488ff'), linestyle='--', alpha=0.8, label='Astronomical Twilight')
-        ax3.axhline(y=-18, color=chart_color('#aa44ff'), linestyle='--', alpha=0.8, label='Night')
+        ax3.axhline(y=DARK_SKY_ALTITUDE, color=chart_color('#4488ff'), linestyle='--', alpha=0.8, label='Astronomical Twilight')
+        ax3.axhline(y=ASTRONOMICAL_DARK_ALTITUDE, color=chart_color('#aa44ff'), linestyle='--', alpha=0.8, label='Night')
 
         # Use the same timezone abbreviation as in title
         sample_time = local_times[0] if local_times else None
@@ -1258,10 +1244,6 @@ class VisibilityPlot(FigureCanvas):
             # Redraw the canvas
             self.draw_idle()
 
-    def get_twilight_condition(self, sun_alt):
-        """Get twilight condition using centralized method"""
-        return DSOVisibilityCalculator.get_twilight_condition(sun_alt)
-
     def _clamp_hours(self, x):
         """x (hours from start) kept inside the calculated range"""
         hours = self.hover_data['hours']
@@ -1345,7 +1327,7 @@ class VisibilityPlot(FigureCanvas):
             f"{dso_name} Az: {dso_az:.0f}° ({compass_direction(dso_az)})\n"
             f"{horizon_line}"
             f"{meridian_line}"
-            f"Sun Alt: {sun_alt:.1f}° ({self.get_twilight_condition(sun_alt)})\n"
+            f"Sun Alt: {sun_alt:.1f}° ({sky_state(sun_alt)[1]})\n"
             f"Optimal: {'Yes' if optimal else 'No'}"
         )
 

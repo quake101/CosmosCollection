@@ -17,6 +17,7 @@ from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_sun
 from astropy.time import Time
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager, open_connection
+from cosmoscollection.planning.NightTimes import ASTRONOMICAL_DARK_ALTITUDE, DARK_SKY_ALTITUDE, SUNSET_ALTITUDE
 from cosmoscollection.planning.Observer import active_site
 
 warnings.filterwarnings('ignore')
@@ -259,7 +260,8 @@ class DSOVisibilityCalculator:
 
         return time_range, dso_altaz, sun_altaz
 
-    def find_optimal_viewing_times(self, dso_altaz, sun_altaz, min_altitude=30, max_sun_altitude=-12, horizon=None):
+    def find_optimal_viewing_times(self, dso_altaz, sun_altaz, min_altitude=30, max_sun_altitude=DARK_SKY_ALTITUDE,
+                                   horizon=None):
         """
         Find optimal viewing times based on altitude and darkness criteria.
 
@@ -407,58 +409,6 @@ class DSOVisibilityCalculator:
         except Exception:
             return 0.0
 
-    def calculate_seasonal_visibility(self, dso_coord, year=None, min_altitude=30):
-        """
-        Calculate when a DSO is optimally visible throughout a year.
-
-        Args:
-            dso_coord (SkyCoord): DSO coordinates
-            year (int): Year to calculate (default: current year)
-            min_altitude (float): Minimum altitude threshold (default: 30 degrees)
-
-        Returns:
-            list: List of date ranges when DSO is optimally visible
-        """
-        if self.location is None:
-            return []
-
-        if year is None:
-            from datetime import datetime
-            year = datetime.now().year
-
-        try:
-            # Sample dates throughout the year (every 10 days)
-            dates = []
-            visibility_data = []
-
-            for day_of_year in range(1, 366, 10):  # Every 10 days
-                try:
-                    date = Time(f"{year}-01-01") + (day_of_year - 1) * u.day
-
-                    # Calculate for midnight (when most DSOs are best visible)
-                    midnight = date + 12 * u.hour  # Approximate local midnight
-
-                    altaz_frame = AltAz(obstime=midnight, location=self.location)
-                    dso_altaz = dso_coord.transform_to(altaz_frame)
-                    sun = get_sun(midnight)
-                    sun_altaz = sun.transform_to(altaz_frame)
-
-                    # Check if object is well-visible (above min altitude and sun is down)
-                    is_visible = (dso_altaz.alt.deg > min_altitude and
-                                sun_altaz.alt.deg < -12)
-
-                    dates.append(date)
-                    visibility_data.append(is_visible)
-
-                except Exception:
-                    continue
-
-            # Find continuous visibility periods
-            return self._group_visibility_seasons(dates, visibility_data)
-
-        except Exception:
-            return []
-
     def _find_viewing_windows(self, time_range, optimal_times, dso_altaz):
         """Find continuous viewing windows from optimal times array."""
         if not np.any(optimal_times):
@@ -490,64 +440,14 @@ class DSOVisibilityCalculator:
 
         return windows
 
-    def _group_visibility_seasons(self, dates, visibility_data):
-        """Group contiguous visibility dates into seasons."""
-        if not dates or not any(visibility_data):
-            return []
-
-        seasons = []
-        current_season_start = None
-
-        for i, (date, is_visible) in enumerate(zip(dates, visibility_data)):
-            if is_visible and current_season_start is None:
-                current_season_start = date
-            elif not is_visible and current_season_start is not None:
-                # End of a visibility season
-                seasons.append({
-                    "start_date": current_season_start,
-                    "end_date": dates[i-1] if i > 0 else current_season_start,
-                })
-                current_season_start = None
-
-        # Handle case where season extends to end of year
-        if current_season_start is not None:
-            seasons.append({
-                "start_date": current_season_start,
-                "end_date": dates[-1],
-            })
-
-        return seasons
-
     @staticmethod
-    def get_twilight_condition(sun_altitude):
-        """
-        Get twilight condition based on sun altitude.
-
-        Args:
-            sun_altitude (float): Sun altitude in degrees
-
-        Returns:
-            str: Twilight condition
-        """
-        if sun_altitude > 0:
-            return "Daylight"
-        elif sun_altitude > -6:
-            return "Civil Twilight"
-        elif sun_altitude > -12:
-            return "Nautical Twilight"
-        elif sun_altitude > -18:
-            return "Astronomical Twilight"
-        else:
-            return "Night"
-
-    @staticmethod
-    def get_moon_illumination(obs_time):
-        """Return moon illumination fraction 0.0–1.0 at the given astropy Time."""
-        from astropy.coordinates import get_body, get_sun
-        import numpy as np
+    def get_moon_illumination(obs_time, sun=None, moon=None):
+        """Return moon illumination fraction 0.0–1.0 at the given astropy Time
+        (from the Moon's angle from the Sun; pass their positions if known)."""
+        from astropy.coordinates import get_body
         try:
-            sun = get_sun(obs_time)
-            moon = get_body('moon', obs_time)
+            sun = get_sun(obs_time) if sun is None else sun
+            moon = get_body('moon', obs_time) if moon is None else moon
             elongation = sun.separation(moon)
             illumination = (1.0 - np.cos(elongation.rad)) / 2.0
             return float(np.clip(illumination, 0.0, 1.0))
@@ -565,11 +465,46 @@ class DSOVisibilityCalculator:
             return None
 
 
-# ---- One night, summed up ----------------------------------------------------
+# ---- Through the year -------------------------------------------------------
 
-SUNSET_ALTITUDE = -0.833        # The sun's top at the horizon, with refraction
-DARK_SKY_ALTITUDE = -12.0       # Sun below this: the viewing windows' "dark sky" (as everywhere in the app)
-ASTRONOMICAL_DARK_ALTITUDE = -18.0
+def seasonal_visibility(calculator, coord, min_altitude=30, horizon=None, year=None, step_days=15):
+    """The parts of a year coord is well placed from calculator's location:
+    [(first, last)] dates of runs of nights - sampled every step_days from
+    Jan 1 - on which it's above min_altitude (and the custom horizon) in a
+    dark sky at some point in the 12 hours around local midnight."""
+    from datetime import date, timedelta
+    year = year or date.today().year
+    sampled = []
+    for offset in range(0, 365, step_days):
+        night = date(year, 1, 1) + timedelta(days=offset)
+        try:
+            _times, dso_altaz, sun_altaz = calculator.calculate_altaz_over_time(coord, night.isoformat(), 12)
+            up = calculator.find_optimal_viewing_times(dso_altaz, sun_altaz, min_altitude, horizon=horizon)
+        except Exception as e:
+            logger.debug(f"Seasonal visibility skipped {night}: {e}")
+            continue
+        sampled.append((night, bool(np.any(up))))
+    seasons, start = [], None
+    for i, (night, up) in enumerate(sampled):
+        if up and start is None:
+            start = night
+        if start is not None and (not up or i == len(sampled) - 1):
+            seasons.append((start, night if up else sampled[i - 1][0]))
+            start = None
+    return seasons
+
+
+def season_months(seasons):
+    """'Nov-Dec, Jan-Mar' - each of seasonal_visibility()'s seasons as its
+    first and last month (one month alone when it starts and ends in it)."""
+    names = []
+    for first, last in seasons:
+        start, end = first.strftime("%b"), last.strftime("%b")
+        names.append(start if start == end else f"{start}-{end}")
+    return ", ".join(names)
+
+
+# ---- One night, summed up ----------------------------------------------------
 
 
 def _crossings(times, values, level):

@@ -22,10 +22,31 @@ DIRECTION_MODES = (
     ("time", "Custom time"),
     ("frame", "Custom time frame"),
 )
-ASTRONOMICAL_TWILIGHT_DEG = -18.0
+
+# The sun's altitude (degrees) at each stage of the night
+SUNSET_ALTITUDE = -0.833        # The sun's top at the horizon, with refraction
+CIVIL_TWILIGHT_ALTITUDE = -6.0
+DARK_SKY_ALTITUDE = -12.0       # Sun below this: a dark sky (viewing windows, dark hours - everywhere in the app)
+ASTRONOMICAL_DARK_ALTITUDE = -18.0
+# (key, name, sun above) from day to night; the keys are Theme.sky_shade()'s
+SKY_STATES = (
+    ("day", "Daylight", SUNSET_ALTITUDE),
+    ("civil", "Civil twilight", CIVIL_TWILIGHT_ALTITUDE),
+    ("nautical", "Nautical twilight", DARK_SKY_ALTITUDE),
+    ("astronomical", "Astronomical twilight", ASTRONOMICAL_DARK_ALTITUDE),
+    ("night", "Night", -90.0),
+)
 
 _COMPASS_POINTS = ('N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
                    'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW')
+
+
+def sky_state(sun_alt):
+    """(key, name) of SKY_STATES for the sun's altitude: ('civil', 'Civil twilight')."""
+    for key, name, above in SKY_STATES:
+        if sun_alt > above:
+            return key, name
+    return SKY_STATES[-1][:2]
 
 
 def compass_direction(az):
@@ -44,7 +65,7 @@ def _twilight(location, noon_local, tz):
 
     times = Time(noon_local) + np.arange(0, 24 * 12 + 1) * 5 * u.min  # every 5 minutes
     sun_alt = get_sun(times).transform_to(AltAz(obstime=times, location=location)).alt.deg
-    dark = sun_alt < ASTRONOMICAL_TWILIGHT_DEG
+    dark = sun_alt < ASTRONOMICAL_DARK_ALTITUDE
     if dark.any():
         first = int(np.argmax(dark))
         last = len(dark) - 1 - int(np.argmax(dark[::-1]))

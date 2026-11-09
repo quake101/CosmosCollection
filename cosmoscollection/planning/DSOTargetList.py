@@ -7,7 +7,6 @@ Allows users to manage their observing target list for deep sky objects
 import sys
 import os
 import re
-import calendar
 from dataclasses import dataclass, field
 from datetime import datetime
 from PySide6.QtCore import Qt, QTimer, Signal, QStringListModel, QThread, QTime
@@ -1104,7 +1103,7 @@ class DuplicateReviewDialog(WindowPositionMixin, QDialog):
 # marked.
 
 from cosmoscollection.planning.NightTimes import (  # noqa: E402,F401
-    ASTRONOMICAL_TWILIGHT_DEG, DIRECTION_MODES, _twilight, compass_direction, compute_directions,
+    DIRECTION_MODES, _twilight, compass_direction, compute_directions,
     direction_cells, resolve_direction_times)
 DIRECTION_SETTING = "target_list_direction"  # "mode|at|from|to", times as HH:MM
 DIRECTION_DEFAULT = ("midnight", "22:00", "21:00", "01:00")
@@ -1862,186 +1861,6 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         self._apply_direction_cells()
         self._update_directions()
     
-    def _calculate_best_months_for_all(self):
-        """Calculate best viewing months for all targets based on user location"""
-        try:
-            # Get user location from database
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT location_lat, location_lon FROM usersettings WHERE is_active = 1 LIMIT 1")
-                location_row = cursor.fetchone()
-                if not location_row:
-                    cursor.execute("SELECT location_lat, location_lon FROM usersettings ORDER BY id DESC LIMIT 1")
-                    location_row = cursor.fetchone()
-
-                if not location_row:
-                    QMessageBox.warning(self, "No Location Set", 
-                        "Please set your observing location in Settings first.\n\n" +
-                        "Go to Settings and enter your latitude and longitude coordinates.")
-                    return
-                
-                lat, lon = location_row
-                logger.debug(f"Using user location: lat={lat}, lon={lon}")
-
-                from cosmoscollection.planning.HorizonProfile import load_active_horizon
-                horizon = load_active_horizon(conn)
-
-                # Update status
-                self.status_label.setText("Calculating best months for all targets...")
-
-                # Calculate best months for each target
-                targets_updated = 0
-                for target in self.targets_data:
-                    if target.get("ra_deg") and target.get("dec_deg"):
-                        best_months = self._calculate_best_months_for_target(
-                            target["ra_deg"], target["dec_deg"], lat, lon, horizon
-                        )
-                        
-                        if best_months:
-                            # Update database
-                            cursor.execute("""
-                                UPDATE usertargetlist SET best_months = ? WHERE id = ?
-                            """, (best_months, target["id"]))
-                            targets_updated += 1
-                
-                conn.commit()
-                
-                # Reload the table to show updated months
-                self._load_targets()
-                
-                horizon_text = " and its custom horizon" if horizon else ""
-                QMessageBox.information(self, "Calculation Complete",
-                    f"Best viewing months calculated for {targets_updated} targets based on your location{horizon_text}.")
-                
-        except Exception as e:
-            logger.error(f"Error calculating best months: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to calculate best months: {str(e)}")
-        finally:
-            self.status_label.setText(f"Loaded {len(self.targets_data)} targets")
-    
-    def _calculate_best_months_for_target(self, ra_deg, dec_deg, lat, lon, horizon=None):
-        """Calculate best viewing months for a single target using centralized calculator
-
-        Args:
-            horizon: Optional HorizonProfile for the location (custom horizon)
-        """
-        # Import required modules at the very top, outside any try blocks
-        import numpy as np
-        from datetime import datetime, timedelta
-        
-        try:
-            # Import astronomy libraries
-            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityCalculator
-            from astropy.coordinates import SkyCoord
-            import astropy.units as u
-            
-            # Create calculator with user location
-            calculator = DSOVisibilityCalculator(lat, lon)
-            
-            # Create coordinate object once since we have RA/Dec
-            dso_coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
-            
-            # Sample dates throughout the year (same approach as DSODetailWindow)
-            current_year = datetime.now().year
-            min_altitude = 30  # Use 30° minimum altitude
-            
-            sample_dates = []
-            visibility_results = []
-            
-            for day_offset in range(0, 365, 15):  # Every 15 days like DSODetailWindow
-                try:
-                    test_date = datetime(current_year, 1, 1) + timedelta(days=day_offset)
-                    date_str = test_date.strftime('%Y-%m-%d')
-                    
-                    # Use coordinate-based calculation instead of name-based
-                    time_range, dso_altaz, sun_altaz = calculator.calculate_altaz_over_time(
-                        dso_coord, date_str, 12)
-                    
-                    # Find optimal viewing times using same criteria
-                    optimal_times = calculator.find_optimal_viewing_times(
-                        dso_altaz, sun_altaz, min_altitude, horizon=horizon)
-                    
-                    results = {"optimal_times": optimal_times}
-                    
-                    is_visible = False
-                    if "error" not in results and np.any(results.get("optimal_times", [])):
-                        is_visible = True
-                    
-                    sample_dates.append(test_date)
-                    visibility_results.append(is_visible)
-                    
-                except Exception as e:
-                    logger.debug(f"Error checking date {day_offset}: {e}")
-                    continue
-            
-            # Group visible periods into months
-            if any(visibility_results):
-                good_months = set()
-                for date, visible in zip(sample_dates, visibility_results):
-                    if visible:
-                        good_months.add(date.month)
-                
-                # Convert month numbers to abbreviations
-                month_abbrs = [calendar.month_abbr[month] for month in sorted(good_months)]
-                
-                # Format the result
-                if month_abbrs:
-                    return self._format_month_ranges(month_abbrs)
-                else:
-                    return "Not optimal from location"
-            else:
-                return "Not optimal from location"
-                
-        except ImportError:
-            logger.error("Missing DSOVisibilityCalculator for best months calculation")
-            return "Calculation unavailable"
-        except Exception as e:
-            logger.error(f"Error calculating best months for target: {str(e)}")
-            return "Calculation error"
-    
-    def _format_month_ranges(self, months):
-        """Format month list into ranges (e.g., 'Nov-Feb, Jun-Aug')"""
-        if not months:
-            return ""
-        
-        # Convert month abbreviations back to numbers for processing
-        month_nums = []
-        month_map = {calendar.month_abbr[i]: i for i in range(1, 13)}
-        
-        for month in months:
-            if month in month_map:
-                month_nums.append(month_map[month])
-        
-        if not month_nums:
-            return ", ".join(months)
-        
-        month_nums.sort()
-        
-        # Find consecutive ranges
-        ranges = []
-        start = month_nums[0]
-        end = month_nums[0]
-        
-        for i in range(1, len(month_nums)):
-            if month_nums[i] == end + 1:
-                end = month_nums[i]
-            else:
-                # Add the range
-                if start == end:
-                    ranges.append(calendar.month_abbr[start])
-                else:
-                    ranges.append(f"{calendar.month_abbr[start]}-{calendar.month_abbr[end]}")
-                start = month_nums[i]
-                end = month_nums[i]
-        
-        # Don't forget the last range
-        if start == end:
-            ranges.append(calendar.month_abbr[start])
-        else:
-            ranges.append(f"{calendar.month_abbr[start]}-{calendar.month_abbr[end]}")
-        
-        return ", ".join(ranges)
-
     def _show_context_menu(self, position):
         """Show context menu when right-clicking on the table"""
         # Get the item at the clicked position
@@ -2240,22 +2059,6 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         dialog = AddTargetDialog(dso_data=dso_data, parent=self)
         if dialog.exec() == QDialog.Accepted:
             self._load_targets()
-
-    def is_dso_in_target_list(self, dso_name):
-        """Check if a DSO is in the target list by name
-
-        Args:
-            dso_name: Name of the DSO to check
-
-        Returns:
-            bool: True if the DSO is in the target list, False otherwise
-        """
-        try:
-            with self.db_manager.get_connection() as conn:
-                return find_existing_target(conn, dso_name) is not None
-        except Exception as e:
-            logger.error(f"Error checking if DSO is in target list: {str(e)}")
-            return False
 
     def open_and_select_target(self, dso_name):
         """Open the target list window and select the target with the given name

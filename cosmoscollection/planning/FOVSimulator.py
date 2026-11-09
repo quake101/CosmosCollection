@@ -33,6 +33,8 @@ from cosmoscollection.core.UrlOpener import open_url
 from cosmoscollection.ui.TimeFormatHelper import format_time, get_time_format_24h
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
 from cosmoscollection.sessions import SessionRows
+from cosmoscollection.planning.NightTimes import (ASTRONOMICAL_DARK_ALTITUDE, CIVIL_TWILIGHT_ALTITUDE,
+                                                  DARK_SKY_ALTITUDE, SUNSET_ALTITUDE, sky_state)
 from cosmoscollection.sessions.SessionFileScanner import angular_separation_deg
 
 logger = logging.getLogger(__name__)
@@ -336,8 +338,6 @@ NIGHT_STEPS = 24 * 60 // NIGHT_STEP_MINUTES
 NIGHT_MINUTES = 24 * 60               # The slider moves a minute at a time
 PLAY_MINUTES_PER_STEP = 1             # Play: a minute per step...
 PLAY_INTERVAL_MS = 40                 # ...25 steps a second
-SUNRISE_ALT = -0.833                  # The sun's top at the horizon, with refraction
-ASTRONOMICAL_DARK_ALT = -18.0
 
 
 def night_profile(lat, lon, noon, ra=None, dec=None, horizon=None):
@@ -369,8 +369,8 @@ def night_profile(lat, lon, noon, ra=None, dec=None, horizon=None):
             if below[i] != below[i - 1] and below[i] == going_down:
                 return i
         return None
-    profile.update(sunset=crossing(SUNRISE_ALT, True), dusk=crossing(ASTRONOMICAL_DARK_ALT, True),
-                   dawn=crossing(ASTRONOMICAL_DARK_ALT, False), sunrise=crossing(SUNRISE_ALT, False))
+    profile.update(sunset=crossing(SUNSET_ALTITUDE, True), dusk=crossing(ASTRONOMICAL_DARK_ALTITUDE, True),
+                   dawn=crossing(ASTRONOMICAL_DARK_ALTITUDE, False), sunrise=crossing(SUNSET_ALTITUDE, False))
     return profile
 
 
@@ -380,7 +380,7 @@ def target_path(lat, lon, when, night):
     segments while it's up between sunset and sunrise, [(index, ra, dec)] on the hour)."""
     if night.get("target_alt") is None:
         return [], []
-    sun_down = night["sun_alt"] < SUNRISE_ALT
+    sun_down = night["sun_alt"] < SUNSET_ALTITUDE
     if not sun_down.any():
         sun_down[:] = True  # No night at all (midsummer far north): the whole day
     keep = sun_down & (night["target_alt"] > -1.0)
@@ -402,19 +402,6 @@ def target_path(lat, lon, when, night):
     return [segment for segment in segments if len(segment) > 1], hours
 
 
-def sky_state(sun_alt):
-    """'Daylight', 'Civil twilight', ... 'Dark' for the sun's altitude."""
-    if sun_alt > SUNRISE_ALT:
-        return "Daylight"
-    if sun_alt > -6:
-        return "Civil twilight"
-    if sun_alt > -12:
-        return "Nautical twilight"
-    if sun_alt > ASTRONOMICAL_DARK_ALT:
-        return "Astronomical twilight"
-    return "Dark"
-
-
 def hour_label(moment):
     """'9 PM' or '21h' - an hour mark, in the user's time format."""
     if get_time_format_24h():
@@ -425,7 +412,7 @@ def hour_label(moment):
 
 def sky_tint(sun_alt):
     """How strongly to tint the sky blue for the sun's altitude: 0 when dark."""
-    return max(0.0, min(1.0, (sun_alt - ASTRONOMICAL_DARK_ALT) / 24.0)) * 0.55
+    return max(0.0, min(1.0, (sun_alt - ASTRONOMICAL_DARK_ALTITUDE) / 24.0)) * 0.55
 
 
 # --- A framing saved to a session ---
@@ -2593,7 +2580,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         if self.night_noon is not None and when.date() != self.night_noon.date():
             text += f" {when:%b} {when.day}"  # After midnight
         if self.night is not None:
-            text += f" · {sky_state(float(self.night['sun_alt'][self._time_index()]))}"
+            text += f" · {sky_state(float(self.night['sun_alt'][self._time_index()]))[1]}"
         self.time_label.setText(("Now: " if self.live else "") + text)
         self._push_sky()  # In Night View this also turns the view with the sky
 
@@ -3329,8 +3316,8 @@ class NightSlider(QWidget):
     the user changes it. (The night profile it paints is every NIGHT_STEP_MINUTES.)"""
 
     moved = Signal(int)
-    SKY_COLORS = ((SUNRISE_ALT, "#6f93bd"), (-6.0, "#4a6488"), (-12.0, "#30425f"),
-                  (ASTRONOMICAL_DARK_ALT, "#1f2a3f"), (-90.0, "#0b0f17"))
+    SKY_COLORS = ((SUNSET_ALTITUDE, "#6f93bd"), (CIVIL_TWILIGHT_ALTITUDE, "#4a6488"), (DARK_SKY_ALTITUDE, "#30425f"),
+                  (ASTRONOMICAL_DARK_ALTITUDE, "#1f2a3f"), (-90.0, "#0b0f17"))
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3454,7 +3441,7 @@ class NightSlider(QWidget):
         minute = max(0, min(NIGHT_MINUTES, minute))
         index = round(minute / NIGHT_STEP_MINUTES)
         moment = night["times"][0] + timedelta(minutes=minute)
-        parts = [format_time(moment), sky_state(float(night["sun_alt"][index]))]
+        parts = [format_time(moment), sky_state(float(night["sun_alt"][index]))[1]]
         if night.get("target_alt") is not None:
             parts.append(f"{self.target_name} alt {float(night['target_alt'][index]):.0f}°")
         if night.get("transit") == index:

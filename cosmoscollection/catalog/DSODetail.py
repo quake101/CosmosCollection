@@ -113,8 +113,8 @@ class ImageCache:
 
 
 class VisibilityCalculationWorker(QObject):
-    """Worker for performing heavy visibility calculations in a background thread."""
-    finished = Signal(str)
+    """Works out an object's viewing seasons in a background thread."""
+    finished = Signal(str, str)  # (the seasons as HTML, their months: "Nov-Dec, Jan-Mar")
     error = Signal(str)
 
     def __init__(self, lat: float, lon: float, ra_deg: float, dec_deg: float, object_name: str):
@@ -125,11 +125,8 @@ class VisibilityCalculationWorker(QObject):
         self.dec_deg = dec_deg
         self.object_name = object_name
 
-        try:
-            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityCalculator
-            self.calculator = DSOVisibilityCalculator(lat, lon)
-        except ImportError:
-            self.calculator = None
+        from cosmoscollection.planning.Visibility import DSOVisibilityCalculator
+        self.calculator = DSOVisibilityCalculator(lat, lon)
 
         # lat/lon are the active location's, so its custom horizon applies
         from cosmoscollection.planning.HorizonProfile import load_active_horizon
@@ -138,73 +135,20 @@ class VisibilityCalculationWorker(QObject):
     def calculate_visibility(self):
         """Calculate visibility seasons in background thread"""
         try:
-            if self.calculator is None:
-                self.error.emit("Visibility calculator not available.")
-                return
-
             from astropy.coordinates import SkyCoord
             import astropy.units as u
-            from datetime import datetime, timedelta
-            import numpy as np
+            from cosmoscollection.planning.Visibility import season_months, seasonal_visibility
 
-            dso_coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
-
-            current_year = datetime.now().year
-            min_altitude = 30
-
-            sample_dates = []
-            visibility_results = []
-
-            for day_offset in range(0, 365, 15):
-                try:
-                    test_date = datetime(current_year, 1, 1) + timedelta(days=day_offset)
-                    date_str = test_date.strftime('%Y-%m-%d')
-
-                    time_range, dso_altaz, sun_altaz = self.calculator.calculate_altaz_over_time(
-                        dso_coord, date_str, 12)
-
-                    optimal_times = self.calculator.find_optimal_viewing_times(
-                        dso_altaz, sun_altaz, min_altitude, horizon=self.horizon)
-
-                    results = {"optimal_times": optimal_times}
-
-                    is_visible = False
-                    if "error" not in results and np.any(results.get("optimal_times", [])):
-                        is_visible = True
-
-                    sample_dates.append(test_date)
-                    visibility_results.append(is_visible)
-
-                except Exception:
-                    continue
-
-            if any(visibility_results):
-                season_strs = []
-                in_season = False
-                season_start = None
-
-                for i, (date, visible) in enumerate(zip(sample_dates, visibility_results)):
-                    if visible and not in_season:
-                        season_start = date
-                        in_season = True
-                    elif not visible and in_season:
-                        if season_start:
-                            season_strs.append(f"{season_start.strftime('%B %d')} - {sample_dates[i-1].strftime('%B %d')}")
-                        in_season = False
-                    elif i == len(sample_dates) - 1 and in_season:
-                        if season_start:
-                            season_strs.append(f"{season_start.strftime('%B %d')} - {date.strftime('%B %d')}")
-
-                if season_strs:
-                    criteria = ">30° altitude and above your custom horizon" if self.horizon else ">30° altitude"
-                    visibility_text = f"Best viewing seasons ({criteria} in dark sky):<br>" + "<br>".join(season_strs)
-                    visibility_text += "<br><br><small>Use Visibility Calculator for detailed nightly times.</small>"
-                else:
-                    visibility_text = "Object not optimally visible from your location this year."
+            coord = SkyCoord(ra=self.ra_deg * u.deg, dec=self.dec_deg * u.deg)
+            seasons = seasonal_visibility(self.calculator, coord, 30, self.horizon)
+            if seasons:
+                criteria = ">30° altitude and above your custom horizon" if self.horizon else ">30° altitude"
+                visibility_text = (f"Best viewing seasons ({criteria} in dark sky):<br>"
+                                   + "<br>".join(f"{first:%B %d} - {last:%B %d}" for first, last in seasons)
+                                   + "<br><br><small>Use Visibility Calculator for detailed nightly times.</small>")
             else:
                 visibility_text = "Object not optimally visible from your location this year."
-
-            self.finished.emit(visibility_text)
+            self.finished.emit(visibility_text, season_months(seasons))
         except Exception as e:
             logger.error(f"Error calculating visibility: {str(e)}", exc_info=True)
             self.error.emit(f"Error calculating viewing season information:<br>{str(e)}")
@@ -246,6 +190,7 @@ class DSODetailWindow(QDialog):
 
         self.user_images = []
         self.current_image_index = 0
+        self.best_months = ""  # The viewing seasons' months, once worked out
 
         self.ra_str, self.dec_str = format_ra(data["ra_deg"]), format_dec(data["dec_deg"])
 
@@ -1056,9 +1001,10 @@ class DSODetailWindow(QDialog):
             logger.error(f"Error setting up visibility calculation: {str(e)}")
             self.season_label.setText(f"Error setting up viewing season calculation:<br>{str(e)}")
 
-    def _on_visibility_calculated(self, visibility_text):
+    def _on_visibility_calculated(self, visibility_text, best_months):
         """Handle completion of visibility calculation"""
         self.season_label.setText(visibility_text)
+        self.best_months = best_months
         logger.debug("Visibility calculation completed in background thread")
 
     def _on_visibility_error(self, error_message):
@@ -1865,13 +1811,8 @@ class DSODetailWindow(QDialog):
             from cosmoscollection.planning.DSOTargetList import AddTargetDialog
 
             enhanced_data = self.data.copy()
-            visibility_text = self.season_label.text()
-
-            if visibility_text and not visibility_text.startswith("Enter your location") and not visibility_text.startswith("Loading"):
-                cleaned_months = self._extract_month_ranges_from_visibility(visibility_text)
-                if cleaned_months:
-                    enhanced_data['best_months'] = cleaned_months
-                    logger.debug(f"Using cleaned visibility info for {self.data.get('name', 'DSO')}: {cleaned_months}")
+            if self.best_months:
+                enhanced_data['best_months'] = self.best_months
 
             dialog = AddTargetDialog(dso_data=enhanced_data, parent=self)
             if dialog.exec():
@@ -1897,40 +1838,6 @@ class DSODetailWindow(QDialog):
             self.data.get('ra_deg'), self.data.get('dec_deg'),
             self.data.get('name', 'Unknown'), self
         )
-
-    def _extract_month_ranges_from_visibility(self, visibility_text):
-        """Extract only month ranges from visibility text"""
-        import re
-
-        clean_text = re.sub(r'<[^>]+>', '', visibility_text)
-
-        if "not optimally visible" in clean_text.lower() or "error" in clean_text.lower():
-            return ""
-
-        month_pattern = r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d+\s*-\s*(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d+'
-
-        matches = re.findall(month_pattern, clean_text)
-
-        if matches:
-            month_abbrev = {
-                'January': 'Jan', 'February': 'Feb', 'March': 'Mar', 'April': 'Apr',
-                'May': 'May', 'June': 'Jun', 'July': 'Jul', 'August': 'Aug',
-                'September': 'Sep', 'October': 'Oct', 'November': 'Nov', 'December': 'Dec'
-            }
-
-            ranges = []
-            for start_month, end_month in matches:
-                start_abbrev = month_abbrev.get(start_month, start_month[:3])
-                end_abbrev = month_abbrev.get(end_month, end_month[:3])
-
-                if start_abbrev == end_abbrev:
-                    ranges.append(start_abbrev)
-                else:
-                    ranges.append(f"{start_abbrev}-{end_abbrev}")
-
-            return ", ".join(ranges)
-
-        return ""
 
     def _remove_from_target_list(self):
         """Remove this DSO from the target list"""
