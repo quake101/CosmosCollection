@@ -18,6 +18,7 @@ from typing import Optional, Tuple, Dict, Any
 
 from PySide6.QtCore import QObject, Signal, QThread
 from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.imaging.WCS import pixel_scale_arcsec, read_wcs_file, read_wcs_header, write_wcs_file
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +161,6 @@ def _save_solution(image_path, result, fresh):
     does; the others don't), so every window finds it next time."""
     if not (result.success and result.wcs_header) or result.solver_used == 'ASTAP':
         return
-    from cosmoscollection.imaging.WCS import read_wcs_header, write_wcs_file
     try:
         if fresh or read_wcs_header(image_path) is None:
             write_wcs_file(image_path, result.wcs_header)
@@ -423,13 +423,13 @@ class PlateSolver:
         wcs_file = Path(image_path).with_suffix('.wcs')
         if use_saved and wcs_file.exists():
             logger.info(f"Found existing WCS file: {wcs_file}")
-            result.wcs_header = self._parse_wcs_file(wcs_file)
+            result.wcs_header = read_wcs_file(wcs_file)
             if result.wcs_header and result.wcs_header.get('CRVAL1') is not None:
                 result.success = True
                 result.ra_center = result.wcs_header.get('CRVAL1')
                 result.dec_center = result.wcs_header.get('CRVAL2')
 
-                result.pixel_scale = self._pixel_scale_from_wcs(result.wcs_header)
+                result.pixel_scale = pixel_scale_arcsec(result.wcs_header)
 
                 logger.info(f"Loaded cached WCS: RA={result.ra_center}, Dec={result.dec_center}, scale={result.pixel_scale}")
                 return result
@@ -491,14 +491,14 @@ class PlateSolver:
 
             if wcs_file.exists():
                 result.success = True
-                result.wcs_header = self._parse_wcs_file(wcs_file)
+                result.wcs_header = read_wcs_file(wcs_file)
 
                 # Extract key values from WCS
                 if result.wcs_header:
                     result.ra_center = result.wcs_header.get('CRVAL1')
                     result.dec_center = result.wcs_header.get('CRVAL2')
 
-                    result.pixel_scale = self._pixel_scale_from_wcs(result.wcs_header)
+                    result.pixel_scale = pixel_scale_arcsec(result.wcs_header)
 
                     logger.info(f"ASTAP solve successful: RA={result.ra_center}, Dec={result.dec_center}, scale={result.pixel_scale}")
 
@@ -537,19 +537,6 @@ class PlateSolver:
         return result
 
     @staticmethod
-    def _pixel_scale_from_wcs(wcs_header: Dict[str, Any]) -> Optional[float]:
-        """Pixel scale in arcsec/pixel. Uses the CD matrix determinant, which
-        holds at any rotation - abs(CD1_1) alone is only right for unrotated
-        images (at ~90 degrees rotation it's near zero)."""
-        if 'CD1_1' in wcs_header:
-            det = (wcs_header['CD1_1'] * wcs_header.get('CD2_2', 0)
-                   - wcs_header.get('CD1_2', 0) * wcs_header.get('CD2_1', 0))
-            return (abs(det) ** 0.5) * 3600
-        if 'CDELT1' in wcs_header:
-            return abs(wcs_header['CDELT1']) * 3600
-        return None
-
-    @staticmethod
     def _read_astap_ini_error(ini_file: Path) -> Optional[str]:
         """Return the ERROR= (or WARNING=) message from an ASTAP .ini file, if any"""
         try:
@@ -558,32 +545,6 @@ class PlateSolver:
             return values.get('ERROR') or values.get('WARNING')
         except OSError:
             return None
-
-    def _parse_wcs_file(self, wcs_path: Path) -> Dict[str, Any]:
-        """Parse ASTAP WCS output file"""
-        wcs_header = {}
-        try:
-            with open(wcs_path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if '=' in line and not line.startswith('#'):
-                        key, value = line.split('=', 1)
-                        key = key.strip()
-                        value = value.split('/')[0].strip()  # Remove comments
-                        value = value.strip("'\" ")
-
-                        # Try to convert to number
-                        try:
-                            if '.' in value:
-                                wcs_header[key] = float(value)
-                            else:
-                                wcs_header[key] = int(value)
-                        except ValueError:
-                            wcs_header[key] = value
-        except Exception as e:
-            logger.error(f"Failed to parse WCS file: {e}")
-
-        return wcs_header
 
     def solve_with_astrometry_net(self, image_path: str, hints: Dict[str, Any] = None) -> PlateSolveResult:
         """

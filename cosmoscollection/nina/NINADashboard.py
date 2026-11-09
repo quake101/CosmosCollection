@@ -40,8 +40,9 @@ from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, Q
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import format_duration
-from cosmoscollection.imaging.AnnotationOverlay import (AnnotationData, WCSTransform, paint_annotations, saved_annotation_layers,
+from cosmoscollection.imaging.AnnotationOverlay import (AnnotationData, paint_annotations, saved_annotation_layers,
                                screen_name_px, stars_in_view)
+from cosmoscollection.imaging.WCS import WCSTransform
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import keep_alive_until_finished, release_on_close
 from cosmoscollection.ui.Theme import (

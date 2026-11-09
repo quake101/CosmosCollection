@@ -171,12 +171,41 @@ def _fits_card_value(text):
     return _coerce_fits_value(text.split('/', 1)[0])
 
 
+def parse_fits_card(card):
+    """(keyword, value) of one header card or .wcs file line - None for a card
+    without a value (COMMENT, HISTORY, blank, END). The '=' belongs in column
+    9, but lines a person wrote ('CRVAL1= 83.8') are read too."""
+    equals = card.find('=', 1, 10)
+    if equals < 0:
+        return None
+    key = card[:equals].strip()
+    if not key or ' ' in key:
+        return None
+    try:
+        return key, _fits_card_value(card[equals + 1:])
+    except Exception:
+        return None
+
+
+def parse_fits_cards(cards):
+    """{keyword: value} from header cards, stopping at END. A keyword given
+    twice keeps its first value, as astropy reads it."""
+    result = {}
+    for card in cards:
+        if card[:8].strip() == 'END':
+            break
+        parsed = parse_fits_card(card)
+        if parsed and parsed[0] not in result:
+            result[parsed[0]] = parsed[1]
+    return result
+
+
 def read_fits_header_fast(file_path, max_blocks=40):
     """Every keyword of a FITS primary header (COMMENT/HISTORY left out), read
     in 2880-byte blocks up to END - usually one small read, where astropy's
-    fits.open makes several round trips (slow on a network drive). Same value
-    types as extract_fits_header. Raises ValueError if it isn't a FITS file."""
-    result = {}
+    fits.open makes several round trips (slow on a network drive). Values as
+    parse_fits_card reads them. Raises ValueError if it isn't a FITS file."""
+    cards = []
     with open(file_path, 'rb') as f:
         for block_index in range(max_blocks):
             block = f.read(FITS_BLOCK)
@@ -184,18 +213,12 @@ def read_fits_header_fast(file_path, max_blocks=40):
                 break
             if block_index == 0 and not block.startswith(b'SIMPLE  ='):
                 raise ValueError(f"Not a FITS file: {file_path}")
-            for start in range(0, FITS_BLOCK, FITS_CARD):
-                card = block[start:start + FITS_CARD].decode('ascii', 'replace')
-                key = card[:8].strip()
-                if key == 'END':
-                    return result
-                if card[8:10] != '= ' or not key or key in result:
-                    continue
-                try:
-                    result[key] = _fits_card_value(card[10:])
-                except Exception:
-                    continue
-    return result
+            block_cards = [block[start:start + FITS_CARD].decode('ascii', 'replace')
+                           for start in range(0, FITS_BLOCK, FITS_CARD)]
+            cards.extend(block_cards)
+            if any(card[:8].strip() == 'END' for card in block_cards):
+                break
+    return parse_fits_cards(cards)
 
 
 def read_xisf_xml(file_path):
@@ -392,6 +415,16 @@ def angular_separation_deg(ra1, dec1, ra2, dec2):
     ra1, dec1, ra2, dec2 = map(math.radians, (ra1, dec1, ra2, dec2))
     h = math.sin((dec2 - dec1) / 2) ** 2 + math.cos(dec1) * math.cos(dec2) * math.sin((ra2 - ra1) / 2) ** 2
     return math.degrees(2 * math.asin(min(1.0, math.sqrt(h))))
+
+
+def angular_separations_deg(ra, dec, ras, decs):
+    """Great-circle separations in degrees from one RA/Dec point to each of
+    arrays ras, decs (degrees) - angular_separation_deg for many at once."""
+    import numpy as np
+    ra, dec = math.radians(ra), math.radians(dec)
+    ras, decs = np.radians(ras), np.radians(decs)
+    h = np.sin((decs - dec) / 2) ** 2 + math.cos(dec) * np.cos(decs) * np.sin((ras - ra) / 2) ** 2
+    return np.degrees(2 * np.arcsin(np.sqrt(np.clip(h, 0.0, 1.0))))
 
 
 def summarize_files(file_dicts):

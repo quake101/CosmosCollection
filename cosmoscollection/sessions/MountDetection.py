@@ -59,6 +59,7 @@ from typing import Optional
 # import is half a second of every command-line command's start
 
 from cosmoscollection.sessions import SessionFileScanner
+from cosmoscollection.imaging.WCS import cd_matrix
 from cosmoscollection.core.DatabaseManager import add_columns
 from cosmoscollection.core.Paths import path_key
 from cosmoscollection.sessions.SessionObservations import make_sub_key, night_of, to_utc
@@ -197,7 +198,7 @@ def _apart(a, b):
     return abs(_wrap(a - b))
 
 
-def separation(predicted):
+def angle_gap(predicted):
     """How far apart the turns an equatorial mount (0, or 180 after a flip) and
     an alt-az mount (the predicted turn, either way round - a frame can be
     mirrored) would show."""
@@ -407,13 +408,9 @@ def _mod180(angle):
 
 
 def position_angle(wcs):
-    """The frame's +y axis on the sky, degrees east of north, from a WCS's CD matrix (or CDELT/CROTA2)."""
-    if "CD1_1" in wcs:
-        cd12, cd22 = float(wcs.get("CD1_2", 0)), float(wcs.get("CD2_2", 0))
-    else:
-        rotation = math.radians(float(wcs.get("CROTA2", 0)))
-        cd12 = -float(wcs.get("CDELT2", 0)) * math.sin(rotation)
-        cd22 = float(wcs.get("CDELT2", 0)) * math.cos(rotation)
+    """The frame's +y axis on the sky, degrees east of north, from a solution's
+    matrix in any of its forms (CD, PC with CDELT, or CDELT with CROTA2)."""
+    _cd11, cd12, _cd21, cd22 = cd_matrix(wcs)
     return math.degrees(math.atan2(cd12, cd22))
 
 
@@ -559,7 +556,7 @@ def _judge_rotation(result, subs, lat, lon, cache, cancelled, memo=None):
     first, last = min(lo, hi), max(lo, hi)
     predicted = float(angles[last] - angles[first])
     hours = (group[last].when - group[first].when).total_seconds() / 3600.0
-    apart = separation(predicted)
+    apart = angle_gap(predicted)
     if apart < MIN_SEPARATION:
         if abs(_wrap(predicted)) > 90:
             result.evidence = (f"An alt-az mount would have turned the field {abs(predicted):.0f}° over "

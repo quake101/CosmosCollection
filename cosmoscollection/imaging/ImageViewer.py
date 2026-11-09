@@ -36,8 +36,9 @@ from cosmoscollection.sessions.SessionFileScanner import (FITS_EXTENSIONS, SUPPO
                                 site_longitude, to_float,
                                 _coerce_fits_value, _file_coordinates)
 from cosmoscollection.imaging.AnnotationOverlay import (ANNOTATION_LAYER_SETTINGS, ANNOTATION_LAYERS, AnnotationData, annotation_store,
-                               image_pixel_size, paint_annotations, read_wcs_header, saved_annotation_layers,
-                               screen_name_px)
+                               paint_annotations, saved_annotation_layers, screen_name_px)
+from cosmoscollection.imaging.WCS import (WCSTransform, cd_matrix, flip_wcs_rows, image_pixel_size, is_solved_header,
+                                          pixel_scale_arcsec, read_wcs_header)
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -554,34 +555,31 @@ def _equipment_rows(kw, image_size):
 def _plate_solution_rows(kw, image_size, fallback_wcs):
     source = None
     wcs_keywords = {key: value for key, value in kw.items() if WCS_KEYWORD_PATTERN.match(key)}
-    if _is_plate_solved(wcs_keywords):
+    if is_solved_header(wcs_keywords):
         source = "File header"
     elif fallback_wcs:
         wcs_keywords = {key: value for key, value in fallback_wcs.items()
                         if WCS_KEYWORD_PATTERN.match(str(key))}
-        if _is_plate_solved(wcs_keywords):
+        if is_solved_header(wcs_keywords):
             source = "Cached plate solve"
     if source is None or not image_size:
         return []
 
     try:
-        import numpy as np
-        from astropy.wcs import WCS
-        from astropy.wcs.utils import proj_plane_pixel_scales
-
-        wcs = WCS(wcs_keywords, naxis=2)
         width, height = image_size
-        center = wcs.all_pix2world(np.array([[(width - 1) / 2.0, (height - 1) / 2.0]]), 0)[0]
-        scale = float(np.mean(proj_plane_pixel_scales(wcs))) * 3600.0
-        cd = wcs.pixel_scale_matrix
-        rotation = math.degrees(math.atan2(-cd[0][1], cd[1][1]))
-    except Exception as e:
+        # The middle of the image - the same pixel whichever way its rows are numbered
+        center_ra, center_dec = WCSTransform(wcs_keywords, width, height).pixel_to_sky((width - 1) / 2,
+                                                                                      (height - 1) / 2)
+        scale = pixel_scale_arcsec(wcs_keywords)
+        _cd11, cd12, _cd21, cd22 = cd_matrix(wcs_keywords)
+        rotation = math.degrees(math.atan2(-cd12, cd22))  # As CROTA2 measures it
+    except (TypeError, ValueError, ZeroDivisionError) as e:
         logger.debug(f"Could not evaluate plate solution: {e}")
         return []
 
     return [
-        ("Center RA", format_ra(center[0])),
-        ("Center Dec", format_dec(center[1])),
+        ("Center RA", format_ra(center_ra % 360)),
+        ("Center Dec", format_dec(center_dec)),
         ("Image Scale", f"{scale:.2f}\"/px"),
         ("Rotation", f"{rotation:.2f}°"),
         ("Field of View", format_fov(scale, width, height)),
@@ -641,11 +639,6 @@ def _add_row(rows, label, value):
 def _to_float(value):
     """A header value as a number (FITS T/F booleans aren't numbers here)."""
     return None if isinstance(value, bool) else to_float(value)
-
-
-def _is_plate_solved(wcs_keywords):
-    return ('CRVAL1' in wcs_keywords and 'CRVAL2' in wcs_keywords and 'CRPIX1' in wcs_keywords
-            and ('CD1_1' in wcs_keywords or 'CDELT1' in wcs_keywords))
 
 
 def format_seconds_detail(seconds):
@@ -1788,7 +1781,6 @@ class ImageViewerWindow(QDialog):
         converted bottom-up before solving) already match the display.
         """
         if self.file_path and Path(self.file_path).suffix.lower() in FITS_EXTENSIONS:
-            from cosmoscollection.imaging.AnnotationOverlay import flip_wcs_rows
             return flip_wcs_rows(wcs_header, image_height)
         return wcs_header
 

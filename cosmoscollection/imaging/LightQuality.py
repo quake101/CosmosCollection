@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 
 from cosmoscollection.imaging import FrameQuality
+from cosmoscollection.imaging.ImageArrays import read_file_bytes
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.sessions import SessionFileScanner
 from cosmoscollection.sessions import SessionObservations
@@ -111,8 +112,13 @@ def _stat(path):
 
 
 def _read(path):
+    """A FITS file's bytes, read ahead on a thread of its own (on a network
+    share most of a frame's time is waiting for its bytes) - None for XISF,
+    which analyze_file reads itself."""
+    if os.path.splitext(path)[1].lower() in SessionFileScanner.XISF_EXTENSIONS:
+        return None
     try:
-        return FrameQuality.read_file(path)
+        return read_file_bytes(path)
     except Exception:
         return None  # analyze_file reads it again and reports why
 

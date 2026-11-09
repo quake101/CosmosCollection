@@ -158,20 +158,10 @@ class FrameMetrics:
 
 # ---- Loading ----------------------------------------------------------------
 
-def read_file(path):
-    """The whole file, for analyze_file to parse in memory - or None for a
-    format it reads itself (XISF). Lets callers read ahead on threads of their
-    own: on a network share most of a frame's time is waiting for its bytes."""
-    if os.path.splitext(path)[1].lower() in SessionFileScanner.XISF_EXTENSIONS:
-        return None
-    with open(path, "rb") as f:
-        return f.read()
-
-
-def _read_frame(path, raw=None):
+def read_frame(path, raw=None):
     """(pixels, header dict) for a FITS or XISF file; raw is the FITS file's
-    bytes from read_file, when already read."""
-    from cosmoscollection.imaging.ImageArrays import read_astro_array, _read_fits_array
+    bytes, when already read (ImageArrays.read_file_bytes)."""
+    from cosmoscollection.imaging.ImageArrays import read_astro_array, read_file_bytes, _read_fits_array
     ext = os.path.splitext(path)[1].lower()
     if ext in SessionFileScanner.XISF_EXTENSIONS:
         header = SessionFileScanner.extract_xisf_header(path)
@@ -181,7 +171,7 @@ def _read_frame(path, raw=None):
         # network share as astropy's many small reads plus a separate header read.
         from astropy.io import fits
         if raw is None:
-            raw = read_file(path)
+            raw = read_file_bytes(path)
         # Each open gets its own buffer - astropy closes the one it was given
         with fits.open(io.BytesIO(raw)) as hdul:
             full_header = hdul[0].header
@@ -210,7 +200,7 @@ def _bin2(img):
     return out
 
 
-def _luminance(data, header):
+def luminance(data, header):
     """A float32 mono image to analyze, how many sensor pixels each of its
     pixels covers per side, and how many sensor pixels were summed into one.
     Color-camera (Bayer) subs are binned 2x2 into one superpixel per CFA cell
@@ -692,14 +682,14 @@ def _find_trails(sub, noise):
 # ---- Analysis ---------------------------------------------------------------
 
 def analyze_file(path, raw=None):
-    """Measure one light frame (raw: its bytes from read_file, if already read).
+    """Measure one light frame (raw: its bytes, if already read).
     Never raises - failures come back with ok=False."""
     started = time.perf_counter()
     result = FrameMetrics(path=path)
     try:
-        data, header = _read_frame(path, raw)
+        data, header = read_frame(path, raw)
         full_scale = _full_scale(data)
-        img, scale, summed = _luminance(data, header)
+        img, scale, summed = luminance(data, header)
         result.height, result.width = data.shape[:2]
 
         mesh, tile_h, tile_w = _tile_medians(img, TILE)
@@ -868,7 +858,7 @@ def screen_stretched(path, target=0.25):
     """A frame at full resolution for close viewing, as uint8 (h, w) or (h, w, 3):
     debayered to color on a color camera, then auto-stretched like PixInsight's
     STF - each channel on its own, which also neutralizes a color cast."""
-    data, header = _read_frame(path)
+    data, header = read_frame(path)
     white = _full_scale(data)
     if data.ndim == 2 and header.get("BAYERPAT"):
         image = _debayer(data, header)
@@ -895,9 +885,9 @@ def inspection_images(path, crop_radius=32):
     the sensor's resolution. crops are [(image, (x, y))] - the corners, edges
     and center in reading order, at full sensor resolution (the green pixels on
     a color camera) and stretched alike, with each one's center in overview pixels."""
-    data, header = _read_frame(path)
+    data, header = read_frame(path)
     full_scale = _full_scale(data)
-    img, scale, summed = _luminance(data, header)
+    img, scale, summed = luminance(data, header)
     background, noise = _clipped_stats(img[::4, ::4].ravel())
     overview = _auto_stretch(img, background, noise, full_scale * summed)
 

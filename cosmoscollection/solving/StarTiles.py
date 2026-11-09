@@ -27,6 +27,8 @@ import threading
 
 import numpy as np
 
+from cosmoscollection.sessions.SessionFileScanner import angular_separations_deg
+
 logger = logging.getLogger(__name__)
 
 VIZIER_MIRRORS = (    # CDS first, then its official mirrors - each serves the same catalogs
@@ -110,14 +112,6 @@ def _tile_of(level, ras, decs):
     return bands, slices
 
 
-def _separation(ra, dec, ras, decs):
-    """Angular distances (degrees) from ra, dec to each of ras, decs."""
-    ra, dec = math.radians(ra), math.radians(dec)
-    ras, decs = np.radians(ras), np.radians(decs)
-    a = np.sin((decs - dec) / 2) ** 2 + math.cos(dec) * np.cos(decs) * np.sin((ras - ra) / 2) ** 2
-    return np.degrees(2 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0))))
-
-
 def _reach(level, tiles, ra, dec):
     """How far the farthest point of the tiles is from ra, dec (degrees). It's
     a corner, or where a tile's top or bottom edge crosses the RA opposite
@@ -132,7 +126,7 @@ def _reach(level, tiles, ra, dec):
     across = np.where((ra1 <= opposite) & (opposite <= ra2), opposite, ra1)
     ras = np.concatenate([ra1, ra2, ra1, ra2, across, across])
     decs = np.concatenate([dec1, dec1, dec2, dec2, dec1, dec2])
-    return float(_separation(ra, dec, ras, decs).max())
+    return float(angular_separations_deg(ra, dec, ras, decs).max())
 
 
 # ---- The cache file ----------------------------------------------------------
@@ -382,7 +376,7 @@ def _pick(found, tiles, ra, dec, radius, count):
     out a brighter star)."""
     have = [found[tile] for tile in tiles if tile in found]
     stars = np.concatenate([stars for _limit, stars in have] + [np.empty((0, 3))])
-    stars = stars[_separation(ra, dec, stars[:, 0], stars[:, 1]) <= radius]
+    stars = stars[angular_separations_deg(ra, dec, stars[:, 0], stars[:, 1]) <= radius]
     stars = stars[np.argsort(stars[:, 2], kind="stable")]
     if len(have) < len(tiles):
         return stars[:count], False

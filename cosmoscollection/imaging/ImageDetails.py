@@ -37,6 +37,7 @@ from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Paths import path_key
 from cosmoscollection.core.Formatting import count_text, format_duration, format_exposure, trim_number
 from cosmoscollection.sessions import SessionFileScanner, SessionObservations
+from cosmoscollection.imaging.WCS import is_solved_header, pixel_scale_arcsec
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 
 logger = logging.getLogger(__name__)
@@ -660,23 +661,6 @@ def _header_details(header, details, numbers):
                                                    temperature, _to_float(kw.get('XBINNING'))))
 
 
-def _solved_scale(wcs_header):
-    """Image scale in arcsec/px from a plate solution's keywords, or None."""
-    if not wcs_header:
-        return None
-    try:
-        from astropy.wcs import WCS
-        from astropy.wcs.utils import proj_plane_pixel_scales
-        from cosmoscollection.imaging.ImageViewer import WCS_KEYWORD_PATTERN, _is_plate_solved
-        keywords = {key: value for key, value in wcs_header.items() if WCS_KEYWORD_PATTERN.match(str(key))}
-        if not _is_plate_solved(keywords):
-            return None
-        return float(proj_plane_pixel_scales(WCS(keywords, naxis=2)).mean()) * 3600.0
-    except Exception as e:
-        logger.debug(f"Could not read the plate solution's scale: {e}")
-        return None
-
-
 def gather(conn, image_path, header=None, image_size=None, wcs_header=None, fallback_title=None):
     """{field key: text} for an image - '' for what isn't known. conn: an open
     connection (any thread's own); header: the file's HeaderData, or None;
@@ -729,7 +713,7 @@ def gather(conn, image_path, header=None, image_size=None, wcs_header=None, fall
         details["optics"] = format_optics(numbers["focal_length"], numbers.get("aperture"))
 
     # The image scale as measured by a plate solve, else as recorded, else from the equipment
-    scale = _solved_scale(wcs_header) or numbers.get("header_scale")
+    scale = (pixel_scale_arcsec(wcs_header) if is_solved_header(wcs_header) else None) or numbers.get("header_scale")
     if not scale and numbers.get("pixel_size") and numbers.get("focal_length"):
         scale = 206.265 * numbers["pixel_size"] / numbers["focal_length"]
     if scale:
@@ -789,7 +773,7 @@ class DetailsTask(QRunnable):
     def run(self):
         try:
             from cosmoscollection.imaging.ImageViewer import read_file_info
-            from cosmoscollection.imaging.AnnotationOverlay import read_wcs_header
+            from cosmoscollection.imaging.WCS import read_wcs_header
             info = self.file_info
             if info is None:
                 try:

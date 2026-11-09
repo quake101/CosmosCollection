@@ -118,10 +118,10 @@ def _gallery_positions(conn):
 
 
 def _solution_json(path, result, source, seconds, saved_before):
-    from cosmoscollection.solving.PlateSolver import PlateSolver
+    from cosmoscollection.imaging.WCS import pixel_scale_arcsec
     scale = result.pixel_scale
     if scale is None and result.wcs_header:
-        scale = PlateSolver._pixel_scale_from_wcs(result.wcs_header)
+        scale = pixel_scale_arcsec(result.wcs_header)
     return {"path": path, "solved": bool(result.success), "already_solved": saved_before,
             "solver": result.solver_used, "ra": result.ra_center, "dec": result.dec_center,
             "pixel_scale": scale, "hint": source, "seconds": round(seconds, 1),

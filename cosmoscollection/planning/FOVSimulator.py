@@ -36,6 +36,7 @@ from cosmoscollection.sessions import SessionRows
 from cosmoscollection.planning.NightTimes import (ASTRONOMICAL_DARK_ALTITUDE, CIVIL_TWILIGHT_ALTITUDE,
                                                   DARK_SKY_ALTITUDE, SUNSET_ALTITUDE, sky_state)
 from cosmoscollection.sessions.SessionFileScanner import angular_separation_deg
+from cosmoscollection.imaging.WCS import deproject
 
 logger = logging.getLogger(__name__)
 
@@ -138,27 +139,13 @@ def camera_presets():
             for _heading, cameras in CAMERA_PRESET_GROUPS for text, width, height, pixel in cameras}
 
 
-def tangent_to_radec(ra0, dec0, x, y):
-    """Sky position at tangent-plane coordinates x (east) and y (north) around
-    ra0/dec0 - the inverse gnomonic projection, so frames stay true
-    rectangles at any declination."""
-    dec0_r = math.radians(dec0)
-    rho = math.hypot(x, y)
-    if rho == 0:
-        return ra0 % 360.0, dec0
-    c = math.atan(rho)
-    sin_c, cos_c = math.sin(c), math.cos(c)
-    dec = math.asin(cos_c * math.sin(dec0_r) + y * sin_c * math.cos(dec0_r) / rho)
-    ra = ra0 + math.degrees(math.atan2(x * sin_c,
-                                       rho * math.cos(dec0_r) * cos_c - y * math.sin(dec0_r) * sin_c))
-    return ra % 360.0, math.degrees(dec)
-
-
 def offset_to_radec(ra0, dec0, east, north):
     """Sky position at an offset of 'east' and 'north' degrees from ra0/dec0.
     Offsets are angles along each axis, as a sensor sees them (tan(angle)
     on the tangent plane)."""
-    return tangent_to_radec(ra0, dec0, math.tan(math.radians(east)), math.tan(math.radians(north)))
+    ra, dec = deproject(math.degrees(math.tan(math.radians(east))), math.degrees(math.tan(math.radians(north))),
+                        ra0, dec0)
+    return ra % 360.0, dec
 
 
 def frame_to_radec(ra0, dec0, right, up, rotation=0.0):
@@ -171,7 +158,8 @@ def frame_to_radec(ra0, dec0, right, up, rotation=0.0):
     angle = math.radians(rotation)
     east = -x * math.cos(angle) + y * math.sin(angle)
     north = x * math.sin(angle) + y * math.cos(angle)
-    return tangent_to_radec(ra0, dec0, east, north)
+    ra, dec = deproject(math.degrees(east), math.degrees(north), ra0, dec0)
+    return ra % 360.0, dec
 
 
 def frame_corners(ra, dec, width, height, rotation=0.0, steps=8):

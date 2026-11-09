@@ -22,11 +22,9 @@ from PySide6.QtWidgets import QWidget
 
 logger = logging.getLogger(__name__)
 
-# Plate solutions: reading, writing and pixel <-> sky (moved to WCS.py, which has no Qt; kept
-# importable from here)
-from cosmoscollection.imaging.WCS import (  # noqa: E402,F401
-    FITS_EXTENSIONS, WCSTransform, _cd_matrix, _has_matrix, flip_wcs_rows, image_pixel_size, is_solved_header,
-    read_fits_cards, read_wcs_header, write_wcs_file)
+from cosmoscollection.imaging.WCS import (  # noqa: E402
+    WCSTransform, flip_wcs_rows, image_pixel_size, pixel_scale_arcsec, read_wcs_header)
+from cosmoscollection.sessions.SessionFileScanner import FITS_EXTENSIONS  # noqa: E402
 from cosmoscollection.catalog.DSONames import NOT_DSO_TYPES
 from cosmoscollection.core.Settings import app_settings
 
@@ -184,8 +182,7 @@ class AnnotationData:
 
     @property
     def degrees_per_pixel(self):
-        w = self.wcs
-        return math.sqrt(abs(w.cd1_1 * w.cd2_2 - w.cd1_2 * w.cd2_1)) or 1e-4
+        return (pixel_scale_arcsec(self.wcs.header) or 0) / 3600 or 1e-4
 
     @classmethod
     def from_header(cls, header, width, height, fits_rows=False):

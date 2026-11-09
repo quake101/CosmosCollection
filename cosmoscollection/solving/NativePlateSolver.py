@@ -27,6 +27,7 @@ import itertools
 
 import numpy as np
 
+from cosmoscollection.imaging.WCS import deproject, pixel_scale_arcsec, project
 from cosmoscollection.sessions.SessionFileScanner import FITS_EXTENSIONS, SUPPORTED_EXTENSIONS
 
 logger = logging.getLogger(__name__)
@@ -49,32 +50,6 @@ FIELDS = [0.25 * FIELD_STEP ** i for i in range(11)]  # Image diagonals tried, d
 
 class SolveFailed(Exception):
     """The image couldn't be solved - the message says why, for the user."""
-
-
-# ---- Sky <-> tangent plane ---------------------------------------------------
-
-def _project(ra, dec, ra0, dec0):
-    """Gnomonic (TAN) projection about ra0, dec0 - degrees in, degrees out
-    (xi toward increasing RA, eta toward north)."""
-    ra, dec = np.radians(ra), np.radians(dec)
-    ra0, dec0 = math.radians(ra0), math.radians(dec0)
-    cos_c = np.sin(dec) * math.sin(dec0) + np.cos(dec) * math.cos(dec0) * np.cos(ra - ra0)
-    xi = np.cos(dec) * np.sin(ra - ra0) / cos_c
-    eta = (np.sin(dec) * math.cos(dec0) - np.cos(dec) * math.sin(dec0) * np.cos(ra - ra0)) / cos_c
-    return np.degrees(xi), np.degrees(eta)
-
-
-def _deproject(xi, eta, ra0, dec0):
-    """Inverse of _project - degrees in, (ra, dec) degrees out."""
-    xi, eta = math.radians(xi), math.radians(eta)
-    ra0, dec0 = math.radians(ra0), math.radians(dec0)
-    rho = math.hypot(xi, eta)
-    if rho == 0:
-        return math.degrees(ra0), math.degrees(dec0)
-    c = math.atan(rho)
-    dec = math.asin(math.cos(c) * math.sin(dec0) + eta * math.sin(c) * math.cos(dec0) / rho)
-    ra = ra0 + math.atan2(xi * math.sin(c), rho * math.cos(dec0) * math.cos(c) - eta * math.sin(dec0) * math.sin(c))
-    return math.degrees(ra) % 360, math.degrees(dec)
 
 
 # ---- Reference stars ---------------------------------------------------------
@@ -150,10 +125,10 @@ def _load_luminance(path):
     ext = os.path.splitext(path)[1].lower()
     header = {}
     if ext in SUPPORTED_EXTENSIONS:
-        from cosmoscollection.imaging.FrameQuality import _read_frame, _luminance
-        data, header = _read_frame(path)
+        from cosmoscollection.imaging.FrameQuality import read_frame, luminance
+        data, header = read_frame(path)
         height, width = data.shape[:2]
-        img, factor, _summed = _luminance(data, header)
+        img, factor, _summed = luminance(data, header)
         del data
     else:
         img = _picture_luminance(path)
@@ -314,7 +289,7 @@ def _try_field(stars_xy, diag_px, field, ra0, dec0, progress=None):
     catalog = reference_stars(ra0, dec0, field * 0.6)
     if len(catalog) < 8:
         return None
-    xi, eta = _project(catalog[:, 0], catalog[:, 1], ra0, dec0)
+    xi, eta = project(catalog[:, 0], catalog[:, 1], ra0, dec0)
     sky = xi + 1j * eta
 
     image = stars_xy[:, 0] + 1j * stars_xy[:, 1]
@@ -461,7 +436,7 @@ def solve(path, ra, dec, scale=None, progress=None, cancelled=None, loaded=None)
             except SolveFailed:
                 deep = np.empty((0, 3))
             if len(deep) > len(catalog):
-                deep_xi, deep_eta = _project(deep[:, 0], deep[:, 1], ra, dec)
+                deep_xi, deep_eta = project(deep[:, 0], deep[:, 1], ra, dec)
                 deep_sky = deep_xi + 1j * deep_eta
                 matrix, offset = _affine(xy, np.column_stack([sky.real, sky.imag])[matched])
                 fitted = stars @ matrix.T + offset
@@ -473,8 +448,9 @@ def solve(path, ra, dec, scale=None, progress=None, cancelled=None, loaded=None)
         center = np.array([(shape[1] - 1) / 2, (shape[0] - 1) / 2])
         sky_xy = np.column_stack([sky.real, sky.imag])
         matrix, offset = _affine(xy, sky_xy[matched])
-        ra_c, dec_c = _deproject(*(matrix @ center + offset), ra, dec)
-        xi, eta = _project(catalog[matched, 0], catalog[matched, 1], ra_c, dec_c)
+        ra_c, dec_c = deproject(*(matrix @ center + offset), ra, dec)
+        ra_c %= 360
+        xi, eta = project(catalog[matched, 0], catalog[matched, 1], ra_c, dec_c)
         matrix, offset = _affine(xy, np.column_stack([xi, eta]))
         residual = np.hypot(*(xy @ matrix.T + offset - np.column_stack([xi, eta])).T)
         ref = np.linalg.solve(matrix, -offset)                      # Analysis pixel at ra_c, dec_c
@@ -495,7 +471,7 @@ def solve(path, ra, dec, scale=None, progress=None, cancelled=None, loaded=None)
                     "CD1_1": float(cd[0, 0]), "CD1_2": float(cd[0, 1]),
                     "CD2_1": float(cd[1, 0]), "CD2_2": float(cd[1, 1]),
                     "PLTSOLVD": "T"}
-        pixel_scale = math.sqrt(abs(np.linalg.det(cd))) * 3600
+        pixel_scale = pixel_scale_arcsec(solution)
         info = {"stars": len(matched), "rms_arcsec": float(np.sqrt(np.mean(residual ** 2))) * 3600,
                 "scale": pixel_scale, "field": field, "tries": tries,
                 "seconds": time.perf_counter() - started}
@@ -530,15 +506,8 @@ def equipment_scales(path):
         for other, key in rows:
             if key != mine or path_key(other) == wanted or not os.path.isfile(other):
                 continue
-            header = read_wcs_header(other)
-            if not header:
-                continue
-            if "CD1_1" in header:
-                value = math.sqrt(abs(header["CD1_1"] * header.get("CD2_2", 0)
-                                      - header.get("CD1_2", 0) * header.get("CD2_1", 0))) * 3600
-            else:
-                value = abs(float(header.get("CDELT1", 0))) * 3600
-            if value > 0:
+            value = pixel_scale_arcsec(read_wcs_header(other))
+            if value:
                 found[round(math.log(value) / math.log(1.05))] += 1  # Within 5% counts as the same
         return [1.05 ** bucket for bucket, _n in found.most_common()]
     except Exception as e:
@@ -601,7 +570,7 @@ def main(argv):
                 r1, d1 = mine.pixel_to_sky(x, y)
                 r2, d2 = theirs.pixel_to_sky(x, y)
                 worst = max(worst, math.hypot((r1 - r2) * math.cos(math.radians(d1)), d1 - d2) * 3600)
-            their_scale = math.sqrt(abs(theirs.cd1_1 * theirs.cd2_2 - theirs.cd1_2 * theirs.cd2_1)) * 3600
+            their_scale = pixel_scale_arcsec(saved)
             line += f" | vs saved: worst {worst:.1f}\" ({worst / their_scale:.1f} px)"
         print(line)
     del app

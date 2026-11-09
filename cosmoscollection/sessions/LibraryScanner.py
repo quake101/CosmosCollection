@@ -713,8 +713,8 @@ class Catalog:
             decs.append(float(dec))
             sizes.append(float(sizemax or sizemin or 0) / 3600.0)  # Arcseconds -> degrees
         self.ids = ids
-        self.ra = np.radians(np.array(ras))
-        self.dec = np.radians(np.array(decs))
+        self.ra = np.array(ras)     # Degrees
+        self.dec = np.array(decs)
         self.size = np.array(sizes)
         self._index = {i: n for n, i in enumerate(ids)}
         self._all_designations = names
@@ -728,7 +728,7 @@ class Catalog:
         n = self._index.get(dsodetailid)
         if n is None:
             return None, None
-        return math.degrees(float(self.ra[n])), math.degrees(float(self.dec[n]))
+        return float(self.ra[n]), float(self.dec[n])
 
     def label_of(self, dsodetailid):
         """'IC 443 - Jellyfish Nebula': its best designation and its common name
@@ -775,9 +775,7 @@ class Catalog:
         suggestions for where files were pointed: ones the position falls on
         first (as at_position counts them), then best-known, largest, nearest."""
         np = self._np
-        ra, dec = math.radians(ra_deg), math.radians(dec_deg)
-        cos_sep = np.sin(dec) * np.sin(self.dec) + np.cos(dec) * np.cos(self.dec) * np.cos(ra - self.ra)
-        sep = np.degrees(np.arccos(np.clip(cos_sep, -1.0, 1.0)))
+        sep = SessionFileScanner.angular_separations_deg(ra_deg, dec_deg, self.ra, self.dec)
         on = sep <= np.maximum(self.size / 2.0, POSITION_MATCH_RADIUS)
         inside = np.nonzero(sep <= radius_deg)[0]
         best = sorted(inside, key=lambda n: (not on[n], self.rank.get(self.ids[n], 9), -self.size[n], sep[n]))
@@ -815,19 +813,13 @@ class Catalog:
         n = self._index.get(dsodetailid)
         if n is None:
             return None
-        np = self._np
-        ra, dec = math.radians(ra_deg), math.radians(dec_deg)
-        cos_sep = (math.sin(dec) * math.sin(self.dec[n]) + math.cos(dec) * math.cos(self.dec[n])
-                   * math.cos(ra - self.ra[n]))
-        return math.degrees(math.acos(max(-1.0, min(1.0, float(cos_sep)))))
+        return SessionFileScanner.angular_separation_deg(ra_deg, dec_deg, float(self.ra[n]), float(self.dec[n]))
 
     def at_position(self, ra_deg, dec_deg):
         """The most notable DSO the position points at, or None: within its own
         extent or POSITION_MATCH_RADIUS of its center, best catalog first."""
         np = self._np
-        ra, dec = math.radians(ra_deg), math.radians(dec_deg)
-        cos_sep = np.sin(dec) * np.sin(self.dec) + np.cos(dec) * np.cos(self.dec) * np.cos(ra - self.ra)
-        sep = np.degrees(np.arccos(np.clip(cos_sep, -1.0, 1.0)))
+        sep = SessionFileScanner.angular_separations_deg(ra_deg, dec_deg, self.ra, self.dec)
         inside = np.nonzero(sep <= np.maximum(self.size / 2.0, POSITION_MATCH_RADIUS))[0]
         if not len(inside):
             return None
