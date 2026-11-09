@@ -46,17 +46,6 @@ class TonightCancelled(Exception):
     """Stopped before it finished."""
 
 
-def load_time_choice():
-    """(mode, at, from, to) saved for the Time dropdown."""
-    from cosmoscollection.core.Settings import app_settings
-    from cosmoscollection.planning.NightTimes import DIRECTION_MODES
-    settings = app_settings()
-    parts = (settings.value(TIME_SETTING, "", type=str) or "").split("|")
-    if len(parts) != 4 or parts[0] not in dict(DIRECTION_MODES):
-        return TIME_DEFAULT
-    return tuple(parts)
-
-
 def resolve_time_window(time_choice, location, timezone_name, now=None):
     """(start, end, note, times) of the chosen time: local datetimes - start ==
     end for a single moment - and the labeled times the Direction column is for

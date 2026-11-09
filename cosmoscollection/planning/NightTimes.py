@@ -23,6 +23,22 @@ DIRECTION_MODES = (
     ("frame", "Custom time frame"),
 )
 
+
+def load_night_choice(key, default):
+    """(mode, at, from, to) of a "Direction at:" / "Time:" choice saved under a
+    settings key as "mode|at|from|to" (times HH:MM), or default."""
+    from cosmoscollection.core.Settings import app_settings
+    parts = (app_settings().value(key, "", type=str) or "").split("|")
+    if len(parts) != 4 or parts[0] not in dict(DIRECTION_MODES):
+        return tuple(default)
+    return tuple(parts)
+
+
+def save_night_choice(key, choice):
+    """Save a (mode, at, from, to) choice for load_night_choice."""
+    from cosmoscollection.core.Settings import app_settings
+    app_settings().setValue(key, "|".join(choice))
+
 # The sun's altitude (degrees) at each stage of the night
 SUNSET_ALTITUDE = -0.833        # The sun's top at the horizon, with refraction
 CIVIL_TWILIGHT_ALTITUDE = -6.0

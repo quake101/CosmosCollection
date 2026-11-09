@@ -9,14 +9,14 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from PySide6.QtCore import Qt, QTimer, Signal, QThread, QTime
+from PySide6.QtCore import Qt, QTimer, Signal, QThread
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
                                QHeaderView, QTextEdit, QDialog, QComboBox,
                                QLineEdit, QCheckBox, QDateEdit, QSpinBox, QMenu,
                                QListWidget, QListWidgetItem, QSplitter,
-                               QPlainTextEdit, QTimeEdit)
+                               QPlainTextEdit)
 from PySide6.QtGui import QFont, QColor
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
@@ -28,6 +28,7 @@ from cosmoscollection.ui.WindowLifetime import release_on_close
 from cosmoscollection.ui.Theme import COLORS, font_px, theme_manager, themed_style, themed_text
 from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.DSONameCompleter import DSONameCompleter
+from cosmoscollection.ui.NightTimeChooser import NightTimeChooser
 from cosmoscollection.equipment.EquipmentManager import fill_telescope_combo
 from cosmoscollection.sessions import SessionFileScanner
 # The Target List's rows (moved to TargetRows.py, which has no UI imports; kept
@@ -968,20 +969,6 @@ DIRECTION_DEFAULT = ("midnight", "22:00", "21:00", "01:00")
 NOW_REFRESH_MS = 5 * 60 * 1000  # "Now" mode recalculates every 5 minutes
 
 
-def load_direction_setting():
-    """(mode, at, start, end) as saved for the Direction column."""
-    settings = app_settings()
-    parts = (settings.value(DIRECTION_SETTING, "", type=str) or "").split("|")
-    if len(parts) != 4 or parts[0] not in dict(DIRECTION_MODES):
-        return DIRECTION_DEFAULT
-    return tuple(parts)
-
-
-def save_direction_setting(mode, at, start, end):
-    settings = app_settings()
-    settings.setValue(DIRECTION_SETTING, "|".join((mode, at, start, end)))
-
-
 class DirectionWorker(QThread):
     """Computes the Direction column off the UI thread."""
 
@@ -1208,71 +1195,28 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
     
     def _build_direction_controls(self, row):
         """"Direction at:" - which time (or time frame) the Direction column shows."""
-        mode, at, start, end = load_direction_setting()
-        row.addWidget(QLabel("Direction at:"))
-        self.direction_mode_combo = QComboBox()
-        for key, label in DIRECTION_MODES:
-            self.direction_mode_combo.addItem(label, key)
-        self.direction_mode_combo.setToolTip(
+        self.direction_chooser = NightTimeChooser(
+            "Direction at:", DIRECTION_SETTING, DIRECTION_DEFAULT,
             "When the Direction column shows each target's compass direction.\n"
             "Dusk and dawn are astronomical twilight (sun 18° below the horizon).\n"
-            "Tonight means the coming night - or, before dawn, the night you're in.")
-        row.addWidget(self.direction_mode_combo)
-
-        def time_edit(hhmm, tooltip):
-            edit = QTimeEdit(QTime.fromString(hhmm, "HH:mm"))
-            edit.setDisplayFormat("HH:mm")
-            edit.setToolTip(tooltip)
-            edit.timeChanged.connect(lambda _t: self._direction_timer.start())
-            return edit
-
-        self.direction_at_edit = time_edit(at, "Time tonight to show directions for")
-        row.addWidget(self.direction_at_edit)
-        self.direction_from_edit = time_edit(start, "Start of the time frame")
-        row.addWidget(self.direction_from_edit)
-        self.direction_to_label = QLabel("to")
-        row.addWidget(self.direction_to_label)
-        self.direction_to_edit = time_edit(end, "End of the time frame (after midnight is fine)")
-        row.addWidget(self.direction_to_edit)
-        self.direction_note_label = QLabel("")
-        themed_style(self.direction_note_label, lambda: f"color: {COLORS['text_secondary']};")
-        row.addWidget(self.direction_note_label)
-
-        # Time edits are applied once they stop changing, not on every step
-        self._direction_timer = QTimer(self)
-        self._direction_timer.setSingleShot(True)
-        self._direction_timer.setInterval(500)
-        self._direction_timer.timeout.connect(self._on_direction_setting_changed)
+            "Tonight means the coming night - or, before dawn, the night you're in.",
+            "Time tonight to show directions for")
+        self.direction_chooser.changed.connect(self._on_direction_setting_changed)
+        row.addWidget(self.direction_chooser)
         # "Now" moves on: recalculate while the window is open
         self._direction_now_timer = QTimer(self)
         self._direction_now_timer.setInterval(NOW_REFRESH_MS)
         self._direction_now_timer.timeout.connect(self._update_directions)
+        self._update_now_timer()
 
-        index = self.direction_mode_combo.findData(mode)
-        self.direction_mode_combo.setCurrentIndex(max(index, 0))
-        self.direction_mode_combo.currentIndexChanged.connect(lambda _i: self._on_direction_setting_changed())
-        self._show_direction_time_edits()
-
-    def _direction_choice(self):
-        """(mode, at, from, to) currently chosen."""
-        return (self.direction_mode_combo.currentData(),
-                self.direction_at_edit.time().toString("HH:mm"),
-                self.direction_from_edit.time().toString("HH:mm"),
-                self.direction_to_edit.time().toString("HH:mm"))
-
-    def _show_direction_time_edits(self):
-        mode = self.direction_mode_combo.currentData()
-        self.direction_at_edit.setVisible(mode == "time")
-        for widget in (self.direction_from_edit, self.direction_to_label, self.direction_to_edit):
-            widget.setVisible(mode == "frame")
-        if mode == "now":
+    def _update_now_timer(self):
+        if self.direction_chooser.mode() == "now":
             self._direction_now_timer.start()
         else:
             self._direction_now_timer.stop()
 
     def _on_direction_setting_changed(self):
-        self._show_direction_time_edits()
-        save_direction_setting(*self._direction_choice())
+        self._update_now_timer()
         self._update_directions()
 
     def _update_directions(self):
@@ -1291,14 +1235,14 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         if not observer:
             self._direction_cells = {t["id"]: ("Location not set", "Set your location in Settings", False)
                                      for t in self.targets_data}
-            self.direction_note_label.setText("")
+            self.direction_chooser.set_note("")
             self._apply_direction_cells()
             return
         targets = [(t["id"], t["ra_deg"], t["dec_deg"]) for t in self.targets_data if has_position(t)]
-        self.direction_note_label.setText("Calculating...")
+        self.direction_chooser.set_note("Calculating...")
         lat, lon, tz_name = observer
         worker = DirectionWorker(self._direction_generation,
-                                 (targets, lat, lon, tz_name, horizon, *self._direction_choice()))
+                                 (targets, lat, lon, tz_name, horizon, *self.direction_chooser.choice()))
         worker.result_ready.connect(self._on_directions_ready)
         _direction_workers.add(worker)
         worker.finished.connect(lambda: _direction_workers.discard(worker))
@@ -1308,17 +1252,17 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         if generation != self._direction_generation:
             return  # A newer calculation is on its way
         if "error" in result:
-            self.direction_note_label.setText("Couldn't calculate directions")
+            self.direction_chooser.set_note("Couldn't calculate directions")
             return
         self._direction_cells = result["cells"]
         times = result["times"]
         when = " \u2192 ".join(f"{t:%H:%M}" for _label, t in times)
-        mode = self.direction_mode_combo.currentData()
+        mode = self.direction_chooser.mode()
         note = {"now": f"(as of {when})", "dusk": f"({when})", "dawn": f"({when})",
                 "night": f"({when})"}.get(mode, "")
         if result.get("note"):
             note = f"{note} - {result['note']}" if note else result["note"]
-        self.direction_note_label.setText(note)
+        self.direction_chooser.set_note(note)
         self._apply_direction_cells()
 
     def _apply_direction_cells(self):

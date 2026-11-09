@@ -10,12 +10,10 @@ import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMutex
-from PySide6.QtCore import QTime
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
-                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QCheckBox, QApplication,
-                               QTimeEdit)
+                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QCheckBox, QApplication)
 
 from astropy import units as u
 from astropy.time import Time
@@ -35,13 +33,14 @@ from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close
 from cosmoscollection.ui import DSOActions
+from cosmoscollection.ui.NightTimeChooser import NightTimeChooser
 from cosmoscollection.ui.Theme import COLORS, adapt_color, font_px, theme_manager, themed_style, tint
 from cosmoscollection.ui.TimeFormatHelper import format_time, format_datetime
 
 
 from cosmoscollection.planning.BestTonightEngine import (  # noqa: E402,F401
     TIME_DEFAULT, TIME_SETTING, BestTonightCalculation, TonightError, _get_available_catalogs,
-    describe_time_window, load_time_choice, resolve_time_window)
+    describe_time_window, resolve_time_window)
 
 
 class NumericTableWidgetItem(QTableWidgetItem):
@@ -163,13 +162,13 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self._time_note_stale = True  # Resolve again when this one finishes
             return
         self._time_note_stale = False
-        self.twilight_thread = TimeWindowThread(self._time_choice())
+        self.twilight_thread = TimeWindowThread(self.time_chooser.choice())
         self.twilight_thread.result_ready.connect(self._on_twilight_calculated)
         self.twilight_thread.start()
 
     def _on_twilight_calculated(self, note):
         """Show the resolved time window and, the first time, finish initialization."""
-        self.time_note_label.setText(note)
+        self.time_chooser.set_note(note)
         self._twilight_calc_date = datetime.now().strftime("%Y-%m-%d")
         if getattr(self, "_time_note_stale", False):
             QTimer.singleShot(0, self._resolve_time_note)
@@ -291,44 +290,17 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         settings_row2.addWidget(self.dso_limit_spin)
 
         # Time: when the objects should be up (the night, a moment, or a time frame)
-        from cosmoscollection.planning.NightTimes import DIRECTION_MODES
-        mode, at, start, end = load_time_choice()
-        settings_row2.addWidget(QLabel("Time:"))
-        self.time_mode_combo = QComboBox()
-        for key, label in DIRECTION_MODES:
-            self.time_mode_combo.addItem(label, key)
-        self.time_mode_combo.setToolTip(
+        self.time_chooser = NightTimeChooser(
+            "Time:", TIME_SETTING, TIME_DEFAULT,
             "When the objects should be up:\n"
             "\u2022 Tonight: up (above Min Altitude, in dark sky) at some point between dusk and dawn\n"
             "\u2022 Now / Dusk / Midnight / Dawn / Custom time: up at that moment\n"
             "\u2022 Custom time frame: up for the whole frame, e.g. 01:00 to 02:00\n"
             "Dusk and dawn are astronomical twilight. Times are for the coming night\n"
-            "(or, before dawn, the night you're in). Highest in the sky during the time ranks first.")
-        settings_row2.addWidget(self.time_mode_combo)
-
-        def time_edit(hhmm, tooltip):
-            edit = QTimeEdit(QTime.fromString(hhmm, "HH:mm"))
-            edit.setDisplayFormat("HH:mm")
-            edit.setToolTip(tooltip)
-            edit.timeChanged.connect(lambda _t: self._on_time_choice_changed())
-            return edit
-
-        self.time_at_edit = time_edit(at, "Time tonight")
-        settings_row2.addWidget(self.time_at_edit)
-        self.time_from_edit = time_edit(start, "Start of the time frame")
-        settings_row2.addWidget(self.time_from_edit)
-        self.time_to_label = QLabel("to")
-        settings_row2.addWidget(self.time_to_label)
-        self.time_to_edit = time_edit(end, "End of the time frame (after midnight is fine)")
-        settings_row2.addWidget(self.time_to_edit)
-        self.time_note_label = QLabel("")
-        themed_style(self.time_note_label, lambda: f"color: {COLORS['text_secondary']};")
-        settings_row2.addWidget(self.time_note_label)
-
-        index = self.time_mode_combo.findData(mode)
-        self.time_mode_combo.setCurrentIndex(max(index, 0))
-        self.time_mode_combo.currentIndexChanged.connect(lambda _i: self._on_time_choice_changed())
-        self._show_time_edits()
+            "(or, before dawn, the night you're in). Highest in the sky during the time ranks first.",
+            "Time tonight")
+        self.time_chooser.changed.connect(self._resolve_time_note)
+        settings_row2.addWidget(self.time_chooser)
 
         settings_row2.addStretch()
         settings_layout.addLayout(settings_row2)
@@ -455,25 +427,6 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.status_label = QLabel("Initializing astronomical calculations...")
         themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
         main_layout.addWidget(self.status_label)
-
-    def _time_choice(self):
-        """(mode, at, from, to) currently chosen."""
-        return (self.time_mode_combo.currentData(),
-                self.time_at_edit.time().toString("HH:mm"),
-                self.time_from_edit.time().toString("HH:mm"),
-                self.time_to_edit.time().toString("HH:mm"))
-
-    def _show_time_edits(self):
-        mode = self.time_mode_combo.currentData()
-        self.time_at_edit.setVisible(mode == "time")
-        for widget in (self.time_from_edit, self.time_to_label, self.time_to_edit):
-            widget.setVisible(mode == "frame")
-
-    def _on_time_choice_changed(self):
-        self._show_time_edits()
-        settings = app_settings()
-        settings.setValue(TIME_SETTING, "|".join(self._time_choice()))
-        self._resolve_time_note()
 
     def _refresh_horizon_state(self):
         """Load the active location's custom horizon and enable the Use Custom
@@ -659,7 +612,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
 
         # When the objects should be up
-        time_choice = self._time_choice()
+        time_choice = self.time_chooser.choice()
 
         # Re-check the active location's horizon - it may have been imported
         # or cleared in Settings while this window was open
