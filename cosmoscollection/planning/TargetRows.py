@@ -10,6 +10,7 @@ import logging
 from datetime import datetime
 
 from cosmoscollection.catalog.DSONames import designation_candidates
+from cosmoscollection.core.Formatting import known_magnitude
 from cosmoscollection.sessions import SessionFileScanner
 
 logger = logging.getLogger(__name__)
@@ -126,7 +127,7 @@ def add_target(conn, name, dso=None, priority="Medium", status="Not Observed", t
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         name, dso.get("dso_type", ""), dso.get("constellation", ""),
-        dso.get("ra_deg", 0), dso.get("dec_deg", 0), dso.get("magnitude", 0),
+        dso.get("ra_deg", 0), dso.get("dec_deg", 0), known_magnitude(dso.get("magnitude")),
         size_info_text(dso.get("size_min"), dso.get("size_max")),
         priority, status, notes or "", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), telescope_id,
     ))

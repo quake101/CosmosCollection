@@ -21,12 +21,14 @@ from PySide6.QtGui import QFont, QColor
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Formatting import format_magnitude, known_magnitude
 from cosmoscollection.catalog.DSONames import (designation_candidates, display_name, preferred_designation,
                                               type_code, type_name)
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close
 from cosmoscollection.ui.Theme import COLORS, font_px, theme_manager, themed_style, themed_text
 from cosmoscollection.ui import DSOActions
+from cosmoscollection.ui.SortItem import SortItem
 from cosmoscollection.ui.DSONameCompleter import DSONameCompleter
 from cosmoscollection.ui.NightTimeChooser import NightTimeChooser
 from cosmoscollection.equipment.EquipmentPicker import fill_telescope_combo, select_telescope
@@ -42,23 +44,6 @@ import logging
 
 # Set up logging
 logger = logging.getLogger(__name__)
-
-
-class PriorityTableWidgetItem(QTableWidgetItem):
-    """Custom QTableWidgetItem that sorts priorities correctly"""
-
-    PRIORITY_ORDER = {"Urgent": 4, "High": 3, "Medium": 2, "Low": 1}
-
-    def __init__(self, priority_text):
-        super().__init__(priority_text)
-        self.priority_value = self.PRIORITY_ORDER.get(priority_text, 0)
-        self.setTextAlignment(Qt.AlignCenter)
-
-    def __lt__(self, other):
-        """Override less-than operator for proper sorting"""
-        if isinstance(other, PriorityTableWidgetItem):
-            return self.priority_value < other.priority_value
-        return super().__lt__(other)
 
 
 class AddTargetDialog(QDialog):
@@ -229,9 +214,7 @@ class AddTargetDialog(QDialog):
         if dec_deg is not None:
             self.dec_edit.setText(str(dec_deg))
 
-        magnitude = self.dso_data.get("magnitude")
-        if magnitude is not None:
-            self.magnitude_edit.setText(str(magnitude))
+        self.magnitude_edit.setText(format_magnitude(self.dso_data.get("magnitude"), decimals=2))
 
         # Format size
         size_min = self.dso_data.get("size_min", 0)
@@ -255,11 +238,7 @@ class AddTargetDialog(QDialog):
         if dec is not None:
             self.dec_edit.setText(str(round(dec, 6)))
 
-        mag = data.get("magnitude")
-        if mag is not None:
-            self.magnitude_edit.setText(str(round(mag, 2)))
-        else:
-            self.magnitude_edit.setText("")
+        self.magnitude_edit.setText(format_magnitude(data.get("magnitude"), decimals=2))
 
         sizemin = data.get("sizemin") or 0
         sizemax = data.get("sizemax") or 0
@@ -1322,9 +1301,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         if dec_deg is not None:
             dialog.dec_edit.setText(str(dec_deg))
 
-        magnitude = target_data.get("magnitude")
-        if magnitude is not None:
-            dialog.magnitude_edit.setText(str(magnitude))
+        dialog.magnitude_edit.setText(format_magnitude(target_data.get("magnitude"), decimals=2))
 
         dialog.size_edit.setText(target_data.get("size_info", ""))
         dialog.priority_combo.setCurrentText(target_data.get("priority", "Medium"))
@@ -1566,27 +1543,22 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             self.targets_table.setItem(row, 2, QTableWidgetItem(target.get("constellation", "")))
 
             # Magnitude - use numeric sorting
-            magnitude = target.get("magnitude", 0)
-            mag_item = QTableWidgetItem()
-            mag_item.setData(Qt.DisplayRole, f"{magnitude:.1f}" if magnitude > 0 else "")
-            mag_item.setData(Qt.UserRole, magnitude if magnitude > 0 else 999)  # Store numeric value for sorting
-            mag_item.setTextAlignment(Qt.AlignCenter)
+            magnitude = known_magnitude(target.get("magnitude"))
+            # Blank when unknown, sorted after the known ones
+            mag_item = SortItem(format_magnitude(magnitude), magnitude if magnitude is not None else 999)
             self.targets_table.setItem(row, 3, mag_item)
 
             # Size
             self.targets_table.setItem(row, 4, QTableWidgetItem(target.get("size_info", "")))
 
-            # Priority - use custom PriorityTableWidgetItem for proper sorting
+            # Priority - sorted Low to Urgent
             priority = target.get("priority", "")
-            priority_item = PriorityTableWidgetItem(priority)
+            priority_item = SortItem(priority, TARGET_PRIORITIES.index(priority) if priority in TARGET_PRIORITIES else -1)
             self.targets_table.setItem(row, 5, priority_item)
 
             # Status - use status order for sorting
             status = target.get("status", "")
-            status_item = QTableWidgetItem(status)
-            status_order = {"Not Observed": 1, "Observed": 2, "Imaged": 3, "Completed": 4}
-            status_item.setData(Qt.UserRole, status_order.get(status, 0))  # Store numeric value for sorting
-            status_item.setTextAlignment(Qt.AlignCenter)
+            status_item = SortItem(status, TARGET_STATUSES.index(status) if status in TARGET_STATUSES else -1)
             self.targets_table.setItem(row, 6, status_item)
 
             # Telescope - display name or "Any" for unassigned
@@ -1621,9 +1593,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
                 formatted_date = ""
                 date_timestamp = 0
 
-            date_item = QTableWidgetItem(formatted_date)
-            date_item.setData(Qt.UserRole, date_timestamp)  # Store timestamp for sorting
-            date_item.setTextAlignment(Qt.AlignCenter)
+            date_item = SortItem(formatted_date, date_timestamp)
             self.targets_table.setItem(row, 10, date_item)
 
         # Re-enable sorting
@@ -1745,9 +1715,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             if dec_deg is not None:
                 dialog.dec_edit.setText(str(dec_deg))
 
-            magnitude = target_data.get("magnitude")
-            if magnitude is not None:
-                dialog.magnitude_edit.setText(str(magnitude))
+            dialog.magnitude_edit.setText(format_magnitude(target_data.get("magnitude"), decimals=2))
 
             dialog.size_edit.setText(target_data.get("size_info", ""))
             dialog.priority_combo.setCurrentText(target_data.get("priority", "Medium"))

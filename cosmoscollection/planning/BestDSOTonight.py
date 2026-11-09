@@ -33,35 +33,16 @@ from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close
 from cosmoscollection.ui import DSOActions
+from cosmoscollection.ui.SortItem import SortItem
 from cosmoscollection.ui.NightTimeChooser import NightTimeChooser
 from cosmoscollection.ui.Theme import COLORS, adapt_color, font_px, theme_manager, themed_style, tint
 from cosmoscollection.ui.TimeFormatHelper import format_time, format_datetime
+from cosmoscollection.core.Formatting import format_magnitude
 
 
 from cosmoscollection.planning.BestTonightEngine import (  # noqa: E402,F401
     TIME_DEFAULT, TIME_SETTING, BestTonightCalculation, TonightError, _get_available_catalogs,
     describe_time_window, resolve_time_window)
-
-
-class NumericTableWidgetItem(QTableWidgetItem):
-    """Custom QTableWidgetItem that sorts by numeric value stored in UserRole"""
-    def __lt__(self, other):
-        """Override less-than operator for proper numeric sorting"""
-        self_value = self.data(Qt.UserRole)
-        other_value = other.data(Qt.UserRole)
-
-        # Handle None values
-        if self_value is None:
-            return True
-        if other_value is None:
-            return False
-
-        # Compare numeric values
-        try:
-            return float(self_value) < float(other_value)
-        except (ValueError, TypeError):
-            # Fallback to string comparison if conversion fails
-            return super().__lt__(other)
 
 
 class DSOCalculationThread(QThread):
@@ -251,7 +232,9 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.max_magnitude_combo = QComboBox()
         self.max_magnitude_combo.addItems(["8.0", "10.0", "12.0", "14.0", "16.0"])
         self.max_magnitude_combo.setCurrentText("12.0")
-        self.max_magnitude_combo.setToolTip("Maximum magnitude for DSO selection (ignored when using Target List)")
+        self.max_magnitude_combo.setToolTip(
+            "Maximum magnitude for DSO selection (ignored when using Target List).\n"
+            "Objects without a known magnitude (mostly nebulae and dark nebulae) are included too.")
         settings_row1.addWidget(self.max_magnitude_combo)
 
         # Catalog dropdown selection
@@ -286,7 +269,10 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.dso_limit_spin.setRange(50, 1000)
         self.dso_limit_spin.setValue(200)
         self.dso_limit_spin.setSingleStep(50)
-        self.dso_limit_spin.setToolTip("Maximum number of DSOs to process (ignored when using target list)")
+        self.dso_limit_spin.setToolTip(
+            "How many of the brightest DSOs to check - and as many again without a known\n"
+            "magnitude (mostly nebulae and dark nebulae), largest first.\n"
+            "Ignored when using the Target List.")
         settings_row2.addWidget(self.dso_limit_spin)
 
         # Time: when the objects should be up (the night, a moment, or a time frame)
@@ -655,7 +641,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         for row in range(self.results_table.rowCount()):
             item = self.results_table.item(row, moon_col)
             if item is not None:
-                moon_sep = item.data(Qt.UserRole)
+                moon_sep = item.sort_key()
                 self._color_moon_item(item, None if moon_sep is None or moon_sep < 0 else moon_sep)
 
     def display_results(self, visible_dsos):
@@ -745,30 +731,18 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             # Constellation
             self.results_table.setItem(row, 2, QTableWidgetItem(dso_info["constellation"]))
             
-            # Magnitude - use numeric sorting, show "N/A" for unknown magnitude
+            # Magnitude - numeric sorting; blank when unknown (sorted last)
             mag_value = dso_info['magnitude']
-            mag_item = NumericTableWidgetItem()
-            if mag_value >= 99.0:
-                mag_item.setData(Qt.DisplayRole, "N/A")
-            else:
-                mag_item.setData(Qt.DisplayRole, f"{mag_value:.1f}")
-            mag_item.setData(Qt.UserRole, mag_value)  # Store numeric value for sorting
-            mag_item.setTextAlignment(Qt.AlignCenter)
+            mag_item = SortItem(format_magnitude(mag_value), mag_value if mag_value is not None else 99.0)
             self.results_table.setItem(row, 3, mag_item)
 
             # Maximum altitude - use numeric sorting
-            alt_item = NumericTableWidgetItem()
-            alt_item.setData(Qt.DisplayRole, f"{dso_data['max_altitude']:.0f}°")
-            alt_item.setData(Qt.UserRole, dso_data['max_altitude'])  # Store numeric value for sorting
-            alt_item.setTextAlignment(Qt.AlignCenter)
+            alt_item = SortItem(f"{dso_data['max_altitude']:.0f}°", dso_data['max_altitude'])  # Store numeric value for sorting
             self.results_table.setItem(row, 4, alt_item)
 
             # Best time - store time as sortable value
             time_str = format_time(dso_data["optimal_time"])
-            time_item = NumericTableWidgetItem()
-            time_item.setData(Qt.DisplayRole, time_str)
-            time_item.setData(Qt.UserRole, dso_data["optimal_time"].timestamp())  # 01:00 sorts after 23:00
-            time_item.setTextAlignment(Qt.AlignCenter)
+            time_item = SortItem(time_str, dso_data["optimal_time"].timestamp())  # 01:00 sorts after 23:00
             self.results_table.setItem(row, 5, time_item)
 
             # Direction
@@ -778,11 +752,8 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self.results_table.setItem(row, 6, dir_item)
 
             # Visible hours - use numeric sorting
-            hours_item = NumericTableWidgetItem()
             visible_hours = dso_data['visible_hours']
-            hours_item.setData(Qt.DisplayRole, f"{visible_hours:.1f}h" if visible_hours is not None else "\u2014")
-            hours_item.setData(Qt.UserRole, visible_hours or 0)  # Store numeric value for sorting
-            hours_item.setTextAlignment(Qt.AlignCenter)
+            hours_item = SortItem(f"{visible_hours:.1f}h" if visible_hours is not None else "\u2014", visible_hours or 0)
             self.results_table.setItem(row, 7, hours_item)
 
             # Telescope column (only when using target list)
@@ -794,14 +765,10 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
             # Moon separation cell
             moon_sep = dso_data.get("moon_separation")
-            moon_item = NumericTableWidgetItem()
             if moon_sep is not None:
-                moon_item.setData(Qt.DisplayRole, f"{moon_sep:.0f}°")
-                moon_item.setData(Qt.UserRole, moon_sep)
+                moon_item = SortItem(f"{moon_sep:.0f}°", moon_sep)
             else:
-                moon_item.setData(Qt.DisplayRole, "N/A")
-                moon_item.setData(Qt.UserRole, -1.0)  # sorts to bottom
-            moon_item.setTextAlignment(Qt.AlignCenter)
+                moon_item = SortItem("N/A", -1.0)  # sorts to bottom
             self._color_moon_item(moon_item, moon_sep)
             if moon_sep is None:
                 moon_item.setToolTip("Moon separation unavailable.")

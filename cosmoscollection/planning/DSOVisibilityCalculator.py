@@ -43,7 +43,7 @@ from cosmoscollection.planning.Observer import active_site, coordinates_text
 from cosmoscollection.planning.MonthCalendars import MultiMonthCalendar, hours_legend_row
 from cosmoscollection.planning.NightTimes import compass_direction
 from cosmoscollection.core.Settings import app_settings
-from cosmoscollection.core.Formatting import format_duration
+from cosmoscollection.core.Formatting import format_dec, format_duration, format_ra
 
 
 # Import DatabaseManager from separate file
@@ -1068,8 +1068,8 @@ class DSOVisibilityApp(WindowPositionMixin, QMainWindow):
         local_tz = results['local_tz']
 
         text = f"Results for {dso_name}:\n"
-        text += f"RA: {dso_coord.ra.to_string(unit=u.hour, precision=1)}\n"
-        text += f"Dec: {dso_coord.dec.to_string(unit=u.deg, precision=1)}\n\n"
+        text += f"RA: {format_ra(dso_coord.ra.deg)}\n"
+        text += f"Dec: {format_dec(dso_coord.dec.deg)}\n\n"
 
         # Find maximum altitude and its direction
         max_alt_idx = np.argmax(dso_altaz.alt.deg)

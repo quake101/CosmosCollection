@@ -287,11 +287,12 @@ class TargetListActionsMixin:
 
     @_reported("remove from the Target List")
     def _remove_from_target_list(self):
-        name = self.data.get("name") or "this object"
+        # Named as the list has it ("Barnard 33 (Horsehead)"), which may differ from the catalog's name
+        entry = target_list_entry(self.data)
+        name = (entry or {}).get("name") or self.data.get("name") or "this object"
         if QMessageBox.question(self, "Remove from Target List", f"Remove '{name}' from the target list?",
                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
-        entry = target_list_entry(self.data)
         if entry:
             from cosmoscollection.planning.TargetRows import delete_target
             with DatabaseManager().get_connection() as conn:

@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 
 from cosmoscollection.cli.Output import (EXIT_USAGE, CliError, Column, note, print_fields, print_json,
                                          print_table)
-from cosmoscollection.core.Formatting import count_text
+from cosmoscollection.core.Formatting import count_text, format_magnitude
 
 # Best DSO Tonight's defaults (BestTonightEngine's DEFAULT_*), here so --help doesn't load astropy
 DEFAULT_MIN_ALTITUDE = 30
@@ -188,7 +188,7 @@ def _tonight_json(result, targets):
         "id": info.get("id"),
         "type": info["type"], "type_name": type_name(info["type"]),
         "constellation": (info["constellation"] or "").upper() or None,
-        "magnitude": None if magnitude >= 99 else magnitude,
+        "magnitude": magnitude,  # None when unknown
         "ra_deg": info["ra_deg"], "dec_deg": info["dec_deg"],
         "max_altitude": round(float(result["max_altitude"]), 1),
         "best_time": _iso(result["optimal_time"]),
@@ -211,7 +211,7 @@ def _sort_tonight(results, sort):
     keys = {
         "hours": lambda r: -(r["visible_hours"] or 0),
         "altitude": lambda r: -r["max_altitude"],
-        "magnitude": lambda r: r["dso_info"]["magnitude"],
+        "magnitude": lambda r: (r["dso_info"]["magnitude"] is None, r["dso_info"]["magnitude"] or 0),
         "time": lambda r: r["optimal_time"],
         "moon": lambda r: -(r.get("moon_separation") if r.get("moon_separation") is not None else -1),
     }
@@ -305,7 +305,7 @@ def run_tonight(ctx):
                flex=True),
         Column("Type", lambda r: type_name(r["dso_info"]["type"]), flex=True),
         Column("Const", lambda r: (r["dso_info"]["constellation"] or "").upper()),
-        Column("Mag", lambda r: "" if r["dso_info"]["magnitude"] >= 99 else f"{r['dso_info']['magnitude']:.1f}", ">"),
+        Column("Mag", lambda r: format_magnitude(r["dso_info"]["magnitude"]), ">"),
         Column("Max alt", lambda r: f"{r['max_altitude']:.0f}°", ">"),
         Column("Best time", lambda r: _clock(r["optimal_time"]), ">"),
         Column("Direction", lambda r: r.get("direction") or ""),

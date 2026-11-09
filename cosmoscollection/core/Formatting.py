@@ -22,8 +22,8 @@ def format_dec(dec_deg):
     if dec_deg is None:
         return ""
     dec_deg = float(dec_deg)
-    sign = '-' if dec_deg < 0 else '+'
     total_arcsec = round(abs(dec_deg) * 3600.0)
+    sign = '-' if dec_deg < 0 and total_arcsec else '+'  # A hair below 0 rounds to +00° 00' 00"
     degrees, remainder = divmod(total_arcsec, 3600)
     arcmin, arcsec = divmod(remainder, 60)
     return f"{sign}{degrees:02d}° {arcmin:02d}' {arcsec:02d}\""
@@ -43,6 +43,27 @@ def format_duration(seconds):
     if hours and minutes:
         return f"{hours}h {minutes}m"
     return f"{hours}h" if hours else f"{minutes}m"
+
+
+# The catalog writes 79.9 (dark nebulae) or 99.9 for "magnitude unknown", and a
+# Target List entry added without one has 0
+UNKNOWN_MAGNITUDE_FROM = 50.0
+
+
+def known_magnitude(value):
+    """An object's magnitude as a number, or None when it isn't known (blank,
+    0, or the catalog's 79.9 / 99.9 stand-ins)."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if 0 < value < UNKNOWN_MAGNITUDE_FROM else None
+
+
+def format_magnitude(value, decimals=1, unknown=""):
+    """'6.5' - or `unknown` (default blank) when it isn't known."""
+    value = known_magnitude(value)
+    return f"{value:.{decimals}f}" if value is not None else unknown
 
 
 def format_exposure(seconds):

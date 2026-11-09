@@ -26,7 +26,7 @@ from PySide6.QtCore import (Qt, QItemSelection, QItemSelectionModel, QPointF, QT
                             Signal)
 from PySide6.QtGui import QColor, QCursor, QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QWidget, QLabel,
-                               QPushButton, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView,
+                               QPushButton, QComboBox, QTableWidget, QHeaderView,
                                QAbstractItemView, QSplitter, QGroupBox, QDoubleSpinBox, QProgressBar,
                                QMenu, QMessageBox, QSizePolicy, QToolButton,
                                QWidgetAction, QScrollArea, QCheckBox, QFileDialog, QProgressDialog, QSpinBox,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, Q
 from cosmoscollection.imaging import FrameQuality
 from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.ui.WindowLifetime import retire_thread
+from cosmoscollection.ui.SortItem import SortItem
 from cosmoscollection.ui.TimeFormatHelper import format_time
 from cosmoscollection.ui.ZoomableImageView import ZoomableImageView
 from cosmoscollection.core.Settings import app_settings
@@ -149,22 +150,6 @@ class InspectionLoader(QThread):
 
 
 # ---- Widgets --------------------------------------------------------------------
-
-class SortItem(QTableWidgetItem):
-    """A table cell that sorts by a key rather than its text."""
-    SORT_ROLE = Qt.UserRole + 1
-
-    def __init__(self, text, sort_key, align=Qt.AlignCenter):
-        super().__init__(text)
-        self.setData(self.SORT_ROLE, sort_key)
-        self.setTextAlignment(align)
-
-    def __lt__(self, other):
-        try:
-            return self.data(self.SORT_ROLE) < other.data(self.SORT_ROLE)
-        except TypeError:
-            return super().__lt__(other)
-
 
 class CropTile(QLabel):
     """One crop, scaled up to fill the tile with crisp (unsmoothed) pixels so

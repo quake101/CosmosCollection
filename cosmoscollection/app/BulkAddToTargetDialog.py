@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.core.Formatting import known_magnitude
 
 
 # --- Bulk Add to Target List Dialog ---
@@ -142,7 +143,7 @@ class BulkAddToTargetDialog(QDialog):
                         dso.get('constellation', ''),
                         dso.get('ra_deg', 0),
                         dso.get('dec_deg', 0),
-                        dso.get('magnitude', 0),
+                        known_magnitude(dso.get('magnitude')),
                         size_info,
                         priority,
                         date_added,

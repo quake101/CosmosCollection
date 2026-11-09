@@ -29,11 +29,13 @@ from cosmoscollection.planning.Observer import active_site
 from cosmoscollection.planning.MonthCalendars import LayeredMonthCalendar, MultiMonthCalendar
 from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.core.Settings import app_settings
-from cosmoscollection.core.Formatting import format_dec, format_duration, format_exposure, format_ra
+from cosmoscollection.core.Formatting import (format_dec, format_duration, format_exposure, format_magnitude,
+                                              format_ra, known_magnitude)
 from cosmoscollection.catalog.DSONames import display_name
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close, retire_thread
 from cosmoscollection.ui import DSOActions
+from cosmoscollection.ui.SortItem import SortItem
 from cosmoscollection.ui.DSONameCompleter import DSONameCompleter
 from cosmoscollection.equipment.EquipmentPicker import (equipment_filter_combo, fill_equipment_filter,
                                                         fill_telescope_combo, select_telescope)
@@ -224,40 +226,6 @@ def _rollback(db_manager):
 
 # Sessions still to be imaged - listed above finished ones
 OPEN_STATUSES = ("Planned", "In Progress")
-
-
-class SortItem(QTableWidgetItem):
-    """A table cell that sorts by a number rather than its text ('10.5 h' after
-    '2.0 h'), and within its group: groups keep their order whichever way a
-    column is sorted (open sessions stay above finished ones)."""
-    SORT_ROLE = Qt.UserRole + 1
-    GROUP_ROLE = Qt.UserRole + 2
-
-    def __init__(self, text, sort_key=None, align=None, group=None):
-        super().__init__(text)
-        if sort_key is not None:
-            self.setData(self.SORT_ROLE, sort_key)
-        if group is not None:
-            self.setData(self.GROUP_ROLE, group)
-        if align is not None:
-            self.setTextAlignment(align)
-
-    def __lt__(self, other):
-        group, other_group = self.data(self.GROUP_ROLE), other.data(self.GROUP_ROLE)
-        if group is not None and other_group is not None and group != other_group:
-            table = self.tableWidget()
-            # Qt sorts descending by asking other < self - turn that around to keep groups in place
-            if table is not None and table.horizontalHeader().sortIndicatorOrder() == Qt.DescendingOrder:
-                return group > other_group
-            return group < other_group
-        key, other_key = self.data(self.SORT_ROLE), other.data(self.SORT_ROLE)
-        if key is not None and other_key is not None:
-            try:
-                return key < other_key
-            except TypeError:
-                pass
-        # Not super().__lt__(): PySide sends that back to this override
-        return self.text() < other.text()
 
 
 class GroupDividerDelegate(QStyledItemDelegate):
@@ -1092,8 +1060,8 @@ class LinkTargetDialog(WindowPositionMixin, QDialog):
                 in suggested + others:
             details = ", ".join(p for p in (dso_type, constellation) if p)
             label = f"{name} ({details})" if details else name
-            if magnitude is not None:
-                label += f" - Mag {magnitude:.1f}"
+            if known_magnitude(magnitude) is not None:
+                label += f" - Mag {format_magnitude(magnitude)}"
             reasons = []
             if name_score:
                 reasons.append("same name")

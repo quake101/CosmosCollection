@@ -28,7 +28,7 @@ from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.ZoomableImageView import ZoomableImageView
 from cosmoscollection.ui.DSOActions import TargetListActionsMixin
 from cosmoscollection.core.UrlOpener import open_url
-from cosmoscollection.core.Formatting import format_dec, format_ra
+from cosmoscollection.core.Formatting import format_dec, format_magnitude, format_ra
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -711,8 +711,9 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
             object_info_layout = QVBoxLayout()
 
             # Add Object information with proper null handling
-            magnitude_str = f"{self.data['magnitude']:.2f}" if self.data['magnitude'] is not None else "Unknown"
-            surface_brightness_str = f"{self.data['surface_brightness']:.2f} mag/arcmin2" if self.data['surface_brightness'] is not None else "Unknown"
+            magnitude_str = format_magnitude(self.data['magnitude'], decimals=2, unknown="Unknown")
+            surface_brightness = format_magnitude(self.data['surface_brightness'], decimals=2)  # Same stand-ins
+            surface_brightness_str = f"{surface_brightness} mag/arcmin2" if surface_brightness else "Unknown"
 
             # Handle size information
             size_min = self.data['size_min'] if self.data['size_min'] is not None else 0

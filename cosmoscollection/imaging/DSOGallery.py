@@ -2523,8 +2523,9 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
                                               item_data.get('ra_deg'), item_data.get('dec_deg'), versions)
 
     def _open_dso_details(self, item_data):
-        """Open DSO detail window for the selected object"""
-        DSOActions.open_dso_details({'dsodetailid': item_data['dsodetailid'], 'name': item_data['name']})
+        """Open DSO detail window for the selected object - under its main
+        designation ("M 42"), not the card's list of all its names"""
+        DSOActions.open_dso_details({'dsodetailid': item_data['dsodetailid'], 'name': _main_name(item_data['name'])})
 
     def _show_card_context_menu(self, item_data, position):
         """Show context menu when right-clicking on a card"""
@@ -2539,7 +2540,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
         if len(rows) > 1:
             details_menu = context_menu.addMenu("View DSO Details")
             for row in rows:
-                details_menu.addAction(row['name'], lambda checked=False, row=row: self._open_dso_details(row))
+                details_menu.addAction(_main_name(row['name']), lambda checked=False, row=row: self._open_dso_details(row))
         else:
             details_action = context_menu.addAction("View DSO Details")
             details_action.triggered.connect(lambda: self._open_dso_details(item_data))

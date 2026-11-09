@@ -22,6 +22,7 @@ from astropy.time import Time
 
 from cosmoscollection.core.DatabaseManager import open_connection
 from cosmoscollection.app.DSOData import DESIGNATIONS_SQL
+from cosmoscollection.core.Formatting import UNKNOWN_MAGNITUDE_FROM, known_magnitude
 
 warnings.filterwarnings('ignore')
 
@@ -35,7 +36,6 @@ TIME_DEFAULT = ("night", "22:00", "01:00", "02:00")
 DEFAULT_MIN_ALTITUDE = 30
 DEFAULT_MAX_MAGNITUDE = 12.0
 DEFAULT_DSO_LIMIT = 200
-UNKNOWN_MAGNITUDE = 99.0  # Target List entries without a magnitude
 
 
 class TonightError(Exception):
@@ -235,7 +235,7 @@ class BestTonightCalculation:
             """
             if self.hide_completed:
                 query += " AND COALESCE(t.status, '') != 'Completed'"
-            query += " ORDER BY t.magnitude ASC"
+            query += " ORDER BY t.name"
 
             cursor.execute(query)
 
@@ -244,9 +244,6 @@ class BestTonightCalculation:
             for row in rows:
                 name, dso_type, constellation, magnitude, ra_deg, dec_deg, size_info, telescope_id, telescope_name = row
                 if name and ra_deg is not None and dec_deg is not None:
-                    # Default NULL magnitude to 99.0 sentinel so object is still processed
-                    if magnitude is None:
-                        magnitude = UNKNOWN_MAGNITUDE
                     # Query designations from main database by matching coordinates
                     cursor.execute(f"""
                         SELECT {DESIGNATIONS_SQL} as designations
@@ -264,7 +261,7 @@ class BestTonightCalculation:
                         "name": name,
                         "type": dso_type or "Unknown",
                         "constellation": constellation or "Unknown",
-                        "magnitude": float(magnitude),
+                        "magnitude": known_magnitude(magnitude),  # None when unknown
                         "surface_brightness": 0.0,
                         "size_min": 0.0,
                         "size_max": 0.0,
@@ -288,8 +285,29 @@ class BestTonightCalculation:
             conn = open_connection()
             cursor = conn.cursor()
 
-            # Build the query with catalog filtering if specified
-            base_query = f"""
+            # Both searches take the catalog and type filters
+            filters = """
+                    AND d.constellation IS NOT NULL
+                    AND d.dsotype IS NOT NULL
+                    AND d.ra IS NOT NULL
+                    AND d.dec IS NOT NULL
+            """
+            filter_params = []
+            if self.selected_catalogs:
+                catalog_placeholders = ','.join('?' * len(self.selected_catalogs))
+                filters += f"""
+                    AND d.id IN (
+                        SELECT dsodetailid FROM cataloguenr
+                        WHERE catalogue IN ({catalog_placeholders})
+                    )
+                """
+                filter_params.extend(self.selected_catalogs)
+            if self.selected_dso_types:
+                type_placeholders = ','.join('?' * len(self.selected_dso_types))
+                filters += f" AND d.dsotype IN ({type_placeholders})"
+                filter_params.extend(self.selected_dso_types)
+
+            columns = f"""
                 SELECT
                     d.id,
                     {DESIGNATIONS_SQL} as designations,
@@ -303,42 +321,26 @@ class BestTonightCalculation:
                     d.ra as ra_deg,
                     d.dec as dec_deg
                 FROM dsodetail d
-                WHERE d.magnitude IS NOT NULL
-                    AND d.magnitude <= ?
-                    AND d.constellation IS NOT NULL
-                    AND d.dsotype IS NOT NULL
-                    AND d.ra IS NOT NULL
-                    AND d.dec IS NOT NULL
             """
-
-            params = [self.max_magnitude]
-
-            # Add catalog filtering if catalogs are selected
-            if self.selected_catalogs:
-                catalog_placeholders = ','.join('?' * len(self.selected_catalogs))
-                base_query += f"""
-                    AND d.id IN (
-                        SELECT dsodetailid FROM cataloguenr
-                        WHERE catalogue IN ({catalog_placeholders})
-                    )
-                """
-                params.extend(self.selected_catalogs)
-
-            # Add DSO type filtering if types are selected
-            if self.selected_dso_types:
-                type_placeholders = ','.join('?' * len(self.selected_dso_types))
-                base_query += f" AND d.dsotype IN ({type_placeholders})"
-                params.extend(self.selected_dso_types)
-
-            base_query += f" ORDER BY d.magnitude ASC LIMIT {int(self.dso_limit)}"
-
-            cursor.execute(base_query, params)
-
+            limit = int(self.dso_limit)
+            # The brightest, up to the DSO Limit, within Max Magnitude
+            cursor.execute(columns + """
+                WHERE d.magnitude > 0 AND d.magnitude < ? AND d.magnitude <= ?
+            """ + filters + f" ORDER BY d.magnitude ASC LIMIT {limit}",
+                           [UNKNOWN_MAGNITUDE_FROM, self.max_magnitude] + filter_params)
             rows = cursor.fetchall()
+            # And as many again without a known magnitude (mostly nebulae and dark
+            # nebulae, which are good targets too), largest first
+            cursor.execute(columns + """
+                WHERE (d.magnitude IS NULL OR d.magnitude <= 0 OR d.magnitude >= ?)
+            """ + filters + f" ORDER BY COALESCE(d.sizemax, d.sizemin, 0) DESC LIMIT {limit}",
+                           [UNKNOWN_MAGNITUDE_FROM] + filter_params)
+            rows += cursor.fetchall()
+
             dsos = []
             for row in rows:
                 dso_id, designations, dso_type, constellation, magnitude, surface_brightness, size_min, size_max, dso_class, ra_deg, dec_deg = row
-                if designations and magnitude is not None and ra_deg is not None and dec_deg is not None:
+                if designations and ra_deg is not None and dec_deg is not None:
                     # Take the first designation as the primary name
                     primary_name = designations.split(',')[0].strip()
                     dsos.append({
@@ -346,7 +348,7 @@ class BestTonightCalculation:
                         "name": primary_name,
                         "type": dso_type or "Unknown",
                         "constellation": constellation or "Unknown",
-                        "magnitude": float(magnitude),
+                        "magnitude": known_magnitude(magnitude),  # None when unknown
                         "surface_brightness": float(surface_brightness) if surface_brightness is not None else 0.0,
                         "size_min": float(size_min) if size_min is not None else 0.0,
                         "size_max": float(size_max) if size_max is not None else 0.0,
@@ -483,8 +485,13 @@ class BestTonightCalculation:
                 if progress:
                     progress(min(int(completed_count * 100 / total_dsos), 100))
 
-        # Sort by combination of altitude and magnitude (lower magnitude is better)
-        visible_dsos.sort(key=lambda x: (-x["max_altitude"] + x["dso_info"]["magnitude"]), reverse=False)
+        # Higher and brighter first. An unknown magnitude (mostly nebulae) counts as
+        # the Max Magnitude, so it isn't pushed below everything else.
+        def rank(dso):
+            magnitude = dso["dso_info"]["magnitude"]
+            return -dso["max_altitude"] + (magnitude if magnitude is not None else self.max_magnitude)
+
+        visible_dsos.sort(key=rank)
 
         self._add_direction_cells(visible_dsos)
         self._add_moon(visible_dsos)

@@ -7,7 +7,7 @@ import os
 
 from cosmoscollection.cli.Output import (EXIT_USAGE, CliError, Column, note, print_fields, print_json,
                                          print_table)
-from cosmoscollection.core.Formatting import count_text, format_duration
+from cosmoscollection.core.Formatting import count_text, format_duration, format_magnitude, known_magnitude
 
 REFRESH_NOTE = "If the app is open, its windows show this change after they're refreshed or reopened."
 
@@ -206,7 +206,7 @@ def _dso_json(dso):
         "constellation_name": constellation_name(dso["constellation"]),
         "ra_deg": dso["ra_deg"], "dec_deg": dso["dec_deg"],
         "ra": format_ra(dso["ra_deg"]), "dec": format_dec(dso["dec_deg"]),
-        "magnitude": _magnitude(dso["magnitude"]), "surface_brightness": _magnitude(dso["surface_brightness"]),
+        "magnitude": known_magnitude(dso["magnitude"]), "surface_brightness": known_magnitude(dso["surface_brightness"]),
         "size_arcmin": [round(dso["size_max"], 2), round(dso["size_min"], 2)],
         "image_count": dso["image_count"],
     }
@@ -259,23 +259,9 @@ def _dso_columns(search, catalog):
         Column("Common name", lambda d: common_name_from_designations(d["designations"]) or "", flex=True),
         Column("Type", lambda d: type_name(d["dso_type"])),
         Column("Const", lambda d: (d["constellation"] or "").upper()),
-        Column("Mag", lambda d: _magnitude_text(d["magnitude"]), ">"),
+        Column("Mag", lambda d: format_magnitude(d["magnitude"]), ">"),
         Column("Images", lambda d: d["image_count"], ">"),
     ]
-
-
-def _magnitude(value):
-    """A catalog magnitude, or None when unknown (blank, or the catalog's 99.9)."""
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if value >= 99 else value
-
-
-def _magnitude_text(value):
-    value = _magnitude(value)
-    return f"{value:.1f}" if value is not None else ""
 
 
 def _print_dsos(ctx, matches, search, catalog, limit, what):
@@ -311,7 +297,7 @@ def run_dso_list(ctx):
     if sort == "name":
         matches.sort(key=search.sort_key(catalog))
     elif sort == "magnitude":
-        matches.sort(key=lambda d: (_magnitude(d["magnitude"]) is None, _magnitude(d["magnitude"]) or 0))
+        matches.sort(key=lambda d: (known_magnitude(d["magnitude"]) is None, known_magnitude(d["magnitude"]) or 0))
     elif sort == "images":
         matches.sort(key=lambda d: -d["image_count"])
     else:
@@ -357,8 +343,8 @@ def run_dso_show(ctx):
         ("Constellation", data["constellation_name"]),
         ("RA / Dec", f"{data['ra']}  {data['dec']}  ({data['ra_deg']:.4f}, {data['dec_deg']:+.4f})"
          if data["ra_deg"] is not None else None),
-        ("Magnitude", _magnitude_text(data["magnitude"]) or None),
-        ("Surface brightness", _magnitude_text(data["surface_brightness"]) or None),
+        ("Magnitude", format_magnitude(data["magnitude"]) or None),
+        ("Surface brightness", format_magnitude(data["surface_brightness"]) or None),
         ("Size", size),
         ("Target List", f"{target['priority']} priority, {target['status']} (as '{target['name']}', "
                         f"id {target['id']})" if target else "not on it"),
@@ -618,10 +604,12 @@ def _target_rows(conn):
 
 
 def _target_json(target):
-    return {key: target.get(key) for key in ("id", "name", "dso_type", "constellation", "ra_deg", "dec_deg",
+    data = {key: target.get(key) for key in ("id", "name", "dso_type", "constellation", "ra_deg", "dec_deg",
                                               "magnitude", "size_info", "priority", "status", "best_months",
                                               "notes", "date_added", "date_observed", "telescope_id",
                                               "session_count")}
+    data["magnitude"] = known_magnitude(data["magnitude"])  # None when unknown
+    return data
 
 
 def run_targets_list(ctx):

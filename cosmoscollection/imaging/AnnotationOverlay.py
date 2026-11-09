@@ -27,6 +27,7 @@ from cosmoscollection.imaging.WCS import (  # noqa: E402
 from cosmoscollection.sessions.SessionFileScanner import FITS_EXTENSIONS  # noqa: E402
 from cosmoscollection.catalog.DSONames import NOT_DSO_TYPES
 from cosmoscollection.core.Settings import app_settings
+from cosmoscollection.core.Formatting import known_magnitude
 
 
 @dataclass
@@ -197,7 +198,6 @@ class AnnotationData:
 
 # Catalog entries that aren't deep-sky objects: stars the NGC/IC listed, and
 # entries for objects that don't exist
-UNKNOWN_MAGNITUDE = 50    # The catalog's stand-ins for "unknown" are 79.9 and 99.9
 
 
 def _annotation_priority(item):
@@ -210,7 +210,8 @@ def _annotation_priority(item):
         rank = 1
     else:
         rank = 3 if kind == "DRKNB" else 2
-    magnitude = item.magnitude if item.magnitude is not None and item.magnitude < UNKNOWN_MAGNITUDE else 99
+    magnitude = known_magnitude(item.magnitude)
+    magnitude = magnitude if magnitude is not None else 99  # Unknown: after the rest
     return rank, magnitude, -(item.size or 0)
 
 
