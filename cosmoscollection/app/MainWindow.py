@@ -29,7 +29,7 @@ from cosmoscollection.app.SystemTrayManager import SystemTrayManager
 from cosmoscollection.planning.Observer import active_site
 from cosmoscollection.catalog.DSONames import DSO_TYPES
 from cosmoscollection.core.Settings import app_settings
-from cosmoscollection.catalog.DSODetail import DSODetailWindow
+import cosmoscollection.catalog.DSODetail  # noqa: F401 - loaded with the main window, so DSO Details opens quickly
 from cosmoscollection.catalog.SimbadWorker import SimbadLoadingDialog, SimbadQueryWorker
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.core.ResourceManager import ResourceManager
@@ -37,11 +37,12 @@ from cosmoscollection.imaging.CollageBuilder import open_collage_builder
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
 from cosmoscollection.planning.FOVSimulator import AladinLiteWindow
 from cosmoscollection.ui.WindowLifetime import keep_when_closed, window_is_open
+from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 
 from cosmoscollection.app.AboutDialog import AboutDialog
 from cosmoscollection.app.BulkAddToTargetDialog import BulkAddToTargetDialog
-from cosmoscollection.app.DSOData import load_all_dso_data, load_dso
+from cosmoscollection.app.DSOData import load_all_dso_data
 from cosmoscollection.app.DSOTableModel import DSOTableModel
 from cosmoscollection.app.SettingsDialog import SettingsDialog
 from cosmoscollection.app.UpdateDialogs import offer_update_and_apply, run_update_check
@@ -458,9 +459,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _show_target_list(self):
         """Show the DSO Target List window"""
         try:
-            from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
-            if not window_is_open(getattr(self, 'target_list_window', None)):
-                self.target_list_window = DSOTargetListWindow()
+            self.target_list_window = DSOActions.tool_window("DSOTargetListWindow")
             self.target_list_window.show()
             self.target_list_window.raise_()
             self.target_list_window.activateWindow()
@@ -472,9 +471,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
     def _show_session_manager(self):
         """Show the Session Manager window"""
         try:
-            from cosmoscollection.sessions.SessionManager import SessionManagerWindow
-            if not window_is_open(getattr(self, 'session_manager_window', None)):
-                self.session_manager_window = SessionManagerWindow()
+            self.session_manager_window = DSOActions.tool_window("SessionManagerWindow")
             self.session_manager_window.show()
             self.session_manager_window.raise_()
             self.session_manager_window.activateWindow()
@@ -1056,37 +1053,11 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         self._update_status()
 
     def _on_double_click(self, index):
-        try:
-            logger.debug(f"Double click on row {index.row()}")
-            row = index.row()
-            entry = self.model.filtered_data[row]
-            logger.debug(f"Selected entry: {entry}")
-
-            # Get fresh data from database using the connection manager
-            with self.db_manager.get_connection() as conn:
-                data = load_dso(conn, entry["dsodetailid"])
-            if not data:
-                logger.error(f"Could not find object {entry['name']}")
-                return
-            self._create_detail_window(data, entry)
-
-        except Exception as e:
-            logger.error(f"Error in _on_double_click: {str(e)}", exc_info=True)
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Error", f"An error occurred: {str(e)}")
-
-    def _create_detail_window(self, data, entry):
-        """Create and show the detail window with the given data (load_dso's dict)"""
-        # Use the name from the table entry instead of reconstructing it
-        data["name"] = entry["name"]
-
-        logger.debug(f"Data dictionary: {data}")
-
-        logger.debug("Creating detail window")
-        # Create the window in a new thread
-        detail_window = DSODetailWindow(data)
-        detail_window.show()
-        logger.debug("Detail window shown")
+        """Open the double-clicked object in DSO Details (its own window, not
+        kept in front of this one)."""
+        row = index.row()
+        if 0 <= row < len(self.model.filtered_data):
+            DSOActions.open_dso_details(self.model.filtered_data[row], None)
 
     def _refresh_data(self):
         """Pick up image count changes after images are added"""
@@ -1104,242 +1075,12 @@ class MainWindow(WindowPositionMixin, QMainWindow):
             logger.error(f"Error refreshing data: {str(e)}", exc_info=True)
 
     def _show_context_menu(self, position):
-        """Show context menu when right-clicking on the DSO table"""
-        # Get the item at the clicked position
+        """Right-click menu for an object in the table (see DSOActions)."""
         index = self.table_view.indexAt(position)
-        if not index.isValid():
-            return  # No item at this position
-
-        # Get the row number
-        row = index.row()
-        if row < 0 or row >= len(self.model.filtered_data):
+        if not index.isValid() or not 0 <= index.row() < len(self.model.filtered_data):
             return
-
-        # Create context menu
-        context_menu = QMenu(self)
-
-        # Add menu actions
-        details_action = context_menu.addAction("View DSO Details")
-        details_action.triggered.connect(lambda: self._context_view_details(row))
-
-        visibility_action = context_menu.addAction("Visibility Calculator")
-        visibility_action.triggered.connect(lambda: self._context_open_visibility(row))
-
-        aladin_action = context_menu.addAction("FOV Simulator")
-        aladin_action.triggered.connect(lambda: self._context_open_aladin(row))
-
-        if NINAIntegration.is_enabled():
-            context_menu.addSeparator()
-            nina_menu = context_menu.addMenu("NINA")
-            nina_action = nina_menu.addAction("Send to Framing Assistant")
-            nina_action.triggered.connect(lambda: self._context_send_to_nina(row))
-            slew_action = nina_menu.addAction("Slew to Target")
-            slew_action.triggered.connect(lambda: self._context_slew_to_target(row))
-
-        context_menu.addSeparator()
-
-        # Is it already on the Target List / in the Session Manager?
-        target_entry, sessions = self._context_list_status(row)
-
-        if sessions:
-            sessions_menu = context_menu.addMenu(f"Sessions ({len(sessions)})")
-            for session_id, session_name, date, status, _ in sessions:
-                session_action = sessions_menu.addAction(f"{date or 'No date'} – {session_name} ({status})")
-                session_action.triggered.connect(lambda checked=False, sid=session_id: self._context_open_session(sid))
-            sessions_menu.addSeparator()
-            plan_action = sessions_menu.addAction("Plan a New Session")
-        else:
-            plan_action = context_menu.addAction("Plan a Session")
-        plan_action.triggered.connect(lambda: self._context_plan_session(row, target_entry))
-
-        if target_entry:
-            target_action = context_menu.addAction("Open in Target List")
-            target_action.triggered.connect(lambda: self._context_open_in_target_list(target_entry))
-        else:
-            target_action = context_menu.addAction("Add to Target List")
-            target_action.triggered.connect(lambda: self._context_add_to_target_list(row))
-
-        # Show the menu at the clicked position
-        context_menu.exec(self.table_view.mapToGlobal(position))
-
-    def _context_list_status(self, row):
-        """The row's Target List entry (or None) and its Session Manager sessions -
-        matched by name, other designations or position, like everywhere else."""
-        entry = self.model.filtered_data[row]
-        name = entry.get('name', '')
-        ra_deg, dec_deg = entry.get('ra_deg'), entry.get('dec_deg')
-        try:
-            from cosmoscollection.planning.DSOTargetList import find_existing_target
-            from cosmoscollection.sessions.SessionRows import sessions_for_object
-            with self.db_manager.get_connection() as conn:
-                return (find_existing_target(conn, name, ra_deg, dec_deg),
-                        sessions_for_object(conn, name, ra_deg, dec_deg, entry.get('dsodetailid')))
-        except Exception as e:
-            logger.error(f"Error checking Target List / sessions for {name}: {e}", exc_info=True)
-            return None, []
-
-    def _context_open_in_target_list(self, target_entry):
-        """Open the Target List with this object's entry selected"""
-        try:
-            from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
-            if not window_is_open(getattr(self, 'target_list_window', None)):
-                self.target_list_window = DSOTargetListWindow()
-            if not self.target_list_window.open_and_select_target(target_entry['name']):
-                QMessageBox.warning(self, "Not Found", f"Could not find '{target_entry['name']}' in your target list.")
-        except Exception as e:
-            logger.error(f"Error opening Target List: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open Target List: {str(e)}")
-
-    def _context_open_session(self, session_id):
-        """Open the Session Manager with this session selected"""
-        try:
-            from cosmoscollection.sessions.SessionManager import SessionManagerWindow
-            if not window_is_open(getattr(self, 'session_manager_window', None)):
-                self.session_manager_window = SessionManagerWindow()
-            self.session_manager_window.open_and_select_session(session_id)
-        except Exception as e:
-            logger.error(f"Error opening Session Manager: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open Session Manager: {str(e)}")
-
-    def _context_plan_session(self, row, target_entry=None):
-        """Open Session Manager pre-filled with this DSO (linked to its Target List entry)"""
-        try:
-            entry = self.model.filtered_data[row]
-            dso_data = {
-                'id': target_entry['id'] if target_entry else None,
-                'name': entry.get('name', ''),
-                'dsodetailid': entry.get('dsodetailid'),
-                'ra_deg': entry.get('ra_deg'),
-                'dec_deg': entry.get('dec_deg'),
-                'designations': entry.get('designations', '')
-            }
-            from cosmoscollection.sessions.SessionManager import SessionManagerWindow
-            if not window_is_open(getattr(self, 'session_manager_window', None)):
-                self.session_manager_window = SessionManagerWindow()
-            self.session_manager_window.create_session_from_dso(dso_data)
-        except Exception as e:
-            logger.error(f"Error opening Session Manager: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open Session Manager: {str(e)}")
-
-    def _context_view_details(self, row):
-        """View DSO details from context menu"""
-        # Get the index and trigger the existing double-click method
-        model_index = self.model.index(row, 0)
-        self._on_double_click(model_index)
-
-    def _context_open_visibility(self, row):
-        """Open DSO Visibility Calculator from context menu"""
-        try:
-            entry = self.model.filtered_data[row]
-            dso_name = entry.get("name", "")
-            ra_deg = entry.get("ra_deg", 0)
-            dec_deg = entry.get("dec_deg", 0)
-
-            if not dso_name:
-                QMessageBox.warning(self, "Error", "No DSO name available")
-                return
-
-            logger.debug(f"Opening DSO Visibility Calculator for: {dso_name} at RA {ra_deg}° Dec {dec_deg}°")
-
-            # Import and open DSO Visibility Calculator
-            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityApp
-
-            # Store reference to prevent garbage collection
-            self.visibility_window = DSOVisibilityApp()
-
-            # Set DSO name in input field for display and title
-            if hasattr(self.visibility_window, 'dso_input'):
-                self.visibility_window.dso_input.setText(dso_name)
-                logger.debug(f"Set DSO name in input field: {dso_name}")
-            else:
-                logger.warning("DSO input field not found in visibility window")
-
-            # Use coordinates for accurate calculation
-            if hasattr(self.visibility_window, 'set_dso_coordinates'):
-                self.visibility_window.set_dso_coordinates(ra_deg, dec_deg)
-                logger.debug(f"Set coordinates: RA {ra_deg}° Dec {dec_deg}°")
-
-            # Show the window immediately
-            self.visibility_window.show()
-            self.visibility_window.raise_()
-            self.visibility_window.activateWindow()
-
-            # Automatically trigger calculation after a short delay
-            if hasattr(self.visibility_window, 'calculate_visibility'):
-                QTimer.singleShot(500, self.visibility_window.calculate_visibility)
-                logger.debug("Triggered automatic visibility calculation")
-            else:
-                logger.warning("Calculate visibility method not found in visibility window")
-
-            logger.debug("DSO Visibility Calculator window opened successfully")
-
-        except Exception as e:
-            logger.error(f"Error opening DSO Visibility Calculator: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open DSO Visibility Calculator: {str(e)}")
-
-    def _context_open_aladin(self, row):
-        """Open Aladin Lite from context menu"""
-        try:
-            entry = self.model.filtered_data[row]
-
-            # Create data dictionary similar to what DSODetailWindow creates
-            detail_data = {
-                'name': entry.get('name', ''),
-                'ra_deg': entry.get('ra_deg', 0),
-                'dec_deg': entry.get('dec_deg', 0),
-                'size_min': entry.get('size_min', 30),
-                'size_max': entry.get('size_max', 30),
-                'dsodetailid': entry.get('dsodetailid', '')
-            }
-
-            # Import and open Aladin Lite window
-            # Store reference to prevent garbage collection and manage window lifecycle
-            if not window_is_open(getattr(self, 'aladin_window', None)):
-                self.aladin_window = AladinLiteWindow(detail_data, self)
-                self.aladin_window.show()
-            else:
-                # If window is already open, bring it to front
-                self.aladin_window.raise_()
-                self.aladin_window.activateWindow()
-
-        except Exception as e:
-            logger.error(f"Error opening Aladin Lite: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open Aladin Lite: {str(e)}")
-
-    def _context_add_to_target_list(self, row):
-        """Add DSO to target list from context menu"""
-        try:
-            entry = self.model.filtered_data[row]
-
-            # Create data dictionary for target list
-            dso_data = {
-                'name': entry.get('name', ''),
-                'ra_deg': entry.get('ra_deg', 0),
-                'dec_deg': entry.get('dec_deg', 0),
-                'magnitude': entry.get('magnitude', 0),
-                'size_min': entry.get('size_min', 0),
-                'size_max': entry.get('size_max', 0),
-                'constellation': entry.get('constellation', ''),
-                'dso_type': entry.get('dso_type', ''),
-                'dso_class': entry.get('dso_class', ''),
-                'designations': entry.get('designations', '')
-            }
-
-            # Import and open Target List window, then add the DSO
-            from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
-            if not window_is_open(getattr(self, 'target_list_window', None)):
-                self.target_list_window = DSOTargetListWindow()
-
-            self.target_list_window.show()
-            self.target_list_window.raise_()
-            self.target_list_window.activateWindow()
-
-            # Add the DSO to the target list
-            self.target_list_window.add_target_from_dso(dso_data)
-
-        except Exception as e:
-            logger.error(f"Error adding to target list: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to add to target list: {str(e)}")
+        menu = DSOActions.build_dso_context_menu(self, self.model.filtered_data[index.row()], details_parent=None)
+        menu.exec(self.table_view.mapToGlobal(position))
 
     def _on_bulk_add_missing_objects(self):
         """Open bulk-add dialog for all DSOs without images not yet in the target list"""
@@ -1372,22 +1113,6 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             if window_is_open(getattr(self, 'target_list_window', None)):
                 self.target_list_window._load_targets()
-
-    def _context_send_to_nina(self, row):
-        """Send DSO coordinates to NINA Framing Assistant"""
-        entry = self.model.filtered_data[row]
-        NINAIntegration.send_to_framing_assistant(
-            entry.get("ra_deg"), entry.get("dec_deg"),
-            entry.get("name", "Unknown"), self
-        )
-
-    def _context_slew_to_target(self, row):
-        """Slew mount to DSO coordinates"""
-        entry = self.model.filtered_data[row]
-        NINAIntegration.slew_to_coordinates(
-            entry.get("ra_deg"), entry.get("dec_deg"),
-            entry.get("name", "Unknown"), self
-        )
 
     def closeEvent(self, event):
         """Handle window close event"""

@@ -33,7 +33,8 @@ from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import format_dec, format_duration, format_exposure, format_ra
 from cosmoscollection.catalog.DSONames import display_name, suggestion_names
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
-from cosmoscollection.ui.WindowLifetime import release_on_close, retire_thread, window_is_open
+from cosmoscollection.ui.WindowLifetime import release_on_close, retire_thread
+from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.TimeFormatHelper import format_time
 from cosmoscollection.ui.Theme import COLORS, font_px, font_size, themed_style
 from cosmoscollection.sessions import ImportSettings, MountDetection
@@ -4104,10 +4105,7 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         if not self._current_session or not self._current_session.get("target_id"):
             return
         try:
-            from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
-            if not window_is_open(getattr(self, "target_list_window", None)):
-                self.target_list_window = DSOTargetListWindow()
-            self.target_list_window.open_and_select_target(self._current_session.get("dso_name"))
+            DSOActions.tool_window("DSOTargetListWindow").open_and_select_target(self._current_session.get("dso_name"))
         except Exception as e:
             logger.error(f"Error opening target list: {e}")
             QMessageBox.warning(self, "Error", f"Could not open Target List: {e}")
@@ -4280,39 +4278,25 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         return find_full_dso_data(self.db_manager, session.get("dso_name", ""), session)
 
     def _session_coordinates(self, session):
-        """(ra_deg, dec_deg) - the session's own, else its object's catalogue position."""
+        """(ra_deg, dec_deg) - the session's own, else its object's catalog position."""
         if session.get("ra_deg") is not None and session.get("dec_deg") is not None:
             return session["ra_deg"], session["dec_deg"]
         data = self._catalog_data(session)
         return (data["ra_deg"], data["dec_deg"]) if data else (None, None)
 
     def _open_dso_details(self, session):
-        data = self._catalog_data(session)
-        if not data:
-            QMessageBox.warning(self, "Object Not Found",
-                                f"Could not find {session.get('dso_name', 'this object')} in the DSO catalogue.")
-            return
-        try:
-            from cosmoscollection.catalog.DSODetail import DSODetailWindow
-            DSODetailWindow(data, self).show()
-        except Exception as e:
-            logger.error(f"Error opening DSO details: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open DSO details: {e}")
+        DSOActions.open_dso_details({**session, "name": session.get("dso_name") or ""}, self)
 
     def _open_fov_simulator(self, session):
         data = self._catalog_data(session)
         if not data:
             QMessageBox.warning(self, "Object Not Found",
-                                f"Could not find {session.get('dso_name', 'this object')} in the DSO catalogue.")
+                                f"Could not find {session.get('dso_name', 'this object')} in the DSO catalog.")
             return
-        try:
-            from cosmoscollection.planning.FOVSimulator import AladinLiteWindow, load_session_framing
-            with self.db_manager.get_connection() as conn:
-                framing = load_session_framing(conn, session["id"])
-            AladinLiteWindow(data, self, framing=framing, session_id=session["id"]).show()
-        except Exception as e:
-            logger.error(f"Error opening FOV Simulator: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open FOV Simulator: {e}")
+        from cosmoscollection.planning.FOVSimulator import load_session_framing
+        with self.db_manager.get_connection() as conn:
+            framing = load_session_framing(conn, session["id"])
+        DSOActions.open_fov(data, self, framing=framing, session_id=session["id"])
 
     def _open_visibility_calculator(self, session):
         """DSO Visibility Calculator for the session's object, opened on tonight (for
@@ -4325,20 +4309,8 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
                                 f"This session has no coordinates and {session.get('dso_name', 'its object')} "
                                 "wasn't found in the DSO catalog.")
             return
-        try:
-            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityApp
-            window = DSOVisibilityApp()
-            window.dso_input.setText(session.get("dso_name") or "")
-            window.set_dso_coordinates(ra_deg, dec_deg)
-            self._visibility_window = window  # keep a reference so it isn't garbage collected
-            window.show()
-            window.raise_()
-            window.activateWindow()
-            # Same short delay as the other places that open it, so the window is fully up first
-            QTimer.singleShot(500, window.calculate_visibility)
-        except Exception as e:
-            logger.error(f"Error opening Visibility Calculator: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open Visibility Calculator: {e}")
+        DSOActions.open_visibility({"name": session.get("dso_name") or "", "ra_deg": ra_deg, "dec_deg": dec_deg},
+                                   self)
 
     def _nina_action(self, session, nina_function):
         ra_deg, dec_deg = self._session_coordinates(session)

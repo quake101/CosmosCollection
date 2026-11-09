@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QThread, QRectF, QObject,
 from PySide6.QtGui import QPixmap, QPainter, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
-    QGroupBox, QScrollArea, QMessageBox, QProgressBar, QMenu, QApplication
+    QGroupBox, QScrollArea, QMessageBox, QProgressBar, QMenu
 )
 
 from cosmoscollection.imaging import ImageDetails
@@ -27,7 +27,6 @@ from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Paths import path_key
 from cosmoscollection.ui.Theme import COLORS, adapt_color, font_size, theme_manager, themed_style
 from cosmoscollection.ui.WindowPositionManager import WindowPositionManager
-from cosmoscollection.ui.WindowLifetime import window_is_open
 from cosmoscollection.core.Formatting import format_dec, format_ra, trim_number
 from cosmoscollection.ui.TimeFormatHelper import format_datetime
 from cosmoscollection.sessions.SessionObservations import parse_obs_datetime
@@ -48,10 +47,6 @@ logger = logging.getLogger(__name__)
 # destroyed while still running crashes the app, so keep a reference until
 # the load finishes instead of blocking the window close on it.
 _orphaned_workers = set()
-
-# The Session Manager opened from a viewer, when there's no main window to open it
-_session_manager_window = None
-
 
 # File Information values may wrap after these (path separators, punctuation -
 # not dots, which would split numbers like 300.00 and file extensions)...
@@ -1579,20 +1574,9 @@ class ImageViewerWindow(QDialog):
         self._details_layout_changed()
 
     def _open_session(self, session_id):
-        """The Session Manager with the session selected - the main window's, when there is one."""
-        global _session_manager_window
-        try:
-            main = next((w for w in QApplication.topLevelWidgets() if hasattr(w, "_context_open_session")), None)
-            if main is not None:
-                main._context_open_session(session_id)
-                return
-            from cosmoscollection.sessions.SessionManager import SessionManagerWindow
-            if not window_is_open(_session_manager_window):
-                _session_manager_window = SessionManagerWindow()
-            _session_manager_window.open_and_select_session(session_id)
-        except Exception as e:
-            logger.error(f"Error opening Session Manager: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open Session Manager: {e}")
+        """The Session Manager (the open one, if any) with the session selected."""
+        from cosmoscollection.ui.DSOActions import open_session
+        open_session(session_id, self)
 
     # Export (ImageExport.py)
 

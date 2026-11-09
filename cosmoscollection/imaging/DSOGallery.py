@@ -31,6 +31,7 @@ from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.core.Formatting import format_duration
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import refresh_open, release_on_close
+from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.Theme import COLORS, font_px, font_size, themed_style
 from cosmoscollection.imaging.ImageLoader import load_astro_pixmap, load_astro_qimage, read_image_file, write_image_file
 from cosmoscollection.solving.PlateSolver import describe_solving
@@ -615,30 +616,6 @@ def open_image_viewer(parent, name, image_path, ra_deg=None, dec_deg=None, versi
         return viewer
     except Exception as e:
         QMessageBox.critical(parent, "Error", f"Failed to open image viewer:\n{str(e)}")
-        return None
-
-
-def open_dso_details(parent, dsodetailid, name=None):
-    """Open the DSO Detail window for an object (by dsodetailid)."""
-    try:
-        from cosmoscollection.catalog.DSODetail import DSODetailWindow
-
-        from cosmoscollection.app.DSOData import load_dso
-        with DatabaseManager().get_connection() as conn:
-            data = load_dso(conn, dsodetailid)
-        if not data:
-            QMessageBox.warning(parent, "Error", "Could not load DSO details")
-            return None
-        if name:
-            data["name"] = name
-        detail_window = DSODetailWindow(data)
-        _keep(detail_window)
-        detail_window.show()
-        detail_window.raise_()
-        detail_window.activateWindow()
-        return detail_window
-    except Exception as e:
-        QMessageBox.critical(parent, "Error", f"Failed to open DSO details:\n{str(e)}")
         return None
 
 
@@ -2561,7 +2538,7 @@ class DSOGalleryWindow(WindowPositionMixin, QMainWindow):
 
     def _open_dso_details(self, item_data):
         """Open DSO detail window for the selected object"""
-        open_dso_details(self, item_data['dsodetailid'], item_data['name'])
+        DSOActions.open_dso_details({'dsodetailid': item_data['dsodetailid'], 'name': item_data['name']})
 
     def _show_card_context_menu(self, item_data, position):
         """Show context menu when right-clicking on a card"""

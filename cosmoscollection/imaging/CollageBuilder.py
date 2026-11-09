@@ -5671,8 +5671,8 @@ class CollageBuilderWindow(WindowPositionMixin, QDialog):
     def view_dso_details(self, image_id):
         row = self.library.get(image_id)
         if row is not None and row["dsodetailid"]:
-            from cosmoscollection.imaging.DSOGallery import open_dso_details
-            open_dso_details(self, row["dsodetailid"], row["dso_name"])
+            from cosmoscollection.ui.DSOActions import open_dso_details
+            open_dso_details({"dsodetailid": row["dsodetailid"], "name": row["dso_name"]})
 
     def _add_view_actions(self, menu, image_id):
         """View Full Image / View DSO Details for an image (canvas and library menus)."""

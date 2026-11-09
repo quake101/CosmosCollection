@@ -14,7 +14,7 @@ from PySide6.QtCore import QTime
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
-                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QMenu, QCheckBox, QApplication,
+                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QCheckBox, QApplication,
                                QTimeEdit)
 
 from astropy import units as u
@@ -33,10 +33,10 @@ from cosmoscollection.planning.Observer import active_site, coordinates_text
 from cosmoscollection.catalog.DSONames import type_name
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
-from cosmoscollection.ui.WindowLifetime import release_on_close, window_is_open
+from cosmoscollection.ui.WindowLifetime import release_on_close
+from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.Theme import COLORS, adapt_color, font_px, theme_manager, themed_style, tint
 from cosmoscollection.ui.TimeFormatHelper import format_time, format_datetime
-from cosmoscollection.nina.NINAIntegration import NINAIntegration
 
 
 from cosmoscollection.planning.BestTonightEngine import (  # noqa: E402,F401
@@ -875,46 +875,25 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         # Sort by visible hours (column 7) in descending order by default
         self.results_table.sortByColumn(7, Qt.DescendingOrder)
 
-    def on_item_double_clicked(self, item):
-        """Handle double-click on table item to show object details"""
-        try:
-            # Get DSO data from the name item (column 0) of the clicked row
-            name_item = self.results_table.item(item.row(), 0)
-            if name_item:
-                dso_data = name_item.data(Qt.UserRole)
-                if dso_data:
-                    self.show_object_detail(dso_data)
-                else:
-                    QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Could not open object details: {e}")
-    
-    def show_object_detail(self, dso_data):
-        """Show detailed information for the selected DSO"""
-        try:
-            from cosmoscollection.catalog.DSODetail import DSODetailWindow
-            from cosmoscollection.app.DSOData import find_full_dso_data, load_dso
-            info = dso_data["dso_info"]
-            db_manager = DatabaseManager()
-            detail_data = None
-            if info.get("id") is not None:  # A catalog object (Target List entries have no id)
-                with db_manager.get_connection() as conn:
-                    detail_data = load_dso(conn, info["id"])
-            if detail_data is None:
-                detail_data = find_full_dso_data(db_manager, info["name"], info)
-            if detail_data is None:
-                QMessageBox.warning(self, "Not Found", f"{info['name']} isn't in the catalog.")
-                return
-            detail_data["name"] = info["name"]
+    def _row_object(self, row):
+        """The object a results row shows, as DSOActions takes it - or None."""
+        name_item = self.results_table.item(row, 0)
+        dso_data = name_item.data(Qt.UserRole) if name_item else None
+        if not dso_data:
+            return None
+        info = dso_data["dso_info"]
+        return {"name": info["name"], "ra_deg": info["ra_deg"], "dec_deg": info["dec_deg"],
+                "dsodetailid": info.get("id"),  # Target List entries have none
+                "designations": info.get("designations", ""), "magnitude": info.get("magnitude"),
+                "size_min": info.get("size_min"), "size_max": info.get("size_max"),
+                "constellation": info.get("constellation"), "dso_type": info.get("type"),
+                "dso_class": info.get("dso_class")}
 
-            # Create and show the detail window
-            detail_window = DSODetailWindow(detail_data, self)
-            detail_window.show()
-            
-        except ImportError as e:
-            QMessageBox.warning(self, "Import Error", f"Could not load DSODetailWindow: {e}")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Could not open object details: {e}")
+    def on_item_double_clicked(self, item):
+        """Open the double-clicked object in DSO Details."""
+        obj = self._row_object(item.row())
+        if obj:
+            DSOActions.open_dso_details(obj, self)
 
     def handle_error(self, error_msg):
         """Handle calculation errors"""
@@ -926,377 +905,11 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         QMessageBox.warning(self, "Calculation Error", error_msg)
 
     def _show_context_menu(self, position):
-        """Show context menu when right-clicking on the DSO table"""
-        # Get the item at the clicked position
+        """Right-click menu for an object in the results (see DSOActions)."""
         index = self.results_table.indexAt(position)
-        if not index.isValid():
-            return  # No item at this position
-
-        # Get the row number
-        row = index.row()
-        if row < 0 or row >= self.results_table.rowCount():
-            return
-
-        # Create context menu
-        context_menu = QMenu(self)
-
-        # Add menu actions
-        details_action = context_menu.addAction("View DSO Details")
-        details_action.triggered.connect(lambda: self._context_view_details(row))
-
-        visibility_action = context_menu.addAction("Visibility Calculator")
-        visibility_action.triggered.connect(lambda: self._context_open_visibility(row))
-
-        aladin_action = context_menu.addAction("FOV Simulator")
-        aladin_action.triggered.connect(lambda: self._context_open_aladin(row))
-
-        if NINAIntegration.is_enabled():
-            context_menu.addSeparator()
-            nina_menu = context_menu.addMenu("NINA")
-            nina_action = nina_menu.addAction("Send to Framing Assistant")
-            nina_action.triggered.connect(lambda: self._context_send_to_nina(row))
-            slew_action = nina_menu.addAction("Slew to Target")
-            slew_action.triggered.connect(lambda: self._context_slew_to_target(row))
-
-        plan_session_action = context_menu.addAction("Plan a Session")
-        plan_session_action.triggered.connect(lambda: self._context_plan_session(row))
-
-        context_menu.addSeparator()
-
-        # Check if DSO is already in target list
-        name_item = self.results_table.item(row, 0)
-        if name_item:
-            dso_data = name_item.data(Qt.UserRole)
-            if dso_data:
-                dso_name = dso_data["dso_info"]["name"]
-
-                # Check if in target list
-                is_in_target_list = self._is_dso_in_target_list(dso_name)
-
-                if is_in_target_list:
-                    # Show "Open from Target List" option
-                    open_target_action = context_menu.addAction("Open from Target List")
-                    open_target_action.triggered.connect(lambda: self._context_open_from_target_list(row))
-                else:
-                    # Show "Add to Target List" option
-                    target_action = context_menu.addAction("Add to Target List")
-                    target_action.triggered.connect(lambda: self._context_add_to_target_list(row))
-
-        # Show the menu at the clicked position
-        context_menu.exec(self.results_table.mapToGlobal(position))
-
-    def _context_view_details(self, row):
-        """View DSO details from context menu"""
-        try:
-            # Get DSO data from the name item (column 0) of the selected row
-            name_item = self.results_table.item(row, 0)
-            if name_item:
-                dso_data = name_item.data(Qt.UserRole)
-                if dso_data:
-                    self.show_object_detail(dso_data)
-                else:
-                    QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to open DSO details: {str(e)}")
-
-    def _context_open_visibility(self, row):
-        """Open DSO Visibility Calculator from context menu"""
-        try:
-            # Get DSO data from the name item (column 0) of the selected row
-            name_item = self.results_table.item(row, 0)
-            if name_item:
-                dso_data = name_item.data(Qt.UserRole)
-                if dso_data:
-                    dso_name = dso_data["dso_info"]["name"]
-
-                    # Get coordinates
-                    coordinates = dso_data.get("coordinates")
-                    if coordinates:
-                        ra_deg = coordinates.ra.degree
-                        dec_deg = coordinates.dec.degree
-                    else:
-                        # Fallback - try to get coordinates again
-                        from astropy.coordinates import SkyCoord
-                        try:
-                            coord = SkyCoord.from_name(dso_name)
-                            ra_deg = coord.ra.degree
-                            dec_deg = coord.dec.degree
-                        except:
-                            ra_deg = 0.0
-                            dec_deg = 0.0
-
-                    # Import and open DSO Visibility Calculator
-                    from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityApp
-
-                    # Store reference to prevent garbage collection - use list to allow multiple windows
-                    if not hasattr(self, 'visibility_windows'):
-                        self.visibility_windows = []
-
-                    visibility_window = DSOVisibilityApp()
-
-                    # Set DSO name in input field for display and title
-                    if hasattr(visibility_window, 'dso_input'):
-                        visibility_window.dso_input.setText(dso_name)
-
-                    # Use coordinates for accurate calculation
-                    if hasattr(visibility_window, 'set_dso_coordinates'):
-                        visibility_window.set_dso_coordinates(ra_deg, dec_deg)
-
-                    # Show the window immediately
-                    visibility_window.show()
-                    visibility_window.raise_()
-                    visibility_window.activateWindow()
-
-                    # Store reference after showing to prevent garbage collection
-                    # (closed ones dropped - they're freed once closed)
-                    self.visibility_windows = [w for w in self.visibility_windows if window_is_open(w)]
-                    self.visibility_windows.append(visibility_window)
-
-                    # Automatically trigger calculation after a short delay
-                    if hasattr(visibility_window, 'calculate_visibility'):
-                        QTimer.singleShot(500, visibility_window.calculate_visibility)
-                else:
-                    QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to open DSO Visibility Calculator: {str(e)}")
-
-    def _context_open_aladin(self, row):
-        """Open Aladin Lite from context menu"""
-        try:
-            # Get DSO data from the name item (column 0) of the selected row
-            name_item = self.results_table.item(row, 0)
-            if name_item:
-                dso_data = name_item.data(Qt.UserRole)
-                if dso_data:
-                    # Get coordinates
-                    coordinates = dso_data.get("coordinates")
-                    if coordinates:
-                        ra_deg = coordinates.ra.degree
-                        dec_deg = coordinates.dec.degree
-                    else:
-                        # Fallback - try to get coordinates again
-                        from astropy.coordinates import SkyCoord
-                        try:
-                            coord = SkyCoord.from_name(dso_data["dso_info"]["name"])
-                            ra_deg = coord.ra.degree
-                            dec_deg = coord.dec.degree
-                        except:
-                            ra_deg = 0.0
-                            dec_deg = 0.0
-
-                    # Create data dictionary for Aladin Lite
-                    detail_data = {
-                        'name': dso_data["dso_info"]["name"],
-                        'ra_deg': ra_deg,
-                        'dec_deg': dec_deg,
-                        'size_min': dso_data["dso_info"]["size_min"],
-                        'size_max': dso_data["dso_info"]["size_max"],
-                        'dsodetailid': dso_data["dso_info"]["name"]
-                    }
-
-                    # Import and open Aladin Lite window
-                    from cosmoscollection.planning.FOVSimulator import AladinLiteWindow
-                    aladin_window = AladinLiteWindow(detail_data, self)
-                    aladin_window.show()
-                else:
-                    QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to open Aladin Lite: {str(e)}")
-
-    def _context_send_to_nina(self, row):
-        """Send DSO coordinates to NINA Framing Assistant"""
-        name_item = self.results_table.item(row, 0)
-        if not name_item:
-            return
-
-        dso_data = name_item.data(Qt.UserRole)
-        if not dso_data:
-            QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
-            return
-
-        # Get coordinates from SkyCoord object or fallback to dso_info
-        coordinates = dso_data.get("coordinates")
-        if coordinates:
-            ra_deg = coordinates.ra.degree
-            dec_deg = coordinates.dec.degree
-        else:
-            dso_info = dso_data.get("dso_info", {})
-            ra_deg = dso_info.get("ra_deg")
-            dec_deg = dso_info.get("dec_deg")
-
-        target_name = dso_data.get("dso_info", {}).get("name", "Unknown")
-        NINAIntegration.send_to_framing_assistant(ra_deg, dec_deg, target_name, self)
-
-    def _context_slew_to_target(self, row):
-        """Slew mount to DSO coordinates"""
-        name_item = self.results_table.item(row, 0)
-        if not name_item:
-            return
-
-        dso_data = name_item.data(Qt.UserRole)
-        if not dso_data:
-            QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
-            return
-
-        # Get coordinates from SkyCoord object or fallback to dso_info
-        coordinates = dso_data.get("coordinates")
-        if coordinates:
-            ra_deg = coordinates.ra.degree
-            dec_deg = coordinates.dec.degree
-        else:
-            dso_info = dso_data.get("dso_info", {})
-            ra_deg = dso_info.get("ra_deg")
-            dec_deg = dso_info.get("dec_deg")
-
-        target_name = dso_data.get("dso_info", {}).get("name", "Unknown")
-        NINAIntegration.slew_to_coordinates(ra_deg, dec_deg, target_name, self)
-
-    def _context_plan_session(self, row):
-        """Open Session Manager pre-filled with this DSO, from context menu"""
-        try:
-            # Get DSO data from the name item (column 0) of the selected row
-            name_item = self.results_table.item(row, 0)
-            if name_item:
-                dso_data = name_item.data(Qt.UserRole)
-                if dso_data:
-                    # Get coordinates
-                    coordinates = dso_data.get("coordinates")
-                    if coordinates:
-                        ra_deg = coordinates.ra.degree
-                        dec_deg = coordinates.dec.degree
-                    else:
-                        # Fallback - try to get coordinates again
-                        from astropy.coordinates import SkyCoord
-                        try:
-                            coord = SkyCoord.from_name(dso_data["dso_info"]["name"])
-                            ra_deg = coord.ra.degree
-                            dec_deg = coord.dec.degree
-                        except:
-                            ra_deg = 0.0
-                            dec_deg = 0.0
-
-                    # Create data dictionary for Session Manager
-                    target_data = {
-                        'name': dso_data["dso_info"]["name"],
-                        'ra_deg': ra_deg,
-                        'dec_deg': dec_deg,
-                        'magnitude': dso_data["dso_info"]["magnitude"],
-                        'size_min': dso_data["dso_info"]["size_min"],
-                        'size_max': dso_data["dso_info"]["size_max"],
-                        'constellation': dso_data["dso_info"]["constellation"],
-                        'dso_type': dso_data["dso_info"]["type"],
-                        'dso_class': dso_data["dso_info"]["dso_class"],
-                        'designations': dso_data["dso_info"].get("designations", "")
-                    }
-
-                    # Import and open Session Manager, then create a session for the DSO
-                    from cosmoscollection.sessions.SessionManager import SessionManagerWindow
-                    if not window_is_open(getattr(self, 'session_manager_window', None)):
-                        self.session_manager_window = SessionManagerWindow()
-
-                    self.session_manager_window.create_session_from_dso(target_data)
-                else:
-                    QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to open Session Manager: {str(e)}")
-
-    def _context_add_to_target_list(self, row):
-        """Add DSO to target list from context menu"""
-        try:
-            # Get DSO data from the name item (column 0) of the selected row
-            name_item = self.results_table.item(row, 0)
-            if name_item:
-                dso_data = name_item.data(Qt.UserRole)
-                if dso_data:
-                    # Get coordinates
-                    coordinates = dso_data.get("coordinates")
-                    if coordinates:
-                        ra_deg = coordinates.ra.degree
-                        dec_deg = coordinates.dec.degree
-                    else:
-                        # Fallback - try to get coordinates again
-                        from astropy.coordinates import SkyCoord
-                        try:
-                            coord = SkyCoord.from_name(dso_data["dso_info"]["name"])
-                            ra_deg = coord.ra.degree
-                            dec_deg = coord.dec.degree
-                        except:
-                            ra_deg = 0.0
-                            dec_deg = 0.0
-
-                    # Create data dictionary for target list
-                    target_data = {
-                        'name': dso_data["dso_info"]["name"],
-                        'ra_deg': ra_deg,
-                        'dec_deg': dec_deg,
-                        'magnitude': dso_data["dso_info"]["magnitude"],
-                        'size_min': dso_data["dso_info"]["size_min"],
-                        'size_max': dso_data["dso_info"]["size_max"],
-                        'constellation': dso_data["dso_info"]["constellation"],
-                        'dso_type': dso_data["dso_info"]["type"],
-                        'dso_class': dso_data["dso_info"]["dso_class"],
-                        'designations': dso_data["dso_info"].get("designations", "")
-                    }
-
-                    # Import and open Target List window, then add the DSO
-                    from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
-                    if not window_is_open(getattr(self, 'target_list_window', None)):
-                        self.target_list_window = DSOTargetListWindow()
-
-                    self.target_list_window.show()
-                    self.target_list_window.raise_()
-                    self.target_list_window.activateWindow()
-
-                    # Add the DSO to the target list
-                    self.target_list_window.add_target_from_dso(target_data)
-                else:
-                    QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to add to target list: {str(e)}")
-
-    def _is_dso_in_target_list(self, dso_name):
-        """Check if a DSO is in the target list
-
-        Args:
-            dso_name: Name of the DSO to check
-
-        Returns:
-            bool: True if DSO is in target list, False otherwise
-        """
-        try:
-            from cosmoscollection.planning.DSOTargetList import find_existing_target
-            db_manager = DatabaseManager()
-            with db_manager.get_connection() as conn:
-                return find_existing_target(conn, dso_name) is not None
-        except Exception as e:
-            logger.error(f"Error checking if DSO is in target list: {str(e)}")
-            return False
-
-    def _context_open_from_target_list(self, row):
-        """Open DSO from target list to view notes"""
-        try:
-            # Get DSO data from the name item (column 0) of the selected row
-            name_item = self.results_table.item(row, 0)
-            if name_item:
-                dso_data = name_item.data(Qt.UserRole)
-                if dso_data:
-                    dso_name = dso_data["dso_info"]["name"]
-
-                    # Import and open Target List window
-                    from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
-                    if not window_is_open(getattr(self, 'target_list_window', None)):
-                        self.target_list_window = DSOTargetListWindow()
-
-                    # Open and select the target
-                    success = self.target_list_window.open_and_select_target(dso_name)
-
-                    if not success:
-                        QMessageBox.warning(self, "Not Found",
-                                          f"Could not find '{dso_name}' in your target list.")
-                else:
-                    QMessageBox.warning(self, "Error", "Could not retrieve DSO data from selected row")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to open from target list: {str(e)}")
+        obj = self._row_object(index.row()) if index.isValid() else None
+        if obj:
+            DSOActions.build_dso_context_menu(self, obj).exec(self.results_table.mapToGlobal(position))
 
 
 def main():

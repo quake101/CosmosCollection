@@ -24,6 +24,8 @@ from cosmoscollection.ui.WindowPositionManager import WindowPositionManager
 from cosmoscollection.ui.WindowLifetime import release_on_close, window_is_open
 from cosmoscollection.ui.Theme import COLORS, adapt_color, font_size, themed_style, themed_text
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
+from cosmoscollection.ui import DSOActions
+from cosmoscollection.ui.DSOActions import TargetListActionsMixin
 from cosmoscollection.core.UrlOpener import open_url
 from cosmoscollection.core.Formatting import format_dec, format_ra
 
@@ -154,7 +156,7 @@ class VisibilityCalculationWorker(QObject):
             self.error.emit(f"Error calculating viewing season information:<br>{str(e)}")
 
 
-class DSODetailWindow(QDialog):
+class DSODetailWindow(TargetListActionsMixin, QDialog):
     """
     Detail window for DSO objects with image support including FITS files.
     """
@@ -481,28 +483,9 @@ class DSODetailWindow(QDialog):
             wikipedia_button.clicked.connect(self._open_wikipedia)
             menubar.addWidget(wikipedia_button)
 
-            # Target List menu
+            # Target List menu: Add, or Remove / Open in, as the object is listed
             target_menu = QMenu("Target List", self)
-
-            # Add to Target List action (will be hidden/shown based on state)
-            self.add_target_action = QAction("Add to Target List", self)
-            self.add_target_action.setToolTip("Add this object to your observing target list")
-            self.add_target_action.triggered.connect(self._add_to_target_list)
-            target_menu.addAction(self.add_target_action)
-
-            # Remove from Target List action (initially hidden)
-            self.remove_target_action = QAction("Remove from Target List", self)
-            self.remove_target_action.setToolTip("Remove this object from your target list")
-            self.remove_target_action.triggered.connect(self._remove_from_target_list)
-            self.remove_target_action.setVisible(False)
-            target_menu.addAction(self.remove_target_action)
-
-            # Open from Target List action (initially hidden)
-            self.open_target_action = QAction("Open from Target List", self)
-            self.open_target_action.setToolTip("Open this DSO from your target list")
-            self.open_target_action.triggered.connect(self._open_from_target_list)
-            self.open_target_action.setVisible(False)
-            target_menu.addAction(self.open_target_action)
+            self.add_target_list_actions(target_menu)
 
             # Create Target List button with menu
             target_button = QToolButton()
@@ -517,11 +500,11 @@ class DSODetailWindow(QDialog):
                 nina_menu = QMenu(self)
 
                 framing_action = QAction("Send to Framing Assistant", self)
-                framing_action.triggered.connect(self._send_to_nina)
+                framing_action.triggered.connect(lambda: DSOActions.send_to_nina(self.data, self))
                 nina_menu.addAction(framing_action)
 
                 slew_action = QAction("Slew to Target", self)
-                slew_action.triggered.connect(self._slew_to_nina_target)
+                slew_action.triggered.connect(lambda: DSOActions.slew_to(self.data, self))
                 nina_menu.addAction(slew_action)
 
                 nina_button = QToolButton()
@@ -836,7 +819,7 @@ class DSODetailWindow(QDialog):
             right_layout.addStretch()
 
             # Check if DSO is already in target list and update menu action visibility
-            self._update_target_list_buttons()
+            self.update_target_list_actions()
 
             # Add right layout to a container widget
             right_container = QWidget()
@@ -872,29 +855,7 @@ class DSODetailWindow(QDialog):
                                 "DSO Visibility Calculator is not available. "
                                 "Please ensure DSOVisibilityCalculator.py is in the same directory.")
             return
-
-        try:
-            from cosmoscollection.planning.DSOVisibilityCalculator import DSOVisibilityApp
-
-            object_name = self.data['name']
-            ra_deg = self.data.get('ra_deg')
-            dec_deg = self.data.get('dec_deg')
-
-            # The calculator's own window (like everywhere else that opens it), so
-            # its close stops its threads and tooltips
-            self.visibility_window = DSOVisibilityApp()
-            self.visibility_window.dso_input.setText(object_name)
-            self.visibility_window.set_dso_coordinates(ra_deg, dec_deg)
-            self.visibility_window.show()
-            self.visibility_window.raise_()
-            self.visibility_window.activateWindow()
-            QTimer.singleShot(500, self.visibility_window.calculate_visibility)
-
-            logger.debug(f"Opened visibility calculator for {object_name} with coordinates RA={ra_deg}, Dec={dec_deg}")
-
-        except Exception as e:
-            logger.error(f"Error opening visibility calculator: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open visibility calculator: {str(e)}")
+        DSOActions.open_visibility(self.data, self)
 
     def _fit_to_window(self):
         """Fit the image to the window size"""
@@ -1268,22 +1229,12 @@ class DSODetailWindow(QDialog):
         logger.debug("Image loaded and displayed successfully")
 
     def _open_aladin_lite(self, data):
-        """Open Aladin Lite in a new window"""
-        try:
-            # Import here to avoid circular imports
-            from cosmoscollection.planning.FOVSimulator import AladinLiteWindow
-
-            if not window_is_open(getattr(self, 'aladin_window', None)):
-                self.aladin_window = AladinLiteWindow(data, self)
-                self.aladin_window.show()
-                logger.debug(f"Opened Aladin Lite window for {data['name']}")
-            else:
-                self.aladin_window.raise_()
-                self.aladin_window.activateWindow()
-                logger.debug(f"Aladin Lite window already open, bringing to front")
-        except Exception as e:
-            logger.error(f"Error opening Aladin Lite: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open Aladin Lite: {str(e)}")
+        """The FOV Simulator for this object - the one already open, if it is."""
+        if window_is_open(getattr(self, 'aladin_window', None)):
+            self.aladin_window.raise_()
+            self.aladin_window.activateWindow()
+        else:
+            self.aladin_window = DSOActions.open_fov(data, self)
 
     def _open_wikipedia(self):
         """Open Wikipedia page for the current DSO in the default browser"""
@@ -1761,141 +1712,13 @@ class DSODetailWindow(QDialog):
         self.date_edit.setText("")
         self.notes_edit.setText("")
 
-    def _update_target_list_buttons(self):
-        """Update target list menu action visibility"""
-        try:
-            is_in_target_list = self._check_if_in_target_list()
-
-            if is_in_target_list:
-                self.add_target_action.setVisible(False)
-                self.remove_target_action.setVisible(True)
-                self.open_target_action.setVisible(True)
-            else:
-                self.add_target_action.setVisible(True)
-                self.remove_target_action.setVisible(False)
-                self.open_target_action.setVisible(False)
-
-        except Exception as e:
-            logger.error(f"Error updating target list menu actions: {str(e)}")
-            self.add_target_action.setVisible(True)
-            self.remove_target_action.setVisible(False)
-            self.open_target_action.setVisible(False)
-
-    def _check_if_in_target_list(self):
-        """Check if current DSO is already in the target list"""
-        return self._target_list_entry() is not None
-
-    def _target_list_entry(self):
-        """This DSO's Target List entry - same name, another designation of the
-        same object, or the same position - or None."""
-        try:
-            from cosmoscollection.planning.DSOTargetList import find_existing_target, delete_target
-            dso_name = self.data.get('name', '').strip()
-            if not dso_name:
-                return None
-            with DatabaseManager().get_connection() as conn:
-                return find_existing_target(
-                    conn, dso_name, self.data.get('ra_deg'), self.data.get('dec_deg'))
-        except Exception as e:
-            logger.error(f"Error checking target list status: {str(e)}")
-            return None
-
-    def _find_target_list_name(self):
-        """Find the actual name used in the target list for this DSO"""
-        entry = self._target_list_entry()
-        return entry["name"] if entry else None
-
-    def _add_to_target_list(self):
-        """Add this DSO to the target list"""
-        try:
-            from cosmoscollection.planning.DSOTargetList import AddTargetDialog
-
-            enhanced_data = self.data.copy()
-            if self.best_months:
-                enhanced_data['best_months'] = self.best_months
-
-            dialog = AddTargetDialog(dso_data=enhanced_data, parent=self)
-            if dialog.exec():
-                self._update_target_list_buttons()
-
-        except ImportError as e:
-            logger.error(f"Could not import DSOTargetList: {str(e)}")
-            QMessageBox.warning(self, "Import Error", f"Could not load Target List feature: {e}")
-        except Exception as e:
-            logger.error(f"Error adding to target list: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to add to target list: {str(e)}")
-
-    def _send_to_nina(self):
-        """Send DSO coordinates to NINA Framing Assistant"""
-        NINAIntegration.send_to_framing_assistant(
-            self.data.get('ra_deg'), self.data.get('dec_deg'),
-            self.data.get('name', 'Unknown'), self
-        )
-
-    def _slew_to_nina_target(self):
-        """Slew mount to the current DSO coordinates via NINA"""
-        NINAIntegration.slew_to_coordinates(
-            self.data.get('ra_deg'), self.data.get('dec_deg'),
-            self.data.get('name', 'Unknown'), self
-        )
-
-    def _remove_from_target_list(self):
-        """Remove this DSO from the target list"""
-        try:
-            reply = QMessageBox.question(
-                self, "Remove from Target List",
-                f"Remove '{self.data.get('name', 'this DSO')}' from the target list?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-
-            if reply != QMessageBox.Yes:
-                return
-
-            from cosmoscollection.planning.DSOTargetList import find_existing_target, delete_target
-            dso_name = self.data.get('name', '').strip()
-            if not dso_name:
-                QMessageBox.warning(self, "Error", "Cannot remove: DSO name not found")
-                return
-            entry = self._target_list_entry()
-            if entry:
-                # Just this object's entry (this used to delete every entry with a
-                # matching name or position)
-                with DatabaseManager().get_connection() as conn:
-                    delete_target(conn, entry["id"])
-            self._update_target_list_buttons()
-
-            QMessageBox.information(self, "Success", f"'{dso_name}' removed from target list")
-            logger.debug(f"Removed {dso_name} from target list")
-
-        except Exception as e:
-            logger.error(f"Error removing from target list: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to remove from target list: {str(e)}")
-
-    def _open_from_target_list(self):
-        """Open DSO from target list to view notes"""
-        try:
-            dso_name = self.data.get('name', '').strip()
-            if not dso_name:
-                QMessageBox.warning(self, "Error", "DSO name not found")
-                return
-
-            target_name = self._find_target_list_name()
-            if not target_name:
-                QMessageBox.warning(self, "Not Found", f"Could not find '{dso_name}' in your target list.")
-                return
-
-            from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
-            if not window_is_open(getattr(self, 'target_list_window', None)):
-                self.target_list_window = DSOTargetListWindow()
-
-            success = self.target_list_window.open_and_select_target(target_name)
-
-            if not success:
-                QMessageBox.warning(self, "Not Found", f"Could not find '{target_name}' in your target list.")
-
-        except Exception as e:
-            logger.error(f"Error opening from target list: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open from target list: {str(e)}")
+    def target_list_data(self):
+        """What the Add Target dialog is given: the object, with its best months
+        once the viewing seasons are worked out."""
+        data = dict(self.data)
+        if self.best_months:
+            data['best_months'] = self.best_months
+        return data
 
     def _abandon_image_loader_thread(self):
         """Stop a running image load: its read stops (decoding can't be

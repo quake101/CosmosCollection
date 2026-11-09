@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import urllib.parse
 import numpy as np
 from PySide6.QtCore import Qt, QUrl, QTimer, QSettings, QDate, QRectF, QPointF, Signal, QEvent
-from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPolygonF
+from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout,
     QComboBox, QCheckBox, QPushButton, QMessageBox,
@@ -27,7 +27,8 @@ from cosmoscollection.catalog.DSONames import display_name
 from cosmoscollection.planning.HorizonProfile import load_active_horizon
 from cosmoscollection.core.ResourceManager import ResourceManager
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
-from cosmoscollection.ui.WindowLifetime import refresh_open, release_on_close, window_is_open
+from cosmoscollection.ui.DSOActions import TargetListActionsMixin
+from cosmoscollection.ui.WindowLifetime import refresh_open, release_on_close
 from cosmoscollection.ui.Theme import COLORS, contrast_text, font_px, font_size, themed_style, theme_manager
 from cosmoscollection.core.UrlOpener import open_url
 from cosmoscollection.ui.TimeFormatHelper import format_time, get_time_format_24h
@@ -1046,7 +1047,7 @@ def page_colors():
             "frame": CAMERA_COLOR}
 
 
-class AladinLiteWindow(WindowPositionMixin, QMainWindow):
+class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow):
     WINDOW_POSITION_KEY = "AladinLite"
 
     SMART_TELESCOPES = [
@@ -1231,20 +1232,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
 
         # Target List button
         target_menu = QMenu(self)
-
-        self.add_target_action = QAction("Add to Target List", self)
-        self.add_target_action.triggered.connect(self._add_to_target_list)
-        target_menu.addAction(self.add_target_action)
-
-        self.remove_target_action = QAction("Remove from Target List", self)
-        self.remove_target_action.triggered.connect(self._remove_from_target_list)
-        self.remove_target_action.setVisible(False)
-        target_menu.addAction(self.remove_target_action)
-
-        self.open_target_action = QAction("Open in Target List", self)
-        self.open_target_action.triggered.connect(self._open_from_target_list)
-        self.open_target_action.setVisible(False)
-        target_menu.addAction(self.open_target_action)
+        self.add_target_list_actions(target_menu)
 
         # Search for another target to frame (catalogs, then SIMBAD)
         self.search_edit = QLineEdit()
@@ -1422,7 +1410,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         self._update_fov_info()
 
         # Update target list button state
-        self._update_target_list_button()
+        self.update_target_list_actions()
 
         theme_manager().theme_changed.connect(self._on_theme_changed)
 
@@ -2969,107 +2957,6 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
         threading.Thread(target=test_connection, daemon=True).start()
 
     # ------------------------------------------------------------------
-    # Target List helpers
-    # ------------------------------------------------------------------
-
-    def _check_if_in_target_list(self):
-        """Check if the current DSO is already in the target list."""
-        return self._target_list_entry() is not None
-
-    def _target_list_entry(self):
-        """The current DSO's Target List entry - same name, another designation of
-        the same object, or the same position - or None."""
-        try:
-            from cosmoscollection.planning.DSOTargetList import find_existing_target, delete_target
-            dso_name = self.data.get('name', '').strip()
-            if not dso_name:
-                return None
-            with DatabaseManager().get_connection() as conn:
-                return find_existing_target(
-                    conn, dso_name, self.data.get('ra_deg'), self.data.get('dec_deg'))
-        except Exception as e:
-            logger.error(f"Error checking target list status: {e}")
-            return None
-
-    def _find_target_list_name(self):
-        """Return the stored target list name for the current DSO, or None."""
-        entry = self._target_list_entry()
-        return entry["name"] if entry else None
-
-    def _update_target_list_button(self):
-        """Show/hide target list actions based on current list membership."""
-        try:
-            in_list = self._check_if_in_target_list()
-            self.add_target_action.setVisible(not in_list)
-            self.remove_target_action.setVisible(in_list)
-            self.open_target_action.setVisible(in_list)
-        except Exception as e:
-            logger.error(f"Error updating target list button: {e}")
-            self.add_target_action.setVisible(True)
-            self.remove_target_action.setVisible(False)
-            self.open_target_action.setVisible(False)
-
-    def _add_to_target_list(self):
-        """Open the Add Target dialog for the current DSO."""
-        try:
-            from cosmoscollection.planning.DSOTargetList import AddTargetDialog
-            dialog = AddTargetDialog(dso_data=self.data.copy(), parent=self)
-            if dialog.exec():
-                self._update_target_list_button()
-        except ImportError as e:
-            logger.error(f"Could not import DSOTargetList: {e}")
-            QMessageBox.warning(self, "Import Error", f"Could not load Target List feature: {e}")
-        except Exception as e:
-            logger.error(f"Error adding to target list: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to add to target list: {e}")
-
-    def _remove_from_target_list(self):
-        """Remove the current DSO from the target list after confirmation."""
-        try:
-            dso_name = self.data.get('name', 'this DSO')
-            reply = QMessageBox.question(
-                self, "Remove from Target List",
-                f"Remove '{dso_name}' from the target list?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-            from cosmoscollection.planning.DSOTargetList import find_existing_target, delete_target
-            entry = self._target_list_entry()
-            if entry:
-                # Just this object's entry (this used to delete every entry with a
-                # matching name or position)
-                with DatabaseManager().get_connection() as conn:
-                    delete_target(conn, entry["id"])
-            self._update_target_list_button()
-            QMessageBox.information(self, "Success", f"'{dso_name}' removed from target list.")
-        except Exception as e:
-            logger.error(f"Error removing from target list: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to remove from target list: {e}")
-
-    def _open_from_target_list(self):
-        """Open the Target List window and highlight the current DSO."""
-        try:
-            target_name = self._find_target_list_name()
-            if not target_name:
-                QMessageBox.warning(self, "Not Found",
-                    f"Could not find '{self.data.get('name', '')}' in your target list.")
-                return
-            from cosmoscollection.planning.DSOTargetList import DSOTargetListWindow
-            if not window_is_open(getattr(self, '_target_list_window', None)):
-                self._target_list_window = DSOTargetListWindow()
-            self._target_list_window.show()
-            self._target_list_window.raise_()
-            success = self._target_list_window.open_and_select_target(target_name)
-            if not success:
-                QMessageBox.warning(self, "Not Found",
-                    f"Could not navigate to '{target_name}' in the target list.")
-        except Exception as e:
-            logger.error(f"Error opening from target list: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to open target list: {e}")
-
-    # ------------------------------------------------------------------
     # NINA: the frame as shown, or each mosaic panel - only when clicked
     # ------------------------------------------------------------------
 
@@ -3236,7 +3123,7 @@ class AladinLiteWindow(WindowPositionMixin, QMainWindow):
             spin.blockSignals(False)
         self.frame_center = None
         self._save_aladin_settings()
-        self._update_target_list_button()
+        self.update_target_list_actions()
         ra, dec = self._target_position()
         self._run_js(f"ccSetTarget({json.dumps(ra)}, {json.dumps(dec)}, "
                      f"{json.dumps(f'{ra} {dec}' if ra is not None else name)})")
