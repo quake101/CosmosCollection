@@ -24,17 +24,18 @@ from matplotlib.transforms import blended_transform_factory
 from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import (Qt, QItemSelection, QItemSelectionModel, QPointF, QThread, QTimer,
                             Signal)
-from PySide6.QtGui import QColor, QCursor, QGuiApplication, QImage, QPainter, QPixmap, QTransform
+from PySide6.QtGui import QColor, QCursor, QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QWidget, QLabel,
                                QPushButton, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView,
                                QAbstractItemView, QSplitter, QGroupBox, QDoubleSpinBox, QProgressBar,
-                               QMenu, QMessageBox, QSizePolicy, QGraphicsView, QGraphicsScene, QToolButton,
+                               QMenu, QMessageBox, QSizePolicy, QToolButton,
                                QWidgetAction, QScrollArea, QCheckBox, QFileDialog, QProgressDialog, QSpinBox,
                                QToolTip, QFrame)
 
 from cosmoscollection.imaging import FrameQuality
 from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.ui.WindowLifetime import retire_thread
+from cosmoscollection.ui.ZoomableImageView import ZoomableImageView
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.sessions import SessionFileScanner
 from cosmoscollection.sessions.SessionObservations import night_label
@@ -200,119 +201,6 @@ class CropTile(QLabel):
         if self._image is not None and self.center is not None:
             self.clicked.emit(self.center)
         super().mousePressEvent(event)
-
-
-class ZoomableImageView(QGraphicsView):
-    """An image that zooms with the mouse wheel (around the cursor), pans by
-    dragging, and toggles fit / 100% on double-click. A zoomed-in view carries
-    over to the next image of the same size, so the same stars can be compared
-    frame to frame."""
-    zoom_changed = Signal()
-    ZOOM_STEP = 1.25
-    MAX_ZOOM = 16.0
-
-    def __init__(self):
-        super().__init__()
-        self.setScene(QGraphicsScene(self))
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
-        self.setMinimumSize(320, 200)
-        self._item = None
-        self._fit = True
-        self._view_state = None  # (image size, transform, center) of the last image shown
-        self._loading = QLabel("Loading...", self.viewport())
-        themed_style(self._loading, lambda: f"background: {COLORS['background']}; color: {COLORS['text']}; "
-                                            f"padding: 3px 8px;")
-        self._loading.move(8, 8)
-        self._loading.hide()
-
-    def set_image(self, image, message=""):
-        if self._item is not None:
-            self._view_state = (self._item.pixmap().size(), self.transform(),
-                                self.mapToScene(self.viewport().rect().center()))
-        self.scene().clear()
-        self._item = None
-        self.show_loading(False)
-        if image is None:
-            text = self.scene().addText(message)
-            text.setDefaultTextColor(QColor(COLORS['text_secondary']))
-            self.setSceneRect(text.boundingRect())
-            self.setTransform(QTransform())
-            self.zoom_changed.emit()
-            return
-        self._item = self.scene().addPixmap(QPixmap.fromImage(image))
-        self.setSceneRect(self._item.boundingRect())
-        state = self._view_state
-        if not self._fit and state and state[0] == image.size():
-            self.setTransform(state[1])
-            self.centerOn(state[2])
-            self._zoom_applied()
-        else:
-            self.fit()
-
-    def show_loading(self, loading):
-        self._loading.adjustSize()
-        self._loading.setVisible(loading)
-
-    def has_image(self):
-        return self._item is not None
-
-    def zoom(self):
-        return self.transform().m11()
-
-    def _fit_zoom(self):
-        size = self._item.pixmap().size()
-        viewport = self.viewport().size()
-        return min(viewport.width() / max(size.width(), 1), viewport.height() / max(size.height(), 1))
-
-    def fit(self):
-        self._fit = True
-        if self._item is not None:
-            self.fitInView(self._item, Qt.KeepAspectRatio)
-        self._zoom_applied()
-
-    def set_zoom(self, factor, center=None):
-        if self._item is None:
-            return
-        center = center if center is not None else self.mapToScene(self.viewport().rect().center())
-        factor = min(max(factor, self._fit_zoom() / 2), self.MAX_ZOOM)
-        self.setTransform(QTransform.fromScale(factor, factor))
-        self.centerOn(center)
-        self._fit = False
-        self._zoom_applied()
-
-    def zoom_by(self, step):
-        self.set_zoom(self.zoom() * step)
-
-    def _zoom_applied(self):
-        # Smoothing hides the pixels a close look is for
-        self.setRenderHint(QPainter.SmoothPixmapTransform, self.zoom() < 2)
-        self.zoom_changed.emit()
-
-    def wheelEvent(self, event):
-        if self._item is None:
-            return
-        step = self.ZOOM_STEP if event.angleDelta().y() > 0 else 1 / self.ZOOM_STEP
-        target = self.zoom() * step
-        if self._fit_zoom() / 2 <= target <= self.MAX_ZOOM:
-            self.scale(step, step)  # scale() keeps the point under the cursor in place
-            self._fit = False
-            self._zoom_applied()
-
-    def mouseDoubleClickEvent(self, event):
-        if self._item is None:
-            return
-        if self._fit or abs(self.zoom() - 1) > 1e-3:
-            self.set_zoom(1.0, self.mapToScene(event.position().toPoint()))
-        else:
-            self.fit()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self._fit and self._item is not None:
-            self.fitInView(self._item, Qt.KeepAspectRatio)
-            self._zoom_applied()
 
 
 # ---- Quality chart --------------------------------------------------------------
@@ -1063,6 +951,7 @@ class LightQualityDialog(WindowPositionMixin, QDialog):
         preview_layout = QVBoxLayout(preview)
         preview_layout.setContentsMargins(0, 0, 0, 0)
         self.preview_view = ZoomableImageView()
+        self.preview_view.setMinimumSize(320, 200)
         themed_style(self.preview_view, lambda: f"background: {COLORS['background_light']};")
         self.preview_view.zoom_changed.connect(self._update_zoom_label)
         bar = QHBoxLayout()

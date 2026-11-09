@@ -9,11 +9,11 @@ import os
 from typing import Optional, Dict
 
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, QThread
-from PySide6.QtGui import QPixmap, QPainter, QAction
+from PySide6.QtGui import QPixmap, QAction
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QLineEdit,
     QComboBox, QTextEdit, QGroupBox, QPushButton, QGridLayout,
-    QToolBar, QMessageBox, QMenu, QFileDialog, QProgressBar
+    QToolBar, QMessageBox, QMenu, QFileDialog, QProgressBar, QFrame
 )
 
 from cosmoscollection.equipment import EquipmentMapper
@@ -25,6 +25,7 @@ from cosmoscollection.ui.WindowLifetime import release_on_close, window_is_open
 from cosmoscollection.ui.Theme import COLORS, adapt_color, font_size, themed_style, themed_text
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
 from cosmoscollection.ui import DSOActions
+from cosmoscollection.ui.ZoomableImageView import ZoomableImageView
 from cosmoscollection.ui.DSOActions import TargetListActionsMixin
 from cosmoscollection.core.UrlOpener import open_url
 from cosmoscollection.core.Formatting import format_dec, format_ra
@@ -177,12 +178,7 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
 
         self.data = data
         self.current_image_path = None
-        self.zoom_factor = 1.0
-        self.initial_zoom_factor = 1.0
         self.original_pixmap = None
-        self.image_position = [0, 0]
-        self.drag_start_position = None
-        self.drag_start_image_position = None
         self.image_cache = ImageCache()
         self.db_manager = DatabaseManager()
 
@@ -537,17 +533,17 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
             zoom_layout = QHBoxLayout()
             zoom_out_button = QPushButton("-")
             themed_style(zoom_out_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
-            zoom_out_button.clicked.connect(self._zoom_out)
+            zoom_out_button.clicked.connect(lambda: self.image_view.zoom_by(1 / ZoomableImageView.ZOOM_STEP))
             zoom_layout.addWidget(zoom_out_button)
 
             zoom_in_button = QPushButton("+")
             themed_style(zoom_in_button, lambda: f"QPushButton {{ font-size: {font_size(12)}; }}")
-            zoom_in_button.clicked.connect(self._zoom_in)
+            zoom_in_button.clicked.connect(lambda: self.image_view.zoom_by(ZoomableImageView.ZOOM_STEP))
             zoom_layout.addWidget(zoom_in_button)
 
             reset_button = QPushButton("Reset")
             reset_button.setFixedSize(60, 30)
-            reset_button.clicked.connect(self._reset_zoom)
+            reset_button.clicked.connect(lambda: self.image_view.fit())
             zoom_layout.addWidget(reset_button)
 
             # Add image navigation controls
@@ -609,14 +605,15 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
             zoom_layout.addStretch()
             image_container_layout.addLayout(zoom_layout)
 
-            # Image label
-            self.image_label = QLabel("Loading...")
-            self.image_label.setAlignment(Qt.AlignCenter)
-            themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
-            self.image_label.setMinimumSize(600, 400)  # Increased minimum size
-            self.image_label.installEventFilter(self)  # Install event filter for mouse events
-            self.image_label.setMouseTracking(True)  # Enable mouse tracking
-            image_container_layout.addWidget(self.image_label)
+            # The image: wheel zooms (from fit up to 4x), drag pans, double-click
+            # opens the image viewer
+            self.image_view = ZoomableImageView("Loading...", min_fit_ratio=1.0, max_fit_ratio=4.0,
+                                                toggle_on_double_click=False, keep_zoom=False, message_points=14)
+            self.image_view.setMinimumSize(600, 400)
+            self.image_view.setFrameShape(QFrame.NoFrame)
+            self.image_view.setStyleSheet("background: transparent;")  # The window's color around the image
+            self.image_view.double_clicked.connect(self._open_image_viewer)
+            image_container_layout.addWidget(self.image_view)
 
             # Loading an image: how much of the file is read, then busy while it decodes
             self.image_progress = QProgressBar()
@@ -857,55 +854,6 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
             return
         DSOActions.open_visibility(self.data, self)
 
-    def _fit_to_window(self):
-        """Fit the image to the window size"""
-        if self.original_pixmap is None:
-            return
-
-        # Get available size
-        available_size = self.image_label.size()
-
-        # Calculate zoom factor to fit
-        width_ratio = available_size.width() / self.original_pixmap.width()
-        height_ratio = available_size.height() / self.original_pixmap.height()
-        self.zoom_factor = min(width_ratio, height_ratio)
-
-        # Reset position
-        self.image_position = [0, 0]
-
-        # Update display
-        self._update_zoom()
-
-    def resizeEvent(self, event):
-        """Handle window resize event"""
-        super().resizeEvent(event)
-
-        # If no image is loaded, just return
-        if self.original_pixmap is None:
-            return
-
-        # Store the current relative position of the image center before resize
-        old_size = event.oldSize() if event.oldSize().isValid() else self.size()
-        new_size = event.size()
-
-        # Only auto-fit if we're at the initial zoom level (user hasn't manually zoomed)
-        if abs(self.zoom_factor - self.initial_zoom_factor) < 0.001:
-            # User is at initial zoom - maintain fit to window behavior
-            self._fit_to_window()
-        else:
-            # User has manually zoomed - preserve zoom level and try to maintain image position
-            if old_size.isValid() and old_size.width() > 0 and old_size.height() > 0:
-                # Calculate the ratio of size change
-                width_ratio = new_size.width() / old_size.width()
-                height_ratio = new_size.height() / old_size.height()
-
-                # Adjust image position proportionally to maintain relative position
-                self.image_position[0] = int(self.image_position[0] * width_ratio)
-                self.image_position[1] = int(self.image_position[1] * height_ratio)
-
-            # Update the display with preserved zoom and adjusted position
-            self._update_zoom()
-
     def _load_equipment(self):
         """Load the user's telescopes and cameras into their dropdowns"""
         try:
@@ -1068,8 +1016,7 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
         self._load_user_images()
         for i, img in enumerate(self.user_images):
             if img['id'] == new_image_id:
-                self.image_label.setText("Loading image...")
-                themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
+                self.image_view.set_image(None, "Loading image...")
                 self.current_image_index = i
                 self._load_user_image(img['image_path'])
                 self._load_current_image_info()
@@ -1093,8 +1040,8 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
             # Check if file exists
             if not os.path.exists(image_path):
                 logger.error(f"Image file does not exist: {image_path}")
-                self.image_label.setText(f"Image file not found:\n{os.path.basename(image_path)}\n\nClick 'Relocate Image' button to find the new location")
-                self.image_label.setToolTip(f"File path: {image_path}")
+                self.image_view.set_image(None, f"Image file not found:\n{os.path.basename(image_path)}\n\nClick 'Relocate Image' button to find the new location")
+                self.image_view.setToolTip(f"File path: {image_path}")
                 self._show_relocate_button()
                 return
 
@@ -1104,13 +1051,13 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
                 logger.debug(f"Image file size: {file_size} bytes")
                 if file_size == 0:
                     logger.error(f"Image file is empty: {image_path}")
-                    self.image_label.setText(f"Image file is empty:\n{os.path.basename(image_path)}")
-                    self.image_label.setToolTip(f"File path: {image_path}")
+                    self.image_view.set_image(None, f"Image file is empty:\n{os.path.basename(image_path)}")
+                    self.image_view.setToolTip(f"File path: {image_path}")
                     return
             except OSError as e:
                 logger.error(f"Error checking file size: {e}")
-                self.image_label.setText(f"Cannot access image file:\n{os.path.basename(image_path)}")
-                self.image_label.setToolTip(f"File path: {image_path}\nError: {str(e)}")
+                self.image_view.set_image(None, f"Cannot access image file:\n{os.path.basename(image_path)}")
+                self.image_view.setToolTip(f"File path: {image_path}\nError: {str(e)}")
                 return
 
             # Check cache first
@@ -1125,7 +1072,7 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
             # freeze the UI - the same loader as the Image Viewer, with progress
             from cosmoscollection.imaging.ImageViewer import ImageLoadWorker
             logger.info(f"Image loading: {os.path.basename(image_path)} - {file_size / (1024 * 1024):.1f}MB")
-            self.image_label.setText(f"Loading {os.path.basename(image_path)}...")
+            self.image_view.set_image(None, f"Loading {os.path.basename(image_path)}...")
             self.image_progress.setRange(0, 0)  # Busy until the first progress arrives
             self.image_progress.show()
             self.image_loader_thread = ImageLoadWorker(image_path)
@@ -1137,7 +1084,7 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
 
         except Exception as e:
             logger.error(f"Error initiating image load: {str(e)}", exc_info=True)
-            self.image_label.setText(f"Error loading image:\n{str(e)}")
+            self.image_view.set_image(None, f"Error loading image:\n{str(e)}")
 
     def _on_image_load_progress(self, image_path, done, total):
         """How much of the file is read, under the image and in its place -
@@ -1150,10 +1097,10 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
             self.image_progress.setRange(0, 1000)
             self.image_progress.setValue(int(done * 1000 / total) if total else 0)
             percent = int(done * 100 / total) if total else 0
-            self.image_label.setText(f"Loading {name}...\n\n{percent}% ({_megabytes(done)} of {_megabytes(total)})")
+            self.image_view.set_image(None, f"Loading {name}...\n\n{percent}% ({_megabytes(done)} of {_megabytes(total)})")
         else:
             self.image_progress.setRange(0, 0)
-            self.image_label.setText(f"Loading {name}...\n\nDecoding...")
+            self.image_view.set_image(None, f"Loading {name}...\n\nDecoding...")
 
     def _on_image_loaded(self, qimage, image_path):
         """Handle image loaded signal from background thread"""
@@ -1192,40 +1139,19 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
         file_ext = os.path.splitext(image_path)[1].lower()
 
         if file_ext in SUPPORTED_EXTENSIONS:
-            self.image_label.setText(f"Failed to load FITS/XISF file:\n{os.path.basename(image_path)}\n\nRequires astropy library for FITS support\nError: {error_message}")
+            self.image_view.set_image(None, f"Failed to load FITS/XISF file:\n{os.path.basename(image_path)}\n\nRequires astropy library for FITS support\nError: {error_message}")
         else:
-            self.image_label.setText(f"Failed to load image:\n{os.path.basename(image_path)}\n\nError: {error_message}")
+            self.image_view.set_image(None, f"Failed to load image:\n{os.path.basename(image_path)}\n\nError: {error_message}")
 
-        self.image_label.setToolTip(f"File path: {image_path}")
+        self.image_view.setToolTip(f"File path: {image_path}")
         logger.error(f"Image load failed: {image_path} - {error_message}")
 
     def _display_loaded_image(self):
-        """Display the loaded image with appropriate scaling"""
+        """Show the loaded image, fitted to the view"""
         if self.original_pixmap is None or self.original_pixmap.isNull():
             return
-
-        # Calculate the appropriate size for the image
-        label_size = self.image_label.size()
-        scaled_pixmap = self.original_pixmap.scaled(
-            label_size,
-            Qt.KeepAspectRatio,
-            Qt.FastTransformation  # Use fast transformation for quicker display
-        )
-
-        # Calculate initial zoom factor based on the scaled image
-        self.initial_zoom_factor = min(
-            label_size.width() / self.original_pixmap.width(),
-            label_size.height() / self.original_pixmap.height()
-        )
-        self.zoom_factor = self.initial_zoom_factor
-        self.image_position = [0, 0]
-
-        # Update the display
-        self.image_label.setPixmap(scaled_pixmap)
-        self.image_label.setAlignment(Qt.AlignCenter)
-
-        # Add tooltip for image viewer
-        self.image_label.setToolTip("Double click to open in the image viewer")
+        self.image_view.set_image(self.original_pixmap)
+        self.image_view.setToolTip("Double click to open in the image viewer")
         logger.debug("Image loaded and displayed successfully")
 
     def _open_aladin_lite(self, data):
@@ -1267,79 +1193,6 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
         except Exception as e:
             logger.error(f"Error opening Wikipedia: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to open Wikipedia: {str(e)}")
-
-    def eventFilter(self, obj, event):
-        """Handle mouse events for zooming and panning"""
-        if obj == self.image_label and self.original_pixmap is not None:
-            if event.type() == QEvent.Wheel:
-                if event.angleDelta().y() > 0:
-                    self._zoom_in()
-                else:
-                    self._zoom_out()
-                return True
-            elif event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                self.drag_start_position = event.position()
-                self.drag_start_image_position = self.image_position.copy()
-                return True
-            elif event.type() == QEvent.MouseMove and event.buttons() & Qt.LeftButton:
-                if self.drag_start_position is not None:
-                    dx = event.position().x() - self.drag_start_position.x()
-                    dy = event.position().y() - self.drag_start_position.y()
-                    self.image_position[0] = self.drag_start_image_position[0] + dx
-                    self.image_position[1] = self.drag_start_image_position[1] + dy
-                    self._update_zoom()
-                    return True
-            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
-                self.drag_start_position = None
-                self.drag_start_image_position = None
-                return True
-            elif event.type() == QEvent.MouseButtonDblClick and event.button() == Qt.LeftButton:
-                self._open_image_viewer()
-                return True
-        return super().eventFilter(obj, event)
-
-    def _update_zoom(self):
-        """Update the image display with current zoom level and position"""
-        if self.original_pixmap is not None:
-            new_width = int(self.original_pixmap.width() * self.zoom_factor)
-            new_height = int(self.original_pixmap.height() * self.zoom_factor)
-
-            scaled_pixmap = self.original_pixmap.scaled(
-                new_width, new_height,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-
-            label_size = self.image_label.size()
-            final_pixmap = QPixmap(label_size)
-            final_pixmap.fill(Qt.transparent)
-
-            painter = QPainter(final_pixmap)
-            x = (label_size.width() - scaled_pixmap.width()) // 2 + self.image_position[0]
-            y = (label_size.height() - scaled_pixmap.height()) // 2 + self.image_position[1]
-            painter.drawPixmap(x, y, scaled_pixmap)
-            painter.end()
-
-            self.image_label.setPixmap(final_pixmap)
-
-    def _zoom_in(self):
-        """Zoom in on the image"""
-        if self.original_pixmap is not None:
-            self.zoom_factor = min(self.zoom_factor * 1.2, 4.0 * self.initial_zoom_factor)
-            self._update_zoom()
-
-    def _zoom_out(self):
-        """Zoom out on the image"""
-        if self.original_pixmap is not None:
-            self.zoom_factor = max(self.zoom_factor / 1.2, self.initial_zoom_factor)
-            self._update_zoom()
-
-    def _reset_zoom(self):
-        """Reset zoom and position to original"""
-        if self.original_pixmap is not None:
-            self.zoom_factor = self.initial_zoom_factor
-            self.image_position = [0, 0]
-            self._update_zoom()
 
     def _open_image_viewer(self):
         """Open the current image in a new window - which steps through the
@@ -1414,8 +1267,7 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
                     self._update_image_navigation()
 
                     if self.user_images:
-                        self.image_label.setText("Loading image...")
-                        themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
+                        self.image_view.set_image(None, "Loading image...")
 
                         self.current_image_index = 0
                         current_image = self.user_images[self.current_image_index]
@@ -1423,19 +1275,16 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
                         self._load_current_image_info()
                         self.info_form_container.setVisible(True)
                     else:
-                        self.image_label.setText("No image attached to this DSO.")
-                        themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
+                        self.image_view.set_image(None, "No image attached to this DSO.")
                         self.info_form_container.setVisible(False)
                 else:
                     logger.error(f"Could not find dsodetailid for {self.data['name']}")
-                    self.image_label.setText("No image attached to this DSO.")
-                    themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
+                    self.image_view.set_image(None, "No image attached to this DSO.")
                     self.info_form_container.setVisible(False)
 
         except Exception as e:
             logger.error(f"Error loading user images: {str(e)}", exc_info=True)
-            self.image_label.setText("Error loading images.")
-            themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['error']};")
+            self.image_view.set_image(None, "Error loading images.", error=True)
             self.info_form_container.setVisible(False)
 
     def _update_image_navigation(self):
@@ -1462,8 +1311,7 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
     def _previous_image(self):
         """Navigate to the previous image"""
         if self.user_images and self.current_image_index > 0:
-            self.image_label.setText("Loading image...")
-            themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
+            self.image_view.set_image(None, "Loading image...")
 
             self.current_image_index -= 1
             current_image = self.user_images[self.current_image_index]
@@ -1475,8 +1323,7 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
     def _next_image(self):
         """Navigate to the next image"""
         if self.user_images and self.current_image_index < len(self.user_images) - 1:
-            self.image_label.setText("Loading image...")
-            themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
+            self.image_view.set_image(None, "Loading image...")
 
             self.current_image_index += 1
             current_image = self.user_images[self.current_image_index]
@@ -1628,8 +1475,7 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
                     current_image['image_path'] = new_image_path
 
                     self.relocate_button.setVisible(False)
-                    self.image_label.setText("Loading image...")
-                    themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
+                    self.image_view.set_image(None, "Loading image...")
                     self._load_user_image(new_image_path)
 
                     QMessageBox.information(self, "Success", f"Image location updated successfully!")
@@ -1691,8 +1537,7 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
                     self.current_image_index = 0
                     self._abandon_image_loader_thread()
                     self.current_image_path = None
-                    self.image_label.setText("No Image Loaded")
-                    themed_style(self.image_label, lambda: f"font-size: {font_size(14)}; color: {COLORS['text_disabled']};")
+                    self.image_view.set_image(None, "No Image Loaded")
                     self._clear_image_info()
 
                 self._update_image_navigation()

@@ -26,7 +26,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QByteArray, QPointF, QRectF, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QByteArray, QSize
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QLabel, QGroupBox, QProgressBar, QComboBox, QFrame,
@@ -35,18 +35,18 @@ from PySide6.QtWidgets import (
     QTabWidget, QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QTreeWidget, QTreeWidgetItem, QSplitter, QMessageBox
 )
-from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QIcon, QColor
+from PySide6.QtGui import QPixmap, QImage, QIcon, QColor
 
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import format_duration
-from cosmoscollection.imaging.AnnotationOverlay import (AnnotationData, paint_annotations, saved_annotation_layers,
-                               screen_name_px, stars_in_view)
+from cosmoscollection.imaging.AnnotationOverlay import (AnnotationData, saved_annotation_layers, stars_in_view)
 from cosmoscollection.imaging.WCS import WCSTransform
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import keep_alive_until_finished, release_on_close
+from cosmoscollection.ui.ZoomableImageView import ZoomableImageView
 from cosmoscollection.ui.Theme import (
-    COLORS, adapt_color, chart_background, chart_color, chart_font_size, font_px, theme_manager,
+    COLORS, chart_background, chart_color, chart_font_size, font_px, theme_manager,
     themed_style,
 )
 from cosmoscollection.ui.TimeFormatHelper import format_time
@@ -323,160 +323,15 @@ def nina_solution_to_wcs_header(solution, width, height):
 AUTOFOCUS_STALE_SECONDS = 180
 
 
-class ZoomableImageWidget(QWidget):
-    """Widget that displays an image with zoom (mouse wheel) and pan (drag) support."""
-
-    def __init__(self, parent=None, placeholder_text="No image available"):
-        super().__init__(parent)
-        self._pixmap = None
-        self._zoom = 1.0
-        self._min_zoom = 0.1
-        self._max_zoom = 10.0
-        self._pan_offset = QPointF(0, 0)
-        self._last_mouse_pos = None
-        self._placeholder_text = placeholder_text
-        self._overlay = None  # (AnnotationData, layers) drawn over the image
-
-        self.setMinimumSize(200, 150)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.WheelFocus)
-
-    def setPixmap(self, pixmap):
-        """Set the image to display, preserving zoom/pan if already viewing an image."""
-        had_image = self._pixmap is not None and not self._pixmap.isNull()
-        self._pixmap = pixmap
-        if not had_image:
-            self._reset_view()
-        self.update()
-
-    def setPlaceholderText(self, text):
-        """Set the placeholder text shown when no image is loaded."""
-        self._placeholder_text = text
-        self.update()
-
-    def pixmapSize(self):
-        """Size of the displayed image (QSize; empty when there's none)."""
-        return self._pixmap.size() if self._pixmap and not self._pixmap.isNull() else QSize()
-
-    def setOverlay(self, data, layers=None):
-        """Draw annotations over the image: AnnotationData (solved for this
-        image, at any size) and the layers to show. None removes them."""
-        self._overlay = (data, layers or {}) if data is not None else None
-        self.update()
-
-    def _reset_view(self):
-        """Reset zoom and pan to fit the image in the widget."""
-        self._zoom = 1.0
-        self._pan_offset = QPointF(0, 0)
-
-    def _get_fit_zoom(self):
-        """Calculate the zoom level that fits the image in the widget."""
-        if not self._pixmap or self._pixmap.isNull():
-            return 1.0
-        widget_size = self.size()
-        pixmap_size = self._pixmap.size()
-        scale_x = (widget_size.width() - 10) / pixmap_size.width()
-        scale_y = (widget_size.height() - 10) / pixmap_size.height()
-        return min(scale_x, scale_y, 1.0)  # Don't upscale beyond 100%
-
-    def paintEvent(self, event):
-        """Paint the image with current zoom and pan."""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
-
-        # Fill background
-        painter.fillRect(self.rect(), Qt.black)
-
-        if not self._pixmap or self._pixmap.isNull():
-            # Draw placeholder text
-            painter.setPen(QColor(adapt_color('#a0a0a0', on_dark=True)))
-            painter.drawText(self.rect(), Qt.AlignCenter, self._placeholder_text)
-            return
-
-        # Calculate the effective zoom (fit zoom * user zoom)
-        fit_zoom = self._get_fit_zoom()
-        effective_zoom = fit_zoom * self._zoom
-
-        # Calculate scaled image size
-        scaled_width = self._pixmap.width() * effective_zoom
-        scaled_height = self._pixmap.height() * effective_zoom
-
-        # Center the image, then apply pan offset
-        x = (self.width() - scaled_width) / 2 + self._pan_offset.x()
-        y = (self.height() - scaled_height) / 2 + self._pan_offset.y()
-
-        # Draw the image
-        target_rect = QRectF(x, y, scaled_width, scaled_height)
-        source_rect = QRectF(0, 0, self._pixmap.width(), self._pixmap.height())
-        painter.drawPixmap(target_rect, self._pixmap, source_rect)
-
-        # Annotations follow the image's zoom and pan
-        if self._overlay is not None:
-            data, layers = self._overlay
-            paint_annotations(painter, data, layers, self._pixmap.width(), source_rect, target_rect,
-                              font_px=screen_name_px(target_rect))
-
-        # Draw zoom indicator if zoomed
-        if self._zoom != 1.0:
-            zoom_text = f"{self._zoom * 100:.0f}%"
-            painter.setPen(QColor(adapt_color('#ffffff', on_dark=True)))
-            painter.drawText(10, 20, zoom_text)
-
-    def wheelEvent(self, event: QWheelEvent):
-        """Handle mouse wheel for zooming."""
-        if not self._pixmap or self._pixmap.isNull():
-            return
-
-        # Get zoom delta from wheel
-        delta = event.angleDelta().y()
-        zoom_factor = 1.15 if delta > 0 else 1 / 1.15
-
-        # Calculate new zoom, clamped to limits
-        new_zoom = self._zoom * zoom_factor
-        new_zoom = max(self._min_zoom, min(self._max_zoom, new_zoom))
-
-        if new_zoom != self._zoom:
-            # Zoom toward mouse position
-            mouse_pos = event.position()
-            old_zoom = self._zoom
-            self._zoom = new_zoom
-
-            # Adjust pan to zoom toward mouse position
-            zoom_change = new_zoom / old_zoom
-            center = QPointF(self.width() / 2, self.height() / 2)
-            mouse_offset = mouse_pos - center - self._pan_offset
-            self._pan_offset = self._pan_offset - mouse_offset * (zoom_change - 1)
-
-            self.update()
-
-    def mousePressEvent(self, event: QMouseEvent):
-        """Start panning on mouse press."""
-        if event.button() == Qt.LeftButton:
-            self._last_mouse_pos = event.position()
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        """Pan the image on mouse drag."""
-        if self._last_mouse_pos is not None and self._pixmap and not self._pixmap.isNull():
-            delta = event.position() - self._last_mouse_pos
-            self._pan_offset += delta
-            self._last_mouse_pos = event.position()
-            self.update()
-
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        """End panning on mouse release."""
-        if event.button() == Qt.LeftButton:
-            self._last_mouse_pos = None
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent):
-        """Reset view on double-click."""
-        self._reset_view()
-        self.update()
-
-    def resizeEvent(self, event):
-        """Handle widget resize."""
-        super().resizeEvent(event)
-        self.update()
+def camera_image_view(placeholder):
+    """A zoomable camera image (live view, last image, live stack): black, not
+    enlarged past 100% to fit, double-click to fit again."""
+    view = ZoomableImageView(placeholder, min_fit_ratio=0.1, max_fit_ratio=10.0, toggle_on_double_click=False,
+                             upscale=False, dark=True, show_zoom_text=True)
+    view.setMinimumSize(200, 150)
+    view.setFrameShape(QFrame.NoFrame)
+    view.double_clicked.connect(view.fit)
+    return view
 
 
 class SequencePanel(QWidget):
@@ -2203,7 +2058,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         liveview_settings_layout.addStretch()
         liveview_layout.addLayout(liveview_settings_layout, 0)
 
-        self.liveview_label = ZoomableImageWidget(placeholder_text="Live view not active")
+        self.liveview_label = camera_image_view("Live view not active")
         liveview_layout.addWidget(self.liveview_label, 1)
 
         self.liveview_info_label = QLabel("")
@@ -2247,7 +2102,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         image_settings_layout.addStretch()
         image_layout.addLayout(image_settings_layout, 0)
 
-        self.image_label = ZoomableImageWidget(placeholder_text="No image available")
+        self.image_label = camera_image_view("No image available")
         image_layout.addWidget(self.image_label, 1)
 
         self.image_info_label = QLabel("Target: -- | Exp: --")
@@ -2343,7 +2198,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._ls_annot_data = None          # AnnotationData for the displayed stack
         self._ls_annot_star_lookup = None   # The AnnotationData whose stars are being looked up
 
-        self.livestack_label = ZoomableImageWidget(placeholder_text="Live stack not active")
+        self.livestack_label = camera_image_view("Live stack not active")
         livestack_layout.addWidget(self.livestack_label, 1)
 
         self.livestack_info_label = QLabel("")
@@ -3409,7 +3264,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                 pixmap.loadFromData(image_data)
                 if not pixmap.isNull():
                     self._current_image_pixmap = pixmap
-                    self.image_label.setPixmap(pixmap)
+                    self.image_label.set_image(pixmap)
             except Exception as e:
                 logger.error(f"Error loading image: {e}")
 
@@ -3525,7 +3380,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             pixmap.loadFromData(image_data)
             if not pixmap.isNull():
                 self._current_image_pixmap = pixmap
-                self.image_label.setPixmap(pixmap)
+                self.image_label.set_image(pixmap)
 
         # Show image info with history indicator and update statistics dock
         index = self._viewing_history_index
@@ -3583,13 +3438,13 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
                     pixmap.loadFromData(image_data)
                     if not pixmap.isNull():
                         self._current_livestack_pixmap = pixmap
-                        self.livestack_label.setPixmap(pixmap)
+                        self.livestack_label.set_image(pixmap)
                 except Exception as e:
                     logger.error(f"Error loading livestack image: {e}")
             elif not self._current_livestack_pixmap:
                 # Running but no image yet
-                self.livestack_label.setPlaceholderText("Waiting for first image...")
-                self.livestack_label.setPixmap(None)
+                self.livestack_label.set_placeholder("Waiting for first image...")
+                self.livestack_label.set_image(None)
 
             # Always update info label with target/filter/stack count
             target = status.get('selected_target', '')
@@ -3619,8 +3474,8 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         else:
             # Reset tab text and show inactive message
             self.image_tabs.setTabText(2, "Live Stack")
-            self.livestack_label.setPlaceholderText("Live stack not active")
-            self.livestack_label.setPixmap(None)
+            self.livestack_label.set_placeholder("Live stack not active")
+            self.livestack_label.set_image(None)
             self._current_livestack_pixmap = None
             self.livestack_info_label.setText("")
             # Reset integration cache so the next session recalculates from scratch
@@ -3676,7 +3531,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
     def _on_livestack_annotations_toggled(self, enabled):
         """Show or hide the live stack annotations, solving the stack if needed."""
         if not enabled:
-            self.livestack_label.setOverlay(None)
+            self.livestack_label.set_overlay(None)
             self.livestack_annotations_status.setText("")
             return
         if self._ls_annot_data is not None:
@@ -3693,7 +3548,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         self._ls_annot_count = None
         self._ls_annot_solution = None
         self._ls_annot_data = None
-        self.livestack_label.setOverlay(None)
+        self.livestack_label.set_overlay(None)
         if self.livestack_annotations_check.isChecked():
             self.livestack_annotations_status.setText("Waiting for the live stack")
 
@@ -3762,7 +3617,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             self.livestack_annotations_status.setText(f"Plate solve failed: {error}")
             return
 
-        size = self.livestack_label.pixmapSize()
+        size = self.livestack_label.image_size()
         width, height = size.width(), size.height()
         header = nina_solution_to_wcs_header(solution, width, height) if not size.isEmpty() else None
         if header is None:
@@ -3800,7 +3655,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         if data is None:
             return
         layers = saved_annotation_layers()
-        self.livestack_label.setOverlay(data, layers)
+        self.livestack_label.set_overlay(data, layers)
         count = len(data.dsos)
         text = f"{count} object{'s' if count != 1 else ''}"
         need_stars = layers["stars"] and data.stars is None
@@ -3830,7 +3685,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
     def _sync_livestack_annotation_wcs(self):
         """Fit the plate solution to the displayed stack image's size."""
         data, solution = self._ls_annot_data, self._ls_annot_solution
-        size = self.livestack_label.pixmapSize()
+        size = self.livestack_label.image_size()
         if data is None or solution is None or size.isEmpty():
             return False
         if (data.width, data.height) == (size.width(), size.height()):
@@ -3841,7 +3696,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         # The objects are where they were on the sky - only the mapping to pixels changes
         data.wcs = WCSTransform(header, size.width(), size.height())
         data.width, data.height = size.width(), size.height()
-        self.livestack_label.update()
+        self.livestack_label.viewport().update()
         return True
 
     def _update_livestack_combos(self, available_stacks, status):
@@ -3958,7 +3813,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             pixmap.loadFromData(data)
             if not pixmap.isNull():
                 self._current_image_pixmap = pixmap
-                self.image_label.setPixmap(pixmap)
+                self.image_label.set_image(pixmap)
 
     def _on_livestack_quality_changed(self):
         """Handle user changing the livestack quality or size."""
@@ -3976,7 +3831,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
             pixmap.loadFromData(image_data)
             if not pixmap.isNull():
                 self._current_liveview_pixmap = pixmap
-                self.liveview_label.setPixmap(pixmap)
+                self.liveview_label.set_image(pixmap)
         except Exception as e:
             logger.error(f"Error loading live view image: {e}")
 
@@ -3989,7 +3844,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
         if active:
             self.liveview_toggle_btn.setText("Stop")
             self.liveview_info_label.setText("Live view active")
-            self.liveview_label.setPlaceholderText("Waiting for image...")
+            self.liveview_label.set_placeholder("Waiting for image...")
             # Push current settings to worker
             self.worker.set_liveview_settings(
                 self.liveview_quality_spin.value(),
@@ -4912,7 +4767,7 @@ class NINADashboardWindow(WindowPositionMixin, QMainWindow):
     def resizeEvent(self, event):
         """Handle window resize."""
         super().resizeEvent(event)
-        # ZoomableImageWidget handles its own resizing
+        # The image views handle their own resizing
 
     def closeEvent(self, event):
         """Clean up when window is closed."""
