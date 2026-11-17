@@ -117,11 +117,12 @@ def equipment_filter_combo():
     return combo
 
 
-def fill_equipment_filter(combo, names, current):
-    """List 'All' and the names in use (sorted, blanks left out) without
-    sending a change; current stays chosen if it's still listed. Returns the
-    name chosen ('All' if current isn't listed)."""
-    names = sorted({name for name in names if name}, key=str.casefold)
+def fill_equipment_filter(combo, names, current, extra=()):
+    """List 'All' and the names in use (sorted, blanks left out), then any
+    extra items (e.g. 'Unassigned'), without sending a change; current stays
+    chosen if it's still listed. Returns the name chosen ('All' if current
+    isn't listed). Also fills other lists' name filters (Best DSO Tonight's Type)."""
+    names = sorted({name for name in names if name}, key=str.casefold) + list(extra)
     chosen = current if current in names else ALL
     combo.blockSignals(True)
     combo.clear()

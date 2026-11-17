@@ -13,7 +13,9 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMutex
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QPushButton, QLabel, QTableWidget,
                                QTableWidgetItem, QGroupBox, QMessageBox,
-                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QCheckBox, QApplication)
+                               QHeaderView, QProgressBar, QSpinBox, QComboBox, QCheckBox, QApplication,
+                               QLineEdit, QToolButton)
+from PySide6.QtGui import QKeySequence, QShortcut
 
 from astropy import units as u
 from astropy.time import Time
@@ -28,12 +30,16 @@ logger = logging.getLogger(__name__)
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.planning.Observer import active_site, coordinates_text
-from cosmoscollection.catalog.DSONames import type_name
+from cosmoscollection.catalog.DSONames import constellation_name, type_name
+from cosmoscollection.app.DSOData import normalize_search_text
+from cosmoscollection.equipment.EquipmentPicker import ALL, equipment_filter_combo, fill_equipment_filter
+from cosmoscollection.planning.NightTimes import COMPASS_OCTANTS, compass_octant
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close
 from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.SortItem import SortItem
+from cosmoscollection.ui.StayOpenMenu import StayOpenMenu
 from cosmoscollection.ui.NightTimeChooser import NightTimeChooser
 from cosmoscollection.ui.Theme import COLORS, adapt_color, font_px, theme_manager, themed_style, tint
 from cosmoscollection.ui.TimeFormatHelper import format_time, format_datetime
@@ -117,6 +123,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self._twilight_calc_date = None  # date (YYYY-MM-DD) the twilight window was last computed
         self.available_catalogs = []
         self.visible_dsos_data = []  # Store DSO data for detail window
+        self._using_target_list = False  # Whether the results shown are the Target List's
         self.init_ui()
         # The moon column's colors are item data, so recolor them on theme changes
         # (widget styles follow on their own)
@@ -368,7 +375,8 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         results_group = QGroupBox("Tonight's Best DSOs")
         self.results_group = results_group
         results_layout = QVBoxLayout(results_group)
-        
+        results_layout.addLayout(self._build_filter_row())
+
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(8)
         self.results_table.setHorizontalHeaderLabels([
@@ -413,6 +421,177 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.status_label = QLabel("Initializing astronomical calculations...")
         themed_style(self.status_label, lambda: f"color: {COLORS['info']};")
         main_layout.addWidget(self.status_label)
+
+    # ---- Finding and filtering the results (view only - nothing is recalculated) ----
+
+    DIRECTIONS_SETTING = "BestDSOTonight/result_directions"
+    UNASSIGNED = "Unassigned"
+
+    def _build_filter_row(self):
+        """Search box and Type / Direction / Telescope filters over the results."""
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Search:"))
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("Name, catalog number, type, constellation...")
+        self.search_box.setToolTip(
+            "Show only the results matching this - any of an object's names or catalog\n"
+            "numbers (M31, NGC 224, Andromeda), its type or its constellation (Ctrl+F)")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.setMinimumWidth(240)
+        self.search_box.textChanged.connect(self._apply_result_filters)
+        row.addWidget(self.search_box)
+        QShortcut(QKeySequence.Find, self, activated=lambda: (self.search_box.setFocus(),
+                                                              self.search_box.selectAll()))
+
+        row.addWidget(QLabel("Type:"))
+        self.result_type_filter = equipment_filter_combo()
+        self.result_type_filter.setToolTip(
+            "Show only this type among the results.\n"
+            "(The Type in Calculation Settings picks what's calculated.)")
+        self.result_type_filter.currentIndexChanged.connect(self._apply_result_filters)
+        row.addWidget(self.result_type_filter)
+
+        row.addWidget(QLabel("Direction:"))
+        self.direction_button = QToolButton()
+        self.direction_button.setPopupMode(QToolButton.InstantPopup)
+        self.direction_button.setToolTip(
+            "Show only objects in these directions at their Best Time -\n"
+            "e.g. tick S, SE and SW for a view to the south.")
+        menu = StayOpenMenu(self.direction_button)
+        saved = app_settings().value(self.DIRECTIONS_SETTING, "", type=str)
+        shown = set(saved.split("|")) & set(COMPASS_OCTANTS) if saved else set(COMPASS_OCTANTS)
+        self.direction_actions = {}
+        for point in COMPASS_OCTANTS:
+            action = menu.addAction(point)
+            action.setCheckable(True)
+            action.setChecked(point in shown)
+            action.toggled.connect(self._on_directions_changed)
+            self.direction_actions[point] = action
+        menu.addSeparator()
+        menu.addAction("All Directions").triggered.connect(lambda: self._set_directions(COMPASS_OCTANTS))
+        self.direction_button.setMenu(menu)
+        row.addWidget(self.direction_button)
+
+        # Only Target List results have a telescope (shown by display_results)
+        self.result_telescope_label = QLabel("Telescope:")
+        row.addWidget(self.result_telescope_label)
+        self.result_telescope_filter = equipment_filter_combo()
+        self.result_telescope_filter.setToolTip(
+            "Show only the targets assigned this telescope in your Target List\n"
+            "(Unassigned: targets with no telescope, shown as \"Any\")")
+        self.result_telescope_filter.currentIndexChanged.connect(self._apply_result_filters)
+        row.addWidget(self.result_telescope_filter)
+        self.result_telescope_label.setVisible(False)
+        self.result_telescope_filter.setVisible(False)
+
+        row.addStretch()
+        self.filter_count_label = QLabel()
+        themed_style(self.filter_count_label, lambda: f"color: {COLORS['text_secondary']};")
+        row.addWidget(self.filter_count_label)
+        self.clear_filters_btn = QPushButton("Clear Filters")
+        self.clear_filters_btn.setToolTip("Show all the results again")
+        self.clear_filters_btn.clicked.connect(self._clear_result_filters)
+        row.addWidget(self.clear_filters_btn)
+        self._update_direction_button()
+        self.clear_filters_btn.setEnabled(self._filters_active())  # Saved directions count
+        return row
+
+    def _checked_directions(self):
+        return {point for point, action in self.direction_actions.items() if action.isChecked()}
+
+    def _set_directions(self, points):
+        """Tick exactly these directions (one filter pass, not one per tick)."""
+        for point, action in self.direction_actions.items():
+            action.blockSignals(True)
+            action.setChecked(point in points)
+            action.blockSignals(False)
+        self._on_directions_changed()
+
+    def _on_directions_changed(self):
+        checked = self._checked_directions()
+        app_settings().setValue(self.DIRECTIONS_SETTING,
+                                "" if len(checked) == len(COMPASS_OCTANTS) else "|".join(
+                                    point for point in COMPASS_OCTANTS if point in checked) or "none")
+        self._update_direction_button()
+        self._apply_result_filters()
+
+    def _update_direction_button(self):
+        checked = self._checked_directions()
+        if len(checked) == len(COMPASS_OCTANTS):
+            text = "All"
+        elif not checked:
+            text = "None"
+        else:
+            text = ", ".join(point for point in COMPASS_OCTANTS if point in checked)
+        self.direction_button.setText(text)
+
+    def _filters_active(self):
+        return bool(self.search_box.text().strip()
+                    or self.result_type_filter.currentText() != ALL
+                    or len(self._checked_directions()) != len(COMPASS_OCTANTS)
+                    or (self._using_target_list and self.result_telescope_filter.currentText() != ALL))
+
+    def _clear_result_filters(self):
+        for combo in (self.result_type_filter, self.result_telescope_filter):
+            combo.blockSignals(True)
+            combo.setCurrentText(ALL)
+            combo.blockSignals(False)
+        self.search_box.blockSignals(True)
+        self.search_box.clear()
+        self.search_box.blockSignals(False)
+        self._set_directions(COMPASS_OCTANTS)  # Filters once, for everything
+
+    @staticmethod
+    def _search_keys(dso_data, friendly_type):
+        """The normalized texts a search matches an object by (see normalize_search_text)."""
+        info = dso_data["dso_info"]
+        texts = [info["name"], friendly_type, info.get("constellation") or "",
+                 constellation_name(info.get("constellation"))]
+        texts += (info.get("designations") or "").split(",")
+        return [key for key in (normalize_search_text(text) for text in texts) if key]
+
+    def _refill_result_filters(self, visible_dsos):
+        """List the types and telescopes in these results, keeping the choices still listed."""
+        fill_equipment_filter(self.result_type_filter,
+                              [type_name(d["dso_info"]["type"]) for d in visible_dsos],
+                              self.result_type_filter.currentText())
+        telescopes = [d["dso_info"].get("telescope_name") or "Any" for d in visible_dsos]
+        fill_equipment_filter(self.result_telescope_filter, [t for t in telescopes if t != "Any"],
+                              self.result_telescope_filter.currentText(),
+                              extra=[self.UNASSIGNED] if "Any" in telescopes else ())
+        self.result_telescope_label.setVisible(self._using_target_list)
+        self.result_telescope_filter.setVisible(self._using_target_list)
+
+    def _apply_result_filters(self):
+        """Hide the result rows the search and filters leave out."""
+        query = normalize_search_text(self.search_box.text())
+        wanted_type = self.result_type_filter.currentText()
+        directions = self._checked_directions()
+        all_directions = len(directions) == len(COMPASS_OCTANTS)
+        telescope = self.result_telescope_filter.currentText() if self._using_target_list else ALL
+        if telescope == self.UNASSIGNED:
+            telescope = "Any"  # How an unassigned target is shown
+
+        shown = 0
+        total = self.results_table.rowCount()
+        for row in range(total):
+            name_item = self.results_table.item(row, 0)
+            dso_data = name_item.data(Qt.UserRole) if name_item else None
+            visible = dso_data is not None
+            if visible and query:
+                visible = any(query in key for key in dso_data.get("search_keys", ()))
+            if visible and wanted_type != ALL:
+                visible = type_name(dso_data["dso_info"]["type"]) == wanted_type
+            if visible and not all_directions:
+                visible = compass_octant(dso_data["optimal_azimuth"]) in directions
+            if visible and telescope != ALL:
+                visible = (dso_data["dso_info"].get("telescope_name") or "Any") == telescope
+            self.results_table.setRowHidden(row, not visible)
+            shown += visible
+
+        active = self._filters_active()
+        self.clear_filters_btn.setEnabled(active)
+        self.filter_count_label.setText(f"Showing {shown} of {total}" if active and total else "")
 
     def _refresh_horizon_state(self):
         """Load the active location's custom horizon and enable the Use Custom
@@ -672,6 +851,8 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             self.status_label.setText(f"No DSOs meet the visibility criteria {when}{blocked_text}. Last calculated: {last_calculated}")
             self.status_label.setStyleSheet("")  # Reset to default color
             self.results_table.setRowCount(0)
+            self._refill_result_filters([])
+            self._apply_result_filters()
             return
 
         self.status_label.setText(f"Found {len(visible_dsos)} visible DSOs {when}{blocked_text}. Last calculated: {last_calculated}")
@@ -719,13 +900,15 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         for row, dso_data in enumerate(visible_dsos):
             dso_info = dso_data["dso_info"]
             
+            # Type - use friendly name
+            friendly_type = type_name(dso_info["type"])
+            dso_data["search_keys"] = self._search_keys(dso_data, friendly_type)
+
             # DSO name - store DSO data in item for sorting
             name_item = QTableWidgetItem(dso_info["name"])
             name_item.setData(Qt.UserRole, dso_data)  # Store full DSO data
             self.results_table.setItem(row, 0, name_item)
-            
-            # Type - use friendly name
-            friendly_type = type_name(dso_info["type"])
+
             self.results_table.setItem(row, 1, QTableWidgetItem(friendly_type))
             
             # Constellation
@@ -794,6 +977,10 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
 
         # Sort by visible hours (column 7) in descending order by default
         self.results_table.sortByColumn(7, Qt.DescendingOrder)
+
+        # The search and filters carry over to the new results
+        self._refill_result_filters(visible_dsos)
+        self._apply_result_filters()
 
     def _row_object(self, row):
         """The object a results row shows, as DSOActions takes it - or None."""

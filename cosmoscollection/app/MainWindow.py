@@ -37,6 +37,7 @@ from cosmoscollection.imaging.CollageBuilder import open_collage_builder
 from cosmoscollection.nina.NINAIntegration import NINAIntegration
 from cosmoscollection.planning.FOVSimulator import AladinLiteWindow
 from cosmoscollection.ui.WindowLifetime import keep_when_closed, window_is_open
+from cosmoscollection.ui.StayOpenMenu import StayOpenMenu
 from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 
@@ -48,16 +49,6 @@ from cosmoscollection.app.SettingsDialog import SettingsDialog
 from cosmoscollection.app.UpdateDialogs import offer_update_and_apply, run_update_check
 
 logger = logging.getLogger(__name__)
-
-
-class StayOpenMenu(QMenu):
-    """A QMenu that stays open when checkable actions are clicked."""
-    def mouseReleaseEvent(self, event):
-        action = self.activeAction()
-        if action and action.isCheckable():
-            action.trigger()
-        else:
-            super().mouseReleaseEvent(event)
 
 
 # --- Main App Window ---

@@ -89,7 +89,7 @@ class MapLocationPickerDialog(QDialog):
         self.bridge = None
         self.channel = None
         self._renderer_crashed = False  # Set by _on_render_process_terminated; suppresses the generic load-failed message
-        self._gpu_reset_bar = None   # Shown when the map broke after a graphics reset
+        self._gpu_reset_bar = None   # Shown after a graphics reset: before the map draws, or when it broke
         self._init_failed = False  # Set when the map can't be created at all; exec() then returns immediately
 
         self._setup_ui()
@@ -99,8 +99,14 @@ class MapLocationPickerDialog(QDialog):
         lon_str = f"{abs(initial_lon):.6f}°{'W' if initial_lon < 0 else 'E'}"
         self.coords_label.setText(f"Current position: {lat_str}, {lon_str}\nClick on the map to change location")
 
-        # Create web view immediately instead of deferring
-        self._load_map()
+        # Create web view immediately instead of deferring - unless the graphics card was
+        # reset since the app started: drawing the map then can close the app, so ask first
+        from cosmoscollection.core.GpuReset import was_reset
+        if was_reset():
+            logger.info("Graphics card was reset: asking before drawing the map")
+            self._show_gpu_reset_bar(ahead=True)
+        else:
+            self._load_map()
 
     def _setup_ui(self):
         """Set up the dialog UI"""
@@ -534,17 +540,22 @@ class MapLocationPickerDialog(QDialog):
         from cosmoscollection.core.GpuReset import was_reset
         if not was_reset():
             return False
+        self._show_gpu_reset_bar(ahead=False)
+        return True
+
+    def _show_gpu_reset_bar(self, ahead):
         if self._gpu_reset_bar is None:
             from cosmoscollection.ui.GpuResetBar import GpuResetBar
             self._gpu_reset_bar = GpuResetBar("the map", self._retry_after_gpu_reset,
                                               before_restart=self.reject)
             self.layout().insertWidget(1, self._gpu_reset_bar)  # Below the search row
+        self._gpu_reset_bar.set_ahead(ahead)
         self._gpu_reset_bar.show()
-        return True
 
     def _retry_after_gpu_reset(self):
-        """Try Again on the graphics reset bar: load the map again where it was."""
+        """Try Anyway / Try Again on the graphics reset bar: draw the map (again) where it was."""
         if self.web_view is None:
+            self._load_map()
             return
         self._renderer_crashed = False
         self.web_view.setHtml(self._create_map_html(self.selected_lat, self.selected_lon))

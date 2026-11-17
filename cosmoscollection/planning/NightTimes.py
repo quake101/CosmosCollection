@@ -70,6 +70,15 @@ def compass_direction(az):
     return _COMPASS_POINTS[int((az + 11.25) / 22.5) % 16]
 
 
+# The eight main compass points, N first, clockwise
+COMPASS_OCTANTS = _COMPASS_POINTS[::2]
+
+
+def compass_octant(az):
+    """Which of COMPASS_OCTANTS ('N', 'NE', ... 'NW') an azimuth in degrees is in."""
+    return COMPASS_OCTANTS[int((az % 360 + 22.5) / 45) % 8]
+
+
 def _twilight(location, noon_local, tz):
     """(dusk, dawn) local datetimes of astronomical twilight in the night
     following noon_local, and whether it gets that dark at all (if not, both

@@ -4,15 +4,18 @@ Notices when the graphics card was reset while the app runs, and restarts the ap
 
 A graphics reset (Windows switching Auto HDR on for a game, HDR switched on or off with
 Win+Alt+B, a driver update or recovery) can leave the app's web views - the FOV
-Simulator's sky, the map picker - unable to draw until the app restarts. Sometimes
-Chromium recovers by itself, so a reset alone isn't reported: a web view that then fails
-asks was_reset() and, if so, offers Try Again and Restart App (GpuResetBar).
+Simulator's sky, the map picker - unable to draw until the app restarts, and drawing one
+then can close the app (2026-11-16: aborted about a second after the sky view showed).
+So after a reset a web view asks first (GpuResetBar: Try Anyway or Restart App) instead
+of drawing. Sometimes Chromium recovers by itself: once a web view draws with WebGL again,
+recovered() forgets the reset and watches for the next one.
 
 Windows only: a DirectX (DXGI) factory made at startup stops being "current" once the
 graphics card is reset or changed. Elsewhere was_reset() is always False.
 
     start_watch()                      # once, at startup
-    if was_reset(): ...                # a web view failed - was it the reset?
+    if was_reset(): ...                # before drawing a web view, or after one failed
+    recovered()                        # a web view's WebGL works (after a reset)
     restart_app({"tool": "fov", "data": data})   # quit, then start again
     relaunch_if_requested()            # after app.exec() returns
     take_reopen()                      # in the new app: the tool to open again
@@ -34,11 +37,12 @@ RESTART_WAIT_ENV = "COSMOS_RESTART_WAIT_PID"
 _REOPEN_KEY = "restart/reopen"  # QSettings: the tool to open again after the restart (JSON)
 
 _IID_IDXGIFactory1 = "770aae78-f26f-4dba-a829-253c83d1b387"
+_RELEASE = 2      # IUnknown::Release
 _IS_CURRENT = 13  # IDXGIFactory1::IsCurrent: IUnknown (3) + IDXGIObject (4) + IDXGIFactory (5) + EnumAdapters1
 
-_factory = None          # IDXGIFactory1 pointer (c_void_p), kept for the life of the app
+_factory = None          # IDXGIFactory1 pointer (c_void_p), kept until recovered()
 _is_current = None       # Its IsCurrent(), callable
-_reset = False           # Seen a reset (stays True: the web views stay broken until a restart)
+_reset = False           # Seen a reset (stays True until recovered(): the web views stay broken until a restart)
 _restart_requested = False
 
 
@@ -74,6 +78,23 @@ def was_reset():
     except Exception as e:
         logger.debug(f"Graphics reset check failed: {e}")
     return _reset
+
+
+def recovered():
+    """A web view drew with WebGL, so Chromium's graphics work: forget an earlier reset
+    (the web views no longer ask first) and watch for the next one with a new factory."""
+    global _factory, _is_current, _reset
+    if not was_reset():
+        return
+    logger.info("The web views draw again after the graphics reset")
+    old = _factory
+    _factory, _is_current, _reset = None, None, False
+    try:
+        vtable = ctypes.cast(old, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[_RELEASE])(old)
+    except Exception as e:
+        logger.debug(f"Couldn't release the old graphics reset check: {e}")
+    start_watch()
 
 
 # --------------------------------------------------------------------

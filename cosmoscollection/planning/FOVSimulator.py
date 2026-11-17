@@ -1380,7 +1380,8 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
         self.setCentralWidget(central_widget)
 
         self.fallback_button = None  # Track fallback button to avoid duplicates
-        self._gpu_reset_bar = None   # Shown when the sky view broke after a graphics reset
+        self._gpu_reset_bar = None   # Shown after a graphics reset: before the sky view draws, or when it broke
+        self._draw_despite_reset = False  # Try Anyway / Try Again on that bar: draw without asking
         self._renderer_crashed = False  # Set by _on_render_process_terminated; suppresses the generic load-failed message
 
         # Add loading timeout
@@ -1428,6 +1429,8 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
             if self.web_placeholder:
                 self.web_placeholder.setText(f"The sky view needs the internet.\n{OFFLINE_NOTE}")
                 themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['text_disabled']}; font-size: {font_px(12)}; }}")
+            return
+        if self._ask_before_drawing():
             return
         try:
             logger.debug("Creating web view safely...")
@@ -2837,12 +2840,28 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
             themed_style(self.web_placeholder, lambda: f"QLabel {{ background-color: {COLORS['background']}; color: {COLORS['warning']}; font-size: {font_px(12)}; }}")
         self._add_browser_fallback_button()
 
+    def _ask_before_drawing(self):
+        """If the graphics card was reset since the app started, drawing the sky view can
+        close the app (see core/GpuReset.py): offer Try Anyway / Restart App instead of
+        drawing it. True if asked."""
+        from cosmoscollection.core.GpuReset import was_reset
+        if self._draw_despite_reset or not was_reset():
+            return False
+        logger.info("Graphics card was reset: asking before drawing the sky view")
+        if self.web_placeholder:
+            self.web_placeholder.setText("The sky view waits until you choose above.")
+        self._show_gpu_reset_bar(ahead=True)
+        return True
+
     def _check_gpu_reset(self):
         """The sky view failed: if the graphics card was reset since the app started,
         say so and offer Try Again / Restart App (see core/GpuReset.py)."""
         from cosmoscollection.core.GpuReset import was_reset
         if getattr(self, "_closing", False) or not was_reset():
             return
+        self._show_gpu_reset_bar(ahead=False)
+
+    def _show_gpu_reset_bar(self, ahead):
         if self._gpu_reset_bar is None:
             from cosmoscollection.ui.GpuResetBar import GpuResetBar
             reopen = {"tool": "fov", "data": self.data, "session_id": self.session_id}
@@ -2850,11 +2869,15 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
             central_widget = self.centralWidget()
             if central_widget and central_widget.layout():
                 central_widget.layout().insertWidget(0, self._gpu_reset_bar)
+        self._gpu_reset_bar.set_ahead(ahead)
         self._gpu_reset_bar.show()
 
     def _retry_after_gpu_reset(self):
-        """Try Again on the graphics reset bar: load the sky view again."""
+        """Try Anyway / Try Again on the graphics reset bar: draw the sky view (again)."""
+        self._draw_despite_reset = True
         if self.web_view is None:
+            if self.web_placeholder:
+                self.web_placeholder.setText("Loading Aladin Lite...")
             self._create_web_view_safely()
             return
         central_widget = self.centralWidget()
