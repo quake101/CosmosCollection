@@ -20,6 +20,7 @@ from astropy import units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 from cosmoscollection.core.DatabaseManager import DatabaseManager
+from cosmoscollection.equipment import TelescopeAdvisor
 from cosmoscollection.planning.Observer import active_site, local_zone
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Formatting import format_dec, format_ra
@@ -1396,8 +1397,11 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
 
         # Load persistent settings before creating web view
         self._load_aladin_settings()
+        self.telescope_suggested = False  # The telescope shown was suggested for the object's size
         if framing:
             self._apply_framing(framing)
+        else:
+            self._preselect_telescope()
         if (self.show_horizon.isChecked() or self.show_meridian.isChecked()) and not self._load_observer_location():
             # Saved on, but there's no location (any more)
             for check in (self.show_horizon, self.show_meridian):
@@ -1825,6 +1829,7 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
 
     def _on_telescope_changed(self):
         """Handle telescope selection change"""
+        self.telescope_suggested = False  # The user's pick now
         current_data = self.telescope_combo.currentData()
         if current_data:
             self.selected_telescope = current_data
@@ -1974,12 +1979,7 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
             sensor_width = camera_data['sensor_width']  # mm
             sensor_height = camera_data['sensor_height']  # mm
 
-            # FOV = 2 * arctan(sensor_size / (2 * effective_focal_length)) * (180/π) * 60 (arcmin)
-            fov_width_rad = 2 * math.atan(sensor_width / (2 * effective_fl))
-            fov_height_rad = 2 * math.atan(sensor_height / (2 * effective_fl))
-
-            fov_width_arcmin = fov_width_rad * (180 / math.pi) * 60
-            fov_height_arcmin = fov_height_rad * (180 / math.pi) * 60
+            fov_width_arcmin, fov_height_arcmin = TelescopeAdvisor.camera_fov(sensor_width, sensor_height, effective_fl)
 
             barlow_text = f" with {barlow_factor}x" if barlow_factor != 1.0 else ""
             self._log_fov_once(f"Camera FOV calculation: {sensor_width}x{sensor_height}mm sensor, {effective_fl}mm effective FL{barlow_text}, FOV={fov_width_arcmin:.1f}'x{fov_height_arcmin:.1f}'")
@@ -1992,7 +1992,7 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
                 'type': 'camera',
                 'details': f"{sensor_width}×{sensor_height}mm sensor{barlow_details}",
                 # Arcseconds per pixel, when the camera's pixel size is known
-                'pixel_scale': 206.265 * pixel_size / effective_fl if pixel_size else None,
+                'pixel_scale': TelescopeAdvisor.pixel_scale(pixel_size, effective_fl),
             }
 
         return None
@@ -2244,6 +2244,51 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
             "camera": self.camera_combo.currentText(), "barlow": self.barlow_combo.currentText(),
             "saved": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
+
+    def _preselect_telescope(self):
+        """Start on the object's telescope: the one set on the Target List, else
+        the one suggested for its size (with the suggested camera and reducer/
+        barlow) - else the last one used stays. Not saved as the last one used."""
+        try:
+            with DatabaseManager().get_connection() as conn:
+                assigned = TelescopeAdvisor.assigned_telescope(conn, self.data)
+                fit = None if assigned else TelescopeAdvisor.suggest_for(self.data, TelescopeAdvisor.load_rigs(conn))
+        except Exception as e:
+            logger.error(f"Error finding a telescope for {self.data.get('name')}: {e}")
+            return
+        telescope_id = assigned[0] if assigned else (fit.rig.telescope_id if fit else None)
+        if telescope_id is None:
+            return
+
+        def find(combo, item_id):
+            return next((i for i in range(combo.count())
+                         if (combo.itemData(i) or {}).get('id') == item_id
+                         and not (combo.itemData(i) or {}).get('smart_telescope')), -1)
+
+        index = find(self.telescope_combo, telescope_id)
+        if index < 0:
+            return  # Disabled, or without a focal length
+        combos = (self.telescope_combo, self.camera_combo, self.barlow_combo)
+        for combo in combos:
+            combo.blockSignals(True)
+        try:
+            self.telescope_combo.setCurrentIndex(index)
+            self.selected_telescope = self.telescope_combo.itemData(index)
+            if fit:
+                camera_index = next((i for i in range(self.camera_combo.count())
+                                     if (self.camera_combo.itemData(i) or {}).get('source') == 'user'
+                                     and self.camera_combo.itemData(i).get('type') == 'camera'
+                                     and self.camera_combo.itemData(i).get('id') == fit.rig.camera_id), -1)
+                if camera_index >= 0:
+                    self.camera_combo.setCurrentIndex(camera_index)
+                barlow_index = find(self.barlow_combo, fit.rig.corrector_id) if fit.rig.corrector_id else 0
+                self.barlow_combo.setCurrentIndex(max(barlow_index, 0))  # 0: "None (1.0x)"
+                self.telescope_suggested = True
+            else:
+                self._select_telescope_equipment(telescope_id)
+        finally:
+            for combo in combos:
+                combo.blockSignals(False)
 
     def _apply_framing(self, framing):
         """Show a session's saved framing: its equipment (if it's still here),
@@ -2693,7 +2738,8 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
                     fov_str = f"{telescope_fov_data['width_arcmin']:.1f}'"
                 else:
                     fov_str = f"{telescope_fov_data['width_arcmin']:.1f}'×{telescope_fov_data['height_arcmin']:.1f}'"
-                info_parts.append(f"{telescope_name} ({telescope_fl}mm): {fov_str} {telescope_fov_data['details']}")
+                info_parts.append(f"{telescope_name} ({telescope_fl}mm): {fov_str} {telescope_fov_data['details']}"
+                                  + (" - suggested for this object's size" if getattr(self, "telescope_suggested", False) else ""))
                 if telescope_fov_data.get('pixel_scale'):
                     info_parts.append(f"Pixel scale: {telescope_fov_data['pixel_scale']:.2f}\"/px")
 

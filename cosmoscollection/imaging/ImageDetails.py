@@ -39,6 +39,7 @@ from cosmoscollection.core.Paths import path_key
 from cosmoscollection.core.Formatting import count_text, format_duration, format_exposure, trim_number
 from cosmoscollection.sessions import SessionFileScanner, SessionObservations
 from cosmoscollection.imaging.WCS import is_solved_header, pixel_scale_arcsec
+from cosmoscollection.equipment.TelescopeAdvisor import pixel_scale
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 
 logger = logging.getLogger(__name__)
@@ -645,7 +646,7 @@ def _header_details(header, details, numbers):
     scale = _to_float(_first_value(kw, 'PIXSCALE', 'SCALE'))
     pixel = _to_float(kw.get('XPIXSZ'))  # Includes the binning
     if not scale and pixel and focal_length:
-        scale = 206.265 * pixel / focal_length
+        scale = pixel_scale(pixel, focal_length)
     if scale:
         numbers.setdefault("header_scale", scale)
 
@@ -716,7 +717,7 @@ def gather(conn, image_path, header=None, image_size=None, wcs_header=None, fall
     # The image scale as measured by a plate solve, else as recorded, else from the equipment
     scale = (pixel_scale_arcsec(wcs_header) if is_solved_header(wcs_header) else None) or numbers.get("header_scale")
     if not scale and numbers.get("pixel_size") and numbers.get("focal_length"):
-        scale = 206.265 * numbers["pixel_size"] / numbers["focal_length"]
+        scale = pixel_scale(numbers["pixel_size"], numbers["focal_length"])
     if scale:
         details["scale"] = format_scale(scale, image_size)
     return details

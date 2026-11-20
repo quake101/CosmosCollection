@@ -20,6 +20,7 @@ from dataclasses import dataclass, field, asdict, replace
 
 import numpy as np
 
+from cosmoscollection.equipment.TelescopeAdvisor import pixel_scale
 from cosmoscollection.sessions import SessionFileScanner
 
 logger = logging.getLogger(__name__)
@@ -915,13 +916,7 @@ def inspection_images(path, crop_radius=32):
 
 
 def _arcsec_per_pixel(header):
-    try:
-        pixel_um, focal_mm = float(header.get("XPIXSZ")), float(header.get("FOCALLEN"))
-    except (TypeError, ValueError):
-        return None
-    if pixel_um <= 0 or focal_mm <= 0:
-        return None
-    return 206.265 * pixel_um / focal_mm  # XPIXSZ already includes any camera binning
+    return pixel_scale(header.get("XPIXSZ"), header.get("FOCALLEN"))  # XPIXSZ already includes any camera binning
 
 
 # ---- Grading ----------------------------------------------------------------

@@ -31,7 +31,8 @@ from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.SortItem import SortItem
 from cosmoscollection.ui.DSONameCompleter import DSONameCompleter
 from cosmoscollection.ui.NightTimeChooser import NightTimeChooser
-from cosmoscollection.equipment.EquipmentPicker import fill_telescope_combo, select_telescope
+from cosmoscollection.equipment.EquipmentPicker import fill_telescope_combo, mark_suggested, select_telescope
+from cosmoscollection.equipment import TelescopeAdvisor
 from cosmoscollection.sessions import SessionFileScanner
 # The Target List's rows (moved to TargetRows.py, which has no UI imports; kept
 # importable from here)
@@ -44,6 +45,9 @@ import logging
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+# The Telescope cell's suggested telescope id, for an unassigned target (UserRole stays None)
+SUGGESTED_ROLE = Qt.UserRole + 1
 
 
 class AddTargetDialog(QDialog):
@@ -60,6 +64,12 @@ class AddTargetDialog(QDialog):
         self.db_manager = DatabaseManager()
         self.is_edit_mode = False  # Track if we're editing an existing target
         self.target_id = None  # Store the ID of the target being edited
+        # The telescope suggested for the object's size (TelescopeAdvisor); a new
+        # target's picker follows it until the user picks a telescope
+        with self.db_manager.get_connection() as conn:
+            self._rigs = TelescopeAdvisor.load_rigs(conn)
+        self._suggested_id = None
+        self._follow_suggestion = True
 
         self._setup_ui()
         
@@ -147,6 +157,8 @@ class AddTargetDialog(QDialog):
         telescope_layout.addWidget(QLabel("Telescope:"))
         self.telescope_combo = QComboBox()
         fill_telescope_combo(self.telescope_combo, self.db_manager)
+        self.telescope_combo.activated.connect(self._on_telescope_picked)
+        self.size_edit.textChanged.connect(self._update_suggestion)
         telescope_layout.addWidget(self.telescope_combo)
         telescope_layout.addStretch()
         target_layout.addLayout(telescope_layout)
@@ -192,6 +204,23 @@ class AddTargetDialog(QDialog):
         self.is_edit_mode = True
         self.target_id = target_id
         self.save_btn.setText("Save Changes")
+        # A saved target keeps its telescope ("Any" too) - the suggestion is only marked
+        self._follow_suggestion = False
+
+    def _on_telescope_picked(self, _index):
+        """The user picked a telescope: stop following the suggestion."""
+        self._follow_suggestion = False
+
+    def _update_suggestion(self):
+        """Mark the telescope that suits the object's size (a new target starts on it)."""
+        fits = TelescopeAdvisor.rank(TelescopeAdvisor.object_size({"size_info": self.size_edit.text()}),
+                                     self._rigs)
+        self._suggested_id = fits[0].rig.telescope_id if fits else None
+        mark_suggested(self.telescope_combo, self._suggested_id,
+                       select=self._follow_suggestion and self._suggested_id is not None,
+                       tooltip=TelescopeAdvisor.ranking_tooltip(fits))
+        if self._follow_suggestion and self._suggested_id is None:
+            self.telescope_combo.setCurrentIndex(0)  # "Any"
     
     def _populate_from_dso_data(self):
         """Populate dialog fields with DSO data"""
@@ -990,8 +1019,10 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         # and a generation number so a stale worker's result is ignored
         self._direction_cells = {}
         self._direction_generation = 0
+        self._rigs = []  # The user's equipment, for suggested telescopes (TelescopeAdvisor)
         self._init_ui()
         theme_manager().theme_changed.connect(self._apply_direction_cells)
+        theme_manager().theme_changed.connect(self._color_suggested_telescopes)
         self._load_targets()
     
     def _populate_telescope_filter(self):
@@ -1465,6 +1496,7 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
 
                 rows = cursor.fetchall()
                 self.targets_data = []
+                self._rigs = TelescopeAdvisor.load_rigs(conn)  # Equipment may have changed
 
                 for row in rows:
                     target_data = {
@@ -1561,12 +1593,20 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
             status_item = SortItem(status, TARGET_STATUSES.index(status) if status in TARGET_STATUSES else -1)
             self.targets_table.setItem(row, 6, status_item)
 
-            # Telescope - display name or "Any" for unassigned
+            # Telescope - display name, or the suggested one (dim) / "Any" for unassigned
             telescope_name = target.get("telescope_name", "")
             telescope_id = target.get("telescope_id")
-            telescope_display = telescope_name if telescope_name else "Any"
-            telescope_item = QTableWidgetItem(telescope_display)
-            telescope_item.setData(Qt.UserRole, telescope_id)  # Store telescope_id for filtering
+            telescope_item = QTableWidgetItem(telescope_name if telescope_name else "Any")
+            telescope_item.setData(Qt.UserRole, telescope_id)  # Store telescope_id for filtering (None: unassigned)
+            if telescope_id is None:
+                fits = TelescopeAdvisor.rank(TelescopeAdvisor.object_size(target), self._rigs)
+                if fits:
+                    telescope_item.setText(f"Suggested: {fits[0].rig.telescope_name}")
+                    telescope_item.setToolTip(TelescopeAdvisor.ranking_tooltip(fits))
+                    telescope_item.setData(SUGGESTED_ROLE, fits[0].rig.telescope_id)
+                    font = telescope_item.font()
+                    font.setItalic(True)
+                    telescope_item.setFont(font)
             telescope_item.setTextAlignment(Qt.AlignCenter)
             self.targets_table.setItem(row, 7, telescope_item)
 
@@ -1602,10 +1642,32 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         # Set default sort by Priority (column 5) in descending order (Urgent first)
         self.targets_table.sortItems(5, Qt.DescendingOrder)
 
+        self._color_suggested_telescopes()
+
         # Last results meanwhile (no flicker), then recalculate for any new targets
         self._apply_direction_cells()
         self._update_directions()
     
+    def _color_suggested_telescopes(self):
+        """Suggested telescopes (unassigned targets) in the dim text color - again on a theme change."""
+        for row in range(self.targets_table.rowCount()):
+            item = self.targets_table.item(row, 7)
+            if item and item.data(SUGGESTED_ROLE) is not None:
+                item.setForeground(QColor(COLORS['text_secondary']))
+
+    def _use_suggested_telescope(self, target_id, telescope_id):
+        """Save the suggested telescope as the target's."""
+        try:
+            with self.db_manager.get_connection() as conn:
+                conn.execute("UPDATE usertargetlist SET telescope_id = ? WHERE id = ?", (telescope_id, target_id))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error saving the suggested telescope: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save the telescope: {e}")
+            return
+        self._load_targets()
+        self._select_target_by_id(target_id)
+
     def _show_context_menu(self, position):
         """Right-click menu for a target (see DSOActions), with Edit and Remove."""
         item = self.targets_table.itemAt(position)
@@ -1613,9 +1675,15 @@ class DSOTargetListWindow(WindowPositionMixin, QMainWindow):
         if obj is None:
             return
         row = item.row()
+        telescope_item = self.targets_table.item(row, 7)
+        suggested_id = telescope_item.data(SUGGESTED_ROLE) if telescope_item else None
 
         def extras(menu):
             menu.addAction("Edit Target").triggered.connect(lambda: self._context_edit_target(row))
+            if suggested_id is not None:
+                name = telescope_item.text().removeprefix("Suggested: ")
+                menu.addAction(f"Use Suggested Telescope ({name})").triggered.connect(
+                    lambda: self._use_suggested_telescope(obj["id"], suggested_id))
             menu.addAction("Remove Target").triggered.connect(lambda: self._context_remove_target(row))
 
         menu = DSOActions.build_dso_context_menu(self, obj, extras=extras, on_target_list=True)

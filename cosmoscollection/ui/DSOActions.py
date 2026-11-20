@@ -150,7 +150,11 @@ def open_fov(obj, parent=None, framing=None, session_id=None):
     """The FOV Simulator on the object - with a session's saved framing. Given
     its catalog entry when it has one, for its size and other designations."""
     from cosmoscollection.planning.FOVSimulator import AladinLiteWindow
-    window = AladinLiteWindow(catalog_data(obj) or dict(obj), parent, framing=framing, session_id=session_id)
+    data = catalog_data(obj) or dict(obj)
+    for key in ("telescope_id", "target_id"):  # A Target List entry's telescope, to start on
+        if key in obj:
+            data[key] = obj[key]
+    window = AladinLiteWindow(data, parent, framing=framing, session_id=session_id)
     window.show()
     return window
 

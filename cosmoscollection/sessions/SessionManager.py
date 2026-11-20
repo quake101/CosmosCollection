@@ -38,7 +38,7 @@ from cosmoscollection.ui import DSOActions
 from cosmoscollection.ui.SortItem import SortItem
 from cosmoscollection.ui.DSONameCompleter import DSONameCompleter
 from cosmoscollection.equipment.EquipmentPicker import (equipment_filter_combo, fill_equipment_filter,
-                                                        fill_telescope_combo, select_telescope)
+                                                        fill_telescope_combo, mark_suggested, select_telescope)
 from cosmoscollection.ui.TimeFormatHelper import format_time
 from cosmoscollection.ui.Theme import COLORS, font_px, themed_style
 from cosmoscollection.sessions import ImportSettings, MountDetection
@@ -267,6 +267,7 @@ class SessionFormWidget(QWidget):
         self._target_id = None
         self._scanned_aggregate = None
         self._existing_aggregate = None
+        self._telescope_suggested = False  # The telescope picker is on the suggested one
 
         self._setup_ui()
         self.status_combo.setCurrentText(initial_status)
@@ -344,6 +345,7 @@ class SessionFormWidget(QWidget):
         telescope_row.addWidget(QLabel("Telescope:"))
         self.telescope_combo = QComboBox()
         fill_telescope_combo(self.telescope_combo, self.db_manager)
+        self.telescope_combo.activated.connect(self._on_telescope_picked)
         telescope_row.addWidget(self.telescope_combo, 1)
         equipment_layout.addLayout(telescope_row)
 
@@ -441,7 +443,31 @@ class SessionFormWidget(QWidget):
         self._ra_deg = target_data.get("ra_deg")
         self._dec_deg = target_data.get("dec_deg")
         self._target_id = target_data.get("id")
-        select_telescope(self.telescope_combo, self.db_manager, target_data.get("telescope_id"))
+        if not select_telescope(self.telescope_combo, self.db_manager, target_data.get("telescope_id")):
+            self._suggest_telescope(target_data)
+
+    def _suggest_telescope(self, target_data):
+        """Start on the telescope suggested for the object's size (TelescopeAdvisor)
+        - the files' telescope still takes its place."""
+        from cosmoscollection.equipment import TelescopeAdvisor
+        size = TelescopeAdvisor.object_size(target_data)
+        if size is None:
+            try:
+                size = TelescopeAdvisor.object_size(DSOActions.catalog_data(target_data))
+            except Exception as e:
+                logger.error(f"Error finding the size of {target_data.get('name')}: {e}")
+        try:
+            with self.db_manager.get_connection() as conn:
+                fits = TelescopeAdvisor.rank(size, TelescopeAdvisor.load_rigs(conn))
+        except Exception as e:
+            logger.error(f"Error suggesting a telescope: {e}")
+            return
+        if fits and mark_suggested(self.telescope_combo, fits[0].rig.telescope_id, select=True,
+                                   tooltip=TelescopeAdvisor.ranking_tooltip(fits)):
+            self._telescope_suggested = True
+
+    def _on_telescope_picked(self, _index):
+        self._telescope_suggested = False  # The user's choice now
 
     def _on_common_name_toggled(self, checked):
         """Switch the scanned name to/from its common-name form (unless it's been
@@ -478,8 +504,10 @@ class SessionFormWidget(QWidget):
             if camera:
                 self.camera_combo.setCurrentText(EquipmentMapper.display_name(EquipmentMapper.CAMERA, camera, info))
             telescope_id = EquipmentMapper.resolve(EquipmentMapper.TELESCOPE, telescope, info)
-            if telescope_id is not None and self.telescope_combo.currentData() is None:
-                select_telescope(self.telescope_combo, self.db_manager, telescope_id)
+            if telescope_id is not None and (self.telescope_combo.currentData() is None
+                                             or self._telescope_suggested):
+                if select_telescope(self.telescope_combo, self.db_manager, telescope_id):
+                    self._telescope_suggested = False
         filters = summary.get("filters_used") or []
         if filters:
             self.filters_edit.setText(", ".join(filters))
@@ -529,7 +557,11 @@ class SessionFormWidget(QWidget):
                 h, mnt = (int(p) for p in end_time.split(":")[:2])
                 self.end_time_edit.setTime(QTime(h, mnt))
 
-        select_telescope(self.telescope_combo, self.db_manager, session_data.get("telescope_id"))
+        if (not select_telescope(self.telescope_combo, self.db_manager, session_data.get("telescope_id"))
+                and edit_mode and self._telescope_suggested):
+            self.telescope_combo.setCurrentIndex(0)  # A saved session keeps "Any" (the suggestion stays marked)
+        if edit_mode:
+            self._telescope_suggested = False
 
         self.camera_combo.setCurrentText(session_data.get("camera") or "")
         self.filters_edit.setText(session_data.get("filters_used") or "")
@@ -3707,6 +3739,8 @@ class SessionManagerWindow(WindowPositionMixin, QMainWindow):
         from cosmoscollection.planning.FOVSimulator import load_session_framing
         with self.db_manager.get_connection() as conn:
             framing = load_session_framing(conn, session["id"])
+        if session.get("telescope_id") is not None:
+            data = {**data, "telescope_id": session["telescope_id"]}  # Starts on the session's telescope
         DSOActions.open_fov(data, self, framing=framing, session_id=session["id"])
 
     def _open_visibility_calculator(self, session):

@@ -44,7 +44,8 @@ class SimbadUnavailable(ConnectionError):
 class _NetworkWatch:
     """Watches the requests made through one Simbad's session: each gets a
     timeout, and a failure to get an answer (or a server error) is noted -
-    pyvo wraps those in its own errors, sometimes dropping the cause."""
+    pyvo wraps those in its own errors, sometimes dropping the cause.
+    A 404 is noted as well (see request below)."""
 
     def __init__(self, session, verify=True):
         self.failure = None
@@ -61,7 +62,10 @@ class _NetworkWatch:
             except requests.RequestException as e:
                 self.failure = e
                 raise
-            if response.status_code >= 500:
+            # A 404 counts too: SIMBAD answers every working lookup (even one
+            # with no matches) with 200, so a 404 means the service itself is
+            # missing - CDS has returned 404 for all of /simbad/ while down
+            if response.status_code >= 500 or response.status_code == 404:
                 self.failure = f"HTTP {response.status_code} {response.reason} from {url}"
             return response
 

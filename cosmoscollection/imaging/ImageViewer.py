@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from cosmoscollection.imaging import ImageDetails
+from cosmoscollection.equipment.TelescopeAdvisor import pixel_scale
 from cosmoscollection.core.UrlOpener import show_in_folder
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.core.Paths import path_key
@@ -531,7 +532,7 @@ def _equipment_rows(kw, image_size):
     # Image scale as recorded, or from the optics (XPIXSZ already includes binning)
     scale = _to_float(_first_value(kw, 'PIXSCALE', 'SCALE'))
     if not scale and x_pixel and focal_length:
-        scale = 206.265 * x_pixel / focal_length
+        scale = pixel_scale(x_pixel, focal_length)
     if scale:
         rows.append(("Image Scale", f"{scale:.2f}\"/px"))
         if image_size:

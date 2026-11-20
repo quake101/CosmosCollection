@@ -7,6 +7,7 @@ re-exports these names) and the command line.
 """
 
 import logging
+import re
 from datetime import datetime
 
 from cosmoscollection.catalog.DSONames import designation_candidates
@@ -112,6 +113,17 @@ def size_info_text(size_min, size_max):
     """The Target List's size text ("35.0 x 95.0", arcminutes), or "" when unknown."""
     size_min, size_max = size_min or 0, size_max or 0
     return f"{size_min:.1f} x {size_max:.1f}" if (size_min or size_max) else ""
+
+
+def parse_size_info(text):
+    """(size_min, size_max) in arcminutes from size_info text ("35.0 x 95.0",
+    or one number); (0, 0) when it's blank or not numbers."""
+    numbers = [float(part) for part in re.findall(r"\d+(?:\.\d+)?", str(text or ""))]
+    if not numbers:
+        return 0.0, 0.0
+    if len(numbers) == 1:
+        return numbers[0], numbers[0]
+    return min(numbers[:2]), max(numbers[:2])
 
 
 def add_target(conn, name, dso=None, priority="Medium", status="Not Observed", telescope_id=None, notes=""):

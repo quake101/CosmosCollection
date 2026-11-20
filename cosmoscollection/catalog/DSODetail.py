@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QToolBar, QMessageBox, QMenu, QFileDialog, QProgressBar, QFrame
 )
 
-from cosmoscollection.equipment import EquipmentMapper
+from cosmoscollection.equipment import EquipmentMapper, TelescopeAdvisor
 from cosmoscollection.sessions.SessionFileScanner import SUPPORTED_EXTENSIONS
 from cosmoscollection.planning.Observer import active_site
 from cosmoscollection.core.DatabaseManager import DatabaseManager, set_favorite_image
@@ -220,6 +220,29 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
 
         QTimer.singleShot(300, self._load_user_images)
         QTimer.singleShot(400, self._query_emission_data)
+
+    def _telescope_html(self):
+        """'Telescope: X' when the object's Target List entry has one set, else the
+        suggested telescope with how the object fits each one (TelescopeAdvisor);
+        blank without usable equipment."""
+        from html import escape
+        try:
+            with self.db_manager.get_connection() as conn:
+                assigned = TelescopeAdvisor.assigned_telescope(conn, self.data)
+                rigs = [] if assigned else TelescopeAdvisor.load_rigs(conn)
+        except Exception as e:
+            logger.error(f"Error finding a telescope for {self.data.get('name')}: {e}")
+            return ""
+        if assigned:
+            return f"<b>Telescope:</b> {escape(assigned[1])} (Target List)<br>"
+        if not rigs:
+            return ""
+        fits = TelescopeAdvisor.rank(TelescopeAdvisor.object_size(self.data), rigs)
+        if not fits:
+            return "<b>Suggested Telescope:</b> Size unknown<br>"
+        others = "".join(f"<br>&nbsp;&nbsp;{escape(line)}" for line in TelescopeAdvisor.ranking_lines(fits)[1:])
+        return (f"<b>Suggested Telescope:</b> {escape(TelescopeAdvisor.fit_text(fits[0]))}"
+                + (f"<small>{others}</small>" if others else "") + "<br>")
 
     def _get_update_sources_html(self):
         """Return HTML listing update-database sources that contributed NAME designations to this DSO.
@@ -731,7 +754,8 @@ class DSODetailWindow(TargetListActionsMixin, QDialog):
                 f"<b>Surface Brightness:</b> {surface_brightness_str}<br>"
                 f"<b>Size:</b> {size_str}<br>"
                 f"<b>Type:</b> {self.data['dso_type'] or 'Unknown'}<br>"
-                f"<b>Class:</b> {self.data['dso_class'] or 'Unknown'}<br><br>"
+                f"<b>Class:</b> {self.data['dso_class'] or 'Unknown'}<br>"
+                f"{self._telescope_html()}<br>"
                 f"<b>Other Designations:</b><br>"
             )
 

@@ -2,7 +2,8 @@
 EquipmentPicker.py - Dropdowns of the user's equipment, for any window:
 
 - fill_telescope_combo / select_telescope: a telescope for a target or
-  session ("Any" or an enabled telescope; a saved disabled one stays shown)
+  session ("Any" or an enabled telescope; a saved disabled one stays shown);
+  mark_suggested marks the one TelescopeAdvisor suggests
 - equipment_combo / combo_choice: what a telescope or camera name (from files,
   images or sessions) is - a piece of the user's equipment, not matched, or
   added as new (the Equipment window's Matches tab, the Import Wizard)
@@ -64,6 +65,27 @@ def select_telescope(combo, db_manager, telescope_id):
         combo.addItem(f"{row[0]} (disabled)", telescope_id)
         index = combo.count() - 1
     combo.setCurrentIndex(index)
+    return True
+
+
+SUGGESTED_MARK = " — suggested"
+
+
+def mark_suggested(combo, telescope_id, select=False, tooltip=""):
+    """Mark the suggested telescope in a telescope picker ('... - suggested'),
+    clearing any earlier mark; select it too if select. telescope_id None just
+    clears the mark. tooltip: the picker's tooltip (e.g. the ranking)."""
+    for i in range(combo.count()):
+        text = combo.itemText(i)
+        if text.endswith(SUGGESTED_MARK):
+            combo.setItemText(i, text[:-len(SUGGESTED_MARK)])
+    combo.setToolTip(tooltip)
+    index = combo.findData(telescope_id) if telescope_id is not None else -1
+    if index < 0:
+        return False
+    combo.setItemText(index, combo.itemText(index) + SUGGESTED_MARK)
+    if select:
+        combo.setCurrentIndex(index)
     return True
 
 

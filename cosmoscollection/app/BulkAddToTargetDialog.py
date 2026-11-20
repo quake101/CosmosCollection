@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.core.Formatting import known_magnitude
+from cosmoscollection.planning.TargetRows import size_info_text
 
 
 # --- Bulk Add to Target List Dialog ---
@@ -128,9 +129,7 @@ class BulkAddToTargetDialog(QDialog):
                     priority = self.table.cellWidget(row, 1).currentText()
                     telescope_id = self.table.cellWidget(row, 2).currentData()
 
-                    size_min = dso.get('size_min', 0) or 0
-                    size_max = dso.get('size_max', 0) or 0
-                    size_info = f"{size_min:.1f} x {size_max:.1f}" if (size_min or size_max) else ""
+                    size_info = size_info_text(dso.get('size_min'), dso.get('size_max'))
 
                     cursor.execute("""
                         INSERT INTO usertargetlist (
