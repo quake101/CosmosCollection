@@ -291,6 +291,10 @@ def main():
         from cosmoscollection.core.Diagnostics import start_diagnostics
         start_diagnostics(app)
 
+        # Garbage collection only on the main thread, never mid-calculation (see GarbageCollection)
+        from cosmoscollection.core.GarbageCollection import start_main_thread_collection
+        start_main_thread_collection(app)
+
         # Notices a graphics reset, for web views that break afterward (Restart App)
         from cosmoscollection.core import GpuReset
         GpuReset.start_watch()

@@ -6,7 +6,6 @@ Displays astrophotography-relevant weather data from Open-Meteo API
 
 import sys
 import time
-import gc
 import logging
 
 from dataclasses import dataclass
@@ -38,6 +37,7 @@ from PySide6.QtGui import QColor
 
 from cosmoscollection.core.DatabaseManager import DatabaseManager
 from cosmoscollection.planning.Observer import active_site, coordinates_text
+from cosmoscollection.core.GarbageCollection import collection_paused
 from cosmoscollection.core.Settings import app_settings
 from cosmoscollection.ui.WindowPositionManager import WindowPositionMixin
 from cosmoscollection.ui.WindowLifetime import release_on_close
@@ -195,30 +195,11 @@ class WeatherWorker(QThread):
         try:
             sources = self.fetcher.fetch_sources()
             self.progress.emit("Processing weather data...")
-            # Disable the cyclic GC from here through the weather_loaded emit below. A
-            # native crash (Fatal Python error: Illegal instruction) has recurred at
-            # several unrelated first-call sites inside _process_weather_data (astropy
-            # units.cds import, Time.replicate, an ecliptic frame transform, numpy
-            # arrayprint/__str__, pytz.timezone's os.environ lookup) -- the one constant
-            # every time is "Garbage-collecting" at the top of the trace, in this thread.
-            # That points at a GC pass landing while some C extension has left transient
-            # state a GC traversal isn't safe to observe, not at any one of those
-            # libraries specifically. Re-enabling gc immediately after
-            # _process_weather_data returned (right before this comment used to sit)
-            # wasn't enough -- the crash recurred one line later, right after
-            # gc.enable(), inside weather_loaded.emit() itself (cross-thread signal
-            # delivery allocates too). So the disabled window now extends through the
-            # emit call as well. gc.disable()/enable() is process-wide, not thread-local,
-            # but this whole stretch is quick and runs once per weather refresh, so
-            # briefly deferring collection elsewhere is a small price for not crashing.
-            gc_was_enabled = gc.isenabled()
-            gc.disable()
-            try:
+            # No garbage collection while processing and handing over the result: a
+            # pass landing in this stretch has crashed the app (see GarbageCollection)
+            with collection_paused():
                 daily_summaries = self.fetcher.process(*sources)
                 self.weather_loaded.emit(daily_summaries)
-            finally:
-                if gc_was_enabled:
-                    gc.enable()
 
         except WeatherUnavailable as e:
             self.error_occurred.emit(str(e))

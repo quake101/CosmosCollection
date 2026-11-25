@@ -21,6 +21,7 @@ from astropy.coordinates import SkyCoord
 from astropy.time import Time
 
 from cosmoscollection.core.DatabaseManager import open_connection
+from cosmoscollection.core.GarbageCollection import collection_paused
 from cosmoscollection.app.DSOData import DESIGNATIONS_SQL
 from cosmoscollection.core.Formatting import UNKNOWN_MAGNITUDE_FROM, known_magnitude
 
@@ -439,6 +440,12 @@ class BestTonightCalculation:
         """The visible DSOs, ranked by altitude and magnitude. progress(percent)
         is called as batches finish; cancelled() is checked between them.
         Raises TonightError, or TonightCancelled."""
+        # Several threads in astropy at once: a garbage collection pass landing
+        # meanwhile has crashed the app (see GarbageCollection)
+        with collection_paused():
+            return self._calculate(progress, cancelled)
+
+    def _calculate(self, progress, cancelled):
         if self.location is None:
             raise TonightError("Observer location not configured")
 
