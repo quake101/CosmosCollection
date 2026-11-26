@@ -216,6 +216,19 @@ if sys.platform.startswith('linux'):
         'libkeyutils.so',
         # XML/misc
         'libxml2.so', 'libxslt.so', 'libsqlite3.so',
+        # More base-OS libraries from the build machine. When ubuntu-latest moved to
+        # a newer Ubuntu (between v1.1.18 and v1.1.19), its libtinfo.so.6 began
+        # needing glibc 2.42. The system's GL driver (Mesa, through LLVM) loaded
+        # that copy from _internal instead of the system's own; on Linux Mint 22
+        # (glibc 2.39) it couldn't load, so GLX had no configurations and the app
+        # aborted at startup with "Could not initialize GLX". Wayland sessions
+        # (e.g. CachyOS/KDE) never go through GLX, which is why it went unnoticed.
+        # Nothing bundled needs these except Python's optional readline and _uuid
+        # modules (any distro has libreadline/libtinfo/libuuid) or each other.
+        'libtinfo.so', 'libreadline.so', 'libuuid.so', 'libselinux.so', 'libseccomp.so',
+        'libnettle.so', 'libhogweed.so', 'libnssdbm3.so', 'libXRes.so', 'libglycin-2.so',
+        'liblcms2.so', 'libjpeg.so', 'libbsd.so', 'libmd.so', 'libcap.so', 'liblz4.so',
+        'libgcrypt.so', 'libgpg-error.so',
     )
     for _analysis in (a, a_cli):
         _analysis.binaries = [

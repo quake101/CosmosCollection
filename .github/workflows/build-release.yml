@@ -17,7 +17,12 @@ jobs:
         include:
           - os: windows-latest
             platform: Windows
-          - os: ubuntu-latest
+          # Pinned, not ubuntu-latest: the Linux build bundles some of the build
+          # machine's own libraries, and a newer Ubuntu's need a newer glibc than
+          # older distributions have (v1.1.19-v1.1.24 couldn't start on Linux Mint 22:
+          # "Could not initialize GLX"; see CosmosCollection.spec). Move this forward
+          # deliberately, testing on the oldest distribution supported.
+          - os: ubuntu-24.04
             platform: Linux
           - os: macos-latest
             platform: macOS
@@ -114,7 +119,7 @@ jobs:
         }
 
     - name: Bundle updater helper into distribution (Linux)
-      if: matrix.os == 'ubuntu-latest'
+      if: matrix.platform == 'Linux'
       run: |
         cp dist/CosmosCollectionUpdater dist/CosmosCollection/CosmosCollectionUpdater
         chmod +x dist/CosmosCollection/CosmosCollectionUpdater
@@ -144,7 +149,7 @@ jobs:
         Compress-Archive -Path dist/CosmosCollection/* -DestinationPath dist/CosmosCollection-${{ matrix.platform }}.zip
 
     - name: Create distribution zip (Linux)
-      if: matrix.os == 'ubuntu-latest'
+      if: matrix.platform == 'Linux'
       run: |
         cd dist/CosmosCollection
         zip -r ../CosmosCollection-${{ matrix.platform }}.zip .

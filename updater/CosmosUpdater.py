@@ -197,7 +197,11 @@ def _popen_relaunch(args):
             # once it exits instead of leaving a "failed"/"exited" unit
             # behind forever (as the app's own KDE/GNOME-created units do).
             cmd = [systemd_run, '--user', '--scope', '--quiet', '--collect', '--'] + cmd
-    return subprocess.Popen(cmd, cwd=args.install_dir, close_fds=True)
+    # Without the old app's and this updater's bundled-library paths and
+    # their other variables (see CosmosUpdaterEnv.py), so the relaunched app
+    # starts the way it does from the desktop.
+    from CosmosUpdaterEnv import clean_environment
+    return subprocess.Popen(cmd, cwd=args.install_dir, close_fds=True, env=clean_environment())
 
 
 def _relaunch_app(args, log_path, attempts=2, settle=1.5, healthcheck=0.75):
@@ -392,6 +396,9 @@ def main():
         return e.code if isinstance(e.code, int) else 2
 
     _log(args.log, f"Updater starting, waiting for pid {args.pid} to exit")
+
+    from CosmosUpdaterEnv import register_bundle_dirs
+    register_bundle_dirs(args.install_dir, args.staged_dir)
 
     # A GUI problem (no display, no zenity/kdialog, a crash in the window
     # process) must never block the actual update: open_progress never

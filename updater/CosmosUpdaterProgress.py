@@ -51,18 +51,11 @@ def icon_path():
 
 def _system_tool_env():
     """Environment for running the desktop's own programs (zenity, kdialog,
-    dbus-send, osascript). A frozen Linux build can point LD_LIBRARY_PATH at
-    its own extracted libraries; a system program loading those instead of
-    the system's copies can crash, so put back the original value."""
-    env = os.environ.copy()
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass and meipass in env.get("LD_LIBRARY_PATH", ""):
-        original = env.pop("LD_LIBRARY_PATH_ORIG", None)
-        if original is not None:
-            env["LD_LIBRARY_PATH"] = original
-        else:
-            env.pop("LD_LIBRARY_PATH", None)
-    return env
+    dbus-send, osascript): without the bundles' library paths, which can
+    crash a system program loading them instead of the system's copies (see
+    CosmosUpdaterEnv.py)."""
+    from CosmosUpdaterEnv import clean_environment
+    return clean_environment()
 
 
 def _self_command():
@@ -77,10 +70,9 @@ def _self_env():
     """Environment for the window process: a fresh, independent copy of this
     one-file build rather than one sharing this process's extracted files,
     which the bootloader deletes as soon as this process exits."""
-    env = os.environ.copy()
+    env = _system_tool_env()  # also drops the _PYI_* / _MEIPASS2 hand-off variables
     if getattr(sys, "frozen", False):
         env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"  # PyInstaller 6.9+
-        env.pop("_MEIPASS2", None)  # older PyInstaller
     return env
 
 
