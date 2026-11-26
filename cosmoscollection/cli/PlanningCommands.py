@@ -45,6 +45,9 @@ def register(subparsers, common):
     tonight.add_argument("--targets", action="store_true", help="check your Target List instead of the catalog")
     tonight.add_argument("--hide-completed", action="store_true", help="with --targets: leave out Completed targets")
     tonight.add_argument("--no-horizon", action="store_true", help="ignore the location's custom horizon")
+    tonight.add_argument("--min-moon", type=float, default=0, metavar="DEG",
+                         help="only objects at least this far from the Moon at their best time, in degrees "
+                              "(the window's From Moon filter)")
     tonight.add_argument("--sort", choices=SORTS, default="hours",
                          help="hours up (default, as the window sorts), altitude, magnitude, best time, moon "
                               "distance, or rank (altitude and magnitude together)")
@@ -238,6 +241,8 @@ def run_tonight(ctx):
         raise CliError("--catalog and --type don't apply to --targets.", EXIT_USAGE)
     if args.objects < 1:
         raise CliError("--objects needs a number above 0.", EXIT_USAGE)
+    if not 0 <= args.min_moon <= 180:
+        raise CliError("--min-moon needs degrees from 0 to 180.", EXIT_USAGE)
 
     calculation = BestTonightCalculation(
         min_altitude=args.min_alt, max_magnitude=args.max_mag, selected_catalogs=_catalog_choice(args.catalog),
@@ -258,6 +263,13 @@ def run_tonight(ctx):
     finally:
         progress.done()
 
+    moon = results[0].get("moon_illumination") if results else None
+    near_moon = 0
+    if args.min_moon:
+        # As the window's From Moon filter: an unknown distance stays listed
+        kept = [r for r in results if r.get("moon_separation") is None or r["moon_separation"] >= args.min_moon]
+        near_moon = len(results) - len(kept)
+        results = kept
     results = _sort_tonight(results, args.sort)
     shown = results[:args.limit] if args.limit and args.limit > 0 else results
     when = describe_time_window(calculation.time_mode, calculation.window_start, calculation.window_end)
@@ -265,7 +277,6 @@ def run_tonight(ctx):
         when = f"for all of {when}"
     if now is not None:
         when += f" on the {_night_title(now)}"
-    moon = results[0].get("moon_illumination") if results else None
     horizon_name = calculation.horizon.name if calculation.horizon is not None else None
 
     if ctx.json:
@@ -278,6 +289,7 @@ def run_tonight(ctx):
             "checked": "targets" if args.targets else args.objects,
             "found": len(results), "blocked_by_horizon": calculation.blocked_by_horizon,
             "moon_illumination": None if moon is None else round(moon, 3),
+            "min_moon_separation": args.min_moon or None, "near_moon": near_moon,
             "objects": [_tonight_json(r, args.targets) for r in shown],
         })
         return
@@ -289,13 +301,18 @@ def run_tonight(ctx):
         details.append(f"custom horizon '{horizon_name}'" if horizon_name else "custom horizon")
     if moon is not None:
         details.append(f"Moon {moon:.0%} lit")
+    if args.min_moon:
+        details.append(f"at least {args.min_moon:g}° from the Moon")
     print(", ".join(details))
     if calculation.window_note:
         note(f"Note: {calculation.window_note}.")
     print()
+    left_out = [f"{blocked} blocked by your custom horizon"] if blocked else []
+    if near_moon:
+        left_out.append(f"{near_moon} closer than {args.min_moon:g}° to the Moon")
     if not results:
         print(f"No objects meet the visibility criteria {when}" +
-              (f" ({blocked} blocked by your custom horizon)." if blocked else "."))
+              (f" ({', '.join(left_out)})." if left_out else "."))
         return
 
     from cosmoscollection.catalog.DSONames import common_name_from_designations, type_name
@@ -316,8 +333,9 @@ def run_tonight(ctx):
         columns.insert(-1, Column("Telescope", lambda r: r["dso_info"].get("telescope_name") or ""))
     print_table(shown, columns)
     more = len(results) - len(shown)
-    print(f"\n{count_text(len(results), 'object')} up" + (f", {blocked} more blocked by your custom horizon" if blocked
-                                                     else "") +
+    print(f"\n{count_text(len(results), 'object')} up" +
+          (f", {blocked} more blocked by your custom horizon" if blocked else "") +
+          (f", {near_moon} more closer than {args.min_moon:g}° to the Moon" if near_moon else "") +
           (f" ({more} not shown - use --limit 0 for all)" if more else ""))
 
 

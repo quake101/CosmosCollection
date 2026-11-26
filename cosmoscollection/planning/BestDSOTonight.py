@@ -425,6 +425,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
     # ---- Finding and filtering the results (view only - nothing is recalculated) ----
 
     DIRECTIONS_SETTING = "BestDSOTonight/result_directions"
+    MOON_SETTING = "BestDSOTonight/result_min_moon_separation"
     UNASSIGNED = "Unassigned"
 
     def _build_filter_row(self):
@@ -471,6 +472,20 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         menu.addAction("All Directions").triggered.connect(lambda: self._set_directions(COMPASS_OCTANTS))
         self.direction_button.setMenu(menu)
         row.addWidget(self.direction_button)
+
+        row.addWidget(QLabel("From Moon:"))
+        self.moon_filter_spin = QSpinBox()
+        self.moon_filter_spin.setRange(0, 120)
+        self.moon_filter_spin.setSingleStep(5)
+        self.moon_filter_spin.setSuffix("°")
+        self.moon_filter_spin.setSpecialValueText("Any")  # Shown at 0
+        self.moon_filter_spin.setToolTip(
+            "Show only objects at least this far from the Moon at their Best Time\n"
+            "(the Moon column) - e.g. 45° to stay clear of its glow. Any shows all.\n"
+            "Objects whose distance couldn't be worked out (N/A) stay listed.")
+        self.moon_filter_spin.setValue(app_settings().value(self.MOON_SETTING, 0, type=int))
+        self.moon_filter_spin.valueChanged.connect(self._on_moon_filter_changed)
+        row.addWidget(self.moon_filter_spin)
 
         # Only Target List results have a telescope (shown by display_results)
         self.result_telescope_label = QLabel("Telescope:")
@@ -525,10 +540,15 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
             text = ", ".join(point for point in COMPASS_OCTANTS if point in checked)
         self.direction_button.setText(text)
 
+    def _on_moon_filter_changed(self, value):
+        app_settings().setValue(self.MOON_SETTING, value)
+        self._apply_result_filters()
+
     def _filters_active(self):
         return bool(self.search_box.text().strip()
                     or self.result_type_filter.currentText() != ALL
                     or len(self._checked_directions()) != len(COMPASS_OCTANTS)
+                    or self.moon_filter_spin.value() > 0
                     or (self._using_target_list and self.result_telescope_filter.currentText() != ALL))
 
     def _clear_result_filters(self):
@@ -539,6 +559,10 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         self.search_box.blockSignals(True)
         self.search_box.clear()
         self.search_box.blockSignals(False)
+        self.moon_filter_spin.blockSignals(True)
+        self.moon_filter_spin.setValue(0)
+        self.moon_filter_spin.blockSignals(False)
+        app_settings().setValue(self.MOON_SETTING, 0)
         self._set_directions(COMPASS_OCTANTS)  # Filters once, for everything
 
     @staticmethod
@@ -568,6 +592,7 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
         wanted_type = self.result_type_filter.currentText()
         directions = self._checked_directions()
         all_directions = len(directions) == len(COMPASS_OCTANTS)
+        min_moon = self.moon_filter_spin.value()
         telescope = self.result_telescope_filter.currentText() if self._using_target_list else ALL
         if telescope == self.UNASSIGNED:
             telescope = "Any"  # How an unassigned target is shown
@@ -584,6 +609,9 @@ class BestDSOTonightWindow(WindowPositionMixin, QMainWindow):
                 visible = type_name(dso_data["dso_info"]["type"]) == wanted_type
             if visible and not all_directions:
                 visible = compass_octant(dso_data["optimal_azimuth"]) in directions
+            if visible and min_moon:
+                moon_sep = dso_data.get("moon_separation")
+                visible = moon_sep is None or moon_sep >= min_moon  # Unknown (N/A) stays listed
             if visible and telescope != ALL:
                 visible = (dso_data["dso_info"].get("telescope_name") or "Any") == telescope
             self.results_table.setRowHidden(row, not visible)
