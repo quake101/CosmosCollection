@@ -304,9 +304,10 @@ class MainWindow(WindowPositionMixin, QMainWindow):
         quit_action.triggered.connect(self._quit_application)
         toolbar.addAction(quit_action)
 
-    def _show_settings(self):
-        """Show the settings dialog"""
-        settings_dialog = SettingsDialog(self)
+    def _show_settings(self, *, open_location_manager=False):
+        """Show the settings dialog. Keyword-only so the toolbar action's
+        triggered(checked) signal can't fill it in."""
+        settings_dialog = SettingsDialog(self, open_location_manager=open_location_manager)
         settings_dialog.exec()
         # Update NINA Dashboard action visibility based on current settings
         self.nina_dashboard_action.setVisible(NINAIntegration.is_enabled())
@@ -348,7 +349,7 @@ class MainWindow(WindowPositionMixin, QMainWindow):
                     msg.setDefaultButton(QMessageBox.Yes)
 
                     if msg.exec() == QMessageBox.Yes:
-                        self._show_settings()
+                        self._show_settings(open_location_manager=True)
 
         except Exception as e:
             logger.error(f"Error checking location on startup: {str(e)}")

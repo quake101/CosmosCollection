@@ -162,7 +162,7 @@ class HorizonPreview(QWidget):
 class SettingsDialog(QDialog):
     """Settings dialog for configuring application preferences"""
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, open_location_manager=False):
         super().__init__(parent)
         self.setWindowTitle("Settings - Cosmos Collection")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
@@ -172,7 +172,9 @@ class SettingsDialog(QDialog):
         self.db_manager = DatabaseManager()
         self._setup_ui()
         self._load_current_settings()
-        
+        if open_location_manager:
+            self.tab_widget.setCurrentWidget(self.location_tab)
+
     def _setup_ui(self):
         """Set up the settings dialog UI"""
         layout = QVBoxLayout()
@@ -1021,6 +1023,8 @@ class SettingsDialog(QDialog):
         tab_widget.addTab(integrations_tab, "Integrations")
         tab_widget.addTab(location_tab, "Location Manager")
         tab_widget.addTab(backup_restore_tab, "Backup && Restore")
+        self.tab_widget = tab_widget
+        self.location_tab = location_tab
 
         layout.addWidget(tab_widget)
 
