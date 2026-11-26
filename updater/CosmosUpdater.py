@@ -109,6 +109,31 @@ def _retry(func, attempts=10, delay=0.5):
 _EXECUTABLE_NAMES = {'CosmosCollection', 'CosmosCollection-CLI', 'CosmosCollectionUpdater'}
 
 
+def _copy_file(src_file, dst_file):
+    """Copy src_file over dst_file.
+
+    On Linux/macOS, writing into an executable or shared library that some
+    process is still running fails with ETXTBSY ("Text file busy") - e.g. a
+    second copy of the app left open, which --pid doesn't cover. So copy to
+    a temporary file beside it and rename that over the target instead:
+    rename() swaps the directory entry, any process still running keeps the
+    old file, and the next launch gets the new one. Windows can't replace
+    a running file at all, so it keeps the plain copy (with _retry's waits)."""
+    if sys.platform == "win32":
+        shutil.copy2(src_file, dst_file)
+        return
+    tmp_file = f"{dst_file}.cc-update-tmp"
+    try:
+        shutil.copy2(src_file, tmp_file)
+        os.replace(tmp_file, dst_file)
+    except BaseException:
+        try:
+            os.remove(tmp_file)
+        except OSError:
+            pass
+        raise
+
+
 def _mirror_sync(src_dir, dst_dir, log_path):
     """Make dst_dir's contents match src_dir's: copy every file from
     src_dir into dst_dir (overwriting), then delete anything in dst_dir
@@ -131,7 +156,7 @@ def _mirror_sync(src_dir, dst_dir, log_path):
         for name in files:
             src_file = os.path.join(root, name)
             dst_file = os.path.join(dst_root, name)
-            _retry(lambda sf=src_file, df=dst_file: shutil.copy2(sf, df))
+            _retry(lambda sf=src_file, df=dst_file: _copy_file(sf, df))
             if sys.platform != "win32" and rel == "." and name in _EXECUTABLE_NAMES:
                 try:
                     os.chmod(dst_file, 0o755)

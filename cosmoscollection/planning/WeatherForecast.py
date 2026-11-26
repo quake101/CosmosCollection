@@ -996,8 +996,9 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         header_layout = QHBoxLayout()
         self.location_label = QLabel("Location: Loading...")
         themed_style(self.location_label, lambda: f"font-size: {font_size(11)};")
-        header_layout.addWidget(self.location_label)
-        header_layout.addStretch()
+        # Wraps so a long site name doesn't set the window's minimum width
+        self.location_label.setWordWrap(True)
+        header_layout.addWidget(self.location_label, 1)
 
         self.refresh_btn = QPushButton("Refresh Forecast")
         self.refresh_btn.setToolTip("Fetch fresh weather data (bypasses cache)")
@@ -1059,6 +1060,10 @@ class WeatherForecastWindow(WindowPositionMixin, QMainWindow):
         self._update_attribution()
         themed_style(self.attribution_label, lambda: f"color: {COLORS['text_disabled']}; font-size: {font_size(9)};")
         self.attribution_label.setAlignment(Qt.AlignCenter)
+        # Wrap instead of setting the window's minimum width - the line is long
+        # when several sources are blended
+        self.attribution_label.setWordWrap(True)
+        self.attribution_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.attribution_label.setOpenExternalLinks(False)
         self.attribution_label.linkActivated.connect(lambda url: open_url(url))
         overview_layout.addWidget(self.attribution_label)
