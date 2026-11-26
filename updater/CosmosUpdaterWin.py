@@ -8,6 +8,14 @@ The one-file build's manifest (PyInstaller's default) turns on Common
 Controls 6, so the bar and text get the current Windows look. The window is
 per-monitor DPI aware and re-lays itself out when dragged to a monitor with
 a different scale.
+
+Win32 windows don't follow dark mode on their own. When apps are set to
+Dark (and High Contrast is off), this one asks DWM for a dark title bar,
+paints a dark background and light text, and draws the bar unthemed in
+dark colors: a dark track and the light shade of the user's accent color.
+(Windows' own dark bar style, DarkMode_CopyEngine, has no busy animation:
+its marquee is drawn light. It also reverts whenever the bar switches
+between busy and percent.)
 """
 
 import ctypes
@@ -22,6 +30,8 @@ gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 comctl32 = ctypes.WinDLL("comctl32", use_last_error=True)
+uxtheme = ctypes.WinDLL("uxtheme", use_last_error=True)
+dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 
 LRESULT = ctypes.c_ssize_t
 LONG_PTR = ctypes.c_ssize_t
@@ -30,6 +40,7 @@ WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPA
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
 WM_SETFONT = 0x0030
+WM_CTLCOLORSTATIC = 0x0138
 WM_DPICHANGED = 0x02E0
 WM_USER = 0x0400
 WM_APP = 0x8000
@@ -44,8 +55,15 @@ PBS_SMOOTH = 0x01
 PBS_MARQUEE = 0x08
 PBM_SETPOS = WM_USER + 2
 PBM_SETRANGE32 = WM_USER + 6
+PBM_SETBARCOLOR = WM_USER + 9
 PBM_SETMARQUEE = WM_USER + 10
+PBM_SETBKCOLOR = 0x2001  # CCM_SETBKCOLOR
 GWL_STYLE = -16
+GWL_EXSTYLE = -20
+WS_EX_STATICEDGE = 0x00020000
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_FRAMECHANGED = 0x0020
 COLOR_BTNFACE = 15
 SW_SHOWNORMAL = 1
 SWP_NOZORDER = 0x0004
@@ -54,6 +72,16 @@ MONITOR_DEFAULTTONEAREST = 2
 ICC_PROGRESS_CLASS = 0x20
 IDI_APPLICATION = 32512
 IDC_ARROW = 32512
+SPI_GETHIGHCONTRAST = 0x0042
+HCF_HIGHCONTRASTON = 0x00000001
+DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19  # Windows 10 before 20H1
+
+# Windows 11's dark dialog colors (a COLORREF is 0x00BBGGRR)
+DARK_BACKGROUND = 0x00202020
+DARK_TEXT = 0x00FFFFFF
+DARK_TRACK = 0x00383838  # the track of Windows' own dark progress bar
+DARK_FILL_DEFAULT = 0x00FFCD60  # its fill, #60CDFF, if the accent can't be read
 
 # Layout in 96-DPI pixels
 CLIENT_WIDTH = 440
@@ -84,6 +112,11 @@ class MONITORINFO(ctypes.Structure):
 
 class INITCOMMONCONTROLSEX(ctypes.Structure):
     _fields_ = [("dwSize", wintypes.DWORD), ("dwICC", wintypes.DWORD)]
+
+
+class HIGHCONTRASTW(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwFlags", wintypes.DWORD),
+                ("lpszDefaultScheme", wintypes.LPWSTR)]
 
 
 def _declare():
@@ -129,6 +162,13 @@ def _declare():
     gdi32.CreateFontW.argtypes = [ctypes.c_int] * 5 + [wintypes.DWORD] * 8 + [wintypes.LPCWSTR]
     gdi32.CreateFontW.restype = wintypes.HFONT
     gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    gdi32.CreateSolidBrush.argtypes = [wintypes.COLORREF]
+    gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+    gdi32.SetTextColor.argtypes = [wintypes.HDC, wintypes.COLORREF]
+    gdi32.SetBkColor.argtypes = [wintypes.HDC, wintypes.COLORREF]
+    user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, wintypes.LPVOID, wintypes.UINT]
+    uxtheme.SetWindowTheme.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+    dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD]
     shell32.ExtractIconExW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(wintypes.HICON),
                                        ctypes.POINTER(wintypes.HICON), wintypes.UINT]
     comctl32.InitCommonControlsEx.argtypes = [ctypes.POINTER(INITCOMMONCONTROLSEX)]
@@ -163,6 +203,45 @@ def _set_dpi_awareness():
         pass
 
 
+def _use_dark_mode():
+    """Whether apps are set to Dark in Settings > Personalization > Colors,
+    with High Contrast off (its own colors come from the system)."""
+    contrast = HIGHCONTRASTW()
+    contrast.cbSize = ctypes.sizeof(HIGHCONTRASTW)
+    if (user32.SystemParametersInfoW(SPI_GETHIGHCONTRAST, contrast.cbSize, ctypes.byref(contrast), 0)
+            and contrast.dwFlags & HCF_HIGHCONTRASTON):
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+    except OSError:
+        return False  # before Windows 10 1809, or never set: light
+
+
+def _dark_fill_color():
+    """The light shade of the user's accent color, which dark-mode controls
+    fill with: the second of the eight RGBA colors (lightest first) in
+    Explorer's AccentPalette."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent") as key:
+            palette = winreg.QueryValueEx(key, "AccentPalette")[0]
+        red, green, blue = palette[4], palette[5], palette[6]
+        return red | green << 8 | blue << 16
+    except (OSError, IndexError, TypeError):
+        return DARK_FILL_DEFAULT
+
+
+def _dark_title_bar(hwnd):
+    value = wintypes.BOOL(True)
+    for attribute in (DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD):
+        if dwmapi.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+            return
+
+
 def _window_dpi(hwnd):
     try:
         dpi = user32.GetDpiForWindow(hwnd)
@@ -194,6 +273,9 @@ class _Window:
         self._font = None
         self._closing = False
         self._marquee = False
+        self._dark = _use_dark_mode()
+        self._dark_brush = gdi32.CreateSolidBrush(DARK_BACKGROUND) if self._dark else None
+        self._dark_fill = _dark_fill_color() if self._dark else None
 
         _set_dpi_awareness()
         icc = INITCOMMONCONTROLSEX(ctypes.sizeof(INITCOMMONCONTROLSEX), ICC_PROGRESS_CLASS)
@@ -210,7 +292,7 @@ class _Window:
         wc.hIcon = large_icon
         wc.hIconSm = small_icon
         wc.hCursor = user32.LoadCursorW(None, ctypes.c_void_p(IDC_ARROW))
-        wc.hbrBackground = user32.GetSysColorBrush(COLOR_BTNFACE)
+        wc.hbrBackground = self._dark_brush or user32.GetSysColorBrush(COLOR_BTNFACE)
         wc.lpszClassName = "CosmosCollectionUpdaterProgress"
         if not user32.RegisterClassExW(ctypes.byref(wc)):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -223,6 +305,8 @@ class _Window:
             work.left, work.top, 100, 100, None, None, hinstance, None)
         if not self.hwnd:
             raise ctypes.WinError(ctypes.get_last_error())
+        if self._dark:
+            _dark_title_bar(self.hwnd)
 
         self.label = user32.CreateWindowExW(
             0, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
@@ -231,6 +315,7 @@ class _Window:
             0, "msctls_progress32", "", WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
             0, 0, 10, 10, self.hwnd, None, hinstance, None)
         user32.SendMessageW(self.bar, PBM_SETRANGE32, 0, 100)
+        self._apply_bar_theme()
 
         dpi = _window_dpi(self.hwnd)
         width, height = self._outer_size(dpi)
@@ -280,10 +365,26 @@ class _Window:
         if old_font:
             gdi32.DeleteObject(old_font)
 
+    def _apply_bar_theme(self):
+        """Dark mode: draw the bar unthemed, in dark colors. Re-applied after
+        each switch between busy and percent, which changes its style."""
+        if self._dark:
+            uxtheme.SetWindowTheme(self.bar, "", "")
+            user32.SendMessageW(self.bar, PBM_SETBKCOLOR, 0, DARK_TRACK)
+            user32.SendMessageW(self.bar, PBM_SETBARCOLOR, 0, self._dark_fill)
+            # Unthemed, the bar gives itself a sunken 3D edge (light gray and
+            # white), which looks out of place on a dark window
+            ex_style = self._get_long(self.bar, GWL_EXSTYLE)
+            if ex_style & WS_EX_STATICEDGE:
+                self._set_long(self.bar, GWL_EXSTYLE, ex_style & ~WS_EX_STATICEDGE)
+                user32.SetWindowPos(self.bar, None, 0, 0, 0, 0,
+                                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)
+
     def _set_busy(self):
         if not self._marquee:
             style = self._get_long(self.bar, GWL_STYLE)
             self._set_long(self.bar, GWL_STYLE, style | PBS_MARQUEE)
+            self._apply_bar_theme()
             user32.SendMessageW(self.bar, PBM_SETMARQUEE, 1, 30)
             self._marquee = True
 
@@ -292,6 +393,7 @@ class _Window:
             user32.SendMessageW(self.bar, PBM_SETMARQUEE, 0, 0)
             style = self._get_long(self.bar, GWL_STYLE)
             self._set_long(self.bar, GWL_STYLE, style & ~PBS_MARQUEE)
+            self._apply_bar_theme()
             self._marquee = False
         user32.SendMessageW(self.bar, PBM_SETPOS, percent, 0)
 
@@ -327,6 +429,10 @@ class _Window:
                 return 0
             if msg == WM_CLOSE:
                 return 0  # no closing it mid-update (Alt+F4)
+            if msg == WM_CTLCOLORSTATIC and self._dark:
+                gdi32.SetTextColor(wparam, DARK_TEXT)
+                gdi32.SetBkColor(wparam, DARK_BACKGROUND)
+                return self._dark_brush
             if msg == WM_DPICHANGED:
                 suggested = ctypes.cast(lparam, ctypes.POINTER(wintypes.RECT)).contents
                 user32.SetWindowPos(hwnd, None, suggested.left, suggested.top,
@@ -347,8 +453,9 @@ class _Window:
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
-        if self._font:
-            gdi32.DeleteObject(self._font)
+        for handle in (self._font, self._dark_brush):
+            if handle:
+                gdi32.DeleteObject(handle)
 
 
 def run(title, _icon_path=None):
