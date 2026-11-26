@@ -9,13 +9,11 @@ a staging directory, then launches this helper and quits. This helper waits
 for the main app's process to fully exit, mirrors the staged files over the
 install directory, relaunches the app, and cleans up after itself.
 
-The actual wait/copy/relaunch logic (_run_update below) is stdlib-only by
-design, so the update itself can never be blocked by a GUI problem - it must
-be able to run standalone even while the main app's own bundled libraries
-are mid-replacement. main() additionally shows a PySide6 progress dialog
-(see CosmosUpdaterWorker.py) reporting each stage, imported lazily and
-wrapped so any failure to create it just falls back to running the update
-headless.
+The whole updater is stdlib-only by design, so the update itself can never
+be blocked by a GUI problem - it must be able to run standalone even while
+the main app's own bundled libraries are mid-replacement. It shows a native
+progress window (see CosmosUpdaterProgress.py) in a separate process, so
+any failure to show it just leaves the update running headless.
 
 Usage:
     CosmosCollectionUpdater --pid <main_app_pid> --staged-dir <path>
@@ -134,11 +132,11 @@ def _copy_file(src_file, dst_file):
         raise
 
 
-def _mirror_sync(src_dir, dst_dir, log_path):
+def _mirror_sync(src_dir, dst_dir, log_path, on_progress=None):
     """Make dst_dir's contents match src_dir's: copy every file from
     src_dir into dst_dir (overwriting), then delete anything in dst_dir
     that isn't present in src_dir (handles files removed between
-    releases)."""
+    releases). on_progress(percent) is called as files are copied."""
 
     # os.walk() silently yields nothing for a missing/empty directory rather
     # than raising - without this check, a wrong/missing staged-dir would
@@ -146,6 +144,9 @@ def _mirror_sync(src_dir, dst_dir, log_path):
     # "remove stale entries" pass below, destroying the working install.
     if not os.path.isdir(src_dir) or not os.listdir(src_dir):
         raise RuntimeError(f"staged update directory is missing or empty: {src_dir}")
+
+    total = sum(len(files) for _root, _dirs, files in os.walk(src_dir)) or 1
+    copied = 0
 
     # Copy/overwrite new + changed files
     for root, _dirs, files in os.walk(src_dir):
@@ -162,6 +163,9 @@ def _mirror_sync(src_dir, dst_dir, log_path):
                     os.chmod(dst_file, 0o755)
                 except OSError as e:
                     _log(log_path, f"WARN: could not set executable bit on {dst_file}: {e}")
+            copied += 1
+            if on_progress:
+                on_progress(copied * 100 // total)
 
     # Remove files/dirs present in dst_dir but no longer in src_dir
     for root, dirs, files in os.walk(dst_dir, topdown=False):
@@ -259,38 +263,52 @@ def _write_failure_marker(log_path, install_dir, staged_dir, error):
         pass
 
 
-def _run_update(args, status_cb):
-    """Runs the wait/copy/relaunch steps, reporting each stage through
-    status_cb(text) (in addition to the log file) so a progress dialog can
-    show live status. Returns the process exit code; failures are reported
-    rather than raised so the caller can still relaunch the (possibly old)
-    app either way, matching the original behavior."""
+FAILURE_MESSAGE_SECONDS = 4
 
-    def _report(text):
+
+def _run_update(args, ui):
+    """Runs the wait/copy/relaunch steps, reporting each stage to the log
+    file and to ui (a CosmosUpdaterProgress window, or its no-op stand-in),
+    and closes ui when done. Returns the process exit code; failures are
+    reported rather than raised so the (possibly old) app is relaunched
+    either way."""
+
+    def _report(text, percent=None):
         _log(args.log, text)
-        status_cb(text)
+        ui.text(text)
+        ui.progress(percent)
 
-    _report("Waiting for Cosmos Collection to close...")
+    def _show_failure(text):
+        # Leave a failure message on screen briefly rather than vanishing
+        # the window the instant something goes wrong.
+        _report(text)
+        time.sleep(FAILURE_MESSAGE_SECONDS)
+        ui.close()
+
     _wait_for_pid_exit(args.pid, timeout=60)
     time.sleep(1.0)  # grace period for Windows to release file handles
 
     try:
-        _report("Copying updated files...")
-        _mirror_sync(args.staged_dir, args.install_dir, args.log)
+        _report("Copying updated files...", 0)
+        _mirror_sync(args.staged_dir, args.install_dir, args.log, on_progress=ui.progress)
         _log(args.log, "Mirror sync complete")
     except Exception as e:
-        _report(f"Update failed: {e}")
         _log(args.log, f"ERROR: update failed during file sync: {e}")
         _write_failure_marker(args.log, args.install_dir, args.staged_dir, e)
         # Try to relaunch the (old, possibly partially-updated) app anyway so
         # the user isn't left with nothing running.
         _relaunch_app(args, args.log)
+        _show_failure(f"Update failed: {e}")
         return 1
 
     _report("Restarting Cosmos Collection...")
-    if not _relaunch_app(args, args.log):
-        _report("Cosmos Collection did not restart - please launch it manually.")
+    if _relaunch_app(args, args.log):
+        ui.close()
+    else:
+        _show_failure("Cosmos Collection did not restart - please launch it manually.")
 
+    # After the window closes: the window process runs from the staged
+    # copy of the updater, which is about to be deleted.
     shutil.rmtree(args.staged_dir, ignore_errors=True)
     for path in args.cleanup:
         if os.path.isdir(path):
@@ -312,23 +330,15 @@ def _show_standalone_help(usage_text):
     sys.stdout/sys.stderr to None - argparse's normal print-and-exit for
     --help or missing/bad arguments would otherwise crash silently the
     moment it tries to write, leaving someone who double-clicks the exe
-    directly with no explanation at all. A QMessageBox works regardless,
-    since it doesn't depend on either stream."""
-    try:
-        from PySide6.QtWidgets import QApplication, QMessageBox
-        app = QApplication.instance() or QApplication(sys.argv)
-        box = QMessageBox()
-        box.setWindowTitle("Cosmos Collection Updater")
-        box.setIcon(QMessageBox.Information)
-        box.setText(
-            "This is an internal helper that Cosmos Collection launches "
-            "automatically to apply an update. It isn't meant to be run "
-            "directly."
-        )
-        box.setDetailedText(usage_text)
-        box.exec()
-    except Exception:
-        pass  # Qt unavailable - nothing more we can do in a windowed build
+    directly with no explanation at all. A native message box works
+    regardless, since it doesn't depend on either stream."""
+    from CosmosUpdaterProgress import show_message
+    show_message(
+        "Cosmos Collection Updater",
+        "This is an internal helper that Cosmos Collection launches "
+        "automatically to apply an update. It isn't meant to be run directly.",
+        usage_text,
+    )
 
 
 def main():
@@ -383,15 +393,25 @@ def main():
 
     _log(args.log, f"Updater starting, waiting for pid {args.pid} to exit")
 
+    # A GUI problem (no display, no zenity/kdialog, a crash in the window
+    # process) must never block the actual update: open_progress never
+    # raises, and the window's own process failing just stops its updates.
+    from CosmosUpdaterProgress import NullProgress, open_progress
     try:
-        from CosmosUpdaterWorker import run_with_progress
-        return run_with_progress(lambda status_cb: _run_update(args, status_cb))
+        ui = open_progress("Waiting for Cosmos Collection to close...",
+                           log=lambda message: _log(args.log, message))
     except Exception as e:
-        # A GUI problem (missing display, Qt failure, etc.) must never block
-        # the actual update - fall back to running it headless.
-        _log(args.log, f"WARN: progress dialog unavailable, continuing headless: {e}")
-        return _run_update(args, lambda _text: None)
+        _log(args.log, f"WARN: progress window unavailable, continuing headless: {e}")
+        ui = NullProgress()
+    try:
+        return _run_update(args, ui)
+    finally:
+        ui.close()  # no-op if _run_update already closed it
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--progress-ui"]:
+        # The progress window's own process (see CosmosUpdaterProgress.py)
+        from CosmosUpdaterProgress import run_ui_process
+        sys.exit(run_ui_process())
     sys.exit(main())

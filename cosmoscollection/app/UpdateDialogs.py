@@ -202,7 +202,7 @@ def _download_and_install_update(parent, zip_asset, sha256_asset):
         # this process to exit before it can proceed. A blocking dialog at
         # this point would just sit there until the user notices and
         # dismisses it, making the update look hung. The helper's own
-        # progress dialog (CosmosUpdaterWorker.py) picks up from here to
+        # progress window (CosmosUpdaterProgress.py) picks up from here to
         # narrate the rest of the restart.
         quit_callback()
 

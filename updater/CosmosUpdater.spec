@@ -18,33 +18,50 @@ a = Analysis(
     [script_path],
     pathex=[],
     binaries=[],
-    datas=[
-        # Bundled so CosmosUpdaterWorker.py can load it into a QIcon at
-        # runtime - separate from the icon= below, which only sets the
-        # .exe's own file/taskbar icon.
+    # The progress window's icon on macOS (Dock) and Linux (zenity /
+    # kdialog). Windows doesn't need it: its window uses the .exe's own
+    # icon, set by icon= below.
+    datas=[] if sys.platform == 'win32' else [
         (os.path.join(SPECPATH, '..', 'images', 'CosmosCollectionUpdater.png'), 'images'),
     ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # PySide6 (QtCore/QtGui/QtWidgets, for CosmosUpdaterWorker.py's status
-    # dialog) is auto-detected via its own bundled PyInstaller hooks - excluding
-    # the unused Qt modules the main app also excludes/doesn't need here
-    # keeps this onefile build from ballooning.
+    # The updater is stdlib-only and draws its progress window natively
+    # (CosmosUpdaterProgress.py), so no GUI toolkit belongs in it. These
+    # excludes guard against one being pulled in by accident, which would
+    # grow this one-file build several times over (bundling Qt made it 45 MB).
     excludes=[
-        'PySide6.QtWebEngineCore',
-        'PySide6.QtWebEngineWidgets',
-        'PySide6.QtWebEngineQuick',
-        'PySide6.QtQml',
-        'PySide6.QtQuick',
-        'PySide6.QtNetwork',
-        'scipy',
+        'PySide6',
+        'shiboken6',
         'tkinter',
+        '_tkinter',
+        'numpy',
+        'scipy',
         'pytest',
         'IPython',
         'jupyter',
         'notebook',
+        # Unused stdlib parts that bring DLLs along or are large. hashlib
+        # works without _hashlib (it falls back to the built-in hashes), and
+        # dropping it drops OpenSSL's 5 MB libcrypto. shutil works without
+        # _bz2/_lzma (only its archive helpers use them).
+        'ssl',
+        '_ssl',
+        '_hashlib',
+        '_bz2',
+        '_lzma',
+        'sqlite3',
+        '_sqlite3',
+        'unittest',
+        'pydoc',
+        'pydoc_data',
+        'doctest',
+        'xmlrpc',
+        'asyncio',
+        'multiprocessing',
+        'lib2to3',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
