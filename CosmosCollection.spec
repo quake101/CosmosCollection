@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 import certifi
 import os
+import re
 import sys
 from PyInstaller.utils.hooks import collect_data_files
 
@@ -10,8 +11,68 @@ block_cipher = None
 cert_file = certifi.where()
 cert_dir = os.path.dirname(cert_file)
 
-# Collect astroquery data files (CITATION, configs, etc.)
-astroquery_datas = collect_data_files('astroquery')
+# Collect astroquery data files (CITATION, configs, etc.), without the ~15 MB
+# of test data its tests/ folders hold
+astroquery_datas = collect_data_files('astroquery', excludes=['**/tests/**'])
+
+# Left out of both executables - nothing the app runs needs them:
+_EXCLUDES = [
+    'scipy',
+    'tkinter',
+    'pytest',
+    'IPython',
+    'jupyter',
+    'notebook',
+    # Only astropy's optional table converters (Table.to_pandas) and its tests
+    # import pandas, and the app never calls them (~22 MB)
+    'pandas',
+    # Build tools: pulled in by astropy's build-time setup_package.py files
+    # and by version fallbacks that already handle their absence
+    'setuptools',
+    'setuptools_scm',
+    'pkg_resources',
+    'wheel',
+    '_distutils_hack',
+    # Qt modules the app never loads. They were bundled only because Qt
+    # WebEngine's C++ library links QtQuick, and PyInstaller's Qt hooks then
+    # brought along every QML plugin and the Quick 3D/Graphs/Charts/Controls
+    # libraries those depend on (~70 MB). WebEngine still gets the Qt6Quick
+    # and Qt6Qml libraries it links: binary dependencies are collected on
+    # their own, whatever the Python modules.
+    'PySide6.QtQml',
+    'PySide6.QtQuick',
+    'PySide6.QtQuickWidgets',
+    'PySide6.QtOpenGL',
+    'PySide6.QtPositioning',
+]
+
+# Tests inside these packages (modules and their data), and astropy's
+# build-time setup_package modules. astropy.tests itself stays: importing
+# astropy loads astropy.tests.runner.
+_TEST_PACKAGES = r'(astropy|astroquery|pyvo|astroplan)'
+_TEST_MODULE = re.compile('^' + _TEST_PACKAGES + r'\..*\.(tests|conftest)(\.|$)|\.setup_package$')
+_TEST_DATA = re.compile(_TEST_PACKAGES + r'[/\\](.+[/\\])?tests[/\\]')
+
+# Qt translations: the app is English only. Qt's own strings fall back to
+# English without any .qm file, and Qt WebEngine falls back to its en-US
+# locale pack. Also Qt WebEngine's developer tools, which the app never
+# opens (~10 MB). Matches the Windows and Linux layouts; macOS keeps these
+# inside QtWebEngineCore.framework, which is left as it is.
+_QT_DIR = r'PySide6[/\\](Qt[/\\])?'
+_QT_UNUSED_DATA = re.compile(
+    _QT_DIR + r'translations[/\\](?!qtwebengine_locales[/\\]en-US\.pak$)'
+    + '|' + _QT_DIR + r'resources[/\\]qtwebengine_devtools_resources\.pak$'
+)
+
+
+def _keep_module(entry):
+    return not _TEST_MODULE.search(entry[0])
+
+
+def _keep_file(entry):
+    dest = entry[0]
+    return not (_TEST_DATA.match(dest) or _QT_UNUSED_DATA.match(dest))
+
 
 a = Analysis(
     ['main.py'],
@@ -49,19 +110,45 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
-        'scipy',
-        'tkinter',
-        'pytest',
-        'IPython',
-        'jupyter',
-        'notebook',
+    excludes=_EXCLUDES,
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+# The command line gets its own, smaller code archive: it starts from the
+# CLI package alone, so it leaves out the app's windows and matplotlib (see
+# cosmoscollection/cli/Main.py). Both executables still share the one
+# _internal folder below. QtGui and QtWidgets stay in its graph: a few
+# shared modules the CLI uses import them for images and messages.
+a_cli = Analysis(
+    [os.path.join('cosmoscollection', 'cli', '__main__.py')],
+    pathex=[SPECPATH],
+    binaries=[],
+    datas=[],
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=_EXCLUDES + [
+        'PySide6.QtNetwork',
+        'PySide6.QtPrintSupport',
+        'PySide6.QtWebChannel',
+        'PySide6.QtWebEngineCore',
+        'PySide6.QtWebEngineWidgets',
+        'matplotlib',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
 )
+
+for _analysis in (a, a_cli):
+    _analysis.pure = [entry for entry in _analysis.pure if _keep_module(entry)]
+    _analysis.datas = [entry for entry in _analysis.datas if _keep_file(entry)]
+    _analysis.binaries = [entry for entry in _analysis.binaries if _keep_file(entry)]
 
 if sys.platform.startswith('linux'):
     # These are base Linux/X11/desktop-integration libraries (GTK, NSS, cairo,
@@ -130,12 +217,14 @@ if sys.platform.startswith('linux'):
         # XML/misc
         'libxml2.so', 'libxslt.so', 'libsqlite3.so',
     )
-    a.binaries = [
-        b for b in a.binaries
-        if not os.path.basename(b[0]).startswith(_EXCLUDED_SYSTEM_LIB_PREFIXES)
-    ]
+    for _analysis in (a, a_cli):
+        _analysis.binaries = [
+            b for b in _analysis.binaries
+            if not os.path.basename(b[0]).startswith(_EXCLUDED_SYSTEM_LIB_PREFIXES)
+        ]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz_cli = PYZ(a_cli.pure, a_cli.zipped_data, cipher=block_cipher)
 
 # Product name/version in the .exe files' details, which SignPath code
 # signing checks (see build_tools/version_resource.py)
@@ -167,8 +256,8 @@ exe = EXE(
 
 # Separate CLI executable with console enabled
 exe_cli = EXE(
-    pyz,
-    a.scripts,
+    pyz_cli,
+    a_cli.scripts,
     [],
     exclude_binaries=True,
     name='CosmosCollection-CLI',
@@ -192,6 +281,11 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
+    # Already in a's lists, which COLLECT de-duplicates; listed in case the
+    # command line ever needs a file the app doesn't
+    a_cli.binaries,
+    a_cli.zipfiles,
+    a_cli.datas,
     strip=False,
     upx=False,
     upx_exclude=[],
