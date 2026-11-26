@@ -1443,6 +1443,12 @@ class AladinLiteWindow(TargetListActionsMixin, WindowPositionMixin, QMainWindow)
             try:
                 from PySide6.QtWebEngineWidgets import QWebEngineView
             except ImportError as ie:
+                from cosmoscollection.core.LinuxLibraries import (
+                    missing_from_import_error, show_missing_library_dialog)
+                missing = missing_from_import_error(ie)
+                if missing:
+                    # e.g. libxml2.so.2 on CachyOS/Arch: say which package to install
+                    show_missing_library_dialog(self, "The FOV Simulator's sky view", missing)
                 raise Exception(f"QWebEngineView not available: {ie}")
 
             self.web_view = QWebEngineView()

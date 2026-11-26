@@ -83,8 +83,11 @@ xattr -cr /path/to/CosmosCollection.app
 ```
 </details>
 
+<a id="linux-libraries"></a>
 <details>
 <summary><b>Linux: required system libraries</b></summary>
+
+If a library is missing, the app tells you which one and gives the command that installs it on your distribution, with a Copy Command button.
 
 Install the Qt cursor library once before the first run:
 
@@ -95,8 +98,19 @@ sudo apt-get install libxcb-cursor0
 # Fedora/RHEL
 sudo dnf install xcb-util-cursor
 
-# Arch Linux
+# Arch Linux / CachyOS
 sudo pacman -S xcb-util-cursor
+
+# openSUSE
+sudo zypper install libxcb-cursor0
+```
+
+For a library not listed here, find the package that provides it:
+```bash
+apt-file search libname.so.1        # Ubuntu/Debian (sudo apt-get install apt-file && sudo apt-file update first)
+dnf provides '*/libname.so.1'       # Fedora/RHEL
+sudo pacman -Fy && pacman -F libname.so.1   # Arch Linux / CachyOS
+zypper search --provides libname.so.1       # openSUSE
 ```
 
 **CachyOS / Arch: Map Picker or FOV Simulator won't open.** These use QtWebEngine, which needs the older `libxml2.so.2`. If you see `libxml2.so.2: cannot open shared object file`, install the compatibility package:

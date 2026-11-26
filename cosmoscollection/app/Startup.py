@@ -71,6 +71,12 @@ def main():
     """Start the app."""
     # (QTWEBENGINE_CHROMIUM_FLAGS is already set by Bootstrap.py, imported first.)
 
+    # Linux: a library Qt's window support needs is missing - say what to install, since
+    # Qt would abort while creating QApplication with only a terminal message
+    if sys.platform.startswith("linux"):
+        from cosmoscollection.core.LinuxLibraries import check_before_qt
+        check_before_qt()
+
     # Initialize QtWebEngine BEFORE QApplication: it needs shared OpenGL contexts, which
     # can only be enabled before the application object exists. (This used to import a
     # nonexistent QtWebEngineCore.QtWebEngineCore name, so it always failed silently and

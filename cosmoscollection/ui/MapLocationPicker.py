@@ -411,9 +411,16 @@ class MapLocationPickerDialog(QDialog):
                 from PySide6.QtWebEngineCore import QWebEngineSettings
                 from PySide6.QtWebChannel import QWebChannel
             except ImportError as ie:
-                QMessageBox.warning(self, "Feature Unavailable",
-                    "Map picker requires QtWebEngine which is not available.\n\n"
-                    "You can still enter coordinates manually.")
+                from cosmoscollection.core.LinuxLibraries import (
+                    missing_from_import_error, show_missing_library_dialog)
+                missing = missing_from_import_error(ie)
+                if missing:
+                    # e.g. libxml2.so.2 on CachyOS/Arch: say which package to install
+                    show_missing_library_dialog(self, "The Map Picker", missing)
+                else:
+                    QMessageBox.warning(self, "Feature Unavailable",
+                        "Map picker requires QtWebEngine which is not available.\n\n"
+                        "You can still enter coordinates manually.")
                 logger.error(f"QtWebEngine not available: {ie}")
                 self._init_failed = True
                 return
